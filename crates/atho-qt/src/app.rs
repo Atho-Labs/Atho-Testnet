@@ -151,6 +151,7 @@ pub struct DesktopApp {
     last_error: Option<String>,
     active_tab: NavTab,
     send_to: String,
+    send_label: String,
     send_amount: String,
     send_fee: String,
     receive_label: String,
@@ -197,6 +198,7 @@ impl DesktopApp {
             last_error: None,
             active_tab: NavTab::Overview,
             send_to: String::new(),
+            send_label: String::new(),
             send_amount: String::new(),
             send_fee: String::new(),
             receive_label: String::new(),
@@ -492,13 +494,15 @@ impl DesktopApp {
                 let selected = self.active_tab == tab;
                 let mut button = egui::Button::new(tab.label());
                 if selected {
-                    button = button.fill(egui::Color32::from_rgb(243, 243, 240));
-                    button = button.stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(199, 192, 183),
-                    ));
+                    button =
+                        button
+                            .fill(egui::Color32::from_rgb(72, 72, 72))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(247, 147, 26),
+                            ));
                 }
-                if ui.add(button).clicked() {
+                if ui.add_sized([96.0, 28.0], button).clicked() {
                     self.active_tab = tab;
                 }
             }
@@ -514,14 +518,16 @@ impl DesktopApp {
 
     fn card<R>(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
         egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgb(255, 254, 251))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgb(221, 214, 205),
-            ))
+            .fill(egui::Color32::from_rgb(50, 50, 50))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 24, 24)))
             .rounding(egui::Rounding::same(8.0))
             .show(ui, |ui| {
-                ui.heading(title);
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(18.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(248, 248, 248)),
+                );
                 ui.add_space(6.0);
                 add_contents(ui)
             })
@@ -529,62 +535,73 @@ impl DesktopApp {
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::light();
-        visuals.panel_fill = egui::Color32::from_rgb(249, 247, 244);
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(249, 247, 244);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(244, 241, 236);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(238, 234, 228);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(230, 223, 213);
-        visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(44, 40, 35);
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(45, 45, 45);
+        visuals.window_fill = egui::Color32::from_rgb(41, 41, 41);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(24, 24, 24);
+        visuals.faint_bg_color = egui::Color32::from_rgb(56, 56, 56);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(41, 41, 41);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(70, 70, 70);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(82, 82, 82);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(95, 95, 95);
+        visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(237, 237, 237);
+        visuals.widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(255, 255, 255);
+        visuals.widgets.active.fg_stroke.color = egui::Color32::from_rgb(255, 255, 255);
         visuals.selection.bg_fill = egui::Color32::from_rgb(247, 147, 26);
-        visuals.selection.stroke.color = egui::Color32::from_rgb(88, 52, 12);
-        visuals.window_fill = egui::Color32::from_rgb(247, 245, 241);
+        visuals.selection.stroke.color = egui::Color32::from_rgb(247, 147, 26);
+        visuals.override_text_color = Some(egui::Color32::from_rgb(236, 236, 236));
         ctx.set_visuals(visuals);
 
         let mut style = (*ctx.style()).clone();
-        let mono_heading = egui::FontId::new(20.0, egui::FontFamily::Monospace);
-        let mono_body = egui::FontId::new(14.0, egui::FontFamily::Monospace);
-        let mono_small = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+        let heading = egui::FontId::new(20.0, egui::FontFamily::Proportional);
+        let body = egui::FontId::new(14.0, egui::FontFamily::Proportional);
+        let button = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+        let small = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+        style.text_styles.insert(egui::TextStyle::Heading, heading);
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, mono_heading);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, mono_body.clone());
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, mono_body.clone());
-        style
-            .text_styles
-            .insert(egui::TextStyle::Monospace, mono_body);
-        style.text_styles.insert(egui::TextStyle::Small, mono_small);
+            .insert(egui::TextStyle::Body, body.clone());
+        style.text_styles.insert(egui::TextStyle::Button, button);
+        style.text_styles.insert(egui::TextStyle::Monospace, body);
+        style.text_styles.insert(egui::TextStyle::Small, small);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.interact_size = egui::vec2(36.0, 24.0);
         ctx.set_style(style);
     }
 
     fn show_welcome(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
-            ui.add_space(36.0);
+            ui.add_space(24.0);
             ui.heading("Atho");
             ui.label("A lightweight full node and HD wallet client.");
-            ui.add_space(18.0);
+            ui.add_space(16.0);
             Self::card(ui, "Start", |ui| {
-                ui.label("Node status");
                 ui.label(format!("Network: {}", self.view_model.network_label));
                 ui.label(format!("RPC: {}", self.connection.rpc_address()));
                 ui.label(format!("Connected: {}", self.ui_state.connected));
-                ui.add_space(12.0);
-                if ui.button("Create Wallet").clicked() {
+                ui.add_space(10.0);
+                if ui
+                    .add_sized([180.0, 30.0], egui::Button::new("Create Wallet"))
+                    .clicked()
+                {
                     self.create_form = CreateWalletForm::new(self.connection.network());
                     if let Err(err) = self.generate_create_mnemonic() {
                         self.last_error = Some(err);
                     }
                     self.launch_page = LaunchPage::CreateWallet;
                 }
-                if ui.button("Import Wallet").clicked() {
+                if ui
+                    .add_sized([180.0, 30.0], egui::Button::new("Import Wallet"))
+                    .clicked()
+                {
                     self.import_form = ImportWalletForm::new(self.connection.network());
                     self.launch_page = LaunchPage::ImportWallet;
                 }
-                if ui.button("Open Wallet").clicked() {
+                if ui
+                    .add_sized([180.0, 30.0], egui::Button::new("Open Wallet"))
+                    .clicked()
+                {
                     self.open_form = OpenWalletForm::new(self.connection.network());
                     self.launch_page = LaunchPage::OpenWallet;
                 }
@@ -597,9 +614,12 @@ impl DesktopApp {
         let mut cancel_clicked = false;
         Self::card(ui, "Create Wallet", |ui| {
             ui.label("Create a new HD wallet and encrypt it on disk.");
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.label("Wallet file");
-            ui.text_edit_singleline(&mut self.create_form.wallet_path);
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.create_form.wallet_path),
+            );
             ui.label("Wallet password");
             ui.add(
                 egui::TextEdit::singleline(&mut self.create_form.wallet_password).password(true),
@@ -614,16 +634,16 @@ impl DesktopApp {
                 egui::TextEdit::singleline(&mut self.create_form.mnemonic_passphrase)
                     .password(true),
             );
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             if !self.create_form.mnemonic_text.is_empty() {
                 ui.colored_label(
-                    egui::Color32::from_rgb(180, 70, 0),
+                    egui::Color32::from_rgb(247, 147, 26),
                     "Write this recovery phrase down now. It is shown once.",
                 );
                 let mut phrase = self.create_form.mnemonic_text.clone();
                 ui.add(
                     egui::TextEdit::multiline(&mut phrase)
-                        .desired_rows(4)
+                        .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace)
                         .interactive(false),
@@ -642,7 +662,7 @@ impl DesktopApp {
             }
 
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let ready = !self.create_form.mnemonic_text.is_empty()
                     && self.create_form.acknowledged_backup
                     && !self.create_form.wallet_password.is_empty()
@@ -706,15 +726,21 @@ impl DesktopApp {
             ui.label("Restore a wallet from an existing recovery phrase.");
             ui.add_space(8.0);
             ui.label("Wallet file");
-            ui.text_edit_singleline(&mut self.import_form.wallet_path);
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.import_form.wallet_path),
+            );
             ui.label("Mnemonic phrase");
             ui.add(
                 egui::TextEdit::multiline(&mut self.import_form.mnemonic_phrase)
-                    .desired_rows(4)
+                    .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
             ui.label("Seed passphrase (optional)");
-            ui.text_edit_singleline(&mut self.import_form.mnemonic_passphrase);
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.import_form.mnemonic_passphrase),
+            );
             ui.label("Wallet password");
             ui.add(
                 egui::TextEdit::singleline(&mut self.import_form.wallet_password).password(true),
@@ -726,7 +752,7 @@ impl DesktopApp {
             );
 
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let ready = !self.import_form.wallet_password.is_empty()
                     && self.import_form.wallet_password == self.import_form.wallet_password_confirm
                     && !self.import_form.mnemonic_phrase.trim().is_empty();
@@ -786,15 +812,22 @@ impl DesktopApp {
         let mut open_clicked = false;
         let mut cancel_clicked = false;
         Self::card(ui, "Open Wallet", |ui| {
-            ui.label("Open an existing encrypted wallet file.");
+            ui.label("Enter the wallet password to unlock your wallet.dat file.");
             ui.add_space(8.0);
             ui.label("Wallet file");
-            ui.text_edit_singleline(&mut self.open_form.wallet_path);
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.open_form.wallet_path),
+            );
             ui.label("Wallet password");
-            ui.add(egui::TextEdit::singleline(&mut self.open_form.wallet_password).password(true));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.open_form.wallet_password)
+                    .password(true)
+                    .desired_width(f32::INFINITY),
+            );
 
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
                         !self.open_form.wallet_password.is_empty(),
@@ -831,37 +864,80 @@ impl DesktopApp {
     }
 
     fn show_overview(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("overview_grid")
-            .num_columns(2)
-            .spacing([16.0, 16.0])
-            .show(ui, |ui| {
-                Self::card(ui, "Balances", |ui| {
-                    ui.label("Available");
-                    ui.monospace("0 atoms");
-                    ui.add_space(6.0);
-                    ui.label("Pending");
-                    ui.monospace("0 atoms");
-                    ui.add_space(6.0);
-                    ui.label("Wallet");
+        let wide = ui.available_width() > 860.0;
+        if wide {
+            ui.columns(2, |columns| {
+                Self::card(&mut columns[0], "Balances", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Available:");
+                        ui.monospace("0 atoms");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pending:");
+                        ui.monospace("0 atoms");
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Total:");
+                        ui.monospace("0 atoms");
+                    });
+                    ui.add_space(8.0);
+                    ui.label("Wallet file");
                     ui.monospace(self.wallet_path.as_deref().unwrap_or("No wallet loaded"));
                 });
-                Self::card(ui, "Recent Transactions", |ui| {
-                    ui.label("Wallet-specific transaction history will appear here.");
-                    ui.add_space(6.0);
-                    ui.monospace("No wallet activity indexed yet.");
+                Self::card(&mut columns[1], "Recent Transactions", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Date");
+                        ui.add_space(24.0);
+                        ui.strong("Type");
+                        ui.add_space(24.0);
+                        ui.strong("Label");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.strong("Amount");
+                        });
+                    });
                     ui.separator();
-                    ui.label(format!("Network: {}", self.view_model.network_label));
-                    ui.label(format!("Height: {}", self.view_model.block_count));
-                    ui.label(format!("Mempool: {}", self.view_model.mempool_count));
+                    ui.label("No wallet activity indexed yet.");
+                    ui.add_space(6.0);
+                    ui.label("Wallet-specific transaction history will appear here.");
                 });
-                ui.end_row();
-                Self::card(ui, "Node", |ui| {
+            });
+        } else {
+            Self::card(ui, "Balances", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Available:");
+                    ui.monospace("0 atoms");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pending:");
+                    ui.monospace("0 atoms");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Total:");
+                    ui.monospace("0 atoms");
+                });
+                ui.add_space(8.0);
+                ui.label("Wallet file");
+                ui.monospace(self.wallet_path.as_deref().unwrap_or("No wallet loaded"));
+            });
+            ui.add_space(10.0);
+            Self::card(ui, "Recent Transactions", |ui| {
+                ui.label("No wallet activity indexed yet.");
+                ui.add_space(6.0);
+                ui.label("Wallet-specific transaction history will appear here.");
+            });
+        }
+
+        ui.add_space(10.0);
+        if wide {
+            ui.columns(2, |columns| {
+                Self::card(&mut columns[0], "Node", |ui| {
                     ui.label(format!("RPC: {}", self.connection.rpc_address()));
                     ui.label(format!("Connected: {}", self.ui_state.connected));
                     ui.label(format!("Sync: {}", self.view_model.sync_stage));
                     ui.label(format!("Height: {}", self.view_model.block_count));
                 });
-                Self::card(ui, "Policy", |ui| {
+                Self::card(&mut columns[1], "Policy", |ui| {
                     ui.label(format!("Target block time: {}s", BLOCK_TIME_SECONDS));
                     ui.label(format!("Minimum fee: {} atoms", MIN_TX_FEE_ATOMS));
                     ui.label(format!(
@@ -870,28 +946,61 @@ impl DesktopApp {
                     ));
                 });
             });
+        } else {
+            Self::card(ui, "Node", |ui| {
+                ui.label(format!("RPC: {}", self.connection.rpc_address()));
+                ui.label(format!("Connected: {}", self.ui_state.connected));
+                ui.label(format!("Sync: {}", self.view_model.sync_stage));
+                ui.label(format!("Height: {}", self.view_model.block_count));
+            });
+            ui.add_space(10.0);
+            Self::card(ui, "Policy", |ui| {
+                ui.label(format!("Target block time: {}s", BLOCK_TIME_SECONDS));
+                ui.label(format!("Minimum fee: {} atoms", MIN_TX_FEE_ATOMS));
+                ui.label(format!(
+                    "Receive addresses: {}",
+                    self.ui_state.wallet_snapshot.receive_count
+                ));
+            });
+        }
     }
 
     fn show_send(&mut self, ui: &mut egui::Ui) {
         Self::card(ui, "Create Payment Draft", |ui| {
-            ui.label("Destination address");
-            ui.text_edit_singleline(&mut self.send_to);
-            ui.add_space(8.0);
+            ui.label("Pay to");
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.send_to)
+                    .hint_text("Enter an Atho base56 address"),
+            );
+            ui.label("Label");
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.send_label)
+                    .hint_text("Optional label for this payment"),
+            );
             ui.horizontal(|ui| {
                 ui.label("Amount (atoms)");
-                ui.text_edit_singleline(&mut self.send_amount);
+                ui.add_sized(
+                    [160.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.send_amount),
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("Fee (atoms)");
-                ui.text_edit_singleline(&mut self.send_fee);
+                ui.add_sized(
+                    [160.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.send_fee),
+                );
             });
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Draft").clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Draft payment").clicked() {
                     self.validate_send_draft();
                 }
                 if ui.button("Clear").clicked() {
                     self.send_to.clear();
+                    self.send_label.clear();
                     self.send_amount.clear();
                     self.send_fee.clear();
                     self.send_status.clear();
@@ -899,14 +1008,46 @@ impl DesktopApp {
             });
             ui.add_space(8.0);
             ui.label(&self.send_status);
-            ui.label("Broadcasting will come after the wallet-to-UTXO spend path is wired in.");
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Transaction Fee:");
+                ui.monospace(format!(
+                    "{} atoms/kB",
+                    self.send_fee.trim().parse::<u64>().unwrap_or(0)
+                ));
+                let _ = ui.button("Choose...");
+                ui.colored_label(
+                    egui::Color32::from_rgb(247, 147, 26),
+                    "Warning: Fee estimation is currently not possible.",
+                );
+            });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Send").clicked() {
+                    self.validate_send_draft();
+                }
+                if ui.button("Clear All").clicked() {
+                    self.send_to.clear();
+                    self.send_label.clear();
+                    self.send_amount.clear();
+                    self.send_fee.clear();
+                    self.send_status.clear();
+                }
+                let _ = ui.button("Add Recipient");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("Balance: {} atoms", 0u64));
+                });
+            });
         });
     }
 
     fn show_receive(&mut self, ui: &mut egui::Ui) {
         Self::card(ui, "Receive Address", |ui| {
             ui.label("Label");
-            ui.text_edit_singleline(&mut self.receive_label);
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.receive_label),
+            );
             ui.add_space(8.0);
             ui.label("Current base56 address");
             ui.horizontal(|ui| {
@@ -961,13 +1102,50 @@ impl DesktopApp {
 
     fn show_transactions(&mut self, ui: &mut egui::Ui) {
         Self::card(ui, "Wallet Transactions", |ui| {
-            ui.label("Wallet-specific transaction history will be listed here.");
-            ui.add_space(6.0);
-            ui.monospace("No wallet activity indexed yet.");
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(false, |ui| {
+                    ui.label("All");
+                });
+                ui.add_enabled_ui(false, |ui| {
+                    ui.label("All");
+                });
+                ui.add_enabled_ui(false, |ui| {
+                    let mut search = String::new();
+                    ui.add_sized(
+                        [ui.available_width().min(260.0), 24.0],
+                        egui::TextEdit::singleline(&mut search)
+                            .hint_text("Enter address, transaction id, or label to search"),
+                    );
+                });
+                ui.add_enabled_ui(false, |ui| {
+                    ui.label("Min amount");
+                });
+            });
             ui.separator();
-            ui.label(format!("Network: {}", self.view_model.network_label));
-            ui.label(format!("Height: {}", self.view_model.block_count));
-            ui.label(format!("Mempool: {}", self.view_model.mempool_count));
+            ui.horizontal(|ui| {
+                ui.strong("Date");
+                ui.add_space(32.0);
+                ui.strong("Type");
+                ui.add_space(32.0);
+                ui.strong("Label");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.strong("Amount");
+                });
+            });
+            ui.separator();
+            ui.label("No wallet activity indexed yet.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(format!("Network: {}", self.view_model.network_label));
+                ui.separator();
+                ui.label(format!("Height: {}", self.view_model.block_count));
+                ui.separator();
+                ui.label(format!("Mempool: {}", self.view_model.mempool_count));
+            });
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let _ = ui.button("Export");
+            });
         });
     }
 
@@ -983,11 +1161,11 @@ impl DesktopApp {
             ui.label(format!("Sync stage: {}", self.view_model.sync_stage));
             ui.label(format!("Wallet file: {}", wallet_path));
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Mining threads");
                 ui.add(egui::Slider::new(&mut self.ui_state.mining_cores, 1..=64).show_value(true));
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let ready = self.ui_state.connected && self.wallet.is_some();
                 if ui
                     .add_enabled(ready, egui::Button::new("Start Miner"))
@@ -1021,7 +1199,7 @@ impl DesktopApp {
 
     fn show_main_shell(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("menu_bar")
-            .exact_height(28.0)
+            .exact_height(24.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("File");
@@ -1034,7 +1212,7 @@ impl DesktopApp {
             });
 
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(40.0)
+            .exact_height(44.0)
             .show(ctx, |ui| {
                 self.show_tabs(ui);
             });
@@ -1056,13 +1234,15 @@ impl DesktopApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical(|ui| match self.active_tab {
-                NavTab::Overview => self.show_overview(ui),
-                NavTab::Send => self.show_send(ui),
-                NavTab::Receive => self.show_receive(ui),
-                NavTab::Transactions => self.show_transactions(ui),
-                NavTab::Settings => self.show_settings(ui),
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.active_tab {
+                    NavTab::Overview => self.show_overview(ui),
+                    NavTab::Send => self.show_send(ui),
+                    NavTab::Receive => self.show_receive(ui),
+                    NavTab::Transactions => self.show_transactions(ui),
+                    NavTab::Settings => self.show_settings(ui),
+                });
         });
     }
 
@@ -1082,19 +1262,23 @@ impl DesktopApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(42.0);
-                ui.heading("Atho");
-                ui.label("Lightweight full node, HD wallet, and miner client.");
-                ui.add_space(18.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(22.0);
+                        ui.heading("Atho");
+                        ui.label("Lightweight full node, HD wallet, and miner client.");
+                        ui.add_space(14.0);
 
-                match self.launch_page {
-                    LaunchPage::Welcome => self.show_welcome(ui),
-                    LaunchPage::CreateWallet => self.show_create_wallet(ui),
-                    LaunchPage::ImportWallet => self.show_import_wallet(ui),
-                    LaunchPage::OpenWallet => self.show_open_wallet(ui),
-                }
-            });
+                        match self.launch_page {
+                            LaunchPage::Welcome => self.show_welcome(ui),
+                            LaunchPage::CreateWallet => self.show_create_wallet(ui),
+                            LaunchPage::ImportWallet => self.show_import_wallet(ui),
+                            LaunchPage::OpenWallet => self.show_open_wallet(ui),
+                        }
+                    });
+                });
         });
     }
 }
@@ -1103,7 +1287,7 @@ impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
         self.poll_mining_job();
-        ctx.request_repaint_after(Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(200));
 
         if self.needs_initial_refresh {
             self.needs_initial_refresh = false;

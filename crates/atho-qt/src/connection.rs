@@ -152,9 +152,12 @@ fn start_local_node_if_needed(network: Network, rpc_address: &str) -> Option<Nod
             "atho-qt",
             "node binary not found; falling back to cargo run",
         );
+        let manifest_path = workspace_manifest_path();
         let mut command = Command::new("cargo");
         command
             .arg("run")
+            .arg("--manifest-path")
+            .arg(manifest_path)
             .arg("-p")
             .arg("atho-node")
             .arg("--bin")
@@ -212,6 +215,15 @@ fn node_binary_path() -> Option<PathBuf> {
     let name = if cfg!(windows) { "athod.exe" } else { "athod" };
     let candidate = candidate_dir.join(name);
     candidate.exists().then_some(candidate)
+}
+
+fn workspace_manifest_path() -> PathBuf {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap_or(crate_dir.as_path());
+    workspace_root.join("Cargo.toml")
 }
 
 #[cfg(test)]
