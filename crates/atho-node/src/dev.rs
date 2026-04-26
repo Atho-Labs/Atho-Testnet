@@ -1,20 +1,22 @@
-use atho_core::block::Block;
-use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
-use atho_core::network::Network;
-use atho_core::transaction::{Transaction, TxInput, TxOutput};
-use atho_storage::chainstate::Chainstate;
-use atho_storage::utxo::UtxoEntry;
 use crate::config::NodeConfig;
 use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::node::Node;
+use crate::validation::encode_input_reference;
+use atho_core::block::Block;
+use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
+use atho_core::network::Network;
+use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
 use atho_p2p::relay::RelayLoop;
+use atho_storage::chainstate::Chainstate;
+use atho_storage::utxo::UtxoEntry;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
-use std::sync::{Mutex, OnceLock};
 
 const DEV_ROOT: &str = "dev";
 
@@ -104,7 +106,11 @@ pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     ensure_layout()?;
     let path = audit_dir().join("chain.tsv");
-    copy_or_init(&chain_blocks_file(), &path, "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count")?;
+    copy_or_init(
+        &chain_blocks_file(),
+        &path,
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count",
+    )?;
     Ok(path)
 }
 
@@ -122,7 +128,11 @@ pub fn export_transaction_details(_chainstate: &Chainstate) -> std::io::Result<(
     let inputs_path = audit_dir().join("transaction_inputs.tsv");
     let outputs_path = audit_dir().join("transaction_outputs.tsv");
     copy_or_init(&chain_inputs_file(), &inputs_path, "height\tblock_hash\ttx_index\tinput_index\tprevious_txid\toutput_index\tunlocking_script_hex")?;
-    copy_or_init(&chain_outputs_file(), &outputs_path, "height\tblock_hash\ttx_index\toutput_index\tvalue_atoms\tlocking_script_hex")?;
+    copy_or_init(
+        &chain_outputs_file(),
+        &outputs_path,
+        "height\tblock_hash\ttx_index\toutput_index\tvalue_atoms\tlocking_script_hex",
+    )?;
     Ok((inputs_path, outputs_path))
 }
 
@@ -133,10 +143,18 @@ pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, Pa
     let txs = audit_dir().join("transactions.tsv");
     let inputs = audit_dir().join("transaction_inputs.tsv");
     let outputs = audit_dir().join("transaction_outputs.tsv");
-    copy_or_init(&chain_blocks_file(), &chain, "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count")?;
+    copy_or_init(
+        &chain_blocks_file(),
+        &chain,
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count",
+    )?;
     copy_or_init(&chain_transactions_file(), &txs, "height\tblock_hash\ttx_index\ttxid\tversion\tlock_time\tinput_count\toutput_count\tcanonical_bytes_hex")?;
     copy_or_init(&chain_inputs_file(), &inputs, "height\tblock_hash\ttx_index\tinput_index\tprevious_txid\toutput_index\tunlocking_script_hex")?;
-    copy_or_init(&chain_outputs_file(), &outputs, "height\tblock_hash\ttx_index\toutput_index\tvalue_atoms\tlocking_script_hex")?;
+    copy_or_init(
+        &chain_outputs_file(),
+        &outputs,
+        "height\tblock_hash\ttx_index\toutput_index\tvalue_atoms\tlocking_script_hex",
+    )?;
     Ok((chain, txs, inputs, outputs))
 }
 
@@ -148,43 +166,31 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     append_log(
         "p2p",
         &format!(
-            "dev mine network={} target={} min={} max={} tx_alloc={:.2}",
+            "dev mine network={} target={} min={} max={} tx_alloc_bps={}",
             network.id(),
             hex::encode(clamped_target),
             hex::encode(DIFFICULTY_PROFILE.min_difficulty_target),
             hex::encode(DIFFICULTY_PROFILE.max_difficulty_target),
-            DIFFICULTY_PROFILE.standard_transaction_allocation
+            DIFFICULTY_PROFILE.standard_transaction_allocation_bps
         ),
     )?;
 
     let mut node = Node::new(NodeConfig::new(network));
     let (seed_txid, seed_value, seed_script) = seed_utxo(network);
-    node.chainstate.insert_utxo(UtxoEntry {
-        network,
-        txid: seed_txid,
-        output_index: 0,
-        value_atoms: seed_value,
-        locking_script: vec![seed_script],
-    }).map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
-
-    let tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            previous_txid: seed_txid,
+    node.chainstate
+        .insert_utxo(UtxoEntry {
+            network,
+            txid: seed_txid,
             output_index: 0,
-            unlocking_script: vec![seed_script],
-        }],
-        outputs: vec![TxOutput {
-            value_atoms: seed_value.saturating_sub(500),
-            locking_script: vec![seed_script.saturating_add(1)],
-        }],
-        lock_time: 0,
-        witness: vec![],
-    };
+            value_atoms: seed_value,
+            locking_script: vec![seed_script],
+        })
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+
+    let tx = signed_spend_transaction(network, seed_txid, seed_value, seed_script)?;
 
     let txid = node
-        .mempool
-        .admit(MempoolEntry {
+        .admit_transaction(MempoolEntry {
             transaction: tx,
             fee_atoms: 500,
         })
@@ -211,6 +217,60 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     )?;
     publish_audit_exports()?;
     Ok(audit_dir().join("chain.tsv"))
+}
+
+fn signed_spend_transaction(
+    network: Network,
+    seed_txid: [u8; 48],
+    seed_value: u64,
+    seed_script: u8,
+) -> std::io::Result<Transaction> {
+    let keypair = signing_keypair(network, seed_txid, seed_script)?;
+    let mut tx = Transaction {
+        version: 1,
+        inputs: vec![TxInput {
+            previous_txid: seed_txid,
+            output_index: 0,
+            unlocking_script: vec![seed_script],
+        }],
+        outputs: vec![TxOutput {
+            value_atoms: seed_value.saturating_sub(500),
+            locking_script: vec![seed_script.saturating_add(1)],
+        }],
+        lock_time: 0,
+        witness: vec![],
+    };
+    let digest = tx.signing_digest();
+    let signature = sign(&keypair.secret_key, &digest).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("falcon sign failed: {err:?}"),
+        )
+    })?;
+    tx.witness = TxWitness {
+        signature: signature.0,
+        pubkey: keypair.public_key.0,
+        input_refs: vec![encode_input_reference(&seed_txid, 0)],
+    }
+    .canonical_bytes();
+    Ok(tx)
+}
+
+fn signing_keypair(
+    network: Network,
+    seed_txid: [u8; 48],
+    seed_script: u8,
+) -> std::io::Result<FalconKeypair> {
+    let mut seed = Vec::with_capacity(network.id().len() + seed_txid.len() + 1);
+    seed.extend_from_slice(network.id().as_bytes());
+    seed.extend_from_slice(&seed_txid);
+    seed.push(seed_script);
+    generate_from_seed(&seed).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("falcon keygen failed: {err:?}"),
+        )
+    })
 }
 
 fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
@@ -248,7 +308,7 @@ fn append_block_row(path: &PathBuf, height: u64, block: &Block) -> std::io::Resu
         hex::encode(block.header.previous_block_hash),
         hex::encode(block.header.merkle_root),
         block.header.timestamp,
-        hex::encode(block.header.target),
+        hex::encode(block.header.difficulty_target_or_bits),
         block.header.nonce,
         block.transactions.len()
     )?;

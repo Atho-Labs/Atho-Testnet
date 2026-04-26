@@ -1,14 +1,22 @@
 use crate::config::NodeConfig;
-use crate::error::NodeError;
 use crate::dev;
+use crate::error::NodeError;
 use crate::node::Node;
+use crate::system::AthoSystem;
 use atho_core::network::Network;
+use atho_rpc::request::RpcRequest;
+use atho_rpc::response::RpcResponse;
+use atho_rpc::transport::{read_message, write_message};
+use std::io::BufReader;
+use std::net::TcpListener;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RuntimeError {
     #[error("invalid network")]
     InvalidNetwork,
+    #[error("rpc bind failed: {0}")]
+    RpcBindFailed(String),
 }
 
 #[derive(Debug)]
@@ -48,16 +56,63 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
     Ok(NodeConfig::new(network))
 }
 
-pub fn run() -> Result<(), NodeError> {
-    let config = load_config_from_env()?;
+pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
-    let mut runtime = NodeRuntime::new(config);
-    runtime.start();
-    let _ = dev::append_log("athod", "runtime started");
-    runtime.stop();
+    let mut system = AthoSystem::new(config);
+    system.start();
+    let rpc_address = rpc_bind_address(config.network);
+    let listener = TcpListener::bind(&rpc_address).map_err(|err| {
+        crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
+    })?;
+    let _ = dev::append_log("athod", &format!("runtime started rpc={rpc_address}"));
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(mut stream) => {
+                let request = match stream.try_clone() {
+                    Ok(clone) => {
+                        let mut reader = BufReader::new(clone);
+                        match read_message::<_, RpcRequest>(&mut reader) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = dev::append_log("athod", &format!("rpc read error: {err}"));
+                                continue;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = dev::append_log("athod", &format!("rpc clone error: {err}"));
+                        continue;
+                    }
+                };
+                let response: RpcResponse = system.handle_mut(request);
+                if let Err(err) = write_message(&mut stream, &response) {
+                    let _ = dev::append_log("athod", &format!("rpc write error: {err}"));
+                }
+            }
+            Err(err) => {
+                let _ = dev::append_log("athod", &format!("rpc accept error: {err}"));
+            }
+        }
+    }
     let _ = dev::append_log("athod", "runtime stopped");
     Ok(())
+}
+
+pub fn rpc_bind_address(network: Network) -> String {
+    if let Ok(address) = std::env::var("ATHO_RPC_ADDR") {
+        return address;
+    }
+    match network {
+        Network::Mainnet => String::from("127.0.0.1:18443"),
+        Network::Testnet => String::from("127.0.0.1:18444"),
+        Network::Regnet => String::from("127.0.0.1:18445"),
+    }
+}
+
+pub fn run() -> Result<(), NodeError> {
+    let config = load_config_from_env()?;
+    run_with_config(config)
 }
 
 #[cfg(test)]

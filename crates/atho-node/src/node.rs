@@ -1,9 +1,9 @@
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;
-use crate::mempool::Mempool;
+use crate::mempool::{Mempool, MempoolEntry};
 use crate::miner::Miner;
-use crate::validation::validate_block;
+use crate::validation::validate_block_with_context;
 use atho_core::block::Block;
 use atho_storage::chainstate::Chainstate as StorageChainstate;
 
@@ -24,11 +24,18 @@ impl Node {
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), NodeError> {
-        validate_block(block, self.chainstate.height, self.config.network)?;
-        if block.header.previous_block_hash != self.chainstate.tip_hash {
-            return Err(crate::validation::ValidationError::BlockParentHashMismatch.into());
-        }
+        let working_utxos = self.chainstate.utxo_snapshot();
+        validate_block_with_context(
+            block,
+            self.chainstate.height.saturating_add(1),
+            self.config.network,
+            self.chainstate.tip_hash,
+            working_utxos,
+        )?;
         self.chainstate.connect_block(block)?;
+        let updated_utxos = self.chainstate.utxo_snapshot();
+        self.mempool
+            .revalidate(|txid, output_index| updated_utxos.get(*txid, output_index).cloned());
         let _ = dev::record_block(self.chainstate.height, block);
         let _ = dev::append_log(
             "chain",
@@ -42,27 +49,48 @@ impl Node {
         Ok(())
     }
 
+    pub fn admit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
+        let utxos = self.chainstate.utxo_snapshot();
+        let txid = self.mempool.admit(entry, |txid, output_index| {
+            utxos.get(*txid, output_index).cloned()
+        })?;
+        Ok(txid)
+    }
+
     pub fn mine_candidate_block(&self, miner: &Miner) -> Result<Block, NodeError> {
-        miner.assemble_candidate_block(self)
+        miner.mine_candidate_block(self)
+    }
+
+    pub fn build_candidate_block(&self, miner: &Miner) -> Result<Block, NodeError> {
+        miner.build_candidate_block(self)
     }
 
     pub fn mine_and_connect_candidate_block(&mut self, miner: &Miner) -> Result<Block, NodeError> {
-        let block = miner.assemble_candidate_block(self)?;
+        let block = miner.mine_candidate_block(self)?;
         self.connect_block(&block)?;
         Ok(block)
+    }
+
+    pub fn submit_block(&mut self, block: &Block) -> Result<(), NodeError> {
+        self.connect_block(block)
+    }
+
+    pub fn submit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
+        self.admit_transaction(entry)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::block::{merkle_root, Block, BlockHeader};
+    use crate::mempool::MempoolEntry;
+    use crate::miner::Miner;
+    use crate::validation::encode_input_reference;
+    use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::{pow, subsidy};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
     use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MIN_BYTES};
-    use crate::mempool::MempoolEntry;
-    use crate::miner::Miner;
     use atho_storage::utxo::UtxoEntry;
 
     fn witness_bytes(inputs: usize) -> Vec<u8> {
@@ -74,6 +102,15 @@ mod tests {
         .canonical_bytes()
     }
 
+    fn witness_bytes_for_input(previous_txid: [u8; 48], output_index: u32) -> Vec<u8> {
+        TxWitness {
+            signature: vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
+            pubkey: vec![8; FALCON_512_PUBLIC_KEY_BYTES],
+            input_refs: vec![encode_input_reference(&previous_txid, output_index)],
+        }
+        .canonical_bytes()
+    }
+
     #[test]
     fn node_connect_block_surfaces_storage_errors() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
@@ -81,7 +118,7 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atho(0),
+                value_atoms: subsidy::block_subsidy_atoms(0),
                 locking_script: vec![0],
             }],
             lock_time: 0,
@@ -95,7 +132,7 @@ mod tests {
                 unlocking_script: vec![1],
             }],
             outputs: vec![TxOutput {
-                value_atoms: 1_000,
+                value_atoms: 1_500,
                 locking_script: vec![2],
             }],
             lock_time: 0,
@@ -103,20 +140,23 @@ mod tests {
         };
         let transactions = vec![coinbase, tx];
         let header = BlockHeader {
-                version: 1,
-                previous_block_hash: node.chainstate.tip_hash,
-                merkle_root: merkle_root(&transactions),
-                timestamp: 75,
-                target: pow::DIFFICULTY_PROFILE.min_difficulty_target,
-                nonce: 0,
-            };
-        let block = Block::new(
-            header,
-            transactions,
-        );
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
+            previous_block_hash: node.chainstate.tip_hash,
+            merkle_root: merkle_root(&transactions),
+            witness_root: witness_root(&transactions),
+            timestamp: 75,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            nonce: 0,
+        };
+        let block = Block::new(header, transactions);
 
         let err = node.connect_block(&block).unwrap_err();
-        assert!(matches!(err, NodeError::Storage(_)));
+        assert!(matches!(
+            err,
+            NodeError::Validation(crate::validation::ValidationError::MissingUtxo)
+        ));
     }
 
     #[test]
@@ -126,7 +166,7 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atho(0),
+                value_atoms: subsidy::block_subsidy_atoms(0),
                 locking_script: vec![0],
             }],
             lock_time: 0,
@@ -148,20 +188,23 @@ mod tests {
         };
         let transactions = vec![coinbase, tx];
         let header = BlockHeader {
-                version: 1,
-                previous_block_hash: [1; 48],
-                merkle_root: merkle_root(&transactions),
-                timestamp: 75,
-                target: pow::DIFFICULTY_PROFILE.min_difficulty_target,
-                nonce: 0,
-            };
-        let block = Block::new(
-            header,
-            transactions,
-        );
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
+            previous_block_hash: [1; 48],
+            merkle_root: merkle_root(&transactions),
+            witness_root: witness_root(&transactions),
+            timestamp: 75,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            nonce: 0,
+        };
+        let block = Block::new(header, transactions);
 
         let err = node.connect_block(&block).unwrap_err();
-        assert!(matches!(err, NodeError::Validation(crate::validation::ValidationError::BlockParentHashMismatch)));
+        assert!(matches!(
+            err,
+            NodeError::Validation(crate::validation::ValidationError::BlockParentHashMismatch)
+        ));
     }
 
     #[test]
@@ -184,18 +227,17 @@ mod tests {
                 unlocking_script: vec![1],
             }],
             outputs: vec![TxOutput {
-                value_atoms: 1_000,
+                value_atoms: 1_500,
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: witness_bytes_for_input([9; 48], 0),
         };
-        node.mempool
-            .admit(MempoolEntry {
-                transaction: tx.clone(),
-                fee_atoms: 500,
-            })
-            .unwrap();
+        node.admit_transaction(MempoolEntry {
+            transaction: tx.clone(),
+            fee_atoms: 500,
+        })
+        .unwrap();
 
         let miner = Miner::new(4);
         let block = node.mine_and_connect_candidate_block(&miner).unwrap();

@@ -22,7 +22,7 @@ pub struct DifficultyTargetProfile {
     pub genesis_target: [u8; 48],
     pub min_difficulty_target: [u8; 48],
     pub max_difficulty_target: [u8; 48],
-    pub standard_transaction_allocation: f64,
+    pub standard_transaction_allocation_bps: u16,
 }
 
 pub const POW_PROFILE: ProofOfWork = ProofOfWork {
@@ -42,7 +42,7 @@ pub const DIFFICULTY_PROFILE: DifficultyTargetProfile = DifficultyTargetProfile 
     genesis_target: hex!("000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
     min_difficulty_target: hex!("000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
     max_difficulty_target: hex!("000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000FFF"),
-    standard_transaction_allocation: 0.95,
+    standard_transaction_allocation_bps: 9_500,
 };
 
 pub const MAINNET_INITIAL_TARGET: [u8; 48] = hex!("0000003FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
@@ -72,9 +72,21 @@ pub fn initial_target_for_network(network: Network) -> [u8; 48] {
     }
 }
 
+pub fn target_for_height(network: Network, height: u64) -> [u8; 48] {
+    if height == 0 {
+        DIFFICULTY_PROFILE.genesis_target
+    } else {
+        initial_target_for_network(network)
+    }
+}
+
 pub fn target_within_bounds(target: &[u8; 48]) -> bool {
     target >= &DIFFICULTY_PROFILE.max_difficulty_target
         && target <= &DIFFICULTY_PROFILE.min_difficulty_target
+}
+
+pub fn meets_target(hash: &[u8; 48], target: &[u8; 48]) -> bool {
+    hash <= target
 }
 
 pub fn clamp_target(target: [u8; 48]) -> [u8; 48] {
@@ -102,7 +114,10 @@ mod tests {
         assert_eq!(POW_PROFILE.max_adjust_down_percent, 32);
         assert_eq!(SHA3_384_HASH_BITS, 384);
         assert_eq!(SHA3_384_HASH_HEX_CHARS, 96);
-        assert_eq!(DIFFICULTY_PROFILE.standard_transaction_allocation, 0.95);
+        assert_eq!(
+            DIFFICULTY_PROFILE.standard_transaction_allocation_bps,
+            9_500
+        );
     }
 
     #[test]
@@ -119,9 +134,19 @@ mod tests {
 
     #[test]
     fn difficulty_targets_clamp_and_validate() {
-        assert!(target_within_bounds(&initial_target_for_network(Network::Mainnet)));
-        assert!(target_within_bounds(&initial_target_for_network(Network::Testnet)));
-        assert!(target_within_bounds(&initial_target_for_network(Network::Regnet)));
+        assert!(target_within_bounds(&initial_target_for_network(
+            Network::Mainnet
+        )));
+        assert!(target_within_bounds(&target_for_height(
+            Network::Mainnet,
+            0
+        )));
+        assert!(target_within_bounds(&initial_target_for_network(
+            Network::Testnet
+        )));
+        assert!(target_within_bounds(&initial_target_for_network(
+            Network::Regnet
+        )));
         assert_eq!(
             clamp_target([0xFF; 48]),
             DIFFICULTY_PROFILE.min_difficulty_target

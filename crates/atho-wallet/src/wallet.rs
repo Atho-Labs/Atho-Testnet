@@ -1,13 +1,12 @@
-use atho_core::address::{address_checksum, address_from_public_key};
-use atho_core::constants::ADDRESS_CHECKSUM_BASE56_CHARS;
-use atho_core::crypto::hash::{sha3_256, sha3_384};
-use atho_core::network::Network;
-use atho_crypto::falcon;
 use crate::address_book::AddressBook;
 use crate::hd::{AddressKind, DerivationPath, HdWallet, WalletSeed};
 use crate::keypool::Keypool;
 use crate::mnemonic::MnemonicPhrase;
 use crate::snapshot::WalletSnapshot;
+use atho_core::address::address_parts_from_public_key;
+use atho_core::crypto::hash::{sha3_256, sha3_384};
+use atho_core::network::Network;
+use atho_crypto::falcon;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -22,6 +21,7 @@ pub struct WalletAddress {
     pub path: DerivationPath,
     pub visible_prefix: char,
     pub address: String,
+    pub hashed_public_key: String,
     pub public_key: Vec<u8>,
     pub payment_digest: [u8; 32],
     pub checksum: [u8; 4],
@@ -102,19 +102,42 @@ impl Wallet {
     }
 
     pub fn checkout_receive_address(&mut self) -> WalletAddress {
-        self.checkout(AddressKind::Receive)
+        self.checkout(AddressKind::Receive, None)
     }
 
     pub fn checkout_change_address(&mut self) -> WalletAddress {
-        self.checkout(AddressKind::Change)
+        self.checkout(AddressKind::Change, None)
+    }
+
+    pub fn checkout_receive_address_with_label(&mut self, label: Option<String>) -> WalletAddress {
+        self.checkout(AddressKind::Receive, label)
+    }
+
+    pub fn checkout_change_address_with_label(&mut self, label: Option<String>) -> WalletAddress {
+        self.checkout(AddressKind::Change, label)
+    }
+
+    pub fn address_for_path(&self, path: DerivationPath) -> WalletAddress {
+        self.derive_address(path)
+    }
+
+    pub fn all_addresses(&self) -> Vec<WalletAddress> {
+        self.address_book
+            .snapshot()
+            .into_iter()
+            .map(|record| self.derive_address(record.path))
+            .collect()
     }
 
     fn prefill(&mut self) {
-        self.keypool
-            .refill(&mut self.hd_wallet, self.restore_gap_limit, self.restore_gap_limit);
+        self.keypool.refill(
+            &mut self.hd_wallet,
+            self.restore_gap_limit,
+            self.restore_gap_limit,
+        );
     }
 
-    fn checkout(&mut self, kind: AddressKind) -> WalletAddress {
+    fn checkout(&mut self, kind: AddressKind, label: Option<String>) -> WalletAddress {
         let path = match kind {
             AddressKind::Receive => self
                 .keypool
@@ -126,7 +149,7 @@ impl Wallet {
                 .unwrap_or_else(|| self.hd_wallet.next_path(AddressKind::Change)),
         };
         let address = self.derive_address(path);
-        self.address_book.record(self.network, path, None);
+        self.address_book.record(self.network, path, label);
         match kind {
             AddressKind::Receive => self.snapshot.record_receive(),
             AddressKind::Change => self.snapshot.record_change(),
@@ -144,21 +167,19 @@ impl Wallet {
             AddressKind::Change => 1,
         });
         bytes.extend_from_slice(&path.index.to_le_bytes());
-        let keypair = falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available");
+        let keypair =
+            falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available");
         let public_key = keypair.public_key.as_bytes().to_vec();
-        let payment_digest = atho_core::address::public_key_digest(self.network, &public_key);
-        let visible_prefix = self.network.visible_prefix();
-        let address = address_from_public_key(self.network, &public_key);
-        let body = &address[1..address.len().saturating_sub(ADDRESS_CHECKSUM_BASE56_CHARS)];
-        let checksum = address_checksum(visible_prefix, body);
+        let parts = address_parts_from_public_key(self.network, &public_key);
         WalletAddress {
             network: self.network,
             path,
-            visible_prefix,
-            address,
+            visible_prefix: parts.visible_prefix,
+            address: parts.base56_address,
+            hashed_public_key: parts.hashed_public_key,
             public_key,
-            payment_digest,
-            checksum,
+            payment_digest: parts.payment_digest,
+            checksum: parts.checksum,
         }
     }
 
@@ -214,6 +235,7 @@ pub(crate) struct PersistedWalletState {
 mod tests {
     use super::*;
     use crate::mnemonic::{MnemonicLength, MnemonicPhrase};
+    use atho_core::address::decode_base56_address;
 
     fn phrase() -> MnemonicPhrase {
         MnemonicPhrase::from_entropy(&[0u8; 32], MnemonicLength::Words24).unwrap()
@@ -222,7 +244,8 @@ mod tests {
     #[test]
     fn wallet_restore_reproduces_deterministic_addresses() {
         let mut a = Wallet::from_mnemonic(phrase(), "", Network::Mainnet);
-        let mut b = Wallet::restore_from_phrase(&phrase().as_sentence(), "", Network::Mainnet).unwrap();
+        let mut b =
+            Wallet::restore_from_phrase(&phrase().as_sentence(), "", Network::Mainnet).unwrap();
 
         let a1 = a.checkout_receive_address();
         let b1 = b.checkout_receive_address();
@@ -230,6 +253,12 @@ mod tests {
         assert_eq!(a1.checksum, b1.checksum);
         assert_eq!(a1.visible_prefix, 'A');
         assert_eq!(a1.address, b1.address);
+        assert!(a1
+            .hashed_public_key
+            .starts_with(Network::Mainnet.internal_hpk_prefix()));
+        let (decoded, network) = decode_base56_address(&a1.address).unwrap();
+        assert_eq!(decoded, a1.payment_digest);
+        assert_eq!(network, Network::Mainnet);
     }
 
     #[test]
@@ -242,6 +271,9 @@ mod tests {
         let first = wallet.checkout_receive_address();
         let second = wallet.checkout_receive_address();
         assert_ne!(first.payment_digest, second.payment_digest);
+        assert!(first
+            .hashed_public_key
+            .starts_with(Network::Testnet.internal_hpk_prefix()));
         assert_eq!(wallet.snapshot.receive_count, 2);
         assert_eq!(wallet.address_book.len(), 2);
         assert!(first.address.starts_with('T'));
@@ -250,7 +282,8 @@ mod tests {
     #[test]
     fn wallet_passphrase_changes_root_material() {
         let a = Wallet::from_mnemonic(phrase(), "", Network::Regnet).checkout_receive_address();
-        let b = Wallet::from_mnemonic(phrase(), "secret", Network::Regnet).checkout_receive_address();
+        let b =
+            Wallet::from_mnemonic(phrase(), "secret", Network::Regnet).checkout_receive_address();
         assert_ne!(a.payment_digest, b.payment_digest);
     }
 }

@@ -20,8 +20,12 @@ fn bench_wallet_datafile(c: &mut Criterion) {
 
     c.bench_function("wallet_datafile_save", |b| {
         b.iter(|| {
-            datafile::WalletDataFile::save(black_box(&wallet), black_box("password"), black_box(&path))
-                .unwrap();
+            datafile::WalletDataFile::save(
+                black_box(&wallet),
+                black_box("password"),
+                black_box(&path),
+            )
+            .unwrap();
         })
     });
 
@@ -29,7 +33,8 @@ fn bench_wallet_datafile(c: &mut Criterion) {
 
     c.bench_function("wallet_datafile_load", |b| {
         b.iter(|| {
-            let loaded = datafile::WalletDataFile::load(black_box(&path), black_box("password")).unwrap();
+            let loaded =
+                datafile::WalletDataFile::load(black_box(&path), black_box("password")).unwrap();
             black_box(loaded);
         })
     });

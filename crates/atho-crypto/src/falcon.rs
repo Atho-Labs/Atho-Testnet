@@ -224,7 +224,9 @@ pub fn verify(
     message: &[u8],
     signature: &FalconSignature,
 ) -> Result<bool, CryptoError> {
-    if !public_key_len_ok(public_key.as_bytes().len()) || !signature_len_ok(signature.as_bytes().len()) {
+    if !public_key_len_ok(public_key.as_bytes().len())
+        || !signature_len_ok(signature.as_bytes().len())
+    {
         return Ok(false);
     }
 

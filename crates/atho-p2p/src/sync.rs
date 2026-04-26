@@ -7,7 +7,10 @@ pub struct SyncState {
 impl SyncState {
     pub fn advance(&mut self, height: u64) {
         self.best_height = self.best_height.max(height);
-        crate::audit::append_log("p2p", &format!("sync advanced best_height={}", self.best_height));
+        crate::audit::append_log(
+            "p2p",
+            &format!("sync advanced best_height={}", self.best_height),
+        );
     }
 
     pub fn mark_headers_synced(&mut self) {

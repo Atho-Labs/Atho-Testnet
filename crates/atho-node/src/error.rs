@@ -1,5 +1,6 @@
 use crate::runtime::RuntimeError;
 use crate::validation::ValidationError;
+use atho_rpc::error::RpcError;
 use atho_storage::error::StorageError;
 use thiserror::Error;
 
@@ -11,4 +12,11 @@ pub enum NodeError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+pub fn rpc_error_from_node(error: NodeError) -> RpcError {
+    match error {
+        NodeError::Validation(_) => RpcError::InvalidRequest,
+        NodeError::Runtime(_) | NodeError::Storage(_) => RpcError::Internal,
+    }
 }

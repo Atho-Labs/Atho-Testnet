@@ -22,9 +22,8 @@ pub const MAX_TRANSACTION_SIZE_BYTES: usize = 250_000;
 pub const ADDRESS_DIGEST_BYTES: usize = 32;
 pub const ADDRESS_CHECKSUM_BYTES: usize = 4;
 pub const ADDRESS_CHECKSUM_BASE56_CHARS: usize = 6;
-pub const STANDARD_TRANSACTION_ALLOCATION: f64 = 0.95;
+pub const STANDARD_TRANSACTION_ALLOCATION_BPS: u16 = 9_500;
 
 pub const ADDRESS_ROLE_DOMAIN: &str = "ATHO_ADDR_V1";
 
-pub const BASE56_ALPHABET: &str =
-    "23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
+pub const BASE56_ALPHABET: &str = "23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";

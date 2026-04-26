@@ -2,8 +2,8 @@ use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
-use atho_core::genesis;
 use atho_core::constants::GENESIS_COINBASE_ATOMS;
+use atho_core::genesis;
 use atho_core::network::Network;
 
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl Chainstate {
     pub fn connect_header(&mut self, header: BlockHeader) {
         self.tip_hash = header.block_hash();
         self.tip = Some(header);
-        self.height = self.height.saturating_add(1);
+        self.height = self.tip.as_ref().map(|header| header.height).unwrap_or(0);
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
@@ -64,7 +64,7 @@ impl Chainstate {
         let previous_tip_hash = self.tip_hash;
         self.tip = Some(block.header.clone());
         self.tip_hash = block.header.block_hash();
-        self.height = self.height.saturating_add(1);
+        self.height = block.header.height;
         self.blocks.push(block.clone());
         self.undo_stack.push(ChainUndo {
             previous_tip,
@@ -74,13 +74,24 @@ impl Chainstate {
         Ok(())
     }
 
+    pub fn utxo_snapshot(&self) -> UtxoSet {
+        self.utxos.clone()
+    }
+
+    pub fn utxo_entry(&self, txid: [u8; 48], output_index: u32) -> Option<UtxoEntry> {
+        self.utxos.get(txid, output_index).cloned()
+    }
+
     pub fn disconnect_last_block(&mut self) -> Result<(), StorageError> {
-        let undo = self.undo_stack.pop().ok_or(StorageError::NoBlockToDisconnect)?;
+        let undo = self
+            .undo_stack
+            .pop()
+            .ok_or(StorageError::NoBlockToDisconnect)?;
         self.utxos.disconnect_block(undo.block_undo);
         let _ = self.blocks.pop();
-        self.height = self.height.saturating_sub(1);
         self.tip = undo.previous_tip;
         self.tip_hash = undo.previous_tip_hash;
+        self.height = self.tip.as_ref().map(|header| header.height).unwrap_or(0);
         Ok(())
     }
 
@@ -100,7 +111,7 @@ impl Chainstate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::block::{merkle_root, Block, BlockHeader};
+    use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 
@@ -123,10 +134,15 @@ mod tests {
 
         state.connect_header(BlockHeader {
             version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
             previous_block_hash: [0; 48],
             merkle_root: [0; 48],
+            witness_root: [0; 48],
             timestamp: 75,
-            target: atho_core::consensus::pow::initial_target_for_network(Network::Mainnet),
+            difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                Network::Mainnet,
+            ),
             nonce: 0,
         });
 
@@ -137,13 +153,16 @@ mod tests {
     #[test]
     fn chainstate_connects_and_disconnects_blocks() {
         let mut state = Chainstate::new(Network::Mainnet);
-        state.utxos.insert(crate::utxo::UtxoEntry {
-            network: Network::Mainnet,
-            txid: [9; 48],
-            output_index: 0,
-            value_atoms: 500,
-            locking_script: vec![1],
-        }).unwrap();
+        state
+            .utxos
+            .insert(crate::utxo::UtxoEntry {
+                network: Network::Mainnet,
+                txid: [9; 48],
+                output_index: 0,
+                value_atoms: 500,
+                locking_script: vec![1],
+            })
+            .unwrap();
 
         let tx = Transaction {
             version: 1,
@@ -173,10 +192,15 @@ mod tests {
         let mut block = Block::new(
             BlockHeader {
                 version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
                 timestamp: 75,
-                target: atho_core::consensus::pow::initial_target_for_network(Network::Mainnet),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
                 nonce: 0,
             },
             transactions,

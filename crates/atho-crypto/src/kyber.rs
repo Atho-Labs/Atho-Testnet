@@ -57,11 +57,18 @@ pub fn default_variant() -> KyberVariant {
     KyberVariant::Kyber512
 }
 
-pub fn wrap(_variant: KyberVariant, _public_key: &KyberPublicKey, _plaintext: &[u8]) -> Result<KyberCiphertext, CryptoError> {
+pub fn wrap(
+    _variant: KyberVariant,
+    _public_key: &KyberPublicKey,
+    _plaintext: &[u8],
+) -> Result<KyberCiphertext, CryptoError> {
     Err(CryptoError::BackendUnavailable)
 }
 
-pub fn unwrap(_lockbox: &KyberLockbox, _ciphertext: &KyberCiphertext) -> Result<SecretBytes, CryptoError> {
+pub fn unwrap(
+    _lockbox: &KyberLockbox,
+    _ciphertext: &KyberCiphertext,
+) -> Result<SecretBytes, CryptoError> {
     Err(CryptoError::BackendUnavailable)
 }
 

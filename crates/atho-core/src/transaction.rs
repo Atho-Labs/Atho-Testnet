@@ -65,20 +65,21 @@ impl TxWitness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxInput {
+    #[serde(with = "serde_big_array::BigArray")]
     pub previous_txid: [u8; 48],
     pub output_index: u32,
     pub unlocking_script: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxOutput {
     pub value_atoms: u64,
     pub locking_script: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub version: u16,
     pub inputs: Vec<TxInput>,
@@ -98,6 +99,30 @@ impl Transaction {
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
         self.base_bytes()
+    }
+
+    pub fn full_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.push(0x00);
+        out.push(0x01);
+        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
+        for input in &self.inputs {
+            out.extend_from_slice(&input.previous_txid);
+            out.extend_from_slice(&input.output_index.to_le_bytes());
+            out.extend_from_slice(&(input.unlocking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&input.unlocking_script);
+        }
+        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
+        for output in &self.outputs {
+            out.extend_from_slice(&output.value_atoms.to_le_bytes());
+            out.extend_from_slice(&(output.locking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&output.locking_script);
+        }
+        out.extend_from_slice(&(self.witness.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.witness);
+        out.extend_from_slice(&self.lock_time.to_le_bytes());
+        out
     }
 
     pub fn base_bytes(&self) -> Vec<u8> {
@@ -126,7 +151,7 @@ impl Transaction {
 
     pub fn weight_bytes(&self) -> usize {
         let base = self.base_bytes().len();
-        let total = base.saturating_add(self.witness_bytes());
+        let total = self.full_bytes().len();
         base.saturating_mul(3).saturating_add(total)
     }
 

@@ -36,7 +36,10 @@ impl AddressBook {
     }
 
     pub fn count_kind(&self, kind: AddressKind) -> usize {
-        self.entries.iter().filter(|entry| entry.path.kind == kind).count()
+        self.entries
+            .iter()
+            .filter(|entry| entry.path.kind == kind)
+            .count()
     }
 
     pub fn snapshot(&self) -> Vec<AddressRecord> {
@@ -68,6 +71,9 @@ mod tests {
 
         assert_eq!(book.len(), 1);
         assert_eq!(book.count_kind(AddressKind::Receive), 1);
-        assert_eq!(book.last().and_then(|r| r.label.as_deref()), Some("primary"));
+        assert_eq!(
+            book.last().and_then(|r| r.label.as_deref()),
+            Some("primary")
+        );
     }
 }

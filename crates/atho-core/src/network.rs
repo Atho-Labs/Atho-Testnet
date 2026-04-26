@@ -8,6 +8,23 @@ pub enum Network {
 }
 
 impl Network {
+    pub fn consensus_id(self) -> u8 {
+        match self {
+            Self::Mainnet => 1,
+            Self::Testnet => 2,
+            Self::Regnet => 3,
+        }
+    }
+
+    pub fn from_consensus_id(id: u8) -> Option<Self> {
+        match id {
+            1 => Some(Self::Mainnet),
+            2 => Some(Self::Testnet),
+            3 => Some(Self::Regnet),
+            _ => None,
+        }
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Mainnet => "atho-mainnet",
@@ -70,6 +87,8 @@ mod tests {
     #[test]
     fn network_identity_matches_reference() {
         assert_eq!(Network::Mainnet.id(), "atho-mainnet");
+        assert_eq!(Network::Mainnet.consensus_id(), 1);
+        assert_eq!(Network::from_consensus_id(2), Some(Network::Testnet));
         assert_eq!(Network::Mainnet.p2p_port(), 56_000);
         assert_eq!(Network::Testnet.rpc_port(), 9_110);
         assert_eq!(Network::Regnet.visible_prefix(), 'T');

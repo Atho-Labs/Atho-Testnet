@@ -2,14 +2,13 @@
 
 pub mod address;
 pub mod block;
+pub mod consensus;
 pub mod constants;
 pub mod crypto;
-pub mod consensus;
 pub mod error;
 pub mod genesis;
 pub mod network;
 pub mod transaction;
-
 
 #[cfg(test)]
 mod tests {

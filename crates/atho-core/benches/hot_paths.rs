@@ -1,8 +1,8 @@
-use atho_core::block::{merkle_root, Block, BlockHeader};
+use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::consensus::subsidy;
-use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use atho_core::network::Network;
+use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn sample_transaction() -> Transaction {
@@ -27,7 +27,7 @@ fn sample_block() -> Block {
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy::block_subsidy_atho(0),
+            value_atoms: subsidy::block_subsidy_atoms(0),
             locking_script: vec![0],
         }],
         lock_time: 0,
@@ -39,10 +39,13 @@ fn sample_block() -> Block {
     Block::new(
         BlockHeader {
             version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
             previous_block_hash: [2; 48],
             merkle_root: merkle,
+            witness_root: witness_root(&transactions),
             timestamp: 75,
-            target: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
             nonce: 42,
         },
         transactions,
@@ -57,9 +60,7 @@ fn bench_core_hot_paths(c: &mut Criterion) {
         b.iter(|| black_box(tx.canonical_bytes()))
     });
 
-    c.bench_function("transaction_txid", |b| {
-        b.iter(|| black_box(tx.txid()))
-    });
+    c.bench_function("transaction_txid", |b| b.iter(|| black_box(tx.txid())));
 
     c.bench_function("block_canonical_bytes", |b| {
         b.iter(|| black_box(block.canonical_bytes()))

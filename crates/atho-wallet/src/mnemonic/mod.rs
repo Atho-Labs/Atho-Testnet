@@ -76,7 +76,8 @@ impl MnemonicPhrase {
             .map(|word| word.trim().to_lowercase())
             .filter(|word| !word.is_empty())
             .collect();
-        let length = MnemonicLength::from_word_count(words.len()).ok_or(MnemonicError::InvalidWordCount)?;
+        let length =
+            MnemonicLength::from_word_count(words.len()).ok_or(MnemonicError::InvalidWordCount)?;
         validate_words(&words)?;
         validate_checksum(&words, length)?;
         Ok(Self { words })
@@ -97,7 +98,12 @@ impl MnemonicPhrase {
     pub fn root_seed(&self, passphrase: &str) -> [u8; 64] {
         let mut seed = [0u8; 64];
         let salt = format!("{}{}", MNEMONIC_SCHEME, passphrase);
-        pbkdf2_hmac::<Sha512>(self.as_sentence().as_bytes(), salt.as_bytes(), MNEMONIC_PBKDF2_ITERATIONS, &mut seed);
+        pbkdf2_hmac::<Sha512>(
+            self.as_sentence().as_bytes(),
+            salt.as_bytes(),
+            MNEMONIC_PBKDF2_ITERATIONS,
+            &mut seed,
+        );
         seed
     }
 }

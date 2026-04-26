@@ -32,7 +32,11 @@ impl WireCodec {
         out.extend_from_slice(payload);
         crate::audit::append_log(
             "p2p",
-            &format!("encoded message type={} network={}", u8::from(message.message_type()), message.network().id()),
+            &format!(
+                "encoded message type={} network={}",
+                u8::from(message.message_type()),
+                message.network().id()
+            ),
         );
         Ok(out)
     }
@@ -44,16 +48,22 @@ impl WireCodec {
         if &bytes[..4] != MAGIC {
             return Err(CodecError::InvalidMagic);
         }
-        let message_type = MessageType::try_from(bytes[4]).map_err(|_| CodecError::UnknownMessageType)?;
+        let message_type =
+            MessageType::try_from(bytes[4]).map_err(|_| CodecError::UnknownMessageType)?;
         let network = network_from_byte(bytes[5]).map_err(|_| CodecError::UnsupportedNetwork)?;
-        let payload_len = u32::from_le_bytes(bytes[6..10].try_into().expect("slice length")) as usize;
+        let payload_len =
+            u32::from_le_bytes(bytes[6..10].try_into().expect("slice length")) as usize;
         if bytes.len() < 10 + payload_len {
             return Err(CodecError::MessageTooShort);
         }
         let payload = bytes[10..10 + payload_len].to_vec();
         crate::audit::append_log(
             "p2p",
-            &format!("decoded message type={} network={}", u8::from(message_type), network.id()),
+            &format!(
+                "decoded message type={} network={}",
+                u8::from(message_type),
+                network.id()
+            ),
         );
         Ok(Message::new(network, message_type, payload))
     }

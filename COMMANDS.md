@@ -25,6 +25,8 @@ cargo test -p atho-core -p atho-crypto -p atho-storage -p atho-wallet -p atho-p2
 
 ```bash
 cargo run -p atho-node --bin athod
+cargo run -p atho-node --bin athod -- run testnet
+cargo run -p atho-node --bin athod -- verify mainnet
 ```
 
 ## Wipe dev state
@@ -54,10 +56,28 @@ cargo run -p atho-node --bin athod -- dev mine testnet
 cargo run -p atho-node --bin athod -- dev mine regnet
 ```
 
+## Mine with the standalone miner
+
+```bash
+cargo run -p atho-node --bin athod -- run mainnet
+cargo run -p atho-node --bin atho-mine -- --network mainnet --rpc-addr 127.0.0.1:18443
+cargo run -p atho-node --bin athod -- run testnet
+cargo run -p atho-node --bin atho-mine -- --network testnet --cores 8 --rpc-addr 127.0.0.1:18444
+```
+
+## Generate and inspect addresses
+
+```bash
+cargo run -p atho-wallet --bin atho-address -- generate mainnet --seed-hex 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+cargo run -p atho-wallet --bin atho-address -- generate testnet --phrase "..." --count 2
+cargo run -p atho-wallet --bin atho-address -- inspect A...
+```
+
 ## Quick local loop
 
 ```bash
-cargo run -p atho-node --bin athod -- dev watch
+cargo run -p atho-node --bin athod -- run mainnet
+cargo run -p atho-node --bin atho-mine -- --network mainnet
 cargo run -p atho-node --bin athod -- dev mine mainnet
 cargo run -p atho-node --bin athod -- dev export tx
 ```
@@ -70,9 +90,9 @@ Use `regnet` when you want the fastest local loop.
 ```bash
 cargo check
 cargo test
-cargo run -p atho-node --bin athod -- dev watch
+cargo run -p atho-node --bin athod -- run mainnet
+cargo run -p atho-node --bin atho-mine -- --network mainnet
 cargo run -p atho-qt --bin atho-qt
-cargo run -p atho-node --bin athod -- dev mine mainnet
 cargo run -p atho-node --bin athod -- dev export chain
 cargo run -p atho-node --bin athod -- dev export tx
 ```
@@ -82,8 +102,8 @@ cargo run -p atho-node --bin athod -- dev export tx
 ### Mainnet
 
 ```bash
-cargo run -p atho-node --bin athod -- dev watch
-cargo run -p atho-node --bin athod -- dev mine mainnet
+cargo run -p atho-node --bin athod -- run mainnet
+cargo run -p atho-node --bin atho-mine -- --network mainnet
 cargo run -p atho-node --bin athod -- dev export chain
 cargo run -p atho-node --bin athod -- dev export tx
 ```
@@ -91,8 +111,8 @@ cargo run -p atho-node --bin athod -- dev export tx
 ### Testnet
 
 ```bash
-cargo run -p atho-node --bin athod -- dev watch
-cargo run -p atho-node --bin athod -- dev mine testnet
+cargo run -p atho-node --bin athod -- run testnet
+cargo run -p atho-node --bin atho-mine -- --network testnet
 cargo run -p atho-node --bin athod -- dev export chain
 cargo run -p atho-node --bin athod -- dev export tx
 ```
@@ -100,8 +120,8 @@ cargo run -p atho-node --bin athod -- dev export tx
 ### Regnet
 
 ```bash
-cargo run -p atho-node --bin athod -- dev watch
-cargo run -p atho-node --bin athod -- dev mine regnet
+cargo run -p atho-node --bin athod -- run regnet
+cargo run -p atho-node --bin atho-mine -- --network regnet
 cargo run -p atho-node --bin athod -- dev export chain
 cargo run -p atho-node --bin athod -- dev export tx
 ```
@@ -110,7 +130,7 @@ cargo run -p atho-node --bin athod -- dev export tx
 
 - SHA3-384 hash size: `96` hex characters
 - Target size: `384` bits
-- Standard transaction allocation: `0.95`
+- Standard transaction allocation: `9500 bps`
 - Difficulty bounds are logged automatically during `dev mine`
 - Mainnet/testnet/regnet initial targets are hardcoded in `consensus::pow`
 
@@ -118,6 +138,7 @@ cargo run -p atho-node --bin athod -- dev export tx
 
 ```bash
 cargo run -p atho-qt --bin atho-qt
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:18443
 ```
 
 ## Run the hot-path benchmarks

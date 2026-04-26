@@ -61,6 +61,9 @@ mod tests {
     #[test]
     fn core_error_wraps_specific_protocol_errors() {
         let err = CoreError::from(AddressError::InvalidChecksum);
-        assert!(matches!(err, CoreError::Address(AddressError::InvalidChecksum)));
+        assert!(matches!(
+            err,
+            CoreError::Address(AddressError::InvalidChecksum)
+        ));
     }
 }

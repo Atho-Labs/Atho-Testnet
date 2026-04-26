@@ -23,6 +23,10 @@ impl ViewModel {
                 self.network_label = label;
                 self.sync_stage = String::from("Online");
             }
+            RpcResponse::BlockTemplate(_)
+            | RpcResponse::BlockSubmitted { .. }
+            | RpcResponse::TransactionSubmitted(_)
+            | RpcResponse::MempoolInfo(_) => {}
             RpcResponse::Error(RpcError::MethodNotFound)
             | RpcResponse::Error(RpcError::InvalidRequest)
             | RpcResponse::Error(RpcError::Internal) => {

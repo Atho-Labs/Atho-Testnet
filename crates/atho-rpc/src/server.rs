@@ -1,3 +1,4 @@
+use crate::error::RpcError;
 use crate::request::RpcRequest;
 use crate::response::RpcResponse;
 use atho_core::network::Network;
@@ -20,6 +21,10 @@ impl RpcServer {
         match request {
             RpcRequest::GetBlockCount => RpcResponse::BlockCount(self.block_count),
             RpcRequest::GetNetwork => RpcResponse::Network(self.network.id().to_string()),
+            RpcRequest::GetBlockTemplate
+            | RpcRequest::SubmitBlock(_)
+            | RpcRequest::SubmitTransaction { .. }
+            | RpcRequest::GetMempoolInfo => RpcResponse::Error(RpcError::InvalidRequest),
         }
     }
 }
@@ -32,7 +37,13 @@ mod tests {
     #[test]
     fn server_reports_block_count_and_network() {
         let server = RpcServer::new(Network::Mainnet);
-        assert_eq!(server.handle(RpcRequest::GetNetwork), RpcResponse::Network("atho-mainnet".into()));
-        assert_eq!(server.handle(RpcRequest::GetBlockCount), RpcResponse::BlockCount(0));
+        assert_eq!(
+            server.handle(RpcRequest::GetNetwork),
+            RpcResponse::Network("atho-mainnet".into())
+        );
+        assert_eq!(
+            server.handle(RpcRequest::GetBlockCount),
+            RpcResponse::BlockCount(0)
+        );
     }
 }

@@ -10,7 +10,8 @@ Atho is a from-scratch Rust rebuild of the Atho core stack. The workspace is spl
 - `crates/atho-wallet` - HD wallet, mnemonic, keypool, and wallet datafile handling
 - `crates/atho-p2p` - wire codec, peer protocol, and sync state
 - `crates/atho-rpc` - small RPC surface for the thin client
-- `crates/atho-node` - node runtime, validation, mempool, and orchestration
+- `crates/atho-node` - node runtime, validation, mempool, mining, and orchestration
+- `crates/atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
 - `crates/atho-qt` - thin desktop client
 
 ## Status

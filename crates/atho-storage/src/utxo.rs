@@ -19,7 +19,7 @@ pub struct UtxoEntry {
     pub locking_script: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UtxoSet {
     network: Network,
     entries: BTreeMap<UtxoKey, UtxoEntry>,
@@ -47,6 +47,11 @@ impl UtxoSet {
         Ok(())
     }
 
+    pub fn get(&self, txid: [u8; 48], output_index: u32) -> Option<&UtxoEntry> {
+        let key = UtxoKey { txid, output_index };
+        self.entries.get(&key)
+    }
+
     pub fn remove(&mut self, txid: [u8; 48], output_index: u32) -> Result<UtxoEntry, StorageError> {
         let key = UtxoKey { txid, output_index };
         self.entries.remove(&key).ok_or(StorageError::MissingUtxo)
@@ -71,12 +76,17 @@ impl UtxoSet {
         };
 
         for tx in &block.transactions {
-            undo.spent.extend(spend_inputs(self, tx)?);
+            let spent = spend_inputs(self, tx)?;
+            undo.spent.extend(spent);
+
             let created = create_outputs(tx, self.network);
-            for output in &created {
-                self.insert(output.clone())?;
+            for output in created {
+                if let Err(err) = self.insert(output.clone()) {
+                    self.disconnect_block(undo);
+                    return Err(err);
+                }
+                undo.created.push(output);
             }
-            undo.created.extend(created);
         }
 
         Ok(undo)
@@ -101,7 +111,15 @@ pub struct BlockUndo {
 fn spend_inputs(set: &mut UtxoSet, tx: &Transaction) -> Result<Vec<UtxoEntry>, StorageError> {
     let mut spent = Vec::with_capacity(tx.inputs.len());
     for input in &tx.inputs {
-        spent.push(set.remove(input.previous_txid, input.output_index)?);
+        match set.remove(input.previous_txid, input.output_index) {
+            Ok(entry) => spent.push(entry),
+            Err(err) => {
+                for entry in spent.into_iter().rev() {
+                    let _ = set.insert(entry);
+                }
+                return Err(err);
+            }
+        }
     }
     Ok(spent)
 }
@@ -124,9 +142,9 @@ fn create_outputs(tx: &Transaction, network: Network) -> Vec<UtxoEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::block::{merkle_root, Block, BlockHeader};
-    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+    use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::network::Network;
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 
     fn witness_bytes(inputs: usize) -> Vec<u8> {
         TxWitness {
@@ -193,10 +211,15 @@ mod tests {
         let mut block = Block::new(
             BlockHeader {
                 version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
                 timestamp: 75,
-                target: atho_core::consensus::pow::initial_target_for_network(Network::Mainnet),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
                 nonce: 0,
             },
             transactions,

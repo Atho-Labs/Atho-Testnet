@@ -1,4 +1,5 @@
 use crate::consensus::params::CONSENSUS_PARAMS;
+use crate::constants::ATOMS_PER_ATHO;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubsidySchedule {
@@ -19,6 +20,10 @@ pub fn block_subsidy_atho(height: u64) -> u64 {
     SUBSIDY_SCHEDULE.initial_block_reward_atho >> halvings
 }
 
+pub fn block_subsidy_atoms(height: u64) -> u64 {
+    block_subsidy_atho(height).saturating_mul(ATOMS_PER_ATHO)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26,6 +31,7 @@ mod tests {
     #[test]
     fn subsidy_starts_at_fifty_atho() {
         assert_eq!(block_subsidy_atho(0), 50);
+        assert_eq!(block_subsidy_atoms(0), 50 * ATOMS_PER_ATHO);
     }
 
     #[test]

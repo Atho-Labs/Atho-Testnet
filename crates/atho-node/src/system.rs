@@ -1,9 +1,13 @@
 use crate::config::NodeConfig;
+use crate::error::rpc_error_from_node;
+use crate::mempool::MempoolEntry;
+use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
+use atho_core::block::Block;
 use atho_core::network::Network;
-use atho_wallet::snapshot::WalletSnapshot;
 use atho_rpc::request::RpcRequest;
-use atho_rpc::response::RpcResponse;
+use atho_rpc::response::{BlockTemplate, MempoolInfo, RpcResponse};
+use atho_wallet::snapshot::WalletSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemStatus {
@@ -48,6 +52,71 @@ impl AthoSystem {
             RpcRequest::GetBlockCount => {
                 RpcResponse::BlockCount(self.orchestrator.runtime.node.chainstate.height)
             }
+            RpcRequest::GetMempoolInfo => RpcResponse::MempoolInfo(MempoolInfo {
+                transaction_count: self.orchestrator.runtime.node.mempool.len(),
+                total_fee_atoms: self.orchestrator.runtime.node.mempool.total_fee_atoms(),
+            }),
+            RpcRequest::GetBlockTemplate => {
+                let miner = Miner::new(1);
+                match self.orchestrator.runtime.node.build_candidate_block(&miner) {
+                    Ok(block) => RpcResponse::BlockTemplate(self.block_template(block)),
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                }
+            }
+            RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => {
+                RpcResponse::Error(atho_rpc::error::RpcError::InvalidRequest)
+            }
+        }
+    }
+
+    pub fn handle_mut(&mut self, request: RpcRequest) -> RpcResponse {
+        match request {
+            RpcRequest::SubmitTransaction {
+                transaction,
+                fee_atoms,
+            } => {
+                match self
+                    .orchestrator
+                    .runtime
+                    .node
+                    .submit_transaction(MempoolEntry {
+                        transaction,
+                        fee_atoms,
+                    }) {
+                    Ok(txid) => RpcResponse::TransactionSubmitted(txid),
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                }
+            }
+            RpcRequest::SubmitBlock(block) => {
+                let block_hash = block.header.block_hash();
+                match self.orchestrator.runtime.node.submit_block(&block) {
+                    Ok(()) => RpcResponse::BlockSubmitted {
+                        accepted: true,
+                        block_hash,
+                    },
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                }
+            }
+            RpcRequest::GetBlockTemplate => {
+                let miner = Miner::new(1);
+                match self.orchestrator.runtime.node.build_candidate_block(&miner) {
+                    Ok(block) => RpcResponse::BlockTemplate(self.block_template(block)),
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                }
+            }
+            other => self.handle(other),
+        }
+    }
+
+    fn block_template(&self, block: Block) -> BlockTemplate {
+        BlockTemplate {
+            network: self.network(),
+            height: block.header.height,
+            previous_block_hash: block.header.previous_block_hash,
+            target: block.header.difficulty_target_or_bits,
+            transaction_count: block.transactions.len(),
+            fees_atoms: block.fees_total_atoms,
+            block,
         }
     }
 

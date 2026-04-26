@@ -6,16 +6,8 @@ fn main() {
     let falcon_dir = manifest_dir.join("../../Falcon 512 ");
 
     let sources = [
-        "codec.c",
-        "common.c",
-        "falcon.c",
-        "fft.c",
-        "fpr.c",
-        "keygen.c",
-        "rng.c",
-        "shake.c",
-        "sign.c",
-        "vrfy.c",
+        "codec.c", "common.c", "falcon.c", "fft.c", "fpr.c", "keygen.c", "rng.c", "shake.c",
+        "sign.c", "vrfy.c",
     ];
 
     let mut build = cc::Build::new();

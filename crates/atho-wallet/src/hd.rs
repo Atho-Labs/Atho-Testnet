@@ -1,5 +1,5 @@
-use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressKind {
@@ -42,7 +42,11 @@ impl HdWallet {
         (self.next_receive_index, self.next_change_index)
     }
 
-    pub fn with_counters(seed: WalletSeed, next_receive_index: u32, next_change_index: u32) -> Self {
+    pub fn with_counters(
+        seed: WalletSeed,
+        next_receive_index: u32,
+        next_change_index: u32,
+    ) -> Self {
         Self {
             seed,
             next_receive_index,

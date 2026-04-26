@@ -1,7 +1,7 @@
 use super::{PersistedWalletState, Wallet};
-use atho_core::network::Network;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use atho_core::network::Network;
 use getrandom::getrandom;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
@@ -68,7 +68,8 @@ impl WalletDataFile {
         out.push(self.encryption_mode as u8);
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&self.nonce);
-        let len = u32::try_from(self.ciphertext.len()).map_err(|_| WalletDatafileError::InvalidHeader)?;
+        let len =
+            u32::try_from(self.ciphertext.len()).map_err(|_| WalletDatafileError::InvalidHeader)?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&self.ciphertext);
         Ok(out)
@@ -156,7 +157,13 @@ fn load_impl(path: &Path, password: &str, iterations: u32) -> Result<Wallet, Wal
     if file.encryption_mode != WalletEncryptionMode::PasswordAes256Gcm {
         return Err(WalletDatafileError::UnsupportedEncryptionMode);
     }
-    let state = decrypt_state(password, &file.salt, &file.nonce, &file.ciphertext, iterations)?;
+    let state = decrypt_state(
+        password,
+        &file.salt,
+        &file.nonce,
+        &file.ciphertext,
+        iterations,
+    )?;
     Ok(Wallet::from_state(file.network, None, state))
 }
 
