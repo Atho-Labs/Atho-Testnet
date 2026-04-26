@@ -1,26 +1,102 @@
 # Atho
 
-Atho is a from-scratch Rust rebuild of the Atho core stack. The workspace is split into small crates so the trusted core stays small, auditable, and fast.
+Atho is a from-scratch Rust payment system built around a full node, HD wallet, miner, RPC layer, storage engine, and thin desktop client.
 
-## Workspace
+It is designed to behave like a real blockchain payment stack:
+- transactions are signed, validated, and stored in atoms
+- blocks are mined against difficulty and only accepted after validation
+- chainstate and UTXO data are updated only after consensus checks pass
+- the desktop client stays thin and talks to the node over RPC
 
-- `crates/atho-core` - protocol constants, consensus, transaction, and block primitives
-- `crates/atho-crypto` - thin Falcon and Kyber boundary layer
-- `crates/atho-storage` - chainstate and UTXO storage
-- `crates/atho-wallet` - HD wallet, mnemonic, keypool, and wallet datafile handling
-- `crates/atho-p2p` - wire codec, peer protocol, and sync state
-- `crates/atho-rpc` - small RPC surface for the thin client
-- `crates/atho-node` - node runtime, validation, mempool, mining, and orchestration
-- `crates/atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
-- `crates/atho-qt` - thin desktop client
+The codebase is intentionally split into small crates so the trusted core stays simple, auditable, and fast.
+
+## Core Specs
+
+- Currency unit: `atoms`
+- `1 ATHO = 100,000,000 atoms`
+- Max supply: `168,000,000 ATHO`
+- Initial block reward: `50 ATHO`
+- Halving interval: `1,680,000` blocks
+- Target block time: `75` seconds
+- Minimum transaction fee: `500 atoms`
+- Proof of work hash: `SHA3-384`
+- Hash size: `384` bits / `96` hex characters
+- Consensus math uses integers only
+- Mainnet, testnet, and regnet have separate network identities, genesis data, and RPC defaults
+
+## What Atho Includes
+
+- `atho-core` - protocol constants, consensus, transaction, block, address, and genesis logic
+- `atho-crypto` - thin Falcon and Kyber boundary layer
+- `atho-storage` - chainstate and UTXO storage
+- `atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
+- `atho-p2p` - wire codec, peer protocol, and sync state
+- `atho-rpc` - small RPC surface for the client and miner
+- `atho-node` - node runtime, validation, mempool, mining, and orchestration
+- `atho-qt` - thin desktop wallet/client
+
+## Architecture
+
+Atho follows a Bitcoin-style split:
+
+- `athod` is the always-on node daemon
+- `atho-mine` is the standalone miner client
+- `atho-qt` is the desktop wallet client
+- `atho-address` is the address inspection and generation tool
+
+The node owns validation, consensus, mempool admission, block acceptance, and chainstate updates.
+The desktop client stays light and uses RPC instead of embedding the whole blockchain stack in the UI process.
+
+## Consensus Summary
+
+- Transactions use canonical serialization and txid generation
+- Witness data is committed separately for pruning-safe verification
+- Blocks are validated before chain acceptance
+- Genesis blocks are hardcoded per network
+- PoW is checked against the network target
+- Invalid blocks and transactions are rejected before they can mutate final state
+
+## Running Atho
+
+Use [COMMANDS.md](/Users/eyeanonymous/Desktop/Atho-Alpha /COMMANDS.md) for the exact commands.
+
+Quick start:
+
+```bash
+cargo check
+cargo run -p atho-node --bin athod -- run mainnet
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:18443
+```
+
+## Development Docs
+
+- [COMMANDS.md](/Users/eyeanonymous/Desktop/Atho-Alpha /COMMANDS.md) - build, run, mine, and wallet commands
+- [PACKAGING.md](/Users/eyeanonymous/Desktop/Atho-Alpha /PACKAGING.md) - release artifacts and package layout
+- [dev/README.md](/Users/eyeanonymous/Desktop/Atho-Alpha /dev/README.md) - local wipe workflow and log locations
+- [TODO.md](/Users/eyeanonymous/Desktop/Atho-Alpha /TODO.md) - current build order and remaining work
 
 ## Status
 
-The rebuild is being done brick by brick. The core protocol, wallet, storage, node, and thin client crates already build, test, and package cleanly.
+The core protocol, wallet, storage, node, RPC, and Qt client crates build and test cleanly.
+The desktop client is intentionally thin and still depends on the node for heavy work.
 
-## Start here
+## Repository Layout
 
-- Read `TODO.md` for the current build order
-- Read `COMMANDS.md` for the exact commands to check, test, run, and package
-- Read `PACKAGING.md` for the release layout
-- Read `dev/README.md` for the local wipe workflow and log locations
+```text
+crates/
+  atho-core/      consensus, tx, block, address, genesis
+  atho-crypto/    Falcon and Kyber wrappers
+  atho-storage/   chainstate and UTXO storage
+  atho-wallet/    HD wallet and address generation
+  atho-p2p/       peer protocol and sync
+  atho-rpc/       node/client RPC surface
+  atho-node/     daemon, validation, mempool, mining
+  atho-qt/       desktop client
+```
+
+## Notes
+
+- Keep consensus math integer-only.
+- Keep the node authoritative.
+- Keep the client thin.
+- Keep the trusted core small.
