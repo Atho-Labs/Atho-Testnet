@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dist_dir="${root_dir}/dist"
+target_dir="${dist_dir}/release"
+
+mkdir -p "${target_dir}"
+
+cargo build --release -p atho-node -p atho-qt --manifest-path "${root_dir}/Cargo.toml"
+
+cp "${root_dir}/target/release/athod" "${target_dir}/athod"
+cp "${root_dir}/target/release/atho-qt" "${target_dir}/atho-qt"
+cp "${root_dir}/RELEASE_NOTES.md" "${target_dir}/RELEASE_NOTES.md"
+cp "${root_dir}/PACKAGING.md" "${target_dir}/PACKAGING.md"
+
+echo "staged release artifacts in ${target_dir}"

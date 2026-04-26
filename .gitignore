@@ -1,0 +1,44 @@
+# Build artifacts
+target/
+**/target/
+
+# Logs
+*.log
+**/logs/
+
+# IDE and editor files
+.idea/
+*.iml
+.vscode/
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Miscellaneous
+tmp/
+**/tmp/
+*~
+#*#
+
+# Ignore dev directories and their contents
+**/dev/
+
+# Ignore document files that are not needed in the repo
+*.pdf
+
+# Ignore specific directories that are not part of the source
+rust-toolchain.toml
+Cargo.toml
+Cargo.lock
+dist/
+build/
+target/
+dev/logs
+
+
+
+
+# Ignore lock files if you don't want to track them (optional, but common for Cargo)
+# Cargo.lock
