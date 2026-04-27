@@ -3,7 +3,7 @@ use crate::secret::SecretBytes;
 use atho_core::crypto::hash::sha3_384;
 use getrandom::getrandom;
 use std::ffi::c_void;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const FALCON_512_PUBLIC_KEY_BYTES: usize = 897;
 pub const FALCON_512_SECRET_KEY_BYTES: usize = 1_281;
@@ -163,8 +163,8 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
 
     let mut rng = init_rng(seed);
     let mut public_key = vec![0u8; FALCON_512_PUBLIC_KEY_BYTES];
-    let mut secret_key = vec![0u8; FALCON_512_SECRET_KEY_BYTES];
-    let mut tmp = vec![0u8; FALCON_512_TMP_KEYGEN_BYTES];
+    let mut secret_key = Zeroizing::new(vec![0u8; FALCON_512_SECRET_KEY_BYTES]);
+    let mut tmp = Zeroizing::new(vec![0u8; FALCON_512_TMP_KEYGEN_BYTES]);
     let rc = unsafe {
         falcon_keygen_make(
             &mut rng,
@@ -177,7 +177,6 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
             tmp.len(),
         )
     };
-    tmp.fill(0);
     zeroize_rng(&mut rng);
     if rc != 0 {
         return Err(CryptoError::OperationFailed);
@@ -185,7 +184,7 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
 
     Ok(FalconKeypair {
         public_key: FalconPublicKey(public_key),
-        secret_key: FalconSecretKey(SecretBytes(secret_key)),
+        secret_key: FalconSecretKey(SecretBytes(std::mem::take(&mut *secret_key))),
     })
 }
 
@@ -212,7 +211,7 @@ pub fn sign(secret_key: &FalconSecretKey, message: &[u8]) -> Result<FalconSignat
     seed.zeroize();
     let mut signature = vec![0u8; FALCON_512_SIGNATURE_MAX_BYTES];
     let mut sig_len = signature.len();
-    let mut tmp = vec![0u8; FALCON_512_TMP_SIGN_BYTES];
+    let mut tmp = Zeroizing::new(vec![0u8; FALCON_512_TMP_SIGN_BYTES]);
     let rc = unsafe {
         falcon_sign_dyn(
             &mut rng,
@@ -227,7 +226,6 @@ pub fn sign(secret_key: &FalconSecretKey, message: &[u8]) -> Result<FalconSignat
             tmp.len(),
         )
     };
-    tmp.fill(0);
     zeroize_rng(&mut rng);
     if rc != 0 {
         return Err(CryptoError::OperationFailed);
@@ -252,7 +250,7 @@ pub fn verify(
         falcon_verify(
             signature.as_bytes().as_ptr().cast(),
             signature.as_bytes().len(),
-            0,
+            FALCON_SIG_COMPRESSED,
             public_key.as_bytes().as_ptr().cast(),
             public_key.as_bytes().len(),
             message.as_ptr().cast(),
@@ -261,7 +259,7 @@ pub fn verify(
             tmp.len(),
         )
     };
-    tmp.fill(0);
+    tmp.zeroize();
     Ok(rc == 0)
 }
 

@@ -16,6 +16,11 @@ fn main() {
         .define("FALCON_FPNATIVE", Some("1"))
         .warnings(true)
         .extra_warnings(true)
+        .flag_if_supported("-fstack-protector-strong")
+        .flag_if_supported("-fno-omit-frame-pointer")
+        .flag_if_supported("-fwrapv")
+        .flag_if_supported("-fPIC")
+        .flag_if_supported("-D_FORTIFY_SOURCE=2")
         .flag_if_supported("-O3");
 
     for src in sources {

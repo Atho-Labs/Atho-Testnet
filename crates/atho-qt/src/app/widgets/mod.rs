@@ -51,6 +51,28 @@ pub(crate) fn toolbar_tab(
         egui::Button::image_and_text(icon, egui::RichText::new(label).size(12.0).color(TEXT))
             .fill(fill)
             .stroke(stroke)
+        .frame(true),
+    )
+}
+
+pub(crate) fn compact_tab(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    width: f32,
+) -> egui::Response {
+    let fill = if selected { TOOLBAR_ACTIVE } else { PANEL_BG };
+    let stroke = if selected {
+        egui::Stroke::new(1.0, ACCENT)
+    } else {
+        egui::Stroke::new(1.0, PANEL_STROKE)
+    };
+
+    ui.add_sized(
+        [width, 28.0],
+        egui::Button::new(egui::RichText::new(label).size(11.5).color(TEXT))
+            .fill(fill)
+            .stroke(stroke)
             .frame(true),
     )
 }

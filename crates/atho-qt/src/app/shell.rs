@@ -36,20 +36,20 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                     if ui.button("Open Wallet").clicked() {
                         app.open_form = OpenWalletForm::new(app.connection.network());
                         app.launch_page = LaunchPage::OpenWallet;
-                        app.wallet = None;
+                        app.clear_wallet_state();
                         ui.close_menu();
                     }
                     if ui.button("Create Wallet").clicked() {
                         app.create_form = CreateWalletForm::new(app.connection.network());
                         let _ = app.generate_create_mnemonic();
                         app.launch_page = LaunchPage::CreateWallet;
-                        app.wallet = None;
+                        app.clear_wallet_state();
                         ui.close_menu();
                     }
                     if ui.button("Import Wallet").clicked() {
                         app.import_form = ImportWalletForm::new(app.connection.network());
                         app.launch_page = LaunchPage::ImportWallet;
-                        app.wallet = None;
+                        app.clear_wallet_state();
                         ui.close_menu();
                     }
                     ui.separator();

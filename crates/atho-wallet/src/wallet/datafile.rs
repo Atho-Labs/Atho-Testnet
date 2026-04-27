@@ -254,6 +254,7 @@ mod tests {
         assert_eq!(loaded.snapshot.receive_count, wallet.snapshot.receive_count);
         assert_eq!(loaded.snapshot.change_count, wallet.snapshot.change_count);
         assert_eq!(loaded.address_book.len(), wallet.address_book.len());
+        assert_eq!(loaded.mnemonic_sentence(), wallet.mnemonic_sentence());
         let _ = fs::remove_file(&path);
     }
 

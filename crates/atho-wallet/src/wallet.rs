@@ -101,6 +101,14 @@ impl Wallet {
         WALLET_DATAFILE_NAME
     }
 
+    pub fn mnemonic_phrase(&self) -> Option<&MnemonicPhrase> {
+        self.mnemonic.as_ref()
+    }
+
+    pub fn mnemonic_sentence(&self) -> Option<String> {
+        self.mnemonic.as_ref().map(MnemonicPhrase::as_sentence)
+    }
+
     pub fn checkout_receive_address(&mut self) -> WalletAddress {
         self.checkout(AddressKind::Receive, None)
     }
@@ -148,12 +156,24 @@ impl Wallet {
             .collect()
     }
 
+    pub fn generated_receive_addresses(&self, limit: usize) -> Vec<WalletAddress> {
+        self.generated_addresses(AddressKind::Receive, limit)
+    }
+
+    pub fn generated_change_addresses(&self, limit: usize) -> Vec<WalletAddress> {
+        self.generated_addresses(AddressKind::Change, limit)
+    }
+
+    pub fn receive_addresses(&self, limit: usize) -> Vec<WalletAddress> {
+        self.preview_addresses(AddressKind::Receive, limit)
+    }
+
+    pub fn change_addresses(&self, limit: usize) -> Vec<WalletAddress> {
+        self.preview_addresses(AddressKind::Change, limit)
+    }
+
     fn prefill(&mut self) {
-        self.keypool.refill(
-            &mut self.hd_wallet,
-            self.restore_gap_limit,
-            self.restore_gap_limit,
-        );
+        self.keypool.refill_to_target(&mut self.hd_wallet);
     }
 
     fn checkout(&mut self, kind: AddressKind, label: Option<String>) -> WalletAddress {
@@ -169,11 +189,49 @@ impl Wallet {
         };
         let address = self.derive_address(path);
         self.address_book.record(self.network, path, label);
+        self.keypool.refill_to_target(&mut self.hd_wallet);
         match kind {
             AddressKind::Receive => self.snapshot.record_receive(),
             AddressKind::Change => self.snapshot.record_change(),
         }
         address
+    }
+
+    fn preview_addresses(&self, kind: AddressKind, limit: usize) -> Vec<WalletAddress> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut addresses = Vec::with_capacity(limit);
+        let (receive_queue, change_queue) = self.keypool.snapshot();
+        let queue = match kind {
+            AddressKind::Receive => receive_queue,
+            AddressKind::Change => change_queue,
+        };
+        for path in queue {
+            addresses.push(self.derive_address(path));
+            if addresses.len() == limit {
+                break;
+            }
+        }
+
+        addresses
+    }
+
+    fn generated_addresses(&self, kind: AddressKind, limit: usize) -> Vec<WalletAddress> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut addresses = Vec::with_capacity(limit);
+        for record in self.address_book.snapshot() {
+            if record.path.kind != kind {
+                continue;
+            }
+            addresses.push(self.derive_address(record.path));
+            if addresses.len() == limit {
+                break;
+            }
+        }
+        addresses
     }
 
     fn derive_address(&self, path: DerivationPath) -> WalletAddress {
@@ -197,6 +255,7 @@ impl Wallet {
         let (receive_queue, change_queue) = self.keypool.snapshot();
         PersistedWalletState {
             wallet_seed: *self.hd_wallet.seed(),
+            mnemonic: self.mnemonic.clone(),
             next_receive_index,
             next_change_index,
             restore_gap_limit: self.restore_gap_limit as u32,
@@ -212,9 +271,9 @@ impl Wallet {
         mnemonic: Option<MnemonicPhrase>,
         state: PersistedWalletState,
     ) -> Self {
-        Self {
+        let mut wallet = Self {
             network,
-            mnemonic,
+            mnemonic: mnemonic.or(state.mnemonic),
             hd_wallet: HdWallet::with_counters(
                 WalletSeed(state.wallet_seed),
                 state.next_receive_index,
@@ -224,13 +283,16 @@ impl Wallet {
             address_book: AddressBook::from_records(state.address_book),
             snapshot: state.snapshot,
             restore_gap_limit: state.restore_gap_limit as usize,
-        }
+        };
+        wallet.keypool.refill_to_target(&mut wallet.hd_wallet);
+        wallet
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PersistedWalletState {
     pub wallet_seed: [u8; 32],
+    pub mnemonic: Option<MnemonicPhrase>,
     pub next_receive_index: u32,
     pub next_change_index: u32,
     pub restore_gap_limit: u32,
@@ -309,6 +371,75 @@ mod tests {
         assert_eq!(wallet.snapshot.receive_count, 2);
         assert_eq!(wallet.address_book.len(), 2);
         assert!(first.address.starts_with('T'));
+    }
+
+    #[test]
+    fn wallet_prefills_keypool_and_exposes_receive_preview() {
+        let wallet = Wallet::from_seed(WalletSeed([5; 32]), Network::Mainnet);
+        let receive_preview = wallet.receive_addresses(100);
+        let (receive_queue, change_queue) = wallet.keypool.snapshot();
+        assert_eq!(receive_preview.len(), 100);
+        assert_eq!(receive_preview[0].path.kind, AddressKind::Receive);
+        assert_eq!(receive_preview[0].path.index, 0);
+        assert_eq!(receive_queue.len(), crate::keypool::KEYPOOL_TARGET_SIZE);
+        assert_eq!(change_queue.len(), crate::keypool::KEYPOOL_TARGET_SIZE);
+    }
+
+    #[test]
+    fn wallet_restore_and_preview_are_stable_for_same_phrase() {
+        let phrase = phrase();
+        let a = Wallet::from_mnemonic(phrase.clone(), "pass", Network::Regnet);
+        let b = Wallet::restore_from_phrase(&phrase.as_sentence(), "pass", Network::Regnet)
+            .expect("wallet restore");
+        assert_eq!(a.receive_addresses(100), b.receive_addresses(100));
+    }
+
+    #[test]
+    fn wallet_generated_receive_addresses_follow_checked_out_history() {
+        let mut wallet = Wallet::from_mnemonic(phrase(), "", Network::Testnet);
+        assert!(wallet.generated_receive_addresses(4).is_empty());
+
+        let first = wallet.checkout_receive_address();
+        let second = wallet.checkout_receive_address();
+        let preview = wallet.generated_receive_addresses(4);
+
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].address, first.address);
+        assert_eq!(preview[1].address, second.address);
+    }
+
+    #[test]
+    fn wallet_restore_reproduces_first_hundred_receive_and_change_addresses() {
+        let phrase = phrase();
+        let mut original = Wallet::from_mnemonic(phrase.clone(), "pass", Network::Mainnet);
+        let mut restored = Wallet::restore_from_phrase(&phrase.as_sentence(), "pass", Network::Mainnet)
+            .expect("wallet restore");
+
+        let original_receive: Vec<String> = (0..100)
+            .map(|_| original.checkout_receive_address().address)
+            .collect();
+        let restored_receive: Vec<String> = (0..100)
+            .map(|_| restored.checkout_receive_address().address)
+            .collect();
+        assert_eq!(original_receive, restored_receive);
+
+        let original_change: Vec<String> = (0..100)
+            .map(|_| original.checkout_change_address().address)
+            .collect();
+        let restored_change: Vec<String> = (0..100)
+            .map(|_| restored.checkout_change_address().address)
+            .collect();
+        assert_eq!(original_change, restored_change);
+    }
+
+    #[test]
+    fn wallet_exposes_mnemonic_sentence_when_present() {
+        let wallet = Wallet::from_mnemonic(phrase(), "", Network::Mainnet);
+        assert!(wallet.mnemonic_phrase().is_some());
+        assert_eq!(
+            wallet.mnemonic_sentence(),
+            Some(wallet.mnemonic_phrase().unwrap().as_sentence())
+        );
     }
 
     #[test]

@@ -24,7 +24,8 @@ use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::{Wallet, WalletAddress};
 use eframe::egui;
 use getrandom::getrandom;
-use std::collections::{BTreeMap, BTreeSet};
+use rayon::prelude::*;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,11 +41,14 @@ mod theme;
 mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
-    ActivityRow, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningJobResult,
-    MiningOutcome, NavTab, OpenWalletForm, ReceiveRequestRecord, SendJob, SendOutcome,
-    WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
+    AddressPoolFilter, ActivityRow, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob,
+    MiningJobResult, MiningOutcome, NavTab, OpenWalletForm, ReceiveAddressRow,
+    ReceivePageTab, ReceiveRequestRecord, SendJob, SendOutcome, WalletActivityKind,
+    WalletActivityRow, WalletBalanceSummary, WalletManagementForm,
 };
 use wallet_ledger::WalletLedgerCache;
+
+const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
@@ -53,12 +57,18 @@ pub struct DesktopApp {
     pub view_model: ViewModel,
     wallet: Option<Wallet>,
     wallet_path: Option<String>,
+    wallet_addresses_cache: Vec<WalletAddress>,
+    wallet_owned_utxos_cache: Vec<UtxoEntry>,
     receive_addresses: Vec<WalletAddress>,
+    receive_address_rows: Vec<ReceiveAddressRow>,
+    receive_page_tab: ReceivePageTab,
+    address_pool_filter: AddressPoolFilter,
     current_receive_address: Option<WalletAddress>,
     launch_page: LaunchPage,
     create_form: CreateWalletForm,
     import_form: ImportWalletForm,
     open_form: OpenWalletForm,
+    wallet_management_form: WalletManagementForm,
     last_error: Option<String>,
     active_tab: NavTab,
     send_to: String,
@@ -130,17 +140,24 @@ impl DesktopApp {
             status_monitor,
             ui_state: UiState {
                 mining_cores: available_cores,
+                rotate_coinbase_address: true,
                 ..UiState::default()
             },
             view_model: ViewModel::default(),
             wallet: None,
             wallet_path: None,
+            wallet_addresses_cache: Vec::new(),
+            wallet_owned_utxos_cache: Vec::new(),
             receive_addresses: Vec::new(),
+            receive_address_rows: Vec::new(),
+            receive_page_tab: ReceivePageTab::RequestPayment,
+            address_pool_filter: AddressPoolFilter::Unused,
             current_receive_address: None,
             launch_page,
             create_form: CreateWalletForm::new(network),
             import_form: ImportWalletForm::new(network),
             open_form: OpenWalletForm::new(network),
+            wallet_management_form: WalletManagementForm::new(network),
             last_error: None,
             active_tab: NavTab::Overview,
             send_to: String::new(),
@@ -260,12 +277,58 @@ impl DesktopApp {
             .unwrap_or_else(|| String::from("wallet.dat"))
     }
 
+    pub(crate) fn clear_wallet_state(&mut self) {
+        self.stop_mining_job();
+        self.send_job = None;
+        self.mining_job = None;
+        self.pending_mining_restart = None;
+        self.wallet = None;
+        self.wallet_path = None;
+        self.wallet_addresses_cache.clear();
+        self.wallet_owned_utxos_cache.clear();
+        self.receive_addresses.clear();
+        self.receive_address_rows.clear();
+        self.current_receive_address = None;
+        self.requested_payments.clear();
+        self.selected_receive_request = None;
+        self.wallet_utxos_cache.clear();
+        self.wallet_activity_cache.clear();
+        self.wallet_balance_summary_cache = WalletBalanceSummary::default();
+        self.wallet_balance_cache = 0;
+        self.wallet_ledger_cache = WalletLedgerCache::default();
+        self.wallet_cache_dirty = true;
+        self.receive_label.clear();
+        self.receive_amount.clear();
+        self.receive_message.clear();
+        self.send_to.clear();
+        self.send_label.clear();
+        self.send_amount.clear();
+        self.send_fee.clear();
+        self.send_include_fee_in_total = false;
+        self.send_status = String::from("Enter a destination and ATHO amount.");
+        self.mining_status = String::from("Idle");
+        self.last_mined_block_hash = None;
+        self.last_error = None;
+        self.wallet_management_form.backup_password.clear();
+        self.wallet_management_form.backup_password_confirm.clear();
+        self.receive_page_tab = ReceivePageTab::RequestPayment;
+        self.address_pool_filter = AddressPoolFilter::Unused;
+        self.ui_state.wallet_snapshot = Default::default();
+        self.view_model.ui_state.wallet_snapshot = Default::default();
+    }
+
     fn refresh_wallet_cache(&mut self) {
-        let Some(wallet) = self.wallet_ref() else {
+        let Some(_wallet) = self.wallet_ref() else {
+            self.wallet_addresses_cache.clear();
+            self.wallet_owned_utxos_cache.clear();
             self.wallet_utxos_cache.clear();
             self.wallet_activity_cache.clear();
             self.wallet_balance_summary_cache = WalletBalanceSummary::default();
             self.wallet_balance_cache = 0;
+            self.receive_addresses.clear();
+            self.receive_address_rows.clear();
+            self.wallet_ledger_cache = WalletLedgerCache::default();
+            self.current_receive_address = None;
             return;
         };
         let RpcResponse::Utxos(utxos) = self.connection.request(RpcRequest::ListUtxos) else {
@@ -278,38 +341,48 @@ impl DesktopApp {
         };
         let reserved_inputs = self.mempool_reserved_inputs();
 
-        let (available_owned, balance_summary, available_balance) = {
+        let (wallet_addresses, receive_preview) = {
             let wallet = self.wallet_ref().expect("wallet checked above");
-            let mut owned = utxos
-                .into_iter()
-                .filter(|utxo| match utxo.locking_script.as_slice().try_into() {
-                    Ok(digest) => {
-                        wallet.address_for_payment_digest(&digest).is_some()
-                            && !reserved_inputs.contains(&(utxo.txid, utxo.output_index))
-                    }
-                    Err(_) => false,
-                })
-                .collect::<Vec<_>>();
-            owned.sort_by(|left, right| {
-                right
-                    .txid
-                    .cmp(&left.txid)
-                    .then(right.output_index.cmp(&left.output_index))
-            });
-            let available_owned = owned
-                .iter()
-                .filter(|utxo| utxo.is_spendable_at(current_height))
-                .cloned()
-                .collect::<Vec<_>>();
-            let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
-            let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
-            (available_owned, balance_summary, available_balance)
+            (
+                wallet.all_addresses(),
+                wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT),
+            )
         };
+        let address_lookup = Self::wallet_address_lookup(&wallet_addresses);
+        let mut owned = utxos
+            .into_par_iter()
+            .filter_map(|utxo| {
+                let digest: [u8; 32] = utxo.locking_script.as_slice().try_into().ok()?;
+                if !address_lookup.contains_key(&digest)
+                    || reserved_inputs.contains(&(utxo.txid, utxo.output_index))
+                {
+                    return None;
+                }
+                Some(utxo)
+            })
+            .collect::<Vec<_>>();
+        owned.sort_by(|left, right| {
+            right
+                .txid
+                .cmp(&left.txid)
+                .then(right.output_index.cmp(&left.output_index))
+        });
+        let available_owned = owned
+            .iter()
+            .filter(|utxo| utxo.is_spendable_at(current_height))
+            .cloned()
+            .collect::<Vec<_>>();
+        let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
+        let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
 
-        let wallet_addresses = wallet.all_addresses();
+        self.wallet_addresses_cache = wallet_addresses;
+        self.wallet_owned_utxos_cache = owned;
+        self.receive_addresses = receive_preview;
+        self.refresh_receive_address_rows();
+
         if let Err(err) = self
             .wallet_ledger_cache
-            .refresh(&wallet_addresses, balance_summary.clone())
+            .refresh(&self.wallet_addresses_cache, balance_summary.clone())
         {
             let _ = atho_node::dev::append_log(
                 "atho-qt",
@@ -364,6 +437,85 @@ impl DesktopApp {
         &self.wallet_balance_summary_cache
     }
 
+    fn refresh_receive_address_rows(&mut self) {
+        let current_digest = self
+            .current_receive_address
+            .as_ref()
+            .map(|address| address.payment_digest);
+        self.receive_address_rows = Self::build_receive_address_rows(
+            &self.wallet_addresses_cache,
+            &self.wallet_owned_utxos_cache,
+            current_digest,
+        );
+    }
+
+    fn wallet_address_lookup(addresses: &[WalletAddress]) -> HashMap<[u8; 32], WalletAddress> {
+        addresses
+            .iter()
+            .cloned()
+            .map(|address| (address.payment_digest, address))
+            .collect()
+    }
+
+    fn build_receive_address_rows(
+        wallet_addresses: &[WalletAddress],
+        owned_utxos: &[UtxoEntry],
+        current_digest: Option<[u8; 32]>,
+    ) -> Vec<ReceiveAddressRow> {
+        let mut usage_by_digest: HashMap<[u8; 32], (usize, u64)> = HashMap::new();
+        for utxo in owned_utxos {
+            let Ok(digest) = utxo.locking_script.as_slice().try_into() else {
+                continue;
+            };
+            let entry = usage_by_digest.entry(digest).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(utxo.value_atoms);
+        }
+
+        wallet_addresses
+            .iter()
+            .filter(|address| address.path.kind == AddressKind::Receive)
+            .map(|address| {
+                let (utxo_count, total_atoms) = usage_by_digest
+                    .get(&address.payment_digest)
+                    .copied()
+                    .unwrap_or((0, 0));
+                ReceiveAddressRow {
+                    address: address.clone(),
+                    used: utxo_count > 0,
+                    utxo_count,
+                    total_atoms,
+                    is_current: current_digest == Some(address.payment_digest),
+                }
+            })
+            .collect()
+    }
+
+    fn refresh_wallet_address_views(&mut self) {
+        let Some(_wallet) = self.wallet_ref() else {
+            self.wallet_addresses_cache.clear();
+            self.wallet_owned_utxos_cache.clear();
+            self.wallet_utxos_cache.clear();
+            self.wallet_activity_cache.clear();
+            self.wallet_balance_summary_cache = WalletBalanceSummary::default();
+            self.wallet_balance_cache = 0;
+            self.receive_addresses.clear();
+            self.receive_address_rows.clear();
+            self.wallet_ledger_cache = WalletLedgerCache::default();
+            return;
+        };
+        let (wallet_addresses, receive_preview) = {
+            let wallet = self.wallet_ref().expect("wallet checked above");
+            (
+                wallet.all_addresses(),
+                wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT),
+            )
+        };
+        self.wallet_addresses_cache = wallet_addresses;
+        self.receive_addresses = receive_preview;
+        self.refresh_receive_address_rows();
+    }
+
     fn refresh_wallet_cache_if_needed(&mut self) {
         if !self.wallet_cache_dirty || self.wallet.is_none() {
             return;
@@ -385,27 +537,28 @@ impl DesktopApp {
 
         if !has_receive {
             let first = wallet.checkout_receive_address();
-            self.receive_addresses = vec![first.clone()];
             self.current_receive_address = Some(first);
-        } else {
-            self.receive_addresses = wallet
+        }
+
+        self.receive_addresses = wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT);
+        if self.current_receive_address.is_none() {
+            self.current_receive_address = wallet
                 .address_book
                 .snapshot()
                 .into_iter()
-                .filter(|record| record.path.kind == AddressKind::Receive)
+                .rev()
+                .find(|record| record.path.kind == AddressKind::Receive)
                 .map(|record| wallet.address_for_path(record.path))
-                .collect();
-            self.current_receive_address = self.receive_addresses.last().cloned();
-            if self.receive_addresses.is_empty() {
-                let first = wallet.checkout_receive_address();
-                self.receive_addresses = vec![first.clone()];
-                self.current_receive_address = Some(first);
-            }
+                .or_else(|| self.receive_addresses.first().cloned());
         }
 
+        self.wallet_management_form.backup_path = backup_wallet_path(&wallet_path);
+        self.wallet_management_form.backup_password.clear();
+        self.wallet_management_form.backup_password_confirm.clear();
         self.wallet_path = Some(wallet_path);
         self.wallet = Some(wallet);
         self.sync_wallet_state();
+        self.refresh_wallet_address_views();
         self.refresh_wallet_cache();
         self.active_tab = NavTab::Overview;
         self.launch_page = LaunchPage::Welcome;
@@ -415,7 +568,6 @@ impl DesktopApp {
         if let Some(wallet) = &self.wallet {
             self.ui_state.wallet_snapshot = wallet.snapshot.clone();
             self.view_model.ui_state.wallet_snapshot = wallet.snapshot.clone();
-            self.current_receive_address = self.receive_addresses.last().cloned();
         }
     }
 
@@ -439,6 +591,19 @@ impl DesktopApp {
                 );
                 self.last_error = None;
                 if outcome.accepted {
+                    if self.ui_state.rotate_coinbase_address {
+                        let next_coinbase_address = self.wallet_mut().map(|wallet| {
+                            let address = wallet.checkout_receive_address_with_label(None);
+                            let snapshot = wallet.snapshot.clone();
+                            (address, snapshot)
+                        });
+                        if let Some((address, snapshot)) = next_coinbase_address {
+                            self.current_receive_address = Some(address);
+                            self.ui_state.wallet_snapshot = snapshot.clone();
+                            self.view_model.ui_state.wallet_snapshot = snapshot;
+                            self.refresh_wallet_address_views();
+                        }
+                    }
                     self.wallet_cache_dirty = true;
                 }
                 if self.ui_state.generate_coins {
@@ -648,6 +813,28 @@ impl DesktopApp {
             .map_err(|err| err.to_string())
     }
 
+    fn export_wallet_backup(&self, backup_path: &str, password: &str) -> Result<(), String> {
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        Self::save_wallet_to_path(wallet, backup_path, password)
+    }
+
+    fn change_wallet_passphrase(&self, password: &str) -> Result<(), String> {
+        let wallet_path = self
+            .wallet_path
+            .as_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        Self::save_wallet_to_path(wallet, wallet_path, password)
+    }
+
+    pub(crate) fn wallet_mnemonic_sentence(&self) -> Option<String> {
+        self.wallet_ref().and_then(Wallet::mnemonic_sentence)
+    }
+
     fn open_wallet_from_path(&self, wallet_path: &str, password: &str) -> Result<Wallet, String> {
         let path = PathBuf::from(wallet_path);
         let wallet = Wallet::load_from_datafile(&path, password).map_err(|err| err.to_string())?;
@@ -685,6 +872,7 @@ impl DesktopApp {
     }
 
     fn load_or_create_wallet(&mut self, wallet: Wallet, wallet_path: String) {
+        self.clear_wallet_state();
         self.attach_wallet(wallet, wallet_path);
         self.send_status = String::from("Wallet loaded");
         self.last_error = None;
@@ -706,10 +894,10 @@ impl DesktopApp {
             let snapshot = wallet.snapshot.clone();
             (address, snapshot)
         };
-        self.receive_addresses.push(address.clone());
         self.current_receive_address = Some(address);
         self.ui_state.wallet_snapshot = snapshot.clone();
         self.view_model.ui_state.wallet_snapshot = snapshot;
+        self.refresh_wallet_address_views();
         self.send_status = String::from("Receive address generated");
         self.receive_label.clear();
     }
@@ -762,18 +950,17 @@ impl DesktopApp {
 
     #[allow(dead_code)]
     fn generate_change_address(&mut self) {
-        let (address, snapshot) = {
+        let snapshot = {
             let Some(wallet) = self.wallet_mut() else {
                 self.send_status = String::from("Load or create a wallet first");
                 return;
             };
-            let address = wallet.checkout_change_address_with_label(None);
-            let snapshot = wallet.snapshot.clone();
-            (address, snapshot)
+            wallet.checkout_change_address_with_label(None);
+            wallet.snapshot.clone()
         };
-        self.receive_addresses.push(address);
         self.ui_state.wallet_snapshot = snapshot.clone();
         self.view_model.ui_state.wallet_snapshot = snapshot;
+        self.refresh_wallet_address_views();
         self.send_status = String::from("Change address generated");
     }
 
@@ -808,7 +995,13 @@ impl DesktopApp {
             let wallet = self
                 .wallet_ref()
                 .ok_or_else(|| String::from("Load or create a wallet first"))?;
-            let mut grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)> = BTreeMap::new();
+            let wallet_addresses = if self.wallet_addresses_cache.is_empty() {
+                wallet.all_addresses()
+            } else {
+                self.wallet_addresses_cache.clone()
+            };
+            let wallet_address_lookup = Self::wallet_address_lookup(&wallet_addresses);
+            let mut grouped: HashMap<[u8; 32], (WalletAddress, Vec<UtxoEntry>)> = HashMap::new();
             for utxo in self.wallet_utxos_cache.clone() {
                 if reserved_inputs.contains(&(utxo.txid, utxo.output_index)) {
                     continue;
@@ -817,19 +1010,20 @@ impl DesktopApp {
                     Ok(digest) => digest,
                     Err(_) => continue,
                 };
-                if let Some(address) = wallet.address_for_payment_digest(&digest) {
-                    let key = hex::encode(address.payment_digest);
+                if let Some(address) = wallet_address_lookup.get(&digest) {
                     grouped
-                        .entry(key)
-                        .or_insert((address, Vec::new()))
+                        .entry(address.payment_digest)
+                        .or_insert((address.clone(), Vec::new()))
                         .1
                         .push(utxo);
                 }
             }
 
-            let Some(selected_plan) =
-                Self::select_wallet_utxos(grouped, amount, self.send_include_fee_in_total)?
-            else {
+            let Some(selected_plan) = Self::select_wallet_utxos(
+                grouped.into_values().collect(),
+                amount,
+                self.send_include_fee_in_total,
+            )? else {
                 return Err(String::from(
                     "No spendable wallet UTXOs available; refresh to clear mempool-locked outputs",
                 ));
@@ -964,58 +1158,70 @@ impl DesktopApp {
     }
 
     fn select_wallet_utxos(
-        grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)>,
+        grouped: Vec<(WalletAddress, Vec<UtxoEntry>)>,
         amount_atoms: u64,
         include_fee_in_total: bool,
     ) -> Result<Option<SelectedSpendPlan>, String> {
-        let mut best: Option<SelectedSpendPlan> = None;
+        let best = grouped
+            .into_par_iter()
+            .map(|(address, mut utxos)| {
+                utxos.sort_by(|a, b| b.value_atoms.cmp(&a.value_atoms).then(a.txid.cmp(&b.txid)));
+                let mut best: Option<SelectedSpendPlan> = None;
+                let mut selected = Vec::new();
+                let mut total = 0u64;
+                for utxo in utxos {
+                    total = total.saturating_add(utxo.value_atoms);
+                    selected.push(utxo);
+                    let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
+                    let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
 
-        for (_key, (address, mut utxos)) in grouped {
-            utxos.sort_by(|a, b| b.value_atoms.cmp(&a.value_atoms).then(a.txid.cmp(&b.txid)));
-            let mut selected = Vec::new();
-            let mut total = 0u64;
-            for utxo in utxos {
-                total = total.saturating_add(utxo.value_atoms);
-                selected.push(utxo);
-                let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
-                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
-
-                let candidate_output_count = if include_fee_in_total {
-                    if total == amount_atoms && amount_atoms > estimate_exact_fee {
-                        Some(1)
-                    } else if total > amount_atoms && amount_atoms > estimate_change_fee {
-                        Some(2)
+                    let candidate_output_count = if include_fee_in_total {
+                        if total == amount_atoms && amount_atoms > estimate_exact_fee {
+                            Some(1)
+                        } else if total > amount_atoms && amount_atoms > estimate_change_fee {
+                            Some(2)
+                        } else {
+                            None
+                        }
                     } else {
-                        None
-                    }
-                } else {
-                    let exact_target = amount_atoms.checked_add(estimate_exact_fee);
-                    let change_target = amount_atoms.checked_add(estimate_change_fee);
-                    if exact_target == Some(total) {
-                        Some(1)
-                    } else if change_target.is_some_and(|target| total > target) {
-                        Some(2)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(output_count) = candidate_output_count {
-                    let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
-                    let candidate = SelectedSpendPlan {
-                        address: address.clone(),
-                        utxos: selected.clone(),
-                        total_input_atoms: total,
-                        output_count,
-                        estimated_fee_atoms,
+                        let exact_target = amount_atoms.checked_add(estimate_exact_fee);
+                        let change_target = amount_atoms.checked_add(estimate_change_fee);
+                        if exact_target == Some(total) {
+                            Some(1)
+                        } else if change_target.is_some_and(|target| total > target) {
+                            Some(2)
+                        } else {
+                            None
+                        }
                     };
-                    best = Self::prefer_candidate(best, candidate);
-                    if output_count == 1 {
-                        break;
+
+                    if let Some(output_count) = candidate_output_count {
+                        let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
+                        let candidate = SelectedSpendPlan {
+                            address: address.clone(),
+                            utxos: selected.clone(),
+                            total_input_atoms: total,
+                            output_count,
+                            estimated_fee_atoms,
+                        };
+                        best = Self::prefer_candidate(best, candidate);
+                        if output_count == 1 {
+                            break;
+                        }
                     }
                 }
-            }
-        }
+                best
+            })
+            .reduce(
+                || None,
+                |current, candidate| match (current, candidate) {
+                    (None, next) => next,
+                    (next, None) => next,
+                    (Some(existing), Some(candidate)) => {
+                        Self::prefer_candidate(Some(existing), candidate)
+                    }
+                },
+            );
 
         Ok(best)
     }
@@ -1258,6 +1464,13 @@ impl DesktopApp {
             .unwrap_or_default()
     }
 
+    fn current_receive_address_row(&self) -> Option<&ReceiveAddressRow> {
+        let digest = self.current_receive_address.as_ref()?.payment_digest;
+        self.receive_address_rows
+            .iter()
+            .find(|row| row.address.payment_digest == digest)
+    }
+
     fn selected_receive_request(&self) -> Option<&ReceiveRequestRecord> {
         let selected = self.selected_receive_request?;
         self.requested_payments
@@ -1415,6 +1628,10 @@ fn alternate_wallet_path(network: Network) -> PathBuf {
     let file_name = format!("{}.2", Wallet::datafile_name());
     path.set_file_name(file_name);
     path
+}
+
+fn backup_wallet_path(wallet_path: &str) -> String {
+    format!("{wallet_path}.backup")
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1672,5 +1889,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn receive_address_rows_mark_used_and_current_addresses() {
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Testnet,
+        );
+        let first = wallet.checkout_receive_address();
+        let second = wallet.checkout_receive_address();
+        let _change = wallet.checkout_change_address();
+        let utxo = UtxoEntry::new(
+            Network::Testnet,
+            [9; 48],
+            0,
+            12_345,
+            first.payment_digest.to_vec(),
+            12,
+            false,
+        );
+
+        let rows = DesktopApp::build_receive_address_rows(
+            &wallet.all_addresses(),
+            &[utxo],
+            Some(first.payment_digest),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].used);
+        assert!(rows[0].is_current);
+        assert_eq!(rows[0].utxo_count, 1);
+        assert_eq!(rows[0].total_atoms, 12_345);
+        assert!(!rows[1].used);
+        assert!(!rows[1].is_current);
+        assert_eq!(rows[1].utxo_count, 0);
+        assert_eq!(rows[1].total_atoms, 0);
+        assert_eq!(rows[0].address.address, first.address);
+        assert_eq!(rows[1].address.address, second.address);
     }
 }

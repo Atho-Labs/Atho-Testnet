@@ -1,5 +1,6 @@
 use super::default_wallet_path;
 use atho_core::network::Network;
+use atho_wallet::wallet::WalletAddress;
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
@@ -11,6 +12,54 @@ pub(crate) enum NavTab {
     Receive,
     Transactions,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceivePageTab {
+    RequestPayment,
+    AddressPool,
+}
+
+impl ReceivePageTab {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ReceivePageTab::RequestPayment => "Request payment",
+            ReceivePageTab::AddressPool => "Address pool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressPoolFilter {
+    Unused,
+    Used,
+    All,
+}
+
+impl AddressPoolFilter {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AddressPoolFilter::Unused => "Unused",
+            AddressPoolFilter::Used => "Used",
+            AddressPoolFilter::All => "All",
+        }
+    }
+
+    pub(crate) fn matches(self, used: bool) -> bool {
+        match self {
+            AddressPoolFilter::Unused => !used,
+            AddressPoolFilter::Used => used,
+            AddressPoolFilter::All => true,
+        }
+    }
+
+    pub(crate) fn variants() -> [AddressPoolFilter; 3] {
+        [
+            AddressPoolFilter::Unused,
+            AddressPoolFilter::Used,
+            AddressPoolFilter::All,
+        ]
+    }
 }
 
 impl NavTab {
@@ -75,6 +124,25 @@ impl CreateWalletForm {
 }
 
 #[derive(Debug)]
+pub(crate) struct WalletManagementForm {
+    pub(crate) backup_path: String,
+    pub(crate) backup_password: String,
+    pub(crate) backup_password_confirm: String,
+    pub(crate) show_passwords: bool,
+}
+
+impl WalletManagementForm {
+    pub(crate) fn new(network: Network) -> Self {
+        Self {
+            backup_path: default_backup_wallet_path(network),
+            backup_password: String::new(),
+            backup_password_confirm: String::new(),
+            show_passwords: false,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ImportWalletForm {
     pub(crate) wallet_path: String,
     pub(crate) encrypt_wallet: bool,
@@ -97,6 +165,10 @@ impl ImportWalletForm {
             show_passwords: false,
         }
     }
+}
+
+fn default_backup_wallet_path(network: Network) -> String {
+    format!("{}.backup", default_wallet_path(network).to_string_lossy())
 }
 
 #[derive(Debug)]
@@ -163,6 +235,15 @@ pub(crate) struct ReceiveRequestRecord {
     pub(crate) message: String,
     pub(crate) amount_atoms: Option<u64>,
     pub(crate) address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiveAddressRow {
+    pub(crate) address: WalletAddress,
+    pub(crate) used: bool,
+    pub(crate) utxo_count: usize,
+    pub(crate) total_atoms: u64,
+    pub(crate) is_current: bool,
 }
 
 #[derive(Debug, Clone)]

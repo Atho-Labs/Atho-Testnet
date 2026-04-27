@@ -9,7 +9,10 @@ use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
 use std::io::BufReader;
 use std::net::TcpListener;
+use std::time::Duration;
 use thiserror::Error;
+
+const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -98,6 +101,18 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     for incoming in listener.incoming() {
         match incoming {
             Ok(mut stream) => {
+                if let Err(err) = stream.set_nodelay(true) {
+                    let _ = dev::append_log("athod", &format!("rpc nodelay error: {err}"));
+                    continue;
+                }
+                if let Err(err) = stream.set_read_timeout(Some(RPC_IO_TIMEOUT)) {
+                    let _ = dev::append_log("athod", &format!("rpc read timeout error: {err}"));
+                    continue;
+                }
+                if let Err(err) = stream.set_write_timeout(Some(RPC_IO_TIMEOUT)) {
+                    let _ = dev::append_log("athod", &format!("rpc write timeout error: {err}"));
+                    continue;
+                }
                 let request = match stream.try_clone() {
                     Ok(clone) => {
                         let mut reader = BufReader::new(clone);

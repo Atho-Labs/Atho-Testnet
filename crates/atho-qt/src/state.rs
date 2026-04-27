@@ -6,6 +6,7 @@ pub struct UiState {
     pub connected: bool,
     pub generate_coins: bool,
     pub mining_cores: u32,
+    pub rotate_coinbase_address: bool,
 }
 
 impl UiState {

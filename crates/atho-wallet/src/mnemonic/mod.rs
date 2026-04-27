@@ -1,4 +1,5 @@
 use pbkdf2::pbkdf2_hmac;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -55,7 +56,7 @@ pub enum MnemonicError {
     ChecksumMismatch,
 }
 
-#[derive(Debug, PartialEq, Eq, Zeroize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub struct MnemonicPhrase {
     words: Vec<String>,

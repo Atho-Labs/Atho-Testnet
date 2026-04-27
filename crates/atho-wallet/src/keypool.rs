@@ -2,6 +2,8 @@ use crate::hd::{AddressKind, DerivationPath, HdWallet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+pub const KEYPOOL_TARGET_SIZE: usize = 5_000;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keypool {
     receive: VecDeque<DerivationPath>,
@@ -43,6 +45,10 @@ impl Keypool {
             receive: receive.into_iter().collect(),
             change: change.into_iter().collect(),
         }
+    }
+
+    pub fn refill_to_target(&mut self, wallet: &mut HdWallet) {
+        self.refill(wallet, KEYPOOL_TARGET_SIZE, KEYPOOL_TARGET_SIZE);
     }
 }
 
