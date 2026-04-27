@@ -10,6 +10,13 @@ pub struct MempoolEntry {
     pub fee_atoms: u64,
 }
 
+impl MempoolEntry {
+    pub fn feerate_atoms_per_vbyte(&self) -> u64 {
+        let vsize = self.transaction.vsize_bytes().max(1) as u64;
+        self.fee_atoms / vsize
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Mempool {
     entries: BTreeMap<[u8; 48], MempoolEntry>,
@@ -47,13 +54,19 @@ impl Mempool {
         }
     }
 
-    fn validate_entry<F>(&self, entry: &MempoolEntry, mut lookup: F) -> Result<u64, ValidationError>
+    fn validate_entry<F>(
+        &self,
+        entry: &MempoolEntry,
+        spend_height: u64,
+        mut lookup: F,
+    ) -> Result<u64, ValidationError>
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
         let fee = validate_transaction_with_context(
             &entry.transaction,
             entry.fee_atoms,
+            spend_height,
             |txid, output_index| lookup(txid, output_index),
         )?;
         if Self::input_keys(&entry.transaction).any(|key| self.spent_inputs.contains(&key)) {
@@ -62,7 +75,12 @@ impl Mempool {
         Ok(fee)
     }
 
-    pub fn admit<F>(&mut self, entry: MempoolEntry, lookup: F) -> Result<[u8; 48], ValidationError>
+    pub fn admit<F>(
+        &mut self,
+        entry: MempoolEntry,
+        spend_height: u64,
+        lookup: F,
+    ) -> Result<[u8; 48], ValidationError>
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
@@ -70,16 +88,22 @@ impl Mempool {
         if self.entries.contains_key(&txid) {
             return Err(ValidationError::MempoolConflict);
         }
-        self.validate_entry(&entry, lookup)?;
+        self.validate_entry(&entry, spend_height, lookup)?;
         self.reserve_inputs(&entry.transaction)?;
         self.entries.insert(txid, entry);
-        let _ = dev::append_log("mempool", &format!("admitted tx {}", hex::encode(txid)));
+        let entry = self
+            .entries
+            .get(&txid)
+            .expect("mempool entry just inserted");
+        let summary = dev::summarize_transaction(&entry.transaction, Some(entry.fee_atoms));
+        let _ = dev::append_log("mempool", &format!("admitted {summary}"));
         Ok(txid)
     }
 
     pub fn admit_many<F>(
         &mut self,
         entries: Vec<MempoolEntry>,
+        spend_height: u64,
         mut lookup: F,
     ) -> Result<Vec<[u8; 48]>, ValidationError>
     where
@@ -87,25 +111,37 @@ impl Mempool {
     {
         let mut txids = Vec::with_capacity(entries.len());
         for entry in entries {
-            let txid = self.admit(entry, &mut lookup)?;
+            let txid = self.admit(entry, spend_height, &mut lookup)?;
             txids.push(txid);
         }
         Ok(txids)
     }
 
-    pub fn revalidate<F>(&mut self, mut lookup: F)
+    pub fn revalidate<F>(&mut self, spend_height: u64, mut lookup: F)
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
         let current = std::mem::take(&mut self.entries);
         self.spent_inputs.clear();
+        let before = current.len();
         for (txid, entry) in current {
-            if self.validate_entry(&entry, &mut lookup).is_ok()
+            if self
+                .validate_entry(&entry, spend_height, &mut lookup)
+                .is_ok()
                 && self.reserve_inputs(&entry.transaction).is_ok()
             {
                 self.entries.insert(txid, entry);
             }
         }
+        let kept = self.entries.len();
+        let _ = dev::append_log(
+            "mempool",
+            &format!(
+                "revalidated kept={} dropped={}",
+                kept,
+                before.saturating_sub(kept)
+            ),
+        );
     }
 
     pub fn contains(&self, txid: &[u8; 48]) -> bool {
@@ -125,17 +161,28 @@ impl Mempool {
 
     pub fn valid_transactions<F>(
         &self,
+        spend_height: u64,
         mut lookup: F,
     ) -> Result<(Vec<Transaction>, u64), ValidationError>
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let mut txs = Vec::with_capacity(self.entries.len());
+        let mut ordered: Vec<&MempoolEntry> = self.entries.values().collect();
+        ordered.sort_by(|left, right| {
+            right
+                .feerate_atoms_per_vbyte()
+                .cmp(&left.feerate_atoms_per_vbyte())
+                .then_with(|| right.fee_atoms.cmp(&left.fee_atoms))
+                .then_with(|| left.transaction.txid().cmp(&right.transaction.txid()))
+        });
+
+        let mut txs = Vec::with_capacity(ordered.len());
         let mut fees = 0u64;
-        for entry in self.entries.values() {
+        for entry in ordered {
             let fee = validate_transaction_with_context(
                 &entry.transaction,
                 entry.fee_atoms,
+                spend_height,
                 |txid, output_index| lookup(txid, output_index),
             )?;
             fees = fees.saturating_add(fee);
@@ -146,6 +193,10 @@ impl Mempool {
 
     pub fn total_fee_atoms(&self) -> u64 {
         self.entries.values().map(|entry| entry.fee_atoms).sum()
+    }
+
+    pub fn spent_inputs_snapshot(&self) -> Vec<([u8; 48], u32)> {
+        self.spent_inputs.iter().cloned().collect()
     }
 
     pub fn remove_block_transactions(&mut self, block: &atho_core::block::Block) {
@@ -236,6 +287,7 @@ mod tests {
                     transaction: tx,
                     fee_atoms: 500,
                 },
+                0,
                 |_, _| None,
             )
             .err()
@@ -274,5 +326,99 @@ mod tests {
                 .expect("conflict should fail"),
             ValidationError::MempoolConflict
         );
+    }
+
+    #[test]
+    fn valid_transactions_are_sorted_by_feerate() {
+        let mut mempool = Mempool::new();
+        let low = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [4; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_500,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let low = Transaction {
+            witness: witness_bytes_for_tx(&low),
+            ..low
+        };
+        let high = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [5; 48],
+                output_index: 0,
+                unlocking_script: vec![3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_000,
+                locking_script: vec![4],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let high = Transaction {
+            witness: witness_bytes_for_tx(&high),
+            ..high
+        };
+
+        let low_txid = low.txid();
+        let high_txid = high.txid();
+        let _ = mempool.entries.insert(
+            low_txid,
+            MempoolEntry {
+                transaction: low.clone(),
+                fee_atoms: 2_500,
+            },
+        );
+        let _ = mempool.entries.insert(
+            high_txid,
+            MempoolEntry {
+                transaction: high.clone(),
+                fee_atoms: 3_000,
+            },
+        );
+
+        let mut utxos = std::collections::BTreeMap::new();
+        utxos.insert(
+            ([4; 48], 0),
+            UtxoEntry::new(
+                atho_core::network::Network::Mainnet,
+                [4; 48],
+                0,
+                10_000,
+                vec![1],
+                0,
+                false,
+            ),
+        );
+        utxos.insert(
+            ([5; 48], 0),
+            UtxoEntry::new(
+                atho_core::network::Network::Mainnet,
+                [5; 48],
+                0,
+                10_000,
+                vec![3],
+                0,
+                false,
+            ),
+        );
+
+        let (txs, fees) = mempool
+            .valid_transactions(7, |txid, output_index| {
+                utxos.get(&(*txid, output_index)).cloned()
+            })
+            .expect("both transactions should validate");
+
+        assert_eq!(fees, 5_500);
+        assert_eq!(txs[0].txid(), high_txid);
+        assert_eq!(txs[1].txid(), low_txid);
     }
 }

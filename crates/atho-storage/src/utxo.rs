@@ -1,5 +1,6 @@
 use crate::error::StorageError;
 use atho_core::block::Block;
+use atho_core::constants::{COINBASE_MATURITY_BLOCKS, STANDARD_TX_CONFIRMATIONS};
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,71 @@ pub struct UtxoEntry {
     pub output_index: u32,
     pub value_atoms: u64,
     pub locking_script: Vec<u8>,
+    pub created_height: u64,
+    pub is_coinbase: bool,
+}
+
+impl UtxoEntry {
+    pub fn new(
+        network: Network,
+        txid: [u8; 48],
+        output_index: u32,
+        value_atoms: u64,
+        locking_script: Vec<u8>,
+        created_height: u64,
+        is_coinbase: bool,
+    ) -> Self {
+        Self {
+            network,
+            txid,
+            output_index,
+            value_atoms,
+            locking_script,
+            created_height,
+            is_coinbase,
+        }
+    }
+
+    pub fn coinbase(
+        network: Network,
+        txid: [u8; 48],
+        output_index: u32,
+        value_atoms: u64,
+        locking_script: Vec<u8>,
+        created_height: u64,
+    ) -> Self {
+        Self::new(
+            network,
+            txid,
+            output_index,
+            value_atoms,
+            locking_script,
+            created_height,
+            true,
+        )
+    }
+
+    pub fn confirmation_count(&self, spend_height: u64) -> u64 {
+        spend_height
+            .saturating_sub(self.created_height)
+            .saturating_add(1)
+    }
+
+    pub fn required_confirmations(&self) -> u64 {
+        if self.is_coinbase {
+            COINBASE_MATURITY_BLOCKS
+        } else {
+            STANDARD_TX_CONFIRMATIONS
+        }
+    }
+
+    pub fn is_spendable_at(&self, spend_height: u64) -> bool {
+        self.confirmation_count(spend_height) >= self.required_confirmations()
+    }
+
+    pub fn is_coinbase_mature(&self, spend_height: u64) -> bool {
+        self.is_spendable_at(spend_height)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +151,7 @@ impl UtxoSet {
             let spent = spend_inputs(self, tx)?;
             undo.spent.extend(spent);
 
-            let created = create_outputs(tx, self.network);
+            let created = create_outputs(tx, self.network, block.header.height);
             for output in created {
                 if let Err(err) = self.insert(output.clone()) {
                     self.disconnect_block(undo);
@@ -140,17 +206,21 @@ fn spend_inputs(set: &mut UtxoSet, tx: &Transaction) -> Result<Vec<UtxoEntry>, S
     Ok(spent)
 }
 
-fn create_outputs(tx: &Transaction, network: Network) -> Vec<UtxoEntry> {
+fn create_outputs(tx: &Transaction, network: Network, created_height: u64) -> Vec<UtxoEntry> {
     let txid = tx.txid();
     tx.outputs
         .iter()
         .enumerate()
-        .map(|(output_index, output)| UtxoEntry {
-            network,
-            txid,
-            output_index: output_index as u32,
-            value_atoms: output.value_atoms,
-            locking_script: output.locking_script.clone(),
+        .map(|(output_index, output)| {
+            UtxoEntry::new(
+                network,
+                txid,
+                output_index as u32,
+                output.value_atoms,
+                output.locking_script.clone(),
+                created_height,
+                tx.is_coinbase(),
+            )
         })
         .collect()
 }
@@ -239,13 +309,15 @@ mod tests {
     #[test]
     fn utxo_set_accepts_entries_and_clears_for_reorg() {
         let mut set = UtxoSet::new(Network::Mainnet);
-        let _ = set.insert(UtxoEntry {
-            network: Network::Mainnet,
-            txid: [7; 48],
-            output_index: 0,
-            value_atoms: 500,
-            locking_script: vec![1],
-        });
+        let _ = set.insert(UtxoEntry::new(
+            Network::Mainnet,
+            [7; 48],
+            0,
+            500,
+            vec![1],
+            0,
+            false,
+        ));
 
         assert_eq!(set.len(), 1);
         set.clear();
@@ -255,13 +327,15 @@ mod tests {
     #[test]
     fn utxo_set_applies_and_disconnects_block() {
         let mut set = UtxoSet::new(Network::Mainnet);
-        set.insert(UtxoEntry {
-            network: Network::Mainnet,
-            txid: [1; 48],
-            output_index: 0,
-            value_atoms: 500,
-            locking_script: vec![1],
-        })
+        set.insert(UtxoEntry::new(
+            Network::Mainnet,
+            [1; 48],
+            0,
+            500,
+            vec![1],
+            0,
+            false,
+        ))
         .unwrap();
 
         let tx = Transaction {

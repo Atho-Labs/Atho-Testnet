@@ -1,4 +1,5 @@
 use crate::crypto::hash::sha3_384;
+use crate::encoding::{compact_size_len, write_compact_size};
 use crate::transaction::{Transaction, TxWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -123,6 +124,17 @@ impl Block {
         out
     }
 
+    pub fn compact_bytes(&self) -> Vec<u8> {
+        let mut out = self.header.canonical_bytes();
+        write_compact_size(&mut out, self.transactions.len());
+        for tx in &self.transactions {
+            let tx_bytes = tx.compact_bytes();
+            write_compact_size(&mut out, tx_bytes.len());
+            out.extend_from_slice(&tx_bytes);
+        }
+        out
+    }
+
     pub fn canonical_bytes(&self) -> Vec<u8> {
         self.full_bytes()
     }
@@ -154,6 +166,17 @@ impl Block {
 
     pub fn vsize_bytes(&self) -> usize {
         (self.weight_bytes().saturating_add(3)) / 4
+    }
+
+    pub fn compact_size_bytes(&self) -> usize {
+        let mut total =
+            self.header.canonical_bytes().len() + compact_size_len(self.transactions.len());
+        for tx in &self.transactions {
+            let tx_bytes = tx.compact_bytes();
+            total = total.saturating_add(compact_size_len(tx_bytes.len()));
+            total = total.saturating_add(tx_bytes.len());
+        }
+        total
     }
 
     pub fn merkle_root(&self) -> [u8; 48] {
@@ -254,5 +277,37 @@ mod tests {
 
         let root = merkle_root(&[tx.clone(), tx]);
         assert_ne!(root, [0; 48]);
+    }
+
+    #[test]
+    fn compact_block_bytes_are_not_larger_than_full_bytes() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![crate::transaction::TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![crate::transaction::TxOutput {
+                value_atoms: 500,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![9, 9, 9],
+        };
+        let header = BlockHeader {
+            version: 1,
+            network_id: crate::network::Network::Mainnet,
+            height: 1,
+            previous_block_hash: [2; 48],
+            merkle_root: merkle_root(&[tx.clone()]),
+            witness_root: witness_root(&[tx.clone()]),
+            timestamp: 75,
+            difficulty_target_or_bits: [5; 48],
+            nonce: 42,
+        };
+        let block = Block::new(header, vec![tx]);
+
+        assert!(block.compact_bytes().len() <= block.full_bytes().len());
     }
 }

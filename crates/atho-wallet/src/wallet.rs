@@ -271,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn wallet_restore_preserves_derivation_sequence() {
+        let mut original = Wallet::from_mnemonic(phrase(), "", Network::Regnet);
+        let first_receive = original.checkout_receive_address();
+        let second_receive = original.checkout_receive_address();
+        let first_change = original.checkout_change_address();
+
+        let mut restored =
+            Wallet::restore_from_phrase(&phrase().as_sentence(), "", Network::Regnet).unwrap();
+        assert_eq!(
+            restored.checkout_receive_address().address,
+            first_receive.address
+        );
+        assert_eq!(
+            restored.checkout_receive_address().address,
+            second_receive.address
+        );
+        assert_eq!(
+            restored.checkout_change_address().address,
+            first_change.address
+        );
+    }
+
+    #[test]
     fn wallet_uses_restore_gap_limit_and_keypool_checkout() {
         let mut wallet = Wallet::from_mnemonic(phrase(), "", Network::Testnet);
         assert_eq!(wallet.restore_gap_limit(), DEFAULT_RESTORE_GAP_LIMIT);

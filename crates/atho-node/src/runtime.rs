@@ -33,12 +33,35 @@ impl NodeRuntime {
         }
     }
 
+    pub fn load_or_new(config: NodeConfig) -> Self {
+        Self {
+            node: Node::load_or_new(config),
+            running: false,
+        }
+    }
+
     pub fn start(&mut self) {
         self.running = true;
+        let _ = dev::append_log(
+            "athod",
+            &format!(
+                "runtime running network={} height={}",
+                self.node.config.network.id(),
+                self.node.height()
+            ),
+        );
     }
 
     pub fn stop(&mut self) {
         self.running = false;
+        let _ = dev::append_log(
+            "athod",
+            &format!(
+                "runtime stopped network={} height={}",
+                self.node.config.network.id(),
+                self.node.height()
+            ),
+        );
     }
 }
 
@@ -65,6 +88,12 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
+    println!("athod running on {} rpc={rpc_address}", config.network.id());
+    let status = system.status();
+    println!(
+        "node status height={} mempool={} synced={}",
+        status.block_count, status.mempool_count, status.headers_synced
+    );
     let _ = dev::append_log("athod", &format!("runtime started rpc={rpc_address}"));
     for incoming in listener.incoming() {
         match incoming {

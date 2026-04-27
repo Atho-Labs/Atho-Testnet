@@ -3,16 +3,20 @@ use crate::error::QtError;
 use crate::state::UiState;
 use crate::view::ViewModel;
 use atho_core::address::decode_base56_address;
-use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+use atho_core::block::{merkle_root, Block};
+use atho_core::constants::{ATOMS_PER_ATHO, MIN_TX_FEE_PER_VBYTE_ATOMS};
+use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use atho_crypto::falcon::{
     sign, FalconKeypair, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MAX_BYTES,
 };
 use atho_node::miner::Miner;
-use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+use atho_node::validation::{
+    derive_sig_ref_short, derive_witness_commit_ref, finalize_witness_commit_refs,
+};
 use atho_rpc::request::RpcRequest;
-use atho_rpc::response::RpcResponse;
+use atho_rpc::response::{MempoolSpentInput, RpcResponse};
 use atho_rpc::transport::RpcClient;
 use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
@@ -20,11 +24,12 @@ use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::{Wallet, WalletAddress};
 use eframe::egui;
 use getrandom::getrandom;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dialogs;
 mod models;
@@ -32,11 +37,14 @@ mod pages;
 mod shell;
 mod startup;
 mod theme;
+mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
-    CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningOutcome, NavTab,
-    OpenWalletForm, ReceiveRequestRecord, SendJob, SendOutcome, WalletActivityRow,
+    ActivityRow, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningJobResult,
+    MiningOutcome, NavTab, OpenWalletForm, ReceiveRequestRecord, SendJob, SendOutcome,
+    WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
 };
+use wallet_ledger::WalletLedgerCache;
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
@@ -56,7 +64,7 @@ pub struct DesktopApp {
     send_to: String,
     send_label: String,
     send_amount: String,
-    send_subtract_fee: bool,
+    send_include_fee_in_total: bool,
     send_fee: String,
     receive_label: String,
     receive_amount: String,
@@ -65,6 +73,7 @@ pub struct DesktopApp {
     send_job: Option<SendJob>,
     mining_status: String,
     mining_job: Option<MiningJob>,
+    pending_mining_restart: Option<u32>,
     last_mined_block_hash: Option<[u8; 48]>,
     requested_payments: Vec<ReceiveRequestRecord>,
     selected_receive_request: Option<usize>,
@@ -75,9 +84,31 @@ pub struct DesktopApp {
     show_about_dialog: bool,
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
+    wallet_balance_summary_cache: WalletBalanceSummary,
+    wallet_ledger_cache: WalletLedgerCache,
+    pub(crate) activity_feed: Vec<ActivityRow>,
+    activity_feed_fingerprint: Option<ActivityFeedFingerprint>,
+    wallet_cache_dirty: bool,
+    last_activity_refresh_at: Instant,
+    last_wallet_refresh_at: Instant,
     wallet_balance_cache: u64,
     theme_initialized: bool,
     compact_viewport: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivityFeedFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedSpendPlan {
+    address: WalletAddress,
+    utxos: Vec<UtxoEntry>,
+    total_input_atoms: u64,
+    output_count: usize,
+    estimated_fee_atoms: u64,
 }
 
 impl DesktopApp {
@@ -92,12 +123,13 @@ impl DesktopApp {
         };
         let status_monitor = connection.spawn_status_monitor(Duration::from_secs(1));
         let launch_page = LaunchPage::Welcome;
+        let available_cores = available_mining_cores();
 
         let mut app = Self {
             connection,
             status_monitor,
             ui_state: UiState {
-                mining_cores: 4,
+                mining_cores: available_cores,
                 ..UiState::default()
             },
             view_model: ViewModel::default(),
@@ -114,15 +146,16 @@ impl DesktopApp {
             send_to: String::new(),
             send_label: String::new(),
             send_amount: String::new(),
-            send_subtract_fee: false,
+            send_include_fee_in_total: false,
             send_fee: String::new(),
             receive_label: String::new(),
             receive_amount: String::new(),
             receive_message: String::new(),
-            send_status: String::from("Enter a destination and integer atom amounts."),
+            send_status: String::from("Enter a destination and ATHO amount."),
             send_job: None,
             mining_status: String::from("Idle"),
             mining_job: None,
+            pending_mining_restart: None,
             last_mined_block_hash: None,
             requested_payments: Vec::new(),
             selected_receive_request: None,
@@ -133,6 +166,17 @@ impl DesktopApp {
             show_about_dialog: false,
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
+            wallet_balance_summary_cache: WalletBalanceSummary::default(),
+            wallet_ledger_cache: WalletLedgerCache::default(),
+            activity_feed: Vec::new(),
+            activity_feed_fingerprint: None,
+            wallet_cache_dirty: true,
+            last_activity_refresh_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
+            last_wallet_refresh_at: Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now),
             wallet_balance_cache: 0,
             theme_initialized: false,
             compact_viewport: false,
@@ -145,12 +189,14 @@ impl DesktopApp {
             String::from("Disconnected")
         };
         app.try_open_existing_wallet_on_startup();
+        app.refresh_activity_feed(true);
         app
     }
 
     pub fn refresh(&mut self) -> Result<(), QtError> {
         let status = self.connection.status();
         self.apply_connection_status(status);
+        self.refresh_activity_feed(true);
         if self.wallet.is_some() {
             self.refresh_wallet_cache();
         }
@@ -158,17 +204,35 @@ impl DesktopApp {
     }
 
     fn apply_connection_status(&mut self, status: ConnectionStatus) {
+        let previous_block_count = self.view_model.block_count;
+        let previous_mempool_count = self.view_model.mempool_count;
         self.view_model.network_label = status.network.id().to_string();
         self.view_model.block_count = status.block_count;
         self.view_model.mempool_count = status.mempool_count;
-        self.view_model.sync_best_height = status.block_count;
+        self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
+        self.view_model.running = status.running;
+        self.view_model.headers_synced = status.headers_synced;
+        self.view_model.sync_best_height = status.sync_best_height.max(status.block_count);
         self.view_model.sync_stage = if status.connected {
-            String::from("Connected")
+            if status.running && status.headers_synced {
+                String::from("Synced")
+            } else if status.running {
+                format!("Running at height {}", self.view_model.sync_best_height)
+            } else {
+                String::from("Connected")
+            }
         } else if self.connection.has_local_node() {
             String::from("Starting node")
         } else {
             String::from("Disconnected")
         };
+
+        if self.wallet.is_some()
+            && (status.block_count != previous_block_count
+                || status.mempool_count != previous_mempool_count)
+        {
+            self.wallet_cache_dirty = true;
+        }
 
         if let Some(wallet) = &self.wallet {
             self.view_model.ui_state.wallet_snapshot = wallet.snapshot.clone();
@@ -197,9 +261,10 @@ impl DesktopApp {
     }
 
     fn refresh_wallet_cache(&mut self) {
-        let Some(_wallet) = self.wallet_ref() else {
+        let Some(wallet) = self.wallet_ref() else {
             self.wallet_utxos_cache.clear();
             self.wallet_activity_cache.clear();
+            self.wallet_balance_summary_cache = WalletBalanceSummary::default();
             self.wallet_balance_cache = 0;
             return;
         };
@@ -207,12 +272,21 @@ impl DesktopApp {
             return;
         };
 
-        let (owned, activities, balance) = {
+        let current_height = {
+            let status = self.connection.status();
+            status.sync_best_height.max(status.block_count)
+        };
+        let reserved_inputs = self.mempool_reserved_inputs();
+
+        let (available_owned, balance_summary, available_balance) = {
             let wallet = self.wallet_ref().expect("wallet checked above");
             let mut owned = utxos
                 .into_iter()
                 .filter(|utxo| match utxo.locking_script.as_slice().try_into() {
-                    Ok(digest) => wallet.address_for_payment_digest(&digest).is_some(),
+                    Ok(digest) => {
+                        wallet.address_for_payment_digest(&digest).is_some()
+                            && !reserved_inputs.contains(&(utxo.txid, utxo.output_index))
+                    }
                     Err(_) => false,
                 })
                 .collect::<Vec<_>>();
@@ -222,41 +296,84 @@ impl DesktopApp {
                     .cmp(&left.txid)
                     .then(right.output_index.cmp(&left.output_index))
             });
-            let balance = owned.iter().map(|utxo| utxo.value_atoms).sum();
-            let activities = owned
+            let available_owned = owned
                 .iter()
-                .map(|utxo| {
-                    let label = match utxo.locking_script.as_slice().try_into() {
-                        Ok(digest) => wallet
-                            .address_for_payment_digest(&digest)
-                            .map(|address| address.address)
-                            .unwrap_or_else(|| widgets::short_hash(&utxo.txid)),
-                        Err(_) => widgets::short_hash(&utxo.txid),
-                    };
-
-                    WalletActivityRow {
-                        when: String::from("Current"),
-                        kind: "Received",
-                        label,
-                        amount_atoms: utxo.value_atoms,
-                        reference: widgets::short_hash(&utxo.txid),
-                    }
-                })
-                .collect();
-            (owned, activities, balance)
+                .filter(|utxo| utxo.is_spendable_at(current_height))
+                .cloned()
+                .collect::<Vec<_>>();
+            let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
+            let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
+            (available_owned, balance_summary, available_balance)
         };
 
-        self.wallet_utxos_cache = owned;
-        self.wallet_activity_cache = activities;
-        self.wallet_balance_cache = balance;
+        let wallet_addresses = wallet.all_addresses();
+        if let Err(err) = self
+            .wallet_ledger_cache
+            .refresh(&wallet_addresses, balance_summary.clone())
+        {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!("wallet ledger refresh failed error={err}"),
+            );
+            self.wallet_balance_summary_cache = balance_summary.clone();
+            self.wallet_activity_cache.clear();
+        } else {
+            self.wallet_balance_summary_cache = self.wallet_ledger_cache.summary().clone();
+            self.wallet_activity_cache = self.wallet_ledger_cache.activities().to_vec();
+        }
+
+        self.wallet_utxos_cache = available_owned;
+        self.wallet_balance_cache = available_balance;
+        self.wallet_balance_summary_cache.available_atoms = available_balance;
+        self.last_wallet_refresh_at = Instant::now();
+        self.wallet_cache_dirty = false;
     }
 
     fn wallet_balance_atoms(&self) -> u64 {
         self.wallet_balance_cache
     }
 
+    fn mempool_reserved_inputs(&self) -> BTreeSet<([u8; 48], u32)> {
+        match self.connection.request(RpcRequest::GetMempoolSpentInputs) {
+            RpcResponse::MempoolSpentInputs(inputs) => inputs
+                .into_iter()
+                .map(|MempoolSpentInput { txid, output_index }| (txid, output_index))
+                .collect(),
+            RpcResponse::Error(err) => {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("mempool reservation lookup failed error={err}"),
+                );
+                BTreeSet::new()
+            }
+            other => {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("unexpected mempool reservation response: {other:?}"),
+                );
+                BTreeSet::new()
+            }
+        }
+    }
+
     fn wallet_activity_rows(&self) -> &[WalletActivityRow] {
         &self.wallet_activity_cache
+    }
+
+    fn wallet_balance_summary(&self) -> &WalletBalanceSummary {
+        &self.wallet_balance_summary_cache
+    }
+
+    fn refresh_wallet_cache_if_needed(&mut self) {
+        if !self.wallet_cache_dirty || self.wallet.is_none() {
+            return;
+        }
+        if self.last_wallet_refresh_at.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.refresh_wallet_cache();
+        self.last_wallet_refresh_at = Instant::now();
+        self.wallet_cache_dirty = false;
     }
 
     fn attach_wallet(&mut self, mut wallet: Wallet, wallet_path: String) {
@@ -308,20 +425,55 @@ impl DesktopApp {
         };
 
         match job.receiver.try_recv() {
-            Ok(Ok(outcome)) => {
+            Ok(MiningJobResult::Completed(outcome)) => {
                 self.last_mined_block_hash = Some(outcome.block_hash);
                 self.mining_status = format!("{} at height {}", outcome.message, outcome.height);
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "mining outcome accepted={} height={} hash={}",
+                        outcome.accepted,
+                        outcome.height,
+                        hex::encode(outcome.block_hash)
+                    ),
+                );
+                self.last_error = None;
                 if outcome.accepted {
-                    self.last_error = None;
-                    self.refresh_wallet_cache();
-                    if self.ui_state.generate_coins {
-                        self.start_mining_job();
-                    }
+                    self.wallet_cache_dirty = true;
+                }
+                if self.ui_state.generate_coins {
+                    self.start_mining_job();
                 }
             }
-            Ok(Err(err)) => {
+            Ok(MiningJobResult::Cancelled) => {
+                let _ = atho_node::dev::append_log("atho-qt", "mining worker cancelled");
+                self.last_error = None;
+                if let Some(cores) = self.pending_mining_restart.take() {
+                    self.ui_state.mining_cores = self.clamp_mining_cores(cores);
+                    if self.ui_state.generate_coins
+                        && self.ui_state.connected
+                        && self.wallet.is_some()
+                    {
+                        self.mining_status = format!(
+                            "Restarting miner with {} thread(s)",
+                            self.ui_state.mining_cores
+                        );
+                        self.start_mining_job();
+                    } else {
+                        self.mining_status = String::from("Idle");
+                    }
+                } else {
+                    self.mining_status = String::from("Idle");
+                }
+            }
+            Ok(MiningJobResult::Failed(err)) => {
                 self.mining_status = String::from("Mining failed");
-                self.last_error = Some(err);
+                self.last_error = Some(err.clone());
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("mining worker failed error={err}"),
+                );
+                self.pending_mining_restart = None;
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.mining_job = Some(job);
@@ -330,6 +482,11 @@ impl DesktopApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.mining_status = String::from("Mining worker disconnected");
                 self.last_error = Some(String::from("mining worker disconnected"));
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    "mining worker disconnected error=channel closed",
+                );
+                self.pending_mining_restart = None;
             }
         }
 
@@ -346,14 +503,25 @@ impl DesktopApp {
 
         match job.receiver.try_recv() {
             Ok(Ok(outcome)) => {
-                self.send_fee = outcome.fee_atoms.to_string();
+                self.send_fee = widgets::format_atoms(outcome.fee_atoms);
                 self.send_status = outcome.message;
                 self.last_error = None;
-                self.refresh_wallet_cache();
+                self.wallet_cache_dirty = true;
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("send outcome fee_atoms={}", outcome.fee_atoms),
+                );
             }
             Ok(Err(err)) => {
-                self.send_status = String::from("Submission failed");
+                self.send_status = format!("Submission failed: {err}");
                 self.last_error = Some(err);
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "send submission failed error={}",
+                        self.last_error.as_deref().unwrap_or("unknown")
+                    ),
+                );
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.send_job = Some(job);
@@ -362,6 +530,7 @@ impl DesktopApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.send_status = String::from("Submission worker disconnected");
                 self.last_error = Some(String::from("submission worker disconnected"));
+                let _ = atho_node::dev::append_log("atho-qt", "send worker disconnected");
             }
         }
 
@@ -382,20 +551,73 @@ impl DesktopApp {
         }
 
         let rpc_address = self.connection.rpc_address().to_string();
-        let cores = self.ui_state.mining_cores.max(1);
+        let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
+        self.ui_state.mining_cores = cores;
+        let connection = self.connection.clone();
+        let reward_script = self
+            .current_receive_address
+            .as_ref()
+            .map(|address| address.payment_digest.to_vec());
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
+        let stop_for_thread = Arc::clone(&stop_requested);
         self.mining_status = format!("Starting generation with {} thread(s)", cores);
         self.last_error = None;
+        self.pending_mining_restart = None;
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "starting mining job rpc={} cores={} max_cores={}",
+                rpc_address,
+                cores,
+                self.max_mining_cores()
+            ),
+        );
 
         std::thread::spawn(move || {
-            let result = mine_via_rpc(rpc_address, cores);
+            let result = mine_via_connection(connection, cores, reward_script, stop_for_thread);
             let _ = sender.send(result);
         });
 
         self.mining_job = Some(MiningJob {
             started_at: Instant::now(),
+            stop_requested,
             receiver,
         });
+    }
+
+    fn stop_mining_job(&mut self) {
+        self.pending_mining_restart = None;
+        self.ui_state.generate_coins = false;
+        self.last_error = None;
+        if let Some(job) = &self.mining_job {
+            job.stop_requested.store(true, Ordering::Release);
+            self.mining_status = String::from("Stopping miner");
+            let _ = atho_node::dev::append_log("atho-qt", "stop miner requested");
+        } else {
+            self.mining_status = String::from("Idle");
+        }
+    }
+
+    fn restart_mining_job(&mut self) {
+        let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
+        self.ui_state.mining_cores = cores;
+        self.last_error = None;
+        if self.mining_job.is_some() {
+            self.pending_mining_restart = Some(cores);
+            if let Some(job) = &self.mining_job {
+                job.stop_requested.store(true, Ordering::Release);
+            }
+            self.mining_status = format!("Restarting miner with {} thread(s)", cores);
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!("restart miner requested cores={cores}"),
+            );
+            return;
+        }
+        if self.ui_state.generate_coins {
+            self.start_mining_job();
+        }
     }
 
     fn generate_create_mnemonic(&mut self) -> Result<(), String> {
@@ -564,11 +786,7 @@ impl DesktopApp {
         if destination.is_empty() {
             return Err(String::from("Enter a destination address"));
         }
-        let amount = self
-            .send_amount
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| String::from("Amount must be an integer atom value"))?;
+        let amount = Self::parse_send_amount_atoms(&self.send_amount)?;
         if amount == 0 {
             return Err(String::from("Amount must be greater than zero"));
         }
@@ -584,13 +802,17 @@ impl DesktopApp {
                 "No cached wallet UTXOs available; refresh the wallet first",
             ));
         }
+        let reserved_inputs = self.mempool_reserved_inputs();
 
-        let (_selected_address, selected_utxos, keypair) = {
+        let selected_plan = {
             let wallet = self
                 .wallet_ref()
                 .ok_or_else(|| String::from("Load or create a wallet first"))?;
             let mut grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)> = BTreeMap::new();
             for utxo in self.wallet_utxos_cache.clone() {
+                if reserved_inputs.contains(&(utxo.txid, utxo.output_index)) {
+                    continue;
+                }
                 let digest: [u8; 32] = match utxo.locking_script.as_slice().try_into() {
                     Ok(digest) => digest,
                     Err(_) => continue,
@@ -605,77 +827,133 @@ impl DesktopApp {
                 }
             }
 
-            let Some((selected_address, selected_utxos)) =
-                Self::select_wallet_utxos(grouped, amount)?
+            let Some(selected_plan) =
+                Self::select_wallet_utxos(grouped, amount, self.send_include_fee_in_total)?
             else {
-                return Err(String::from("No spendable wallet UTXOs available"));
+                return Err(String::from(
+                    "No spendable wallet UTXOs available; refresh to clear mempool-locked outputs",
+                ));
             };
-
-            let keypair = wallet.keypair_for_path(selected_address.path);
-            (selected_address, selected_utxos, keypair)
+            selected_plan
         };
 
-        let total_input_atoms: u64 = selected_utxos.iter().map(|utxo| utxo.value_atoms).sum();
-        let fee_with_change = Self::estimate_fee(selected_utxos.len(), 2);
-        if total_input_atoms < amount.saturating_add(fee_with_change) {
-            return Err(String::from("selected inputs do not cover amount plus fee"));
+        let keypair = {
+            let wallet = self
+                .wallet_ref()
+                .ok_or_else(|| String::from("Load or create a wallet first"))?;
+            wallet.keypair_for_path(selected_plan.address.path)
+        };
+        let total_input_atoms = selected_plan.total_input_atoms;
+        let output_count = selected_plan.output_count;
+        let tx_lock_time = Self::transaction_lock_time_nonce();
+        let change_address = if output_count == 2 {
+            Some(
+                self.wallet_mut()
+                    .ok_or_else(|| String::from("Load or create a wallet first"))?
+                    .checkout_change_address_with_label(None),
+            )
+        } else {
+            None
+        };
+        let mut fee_atoms = selected_plan.estimated_fee_atoms;
+        let mut final_transaction = None;
+        for _ in 0..4 {
+            let (recipient_atoms, change_atoms) = if self.send_include_fee_in_total {
+                if amount <= fee_atoms {
+                    return Err(String::from("Amount must exceed the network fee"));
+                }
+                let recipient_atoms = amount
+                    .checked_sub(fee_atoms)
+                    .ok_or_else(|| String::from("Amount must exceed the network fee"))?;
+                let change_atoms = total_input_atoms
+                    .checked_sub(amount)
+                    .ok_or_else(|| String::from("selected inputs do not cover amount"))?;
+                (recipient_atoms, change_atoms)
+            } else if output_count == 1 {
+                (amount, 0)
+            } else {
+                let change_atoms = total_input_atoms
+                    .checked_sub(amount)
+                    .and_then(|value| value.checked_sub(fee_atoms))
+                    .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
+                (amount, change_atoms)
+            };
+            let transaction = Self::build_signed_spend_transaction(
+                &keypair,
+                &selected_plan.utxos,
+                recipient_digest,
+                recipient_atoms,
+                change_atoms,
+                change_address.clone(),
+                tx_lock_time,
+            )?;
+            let actual_fee = transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+            if actual_fee == fee_atoms {
+                final_transaction = Some(transaction);
+                break;
+            }
+            fee_atoms = actual_fee;
+            final_transaction = Some(transaction);
         }
-        let change_address = Some(
-            self.wallet_mut()
-                .ok_or_else(|| String::from("Load or create a wallet first"))?
-                .checkout_change_address_with_label(None),
-        );
-        let provisional_change = total_input_atoms
-            .checked_sub(amount)
-            .and_then(|value| value.checked_sub(fee_with_change))
-            .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
-        let provisional = Self::build_signed_spend_transaction(
-            &keypair,
-            &selected_utxos,
-            recipient_digest,
-            amount,
-            provisional_change,
-            change_address.clone(),
-        )?;
-        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let final_change = total_input_atoms
-            .checked_sub(amount)
-            .and_then(|value: u64| value.checked_sub(fee_atoms))
-            .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
-        if final_change == 0 {
-            return Err(String::from(
-                "selected inputs do not leave change for privacy",
-            ));
+        let final_transaction = final_transaction
+            .ok_or_else(|| String::from("transaction fee calculation mismatch"))?;
+        fee_atoms = final_transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let actual_fee = total_input_atoms
+            .checked_sub(final_transaction.output_value_atoms())
+            .ok_or_else(|| String::from("selected inputs do not cover amount and fee"))?;
+        if actual_fee != fee_atoms {
+            return Err(String::from("transaction fee calculation mismatch"));
         }
-        let final_transaction = Self::build_signed_spend_transaction(
-            &keypair,
-            &selected_utxos,
-            recipient_digest,
-            amount,
-            final_change,
-            change_address,
-        )?;
-        let fee_atoms = final_transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
         let (sender, receiver) = mpsc::channel();
         let rpc_address = self.connection.rpc_address().to_string();
-        std::thread::spawn(move || {
-            let client = RpcClient::new(rpc_address);
-            let result = match client.call(&RpcRequest::SubmitTransaction {
-                transaction: final_transaction,
+        let use_local_node = self.connection.has_local_node();
+        let connection = self.connection.clone();
+        let txid = final_transaction.txid();
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "submitting transaction rpc={} txid={} amount_atoms={} fee_atoms={} include_fee_total={} inputs={} outputs={}",
+                rpc_address,
+                hex::encode(txid),
+                amount,
                 fee_atoms,
-            }) {
-                Ok(RpcResponse::TransactionSubmitted(txid)) => Ok(SendOutcome {
+                self.send_include_fee_in_total,
+                selected_plan.utxos.len(),
+                output_count
+            ),
+        );
+        std::thread::spawn(move || {
+            let result = if use_local_node {
+                match connection.request(RpcRequest::SubmitTransaction {
+                    transaction: final_transaction,
                     fee_atoms,
-                    message: format!("Transaction submitted {}", hex::encode(txid)),
-                }),
-                Ok(RpcResponse::Error(err)) => Err(err.to_string()),
-                Ok(other) => Err(format!("unexpected rpc response: {other:?}")),
-                Err(err) => Err(err.to_string()),
+                }) {
+                    RpcResponse::TransactionSubmitted(txid) => Ok(SendOutcome {
+                        fee_atoms,
+                        message: format!("Transaction submitted {}", hex::encode(txid)),
+                    }),
+                    RpcResponse::Error(err) => Err(err.to_string()),
+                    other => Err(format!("unexpected rpc response: {other:?}")),
+                }
+            } else {
+                let client = RpcClient::new(rpc_address);
+                match client.call(&RpcRequest::SubmitTransaction {
+                    transaction: final_transaction,
+                    fee_atoms,
+                }) {
+                    Ok(RpcResponse::TransactionSubmitted(txid)) => Ok(SendOutcome {
+                        fee_atoms,
+                        message: format!("Transaction submitted {}", hex::encode(txid)),
+                    }),
+                    Ok(RpcResponse::Error(err)) => Err(err.to_string()),
+                    Ok(other) => Err(format!("unexpected rpc response: {other:?}")),
+                    Err(err) => Err(err.to_string()),
+                }
             };
             let _ = sender.send(result);
         });
 
-        self.send_fee = fee_atoms.to_string();
+        self.send_fee = widgets::format_atoms(fee_atoms);
         self.send_status = String::from("Submitting transaction...");
         self.last_error = None;
         self.send_job = Some(SendJob {
@@ -688,8 +966,9 @@ impl DesktopApp {
     fn select_wallet_utxos(
         grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)>,
         amount_atoms: u64,
-    ) -> Result<Option<(WalletAddress, Vec<UtxoEntry>)>, String> {
-        let mut best: Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)> = None;
+        include_fee_in_total: bool,
+    ) -> Result<Option<SelectedSpendPlan>, String> {
+        let mut best: Option<SelectedSpendPlan> = None;
 
         for (_key, (address, mut utxos)) in grouped {
             utxos.sort_by(|a, b| b.value_atoms.cmp(&a.value_atoms).then(a.txid.cmp(&b.txid)));
@@ -698,36 +977,68 @@ impl DesktopApp {
             for utxo in utxos {
                 total = total.saturating_add(utxo.value_atoms);
                 selected.push(utxo);
-                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
                 let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
-                if total >= amount_atoms.saturating_add(estimate_change_fee) {
-                    let candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize) =
-                        (address.clone(), selected.clone(), total, selected.len());
+                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+
+                let candidate_output_count = if include_fee_in_total {
+                    if total == amount_atoms && amount_atoms > estimate_exact_fee {
+                        Some(1)
+                    } else if total > amount_atoms && amount_atoms > estimate_change_fee {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                } else {
+                    let exact_target = amount_atoms.checked_add(estimate_exact_fee);
+                    let change_target = amount_atoms.checked_add(estimate_change_fee);
+                    if exact_target == Some(total) {
+                        Some(1)
+                    } else if change_target.is_some_and(|target| total > target) {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(output_count) = candidate_output_count {
+                    let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
+                    let candidate = SelectedSpendPlan {
+                        address: address.clone(),
+                        utxos: selected.clone(),
+                        total_input_atoms: total,
+                        output_count,
+                        estimated_fee_atoms,
+                    };
                     best = Self::prefer_candidate(best, candidate);
-                    break;
-                }
-                if total >= amount_atoms.saturating_add(estimate_exact_fee) {
-                    let candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize) =
-                        (address.clone(), selected.clone(), total, selected.len());
-                    best = Self::prefer_candidate(best, candidate);
+                    if output_count == 1 {
+                        break;
+                    }
                 }
             }
         }
 
-        Ok(best.map(|(address, selected, _, _)| (address, selected)))
+        Ok(best)
     }
 
     fn prefer_candidate(
-        current: Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)>,
-        candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize),
-    ) -> Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)> {
+        current: Option<SelectedSpendPlan>,
+        candidate: SelectedSpendPlan,
+    ) -> Option<SelectedSpendPlan> {
         match current {
             None => Some(candidate),
             Some(existing) => {
-                let existing_inputs = existing.3;
-                let candidate_inputs = candidate.3;
-                if candidate_inputs < existing_inputs
-                    || (candidate_inputs == existing_inputs && candidate.2 < existing.2)
+                let existing_inputs = existing.utxos.len();
+                let candidate_inputs = candidate.utxos.len();
+                if candidate.estimated_fee_atoms < existing.estimated_fee_atoms
+                    || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
+                        && candidate_inputs < existing_inputs)
+                    || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
+                        && candidate_inputs == existing_inputs
+                        && candidate.output_count < existing.output_count)
+                    || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
+                        && candidate_inputs == existing_inputs
+                        && candidate.output_count == existing.output_count
+                        && candidate.total_input_atoms < existing.total_input_atoms)
                 {
                     Some(candidate)
                 } else {
@@ -782,6 +1093,7 @@ impl DesktopApp {
         amount_atoms: u64,
         change_atoms: u64,
         change_address: Option<WalletAddress>,
+        lock_time: u32,
     ) -> Result<Transaction, String> {
         let mut outputs = vec![TxOutput {
             value_atoms: amount_atoms,
@@ -808,7 +1120,7 @@ impl DesktopApp {
             version: 1,
             inputs,
             outputs,
-            lock_time: 0,
+            lock_time,
             witness: vec![],
         };
         let digest = tx.signing_digest();
@@ -847,6 +1159,98 @@ impl DesktopApp {
         Ok(tx)
     }
 
+    fn transaction_lock_time_nonce() -> u32 {
+        let mut entropy = [0u8; 16];
+        let _ = getrandom(&mut entropy);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let mut preimage = Vec::with_capacity(core::mem::size_of::<u128>() + entropy.len());
+        preimage.extend_from_slice(&nanos.to_le_bytes());
+        preimage.extend_from_slice(&entropy);
+        let digest = sha3_256(&preimage);
+        u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
+    }
+
+    pub(crate) fn format_send_amount_input(atoms: u64) -> String {
+        let whole = atoms / ATOMS_PER_ATHO;
+        let fractional = atoms % ATOMS_PER_ATHO;
+        if fractional == 0 {
+            return whole.to_string();
+        }
+
+        let mut fractional_text = format!("{fractional:08}");
+        while fractional_text.ends_with('0') {
+            fractional_text.pop();
+        }
+        format!("{whole}.{fractional_text}")
+    }
+
+    fn parse_send_amount_atoms(input: &str) -> Result<u64, String> {
+        let normalized: String = input
+            .trim()
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != ',')
+            .collect();
+        if normalized.is_empty() {
+            return Err(String::from("Enter an amount"));
+        }
+        if normalized.starts_with('-') {
+            return Err(String::from("Amount must be greater than zero"));
+        }
+        let normalized = normalized.strip_prefix('+').unwrap_or(&normalized);
+        let mut parts = normalized.split('.');
+        let whole_text = parts.next().unwrap_or_default();
+        let fractional_text = parts.next();
+        if parts.next().is_some() {
+            return Err(String::from("Amount may contain only one decimal point"));
+        }
+
+        let whole_atoms = if whole_text.is_empty() {
+            0
+        } else if whole_text.chars().all(|ch| ch.is_ascii_digit()) {
+            whole_text
+                .parse::<u64>()
+                .map_err(|_| String::from("Amount is too large"))?
+        } else {
+            return Err(String::from(
+                "Amount must contain only digits, commas, and one decimal point",
+            ));
+        };
+
+        let fractional_atoms = match fractional_text {
+            None => 0,
+            Some(text) if text.is_empty() => 0,
+            Some(text) => {
+                if text.len() > 8 {
+                    return Err(String::from("Amount supports up to 8 decimal places"));
+                }
+                if !text.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err(String::from(
+                        "Amount must contain only digits, commas, and one decimal point",
+                    ));
+                }
+                let mut padded = text.to_string();
+                while padded.len() < 8 {
+                    padded.push('0');
+                }
+                padded
+                    .parse::<u64>()
+                    .map_err(|_| String::from("Amount is too large"))?
+            }
+        };
+
+        let atoms = whole_atoms
+            .checked_mul(ATOMS_PER_ATHO)
+            .and_then(|value| value.checked_add(fractional_atoms))
+            .ok_or_else(|| String::from("Amount is too large"))?;
+        if atoms == 0 {
+            return Err(String::from("Amount must be greater than zero"));
+        }
+        Ok(atoms)
+    }
+
     fn current_receive_address_text(&self) -> String {
         self.current_receive_address
             .as_ref()
@@ -883,6 +1287,22 @@ impl DesktopApp {
         });
     }
 
+    fn max_mining_cores(&self) -> u32 {
+        available_mining_cores()
+    }
+
+    fn clamp_mining_cores(&self, cores: u32) -> u32 {
+        cores.clamp(1, self.max_mining_cores())
+    }
+
+    pub(crate) fn activity_feed_export(&self) -> String {
+        self.activity_feed
+            .iter()
+            .map(|row| format!("{} {} {}", row.timestamp, row.component, row.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn read_clipboard_text() -> Option<String> {
         let mut clipboard = arboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
@@ -910,9 +1330,18 @@ impl eframe::App for DesktopApp {
         }
         theme::apply_theme(ctx);
         self.drain_status_updates();
+        self.refresh_activity_feed(false);
         self.poll_send_job();
         self.poll_mining_job();
-        ctx.request_repaint_after(Duration::from_millis(200));
+        self.refresh_wallet_cache_if_needed();
+        let repaint_after = if self.mining_job.is_some() || self.send_job.is_some() {
+            Duration::from_millis(150)
+        } else if self.wallet_cache_dirty || self.active_tab == NavTab::Overview {
+            Duration::from_millis(400)
+        } else {
+            Duration::from_millis(750)
+        };
+        ctx.request_repaint_after(repaint_after);
 
         if self.wallet.is_some() {
             shell::render_main_shell(self, ctx);
@@ -926,6 +1355,50 @@ impl DesktopApp {
     fn drain_status_updates(&mut self) {
         while let Some(status) = self.status_monitor.try_recv_latest() {
             self.apply_connection_status(status);
+        }
+    }
+
+    fn refresh_activity_feed(&mut self, force: bool) {
+        if !force && self.active_tab != NavTab::Overview {
+            return;
+        }
+        if !force && self.last_activity_refresh_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_activity_refresh_at = Instant::now();
+        let path = atho_node::dev::logs_dir().join("activity.log");
+        let fingerprint = match fs::metadata(&path) {
+            Ok(metadata) => ActivityFeedFingerprint {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            },
+            Err(_) => ActivityFeedFingerprint {
+                len: 0,
+                modified: None,
+            },
+        };
+        if self.activity_feed_fingerprint == Some(fingerprint) {
+            return;
+        }
+
+        match atho_node::dev::recent_activity_lines(12) {
+            Ok(lines) => {
+                self.activity_feed = lines
+                    .into_iter()
+                    .map(|line| ActivityRow {
+                        timestamp: line.timestamp,
+                        component: line.component,
+                        message: line.line,
+                    })
+                    .collect();
+                self.activity_feed_fingerprint = Some(fingerprint);
+            }
+            Err(err) => {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("failed to refresh activity feed: {err}"),
+                );
+            }
         }
     }
 }
@@ -950,46 +1423,197 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-fn mine_via_rpc(rpc_address: String, cores: u32) -> Result<MiningOutcome, String> {
-    let client = RpcClient::new(rpc_address);
-    let template = match client.call(&RpcRequest::GetBlockTemplate) {
-        Ok(RpcResponse::BlockTemplate(template)) => template,
-        Ok(RpcResponse::Error(err)) => return Err(err.to_string()),
-        Ok(other) => return Err(format!("unexpected rpc response: {other:?}")),
-        Err(err) => return Err(err.to_string()),
+fn available_mining_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn mine_via_connection(
+    connection: crate::connection::ReadOnlyNodeConnection,
+    cores: u32,
+    reward_script: Option<Vec<u8>>,
+    stop_requested: Arc<AtomicBool>,
+) -> MiningJobResult {
+    if stop_requested.load(Ordering::Acquire) {
+        return MiningJobResult::Cancelled;
+    }
+    let _ = atho_node::dev::append_log("atho-qt", "requesting block template");
+    let template = match connection.request(RpcRequest::GetBlockTemplate) {
+        RpcResponse::BlockTemplate(template) => template,
+        RpcResponse::Error(err) => return MiningJobResult::Failed(err.to_string()),
+        other => return MiningJobResult::Failed(format!("unexpected rpc response: {other:?}")),
+    };
+    let block = if let Some(reward_script) = reward_script.as_deref() {
+        rewrite_reward_script(&template.block, reward_script)
+    } else {
+        template.block
     };
 
     let miner = Miner::new(cores);
-    let block = miner.solve_block(template.block);
+    let _ = atho_node::dev::append_log(
+        "atho-qt",
+        &format!(
+            "solving block height={} cores={} txs={} reward_bound={}",
+            template.height,
+            cores,
+            template.transaction_count,
+            reward_script.is_some()
+        ),
+    );
+    let block = match miner.solve_block_with_cancel(block, stop_requested) {
+        Ok(block) => block,
+        Err(_) => return MiningJobResult::Cancelled,
+    };
     let block_hash = block.header.block_hash();
-    match client.call(&RpcRequest::SubmitBlock(block)) {
-        Ok(RpcResponse::BlockSubmitted { accepted: true, .. }) => Ok(MiningOutcome {
-            height: template.height,
-            block_hash,
-            accepted: true,
-            message: format!(
-                "Block {} accepted at height {}",
-                hex::encode(block_hash),
-                template.height
-            ),
-        }),
-        Ok(RpcResponse::BlockSubmitted {
+    match connection.request(RpcRequest::SubmitBlock(block)) {
+        RpcResponse::BlockSubmitted { accepted: true, .. } => {
+            MiningJobResult::Completed(MiningOutcome {
+                height: template.height,
+                block_hash,
+                accepted: true,
+                message: format!(
+                    "Block {} accepted at height {}",
+                    hex::encode(block_hash),
+                    template.height
+                ),
+            })
+        }
+        RpcResponse::BlockSubmitted {
             accepted: false, ..
-        }) => Ok(MiningOutcome {
+        } => MiningJobResult::Completed(MiningOutcome {
             height: template.height,
             block_hash,
             accepted: false,
             message: format!("Block {} rejected", hex::encode(block_hash)),
         }),
-        Ok(RpcResponse::Error(err)) => Err(err.to_string()),
-        Ok(other) => Err(format!("unexpected rpc response: {other:?}")),
-        Err(err) => Err(err.to_string()),
+        RpcResponse::Error(err) => MiningJobResult::Failed(err.to_string()),
+        other => MiningJobResult::Failed(format!("unexpected rpc response: {other:?}")),
     }
+}
+
+fn rewrite_reward_script(block: &Block, reward_script: &[u8]) -> Block {
+    let mut transactions = block.transactions.clone();
+    if let Some(coinbase) = transactions.first_mut() {
+        if let Some(output) = coinbase.outputs.first_mut() {
+            output.locking_script = reward_script.to_vec();
+        }
+    }
+    let witness_root = atho_core::block::witness_root(&transactions);
+    transactions = transactions
+        .into_iter()
+        .map(|tx| finalize_witness_commit_refs(&tx, witness_root))
+        .collect();
+
+    let mut header = block.header.clone();
+    header.merkle_root = merkle_root(&transactions);
+    header.witness_root = witness_root;
+    let mut rebuilt = Block::new(header, transactions);
+    rebuilt.fees_total_atoms = block.fees_total_atoms;
+    rebuilt.fees_miner_atoms = block.fees_miner_atoms;
+    rebuilt.fees_burned_atoms = block.fees_burned_atoms;
+    rebuilt.fees_pool_atoms = block.fees_pool_atoms;
+    rebuilt.cumulative_burned_atoms = block.cumulative_burned_atoms;
+    rebuilt
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+    use atho_core::consensus::pow;
+    use atho_core::constants::ATOMS_PER_ATHO;
+    use atho_core::network::Network;
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+    use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
+    use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+
+    fn test_keypair() -> FalconKeypair {
+        generate_from_seed(b"atho-qt-rewrite-reward").expect("deterministic keypair")
+    }
+
+    fn witness_bytes(tx: &Transaction) -> Vec<u8> {
+        let keypair = test_keypair();
+        let txid = tx.txid();
+        let digest = tx.signing_digest();
+        let signature = sign(&keypair.secret_key, &digest).expect("deterministic signature");
+        let sig_bytes = signature.0.clone();
+        let staged = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        };
+        let staged_tx = Transaction {
+            witness: staged.canonical_bytes(),
+            ..tx.clone()
+        };
+        let witness_root = staged_tx.witness_commitment_hash();
+        TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0,
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                    witness_commit_ref: derive_witness_commit_ref(
+                        &txid,
+                        &witness_root,
+                        index as u32,
+                    ),
+                })
+                .collect(),
+        }
+        .canonical_bytes()
+    }
+
+    fn test_block() -> Block {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: 50 * ATOMS_PER_ATHO,
+                locking_script: vec![0x11, 0x22, 0x33],
+            }],
+            lock_time: 1,
+            witness: vec![],
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [7; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![4, 5, 6],
+            }],
+            lock_time: 2,
+            witness: vec![],
+        };
+        let spend = Transaction {
+            witness: witness_bytes(&spend),
+            ..spend
+        };
+        let transactions = vec![coinbase, spend];
+        let header = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 2,
+            previous_block_hash: [9; 48],
+            merkle_root: merkle_root(&transactions),
+            witness_root: witness_root(&transactions),
+            timestamp: 150,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            nonce: 0,
+        };
+        Block::new(header, transactions)
+    }
 
     #[test]
     fn desktop_app_refreshes_view_state() {
@@ -1003,5 +1627,50 @@ mod tests {
             LaunchPage::Welcome | LaunchPage::OpenWallet
         ));
         std::env::remove_var("ATHO_QT_LOCAL");
+    }
+
+    #[test]
+    fn parses_decimal_atho_amounts_with_commas() {
+        let atoms = DesktopApp::parse_send_amount_atoms("10,000.44544444").unwrap();
+        assert_eq!(atoms, 10_000 * ATOMS_PER_ATHO + 44_544_444);
+        assert_eq!(
+            DesktopApp::parse_send_amount_atoms("0.938449").unwrap(),
+            93_844_900
+        );
+    }
+
+    #[test]
+    fn formats_atho_amounts_for_input() {
+        let atoms = 10_000 * ATOMS_PER_ATHO + 44_544_444;
+        assert_eq!(
+            DesktopApp::format_send_amount_input(atoms),
+            "10000.44544444"
+        );
+        assert_eq!(DesktopApp::format_send_amount_input(ATOMS_PER_ATHO), "1");
+    }
+
+    #[test]
+    fn rewrite_reward_script_keeps_witness_refs_valid() {
+        let block = test_block();
+        let reward_script = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let rewritten = rewrite_reward_script(&block, &reward_script);
+
+        assert_eq!(
+            rewritten.transactions[0].outputs[0].locking_script,
+            reward_script
+        );
+        assert_eq!(
+            rewritten.witness_root,
+            witness_root(&rewritten.transactions)
+        );
+        for tx in &rewritten.transactions[1..] {
+            let witness = tx.witness_payload().expect("witness payload");
+            for (index, input_ref) in witness.input_refs.iter().enumerate() {
+                assert_eq!(
+                    input_ref.witness_commit_ref,
+                    derive_witness_commit_ref(&tx.txid(), &rewritten.witness_root, index as u32)
+                );
+            }
+        }
     }
 }

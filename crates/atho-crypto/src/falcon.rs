@@ -3,6 +3,7 @@ use crate::secret::SecretBytes;
 use atho_core::crypto::hash::sha3_384;
 use getrandom::getrandom;
 use std::ffi::c_void;
+use zeroize::Zeroize;
 
 pub const FALCON_512_PUBLIC_KEY_BYTES: usize = 897;
 pub const FALCON_512_SECRET_KEY_BYTES: usize = 1_281;
@@ -137,11 +138,22 @@ fn falcon_seed(seed: &[u8]) -> [u8; 48] {
 
 fn init_rng(seed: &[u8]) -> Shake256Context {
     let mut rng = unsafe { std::mem::zeroed::<Shake256Context>() };
-    let seed = falcon_seed(seed);
+    let mut seed = falcon_seed(seed);
     unsafe {
         shake256_init_prng_from_seed(&mut rng, seed.as_ptr().cast(), seed.len());
     }
+    seed.zeroize();
     rng
+}
+
+fn zeroize_rng(rng: &mut Shake256Context) {
+    unsafe {
+        std::ptr::write_bytes(
+            rng as *mut Shake256Context as *mut u8,
+            0,
+            std::mem::size_of::<Shake256Context>(),
+        );
+    }
 }
 
 pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
@@ -166,6 +178,7 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
         )
     };
     tmp.fill(0);
+    zeroize_rng(&mut rng);
     if rc != 0 {
         return Err(CryptoError::OperationFailed);
     }
@@ -181,7 +194,9 @@ pub fn generate(variant: FalconVariant) -> Result<FalconKeypair, CryptoError> {
         FalconVariant::Falcon512 => {
             let mut seed = [0u8; 48];
             getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
-            generate_from_seed(&seed)
+            let keypair = generate_from_seed(&seed);
+            seed.zeroize();
+            keypair
         }
     }
 }
@@ -194,6 +209,7 @@ pub fn sign(secret_key: &FalconSecretKey, message: &[u8]) -> Result<FalconSignat
     let mut seed = [0u8; 48];
     getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
     let mut rng = init_rng(&seed);
+    seed.zeroize();
     let mut signature = vec![0u8; FALCON_512_SIGNATURE_MAX_BYTES];
     let mut sig_len = signature.len();
     let mut tmp = vec![0u8; FALCON_512_TMP_SIGN_BYTES];
@@ -212,6 +228,7 @@ pub fn sign(secret_key: &FalconSecretKey, message: &[u8]) -> Result<FalconSignat
         )
     };
     tmp.fill(0);
+    zeroize_rng(&mut rng);
     if rc != 0 {
         return Err(CryptoError::OperationFailed);
     }
@@ -270,6 +287,15 @@ mod tests {
         let signature = sign(&keypair.secret_key, message).unwrap();
         assert!(verify(&keypair.public_key, message, &signature).unwrap());
         assert!(!verify(&keypair.public_key, b"wrong message", &signature).unwrap());
+    }
+
+    #[test]
+    fn falcon_verify_rejects_wrong_public_key() {
+        let signer = generate_from_seed(b"atho-falcon-signer").unwrap();
+        let other = generate_from_seed(b"atho-falcon-other").unwrap();
+        let message = b"atho signing message";
+        let signature = sign(&signer.secret_key, message).unwrap();
+        assert!(!verify(&other.public_key, message, &signature).unwrap());
     }
 
     #[test]

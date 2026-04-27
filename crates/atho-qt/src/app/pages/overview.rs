@@ -3,23 +3,30 @@ use crate::resources;
 use eframe::egui;
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
-    let balance = app.wallet_balance_atoms();
+    let summary = app.wallet_balance_summary().clone();
     let rows = app.wallet_activity_rows().to_vec();
     let stacked = ui.available_width() < 920.0;
 
     if stacked {
-        render_balances_panel(app, ui, balance);
+        render_balances_panel(app, ui, &summary);
         ui.add_space(10.0);
         render_recent_transactions(ui, app.ui_state.connected, &rows);
     } else {
         ui.columns(2, |columns| {
-            render_balances_panel(app, &mut columns[0], balance);
+            render_balances_panel(app, &mut columns[0], &summary);
             render_recent_transactions(&mut columns[1], app.ui_state.connected, &rows);
         });
     }
+
+    ui.add_space(10.0);
+    render_activity_panel(app, ui);
 }
 
-fn render_balances_panel(app: &DesktopApp, ui: &mut egui::Ui, balance: u64) {
+fn render_balances_panel(
+    app: &DesktopApp,
+    ui: &mut egui::Ui,
+    summary: &crate::app::WalletBalanceSummary,
+) {
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(332.0);
         ui.horizontal(|ui| {
@@ -38,29 +45,19 @@ fn render_balances_panel(app: &DesktopApp, ui: &mut egui::Ui, balance: u64) {
             .show(ui, |ui| {
                 widgets::row_label(ui, "Available:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(balance));
+                    widgets::row_value(ui, &widgets::format_atoms(summary.available_atoms));
                 });
                 ui.end_row();
 
                 widgets::row_label(ui, "Pending:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(0));
+                    widgets::row_value(ui, &widgets::format_atoms(summary.pending_atoms));
                 });
                 ui.end_row();
-            });
 
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        egui::Grid::new("overview_total")
-            .num_columns(2)
-            .spacing([18.0, 10.0])
-            .min_col_width(160.0)
-            .show(ui, |ui| {
                 widgets::row_label(ui, "Total:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(balance));
+                    widgets::row_value(ui, &widgets::format_atoms(summary.total_atoms));
                 });
                 ui.end_row();
             });
@@ -98,7 +95,10 @@ fn render_recent_transactions(
 
         if rows.is_empty() {
             widgets::muted_label(ui, "No transactions to show");
-            widgets::muted_label(ui, "Mine or receive coins to populate wallet activity.");
+            widgets::muted_label(
+                ui,
+                "Mine, receive, or spend coins to populate wallet activity.",
+            );
             return;
         }
 
@@ -106,13 +106,60 @@ fn render_recent_transactions(
             ui.horizontal(|ui| {
                 widgets::muted_label(ui, &row.when);
                 ui.add_space(18.0);
-                ui.label(row.kind);
+                ui.label(row.kind.label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(row.amount_atoms));
+                    widgets::row_value_signed(ui, row.amount_atoms);
                 });
             });
             widgets::muted_label(ui, &row.label);
             ui.add_space(6.0);
         }
+    });
+}
+
+fn render_activity_panel(app: &DesktopApp, ui: &mut egui::Ui) {
+    widgets::panel_frame().show(ui, |ui| {
+        ui.set_min_height(220.0);
+        ui.horizontal(|ui| {
+            widgets::section_header(ui, "Network Activity");
+            ui.add_space(8.0);
+            if widgets::icon_button(ui, resources::copy_icon(15.0), "Copy activity feed").clicked()
+            {
+                DesktopApp::copy_text(ui, app.activity_feed_export());
+            }
+            if !app.ui_state.connected {
+                ui.add_space(8.0);
+                let _ = ui.add(resources::warning_icon(20.0));
+            }
+        });
+        ui.add_space(10.0);
+
+        if app.activity_feed.is_empty() {
+            widgets::muted_label(ui, "No network activity yet.");
+            widgets::muted_label(
+                ui,
+                "Start the node, miner, or submit a transaction to populate this feed.",
+            );
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(170.0)
+            .show(ui, |ui| {
+                for row in app.activity_feed.iter().rev().take(10) {
+                    ui.horizontal(|ui| {
+                        widgets::muted_label(ui, &row.timestamp);
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(&row.component)
+                                .strong()
+                                .color(widgets::TEXT),
+                        );
+                    });
+                    widgets::muted_label(ui, &row.message);
+                    ui.add_space(6.0);
+                }
+            });
     });
 }

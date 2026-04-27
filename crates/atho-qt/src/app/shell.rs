@@ -70,16 +70,32 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         app.active_tab = NavTab::Settings;
                         ui.close_menu();
                     }
-                    if ui.button("Start Miner").clicked() {
+                    if ui.button("Mine Once").clicked() {
                         app.active_tab = NavTab::Settings;
+                        app.ui_state.generate_coins = false;
                         if app.ui_state.connected && app.wallet.is_some() {
-                            app.start_mining_job();
+                            if app.mining_job.is_some() {
+                                app.restart_mining_job();
+                            } else {
+                                app.start_mining_job();
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Mine Loop").clicked() {
+                        app.active_tab = NavTab::Settings;
+                        app.ui_state.generate_coins = true;
+                        if app.ui_state.connected && app.wallet.is_some() {
+                            if app.mining_job.is_some() {
+                                app.restart_mining_job();
+                            } else {
+                                app.start_mining_job();
+                            }
                         }
                         ui.close_menu();
                     }
                     if ui.button("Stop Miner").clicked() {
-                        app.ui_state.generate_coins = false;
-                        app.mining_status = String::from("Idle");
+                        app.stop_mining_job();
                         ui.close_menu();
                     }
                 });
@@ -190,6 +206,11 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         ui.add(egui::ProgressBar::new(progress).desired_width(progress_width));
                         ui.separator();
                         widgets::muted_label(ui, &format!("Height {}", app.view_model.block_count));
+                        ui.separator();
+                        widgets::muted_label(
+                            ui,
+                            &format!("Best {}", app.view_model.sync_best_height),
+                        );
                         ui.separator();
                         widgets::muted_label(
                             ui,

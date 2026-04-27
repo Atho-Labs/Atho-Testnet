@@ -81,6 +81,20 @@ pub(crate) fn row_value(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(13.0).strong().color(ACCENT));
 }
 
+pub(crate) fn row_value_signed(ui: &mut egui::Ui, atoms: i128) {
+    let color = if atoms < 0 {
+        egui::Color32::from_rgb(153, 64, 64)
+    } else {
+        ACCENT
+    };
+    ui.label(
+        egui::RichText::new(format_signed_atoms(atoms))
+            .size(13.0)
+            .strong()
+            .color(color),
+    );
+}
+
 pub(crate) fn muted_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(11.0).color(MUTED));
 }
@@ -110,6 +124,14 @@ pub(crate) fn format_atoms(atoms: u64) -> String {
     let whole = atoms / ATOMS_PER_ATHO;
     let fractional = atoms % ATOMS_PER_ATHO;
     format!("{whole}.{fractional:08} ATHO")
+}
+
+pub(crate) fn format_signed_atoms(atoms: i128) -> String {
+    if atoms < 0 {
+        format!("-{}", format_atoms(atoms.unsigned_abs() as u64))
+    } else {
+        format_atoms(atoms as u64)
+    }
 }
 
 pub(crate) fn short_hash(bytes: &[u8]) -> String {

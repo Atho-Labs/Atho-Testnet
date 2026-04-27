@@ -5,8 +5,10 @@ use thiserror::Error;
 pub enum RpcError {
     #[error("rpc method not found")]
     MethodNotFound,
-    #[error("invalid rpc request")]
-    InvalidRequest,
+    #[error("invalid rpc request: {0}")]
+    InvalidRequest(String),
     #[error("internal rpc error")]
     Internal,
+    #[error("validation error: {0}")]
+    Validation(String),
 }

@@ -16,7 +16,7 @@ pub enum NodeError {
 
 pub fn rpc_error_from_node(error: NodeError) -> RpcError {
     match error {
-        NodeError::Validation(_) => RpcError::InvalidRequest,
+        NodeError::Validation(validation) => RpcError::Validation(validation.to_string()),
         NodeError::Runtime(_) | NodeError::Storage(_) => RpcError::Internal,
     }
 }

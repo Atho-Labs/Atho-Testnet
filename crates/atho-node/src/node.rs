@@ -10,7 +10,7 @@ use atho_storage::chainstate::Chainstate as StorageChainstate;
 #[derive(Debug)]
 pub struct Node {
     pub config: NodeConfig,
-    pub chainstate: StorageChainstate,
+    chainstate: StorageChainstate,
     pub mempool: Mempool,
 }
 
@@ -19,6 +19,69 @@ impl Node {
         Self {
             config,
             chainstate: StorageChainstate::new(config.network),
+            mempool: Mempool::new(),
+        }
+    }
+
+    pub fn network(&self) -> atho_core::network::Network {
+        self.config.network
+    }
+
+    pub fn height(&self) -> u64 {
+        self.chainstate.height
+    }
+
+    pub fn tip_hash(&self) -> [u8; 48] {
+        self.chainstate.tip_hash
+    }
+
+    pub fn utxo_snapshot(&self) -> atho_storage::utxo::UtxoSet {
+        self.chainstate.utxo_snapshot()
+    }
+
+    pub fn utxo_count(&self) -> usize {
+        self.chainstate.utxo_count()
+    }
+
+    pub fn utxo_entry(
+        &self,
+        txid: [u8; 48],
+        output_index: u32,
+    ) -> Option<atho_storage::utxo::UtxoEntry> {
+        self.chainstate.utxo_entry(txid, output_index)
+    }
+
+    pub fn blocks_len(&self) -> usize {
+        self.chainstate.blocks().len()
+    }
+
+    pub fn mempool_len(&self) -> usize {
+        self.mempool.len()
+    }
+
+    pub fn mempool_total_fee_atoms(&self) -> u64 {
+        self.mempool.total_fee_atoms()
+    }
+
+    #[doc(hidden)]
+    pub fn dev_seed_chainstate(
+        &mut self,
+        height: u64,
+        tip_hash: [u8; 48],
+        utxos: impl IntoIterator<Item = atho_storage::utxo::UtxoEntry>,
+    ) -> Result<(), NodeError> {
+        self.chainstate.height = height;
+        self.chainstate.tip_hash = tip_hash;
+        for utxo in utxos {
+            self.chainstate.insert_utxo(utxo)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_or_new(config: NodeConfig) -> Self {
+        Self {
+            config,
+            chainstate: StorageChainstate::load_or_new(config.network),
             mempool: Mempool::new(),
         }
     }
@@ -32,19 +95,31 @@ impl Node {
             self.chainstate.tip_hash,
             working_utxos,
         )?;
-        self.chainstate.connect_block(block)?;
+        if let Err(err) = self.chainstate.connect_block(block) {
+            let _ = dev::append_log(
+                "athod",
+                &format!(
+                    "block connect failed height={} error={} {}",
+                    block.header.height,
+                    err,
+                    dev::summarize_block(block)
+                ),
+            );
+            return Err(err.into());
+        }
         self.mempool.remove_block_transactions(block);
         let updated_utxos = self.chainstate.utxo_snapshot();
         self.mempool
-            .revalidate(|txid, output_index| updated_utxos.get(*txid, output_index).cloned());
+            .revalidate(self.chainstate.height, |txid, output_index| {
+                updated_utxos.get(*txid, output_index).cloned()
+            });
+        let mempool_count = self.mempool.len();
         let _ = dev::record_block(self.chainstate.height, block);
         let _ = dev::append_log(
             "chain",
             &format!(
-                "connected block hash={} height={} txs={}",
-                hex::encode(block.header.block_hash()),
-                self.chainstate.height,
-                block.transactions.len()
+                "connected mempool={mempool_count} {}",
+                dev::summarize_block(block)
             ),
         );
         Ok(())
@@ -52,9 +127,11 @@ impl Node {
 
     pub fn admit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
         let utxos = self.chainstate.utxo_snapshot();
-        let txid = self.mempool.admit(entry, |txid, output_index| {
-            utxos.get(*txid, output_index).cloned()
-        })?;
+        let txid = self
+            .mempool
+            .admit(entry, self.chainstate.height, |txid, output_index| {
+                utxos.get(*txid, output_index).cloned()
+            })?;
         Ok(txid)
     }
 
@@ -77,7 +154,20 @@ impl Node {
     }
 
     pub fn submit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
-        self.admit_transaction(entry)
+        let txid = self.admit_transaction(entry)?;
+        let _ = dev::append_log(
+            "chain",
+            &format!(
+                "accepted transaction txid={} mempool={}",
+                hex::encode(txid),
+                self.mempool.len()
+            ),
+        );
+        Ok(txid)
+    }
+
+    pub fn mempool_spent_inputs(&self) -> Vec<([u8; 48], u32)> {
+        self.mempool.spent_inputs_snapshot()
     }
 }
 
@@ -239,14 +329,17 @@ mod tests {
     #[test]
     fn node_mines_and_connects_candidate_block() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        node.chainstate.height = 6;
         node.chainstate
-            .insert_utxo(UtxoEntry {
-                network: Network::Mainnet,
-                txid: [9; 48],
-                output_index: 0,
-                value_atoms: 2_000,
-                locking_script: vec![1],
-            })
+            .insert_utxo(UtxoEntry::new(
+                Network::Mainnet,
+                [9; 48],
+                0,
+                2_000,
+                vec![1],
+                0,
+                false,
+            ))
             .unwrap();
         let tx = Transaction {
             version: 1,
@@ -290,7 +383,29 @@ mod tests {
         let miner = Miner::new(4);
         let block = node.mine_and_connect_candidate_block(&miner).unwrap();
         assert_eq!(block.transactions.len(), 2);
-        assert_eq!(node.chainstate.height, 1);
+        assert_eq!(node.chainstate.height, 7);
         assert_eq!(node.mempool.len(), 0);
+    }
+
+    #[test]
+    fn node_mines_two_blocks_in_sequence() {
+        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        node.chainstate
+            .insert_utxo(UtxoEntry::new(
+                Network::Mainnet,
+                [9; 48],
+                0,
+                2_000,
+                vec![1],
+                0,
+                false,
+            ))
+            .unwrap();
+        let miner = Miner::new(2);
+        let first = node.mine_and_connect_candidate_block(&miner).unwrap();
+        let second = node.mine_and_connect_candidate_block(&miner).unwrap();
+        assert_eq!(first.header.height, 1);
+        assert_eq!(second.header.height, 2);
+        assert_eq!(node.chainstate.height, 2);
     }
 }

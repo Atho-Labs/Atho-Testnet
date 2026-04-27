@@ -2,7 +2,18 @@ use atho_core::network::Network;
 
 fn main() {
     let _ = atho_node::dev::append_log("atho-qt", "starting atho-qt");
-    let (network, rpc_address) = parse_args();
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return;
+    }
+    let (network, rpc_address, local_node) = parse_args();
+    if local_node {
+        std::env::set_var("ATHO_QT_LOCAL", "1");
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!("starting embedded local node mode for {}", network.id()),
+        );
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Atho")
@@ -34,10 +45,11 @@ fn main() {
     let _ = atho_node::dev::append_log("atho-qt", "stopped atho-qt");
 }
 
-fn parse_args() -> (Network, Option<String>) {
+fn parse_args() -> (Network, Option<String>, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut network = default_network();
     let mut rpc_address = None;
+    let mut local_node = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -71,13 +83,17 @@ fn parse_args() -> (Network, Option<String>) {
                 }
                 i += 2;
             }
+            "--local-node" | "--embedded-node" => {
+                local_node = true;
+                i += 1;
+            }
             _ => {
                 i += 1;
             }
         }
     }
 
-    (network, rpc_address)
+    (network, rpc_address, local_node)
 }
 
 fn default_network() -> Network {
@@ -89,4 +105,11 @@ fn default_network() -> Network {
         "regnet" | "regtest" => Network::Regnet,
         _ => Network::Mainnet,
     }
+}
+
+fn print_usage() {
+    eprintln!("usage:");
+    eprintln!("  atho-qt [mainnet|testnet|regnet]");
+    eprintln!("  atho-qt --network <mainnet|testnet|regnet> [--rpc-addr HOST:PORT]");
+    eprintln!("  atho-qt --local-node");
 }

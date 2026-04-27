@@ -2,11 +2,13 @@
 
 ## Current build
 
-- Rust workspace rebuild in progress
+- Rust workspace builds cleanly
 - Core protocol constants and consensus scaffolding are in place
 - Wallet mnemonic, datafile persistence, and password encryption are in place
-- Thin node runtime, RPC, and Qt client are in place
-- Qt shell is placeholder-level UI with Atho branding and Core-inspired layout
+- Node RPC now exposes live node status, block template, block submission, transaction submission, UTXO listing, and mempool info
+- Qt status now reflects real node data and includes a live activity feed from the shared dev log stream
+- Qt supports an embedded one-command local-node mode via `--local-node`
+- Supply constants now include the derived atom total for the full cap
 
 ## Shipping notes
 
@@ -14,10 +16,11 @@
 - `atho-qt` is the desktop client
 - Wallet datafiles use `.datafile`
 - Password encryption is the default datafile path
+- `athod status` prints the live RPC snapshot and recent activity lines
+- `athod dev watch` tails the unified `dev/logs/activity.log` feed
 
 ## Known limitations
 
-- Qt data is currently stale/mock-backed in the UI shell
+- P2P networking is still scaffold-level rather than a full peer mesh
 - Packaging is local build and staging only
 - Release signing and distribution metadata are not yet wired
-

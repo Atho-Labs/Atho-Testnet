@@ -1,6 +1,7 @@
 use super::default_wallet_path;
 use atho_core::network::Network;
 use std::sync::mpsc;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,13 +116,44 @@ impl OpenWalletForm {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WalletActivityRow {
     pub(crate) when: String,
-    pub(crate) kind: &'static str,
+    pub(crate) kind: WalletActivityKind,
     pub(crate) label: String,
-    pub(crate) amount_atoms: u64,
+    pub(crate) amount_atoms: i128,
     pub(crate) reference: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalletActivityKind {
+    Mined,
+    Received,
+    Sent,
+}
+
+impl WalletActivityKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            WalletActivityKind::Mined => "Mined",
+            WalletActivityKind::Received => "Received",
+            WalletActivityKind::Sent => "Sent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WalletBalanceSummary {
+    pub(crate) available_atoms: u64,
+    pub(crate) pending_atoms: u64,
+    pub(crate) total_atoms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActivityRow {
+    pub(crate) timestamp: String,
+    pub(crate) component: String,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -141,10 +173,18 @@ pub(crate) struct MiningOutcome {
     pub(crate) message: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum MiningJobResult {
+    Completed(MiningOutcome),
+    Cancelled,
+    Failed(String),
+}
+
 #[derive(Debug)]
 pub(crate) struct MiningJob {
     pub(crate) started_at: Instant,
-    pub(crate) receiver: mpsc::Receiver<Result<MiningOutcome, String>>,
+    pub(crate) stop_requested: Arc<AtomicBool>,
+    pub(crate) receiver: mpsc::Receiver<MiningJobResult>,
 }
 
 #[derive(Debug, Clone)]

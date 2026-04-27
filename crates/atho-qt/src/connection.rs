@@ -6,7 +6,7 @@ use atho_rpc::response::{MempoolInfo, RpcResponse};
 use atho_rpc::transport::RpcClient;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,16 +16,32 @@ pub struct ConnectionStatus {
     pub rpc_address: String,
     pub block_count: u64,
     pub mempool_count: usize,
+    pub mempool_total_fee_atoms: u64,
+    pub running: bool,
+    pub headers_synced: bool,
+    pub sync_best_height: u64,
     pub connected: bool,
 }
 
 #[derive(Debug)]
 enum ConnectionBackend {
-    Local(Mutex<AthoSystem>),
+    Local(Arc<Mutex<AthoSystem>>),
     Rpc {
         client: RpcClient,
         _node: Option<NodeProcess>,
     },
+}
+
+impl Clone for ConnectionBackend {
+    fn clone(&self) -> Self {
+        match self {
+            ConnectionBackend::Local(system) => ConnectionBackend::Local(Arc::clone(system)),
+            ConnectionBackend::Rpc { client, .. } => ConnectionBackend::Rpc {
+                client: client.clone(),
+                _node: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -62,6 +78,16 @@ pub struct ReadOnlyNodeConnection {
     rpc_address: String,
 }
 
+impl Clone for ReadOnlyNodeConnection {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            network: self.network,
+            rpc_address: self.rpc_address.clone(),
+        }
+    }
+}
+
 impl ReadOnlyNodeConnection {
     pub fn new(network: Network) -> Self {
         Self::with_rpc_address(network, default_rpc_address(network))
@@ -71,7 +97,7 @@ impl ReadOnlyNodeConnection {
         let backend = if cfg!(test) || std::env::var("ATHO_QT_LOCAL").ok().as_deref() == Some("1") {
             let mut system = AthoSystem::new(atho_node::config::NodeConfig::new(network));
             system.start();
-            ConnectionBackend::Local(Mutex::new(system))
+            ConnectionBackend::Local(Arc::new(Mutex::new(system)))
         } else {
             let node = start_local_node_if_needed(network, &rpc_address);
             ConnectionBackend::Rpc {
@@ -96,7 +122,10 @@ impl ReadOnlyNodeConnection {
     }
 
     pub fn has_local_node(&self) -> bool {
-        matches!(&self.backend, ConnectionBackend::Rpc { _node: Some(_), .. })
+        matches!(
+            &self.backend,
+            ConnectionBackend::Local(_) | ConnectionBackend::Rpc { _node: Some(_), .. }
+        )
     }
 
     pub fn request(&self, request: RpcRequest) -> RpcResponse {
@@ -132,6 +161,10 @@ impl ReadOnlyNodeConnection {
                     rpc_address: self.rpc_address.clone(),
                     block_count: status.block_count,
                     mempool_count: status.mempool_count,
+                    mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+                    running: status.running,
+                    headers_synced: status.headers_synced,
+                    sync_best_height: status.sync_best_height,
                     connected: status.running,
                 }
             }
@@ -142,26 +175,69 @@ impl ReadOnlyNodeConnection {
     }
 
     pub fn spawn_status_monitor(&self, interval: Duration) -> StatusMonitor {
-        let network = self.network;
         let rpc_address = self.rpc_address.clone();
         let (sender, receiver) = mpsc::channel();
 
-        thread::spawn(move || {
-            let client = RpcClient::new(rpc_address.clone());
-            loop {
-                let status = collect_rpc_status(network, &rpc_address, &client);
-                if sender.send(status).is_err() {
-                    break;
-                }
-                thread::sleep(interval);
+        match &self.backend {
+            ConnectionBackend::Local(system) => {
+                let system = Arc::clone(system);
+                thread::spawn(move || loop {
+                    let status = {
+                        let system = system.lock().expect("local node mutex poisoned");
+                        let status = system.status();
+                        ConnectionStatus {
+                            network: status.network,
+                            rpc_address: rpc_address.clone(),
+                            block_count: status.block_count,
+                            mempool_count: status.mempool_count,
+                            mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+                            running: status.running,
+                            headers_synced: status.headers_synced,
+                            sync_best_height: status.sync_best_height,
+                            connected: status.running,
+                        }
+                    };
+                    if sender.send(status).is_err() {
+                        break;
+                    }
+                    thread::sleep(interval);
+                });
             }
-        });
+            ConnectionBackend::Rpc { .. } => {
+                let network = self.network;
+                thread::spawn(move || {
+                    let client = RpcClient::new(rpc_address.clone());
+                    loop {
+                        let status = collect_rpc_status(network, &rpc_address, &client);
+                        if sender.send(status).is_err() {
+                            break;
+                        }
+                        thread::sleep(interval);
+                    }
+                });
+            }
+        }
 
         StatusMonitor { receiver }
     }
 }
 
 fn collect_rpc_status(network: Network, rpc_address: &str, client: &RpcClient) -> ConnectionStatus {
+    if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
+        let connected = status.network == network && status.running;
+        return ConnectionStatus {
+            network: status.network,
+            rpc_address: rpc_address.to_string(),
+            block_count: status.block_count,
+            mempool_count: status.mempool_count,
+            mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+            running: status.running,
+            headers_synced: status.headers_synced,
+            sync_best_height: status.sync_best_height,
+            connected,
+        };
+    }
+
     let network_ok = match client.call(&RpcRequest::GetNetwork) {
         Ok(RpcResponse::Network(label)) => label == network.id(),
         _ => false,
@@ -176,13 +252,16 @@ fn collect_rpc_status(network: Network, rpc_address: &str, client: &RpcClient) -
         })) => transaction_count,
         _ => 0,
     };
-    let connected = network_ok;
     ConnectionStatus {
         network,
         rpc_address: rpc_address.to_string(),
         block_count,
         mempool_count,
-        connected,
+        mempool_total_fee_atoms: 0,
+        running: network_ok,
+        headers_synced: network_ok,
+        sync_best_height: block_count,
+        connected: network_ok,
     }
 }
 
@@ -192,6 +271,14 @@ fn default_rpc_address(network: Network) -> String {
 
 fn start_local_node_if_needed(network: Network, rpc_address: &str) -> Option<NodeProcess> {
     if probe_rpc(rpc_address) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "rpc already available at {} for {}",
+                rpc_address,
+                network.id()
+            ),
+        );
         return None;
     }
 
@@ -232,6 +319,7 @@ fn start_local_node_if_needed(network: Network, rpc_address: &str) -> Option<Nod
                 "atho-qt",
                 &format!("spawned local node bootstrap for {}", network.id()),
             );
+            spawn_bootstrap_watcher(network, rpc_address.to_string());
             Some(NodeProcess { child })
         }
         Err(err) => {
@@ -242,6 +330,38 @@ fn start_local_node_if_needed(network: Network, rpc_address: &str) -> Option<Nod
             None
         }
     }
+}
+
+fn spawn_bootstrap_watcher(network: Network, rpc_address: String) {
+    thread::spawn(move || {
+        let client = RpcClient::new(rpc_address.clone());
+        for attempt in 0..90 {
+            if matches!(
+                client.call(&RpcRequest::GetNodeStatus),
+                Ok(RpcResponse::NodeStatus(_))
+            ) {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "local node ready network={} rpc={} attempts={}",
+                        network.id(),
+                        rpc_address,
+                        attempt + 1
+                    ),
+                );
+                return;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "local node bootstrap still starting network={} rpc={}",
+                network.id(),
+                rpc_address
+            ),
+        );
+    });
 }
 
 fn probe_rpc(rpc_address: &str) -> bool {

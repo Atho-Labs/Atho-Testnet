@@ -1,6 +1,9 @@
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_node::config::NodeConfig;
+use atho_rpc::request::RpcRequest;
+use atho_rpc::response::RpcResponse;
+use atho_rpc::transport::RpcClient;
 
 fn main() {
     if let Err(err) = run() {
@@ -14,6 +17,7 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         None => atho_node::runtime::run().map_err(|err| err.to_string()),
         Some("run") => run_node(&args[1..]),
+        Some("status") => show_status(&args[1..]),
         Some("verify") => verify_node(&args[1..]),
         Some("dev") => run_dev(&args[1..]),
         Some("--help") | Some("-h") => {
@@ -54,36 +58,84 @@ fn verify_node(args: &[String]) -> Result<(), String> {
     atho_node::validation::validate_block(&genesis.block, 0, network)
         .map_err(|err| err.to_string())?;
 
-    if node.chainstate.height != 0 {
-        return Err(format!(
-            "unexpected chain height {}",
-            node.chainstate.height
-        ));
+    if node.height() != 0 {
+        return Err(format!("unexpected chain height {}", node.height()));
     }
-    if node.chainstate.tip_hash != genesis.block_hash {
+    if node.tip_hash() != genesis.block_hash {
         return Err("genesis tip hash mismatch".to_string());
     }
-    if node.chainstate.utxo_count() != 1 {
+    if node.utxo_count() != 1 {
         return Err(format!(
             "unexpected genesis utxo count {}",
-            node.chainstate.utxo_count()
+            node.utxo_count()
         ));
     }
-    if node.chainstate.blocks().len() != 1 {
+    if node.blocks_len() != 1 {
         return Err(format!(
             "unexpected genesis block count {}",
-            node.chainstate.blocks().len()
+            node.blocks_len()
         ));
     }
 
     println!("node verification ok");
     println!("network={}", network.id());
     println!("genesis_hash={}", hex::encode(genesis.block_hash));
-    println!("genesis_height={}", node.chainstate.height);
+    println!("genesis_height={}", node.height());
     println!(
         "genesis_target={}",
         hex::encode(genesis.block.header.difficulty_target_or_bits)
     );
+    Ok(())
+}
+
+fn show_status(args: &[String]) -> Result<(), String> {
+    let network = match network_from_args(args)? {
+        Some(network) => network,
+        None => {
+            atho_node::runtime::load_config_from_env()
+                .map_err(|err| err.to_string())?
+                .network
+        }
+    };
+    let rpc_address = atho_node::runtime::rpc_bind_address(network);
+    let client = RpcClient::new(rpc_address.clone());
+    let status = match client.call(&RpcRequest::GetNodeStatus) {
+        Ok(RpcResponse::NodeStatus(status)) => status,
+        Ok(RpcResponse::Error(err)) => return Err(err.to_string()),
+        Ok(other) => return Err(format!("unexpected rpc response: {other:?}")),
+        Err(err) => {
+            let raw = err.to_string();
+            let hint = if raw.contains("Connection refused") || raw.contains("connection refused") {
+                format!(
+                    "{raw}. start the node first with `cargo run -p atho-node --bin athod run {}` or open the client with `cargo run -p atho-qt --bin atho-qt -- --network {} --local-node`",
+                    network.id(),
+                    network.id()
+                )
+            } else {
+                raw
+            };
+            return Err(hint);
+        }
+    };
+
+    println!("network={}", status.network.id());
+    println!("rpc_address={rpc_address}");
+    println!("running={}", status.running);
+    println!("headers_synced={}", status.headers_synced);
+    println!("block_count={}", status.block_count);
+    println!("mempool_count={}", status.mempool_count);
+    println!("mempool_total_fee_atoms={}", status.mempool_total_fee_atoms);
+    println!("sync_best_height={}", status.sync_best_height);
+
+    if let Ok(lines) = atho_node::dev::recent_activity_lines(8) {
+        if !lines.is_empty() {
+            println!("activity:");
+            for line in lines {
+                println!("[{}] {} {}", line.timestamp, line.component, line.line);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -182,6 +234,7 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("  athod");
     eprintln!("  athod run [mainnet|testnet|regnet]");
+    eprintln!("  athod status [mainnet|testnet|regnet]");
     eprintln!("  athod verify [mainnet|testnet|regnet]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine>");
 }

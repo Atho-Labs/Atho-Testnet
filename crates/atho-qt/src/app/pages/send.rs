@@ -4,21 +4,21 @@ use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use eframe::egui;
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
-    let spendable_balance = app.wallet_balance_atoms();
+    let available_balance = app.wallet_balance_atoms();
 
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(430.0);
-        render_send_form(app, ui, spendable_balance);
+        render_send_form(app, ui, available_balance);
         ui.add_space(6.0);
         render_fee_panel(app, ui);
         ui.add_space(6.0);
         widgets::muted_label(ui, &app.send_status);
         ui.add_space(6.0);
-        render_send_actions(app, ui, spendable_balance);
+        render_send_actions(app, ui, available_balance);
     });
 }
 
-fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, spendable_balance: u64) {
+fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, available_balance: u64) {
     widgets::panel_frame()
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
@@ -73,22 +73,20 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, spendable_balance: 
                     );
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Amount:").size(13.0).strong());
+                    ui.label(egui::RichText::new("Amount (ATHO):").size(13.0).strong());
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [150.0, 28.0],
-                            egui::TextEdit::singleline(&mut app.send_amount),
+                            egui::TextEdit::singleline(&mut app.send_amount)
+                                .hint_text("10,000.44544444"),
                         );
-                        let mut send_unit = 0usize;
-                        egui::ComboBox::from_id_source("send_unit")
-                            .width(112.0)
-                            .selected_text("atoms")
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut send_unit, 0, "atoms");
-                            });
-                        ui.checkbox(&mut app.send_subtract_fee, "Subtract fee from amount");
+                        ui.checkbox(
+                            &mut app.send_include_fee_in_total,
+                            "Include fee in total amount",
+                        );
                         if ui.button("Use available balance").clicked() {
-                            app.send_amount = spendable_balance.to_string();
+                            app.send_amount =
+                                DesktopApp::format_send_amount_input(available_balance);
                         }
                     });
                     ui.end_row();
@@ -109,18 +107,18 @@ fn render_fee_panel(app: &DesktopApp, ui: &mut egui::Ui) {
                 let fee_text = if app.send_fee.is_empty() {
                     format!("{MIN_TX_FEE_PER_VBYTE_ATOMS} atom/vbyte")
                 } else {
-                    format!("{} atoms", app.send_fee)
+                    app.send_fee.clone()
                 };
                 ui.label(egui::RichText::new(fee_text).size(13.0).strong());
                 ui.colored_label(
                     egui::Color32::from_rgb(185, 110, 30),
-                    "Warning: Fee estimation is currently not possible.",
+                    "Fee is computed from transaction size.",
                 );
             });
         });
 }
 
-fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, spendable_balance: u64) {
+fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, available_balance: u64) {
     ui.horizontal(|ui| {
         if ui
             .add_sized(
@@ -145,8 +143,8 @@ fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, spendable_balanc
             app.send_label.clear();
             app.send_amount.clear();
             app.send_fee.clear();
-            app.send_subtract_fee = false;
-            app.send_status = String::from("Enter a destination and integer atom amounts.");
+            app.send_include_fee_in_total = false;
+            app.send_status = String::from("Enter a destination and ATHO amount.");
         }
         let _ = ui.add_enabled(
             false,
@@ -156,8 +154,8 @@ fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, spendable_balanc
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "Balance: {}",
-                    widgets::format_atoms(spendable_balance)
+                    "Available: {}",
+                    widgets::format_atoms(available_balance)
                 ))
                 .size(13.0)
                 .strong(),

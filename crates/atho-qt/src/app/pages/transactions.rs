@@ -1,9 +1,9 @@
-use crate::app::{widgets, DesktopApp, WalletActivityRow};
+use crate::app::{widgets, DesktopApp, WalletActivityKind, WalletActivityRow};
 use crate::resources;
 use eframe::egui;
 
-const DATE_FILTERS: &[&str] = &["All", "Current"];
-const TYPE_FILTERS: &[&str] = &["All", "Received"];
+const DATE_FILTERS: &[&str] = &["All", "Confirmed"];
+const TYPE_FILTERS: &[&str] = &["All", "Mined", "Received", "Sent"];
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
@@ -63,16 +63,11 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                             .min_col_width(80.0)
                             .show(ui, |ui| {
                                 ui.label(&row.when);
-                                ui.label(row.kind);
+                                ui.label(row.kind.label());
                                 ui.label(&row.label);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        widgets::row_value(
-                                            ui,
-                                            &widgets::format_atoms(row.amount_atoms),
-                                        )
-                                    },
+                                    |ui| widgets::row_value_signed(ui, row.amount_atoms),
                                 );
                                 ui.end_row();
                             });
@@ -96,7 +91,11 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 for row in rows {
                     export.push_str(&format!(
                         "{}\t{}\t{}\t{}\t{}\n",
-                        row.when, row.kind, row.label, row.amount_atoms, row.reference
+                        row.when,
+                        row.kind.label(),
+                        row.label,
+                        row.amount_atoms,
+                        row.reference
                     ));
                 }
                 DesktopApp::copy_text(ui, export);
@@ -112,9 +111,15 @@ fn filtered_rows(app: &DesktopApp) -> Vec<WalletActivityRow> {
     app.wallet_activity_rows()
         .iter()
         .filter(|row| {
-            (app.transaction_type_filter == 0 || row.kind == "Received")
+            (app.transaction_type_filter == 0
+                || matches!(
+                    (app.transaction_type_filter, row.kind),
+                    (1, WalletActivityKind::Mined)
+                        | (2, WalletActivityKind::Received)
+                        | (3, WalletActivityKind::Sent)
+                ))
                 && min_amount
-                    .map(|min| row.amount_atoms >= min)
+                    .map(|min| row.amount_atoms.unsigned_abs() >= min as u128)
                     .unwrap_or(true)
                 && (search.is_empty()
                     || row.label.to_ascii_lowercase().contains(&search)

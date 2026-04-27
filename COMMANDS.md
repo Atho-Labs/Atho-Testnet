@@ -32,7 +32,7 @@ cargo test -p atho-core -p atho-crypto -p atho-storage -p atho-wallet -p atho-p2
 
 ## Reset Dev State
 
-Wipe the local blockchain, wallet files, audit exports, and logs:
+Wipe the local blockchain database, wallet files, audit exports, and logs:
 
 ```bash
 cargo run -p atho-node --bin athod -- dev wipe
@@ -57,6 +57,12 @@ Start the node with defaults:
 
 ```bash
 cargo run -p atho-node --bin athod
+```
+
+Inspect the live node state from the terminal:
+
+```bash
+cargo run -p atho-node --bin athod -- status mainnet
 ```
 
 Start the node on a specific network:
@@ -89,6 +95,14 @@ cargo run -p atho-qt --bin atho-qt -- --network testnet --rpc-addr 127.0.0.1:184
 ```
 
 The Qt client can start a local node automatically if the RPC port is not already reachable.
+
+Run the client with an embedded node in one command:
+
+```bash
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+```
+
+This is the one-command “run everything” path for local development. It starts the desktop client and embedded node together, and the client can still fall back to separate node or miner commands when you need them.
 
 ## Run The Miner
 
@@ -138,6 +152,10 @@ Watch live dev logs:
 cargo run -p atho-node --bin athod -- dev watch
 ```
 
+The watch feed now tails `dev/logs/activity.log`, which combines node, miner, p2p, and Qt activity in one stream.
+
+Durable chainstate lives in per-network LMDB environments under `dev/db/<network>/<dataset>/`. Each dataset has its own LMDB environment for `meta`, `blocks`, `transactions`, `utxos`, `peers`, and `addresses`. The mempool stays in RAM and is rebuilt on restart.
+
 ## Quick Flows
 
 Build and test:
@@ -156,8 +174,7 @@ cargo run -p atho-node --bin athod -- dev reset mainnet
 Run the full desktop setup:
 
 ```bash
-cargo run -p atho-node --bin athod -- run mainnet
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:18443
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
 ```
 
 Run the wallet miner path:

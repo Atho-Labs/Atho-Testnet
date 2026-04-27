@@ -13,13 +13,21 @@ use atho_p2p::relay::RelayLoop;
 use atho_storage::chainstate::Chainstate;
 use atho_storage::utxo::UtxoEntry;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 const DEV_ROOT: &str = "dev";
+const ACTIVITY_LOG: &str = "activity.log";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityLine {
+    pub timestamp: String,
+    pub component: String,
+    pub line: String,
+}
 
 fn dev_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -42,6 +50,10 @@ pub fn chain_dir() -> PathBuf {
 
 pub fn wallet_dir() -> PathBuf {
     dev_root().join("wallet")
+}
+
+pub fn db_dir() -> PathBuf {
+    dev_root().join("db")
 }
 
 pub fn audit_dir() -> PathBuf {
@@ -68,22 +80,102 @@ pub fn ensure_layout() -> std::io::Result<()> {
     fs::create_dir_all(logs_dir())?;
     fs::create_dir_all(chain_dir())?;
     fs::create_dir_all(wallet_dir())?;
+    fs::create_dir_all(db_dir())?;
     fs::create_dir_all(audit_dir())?;
     Ok(())
 }
 
 pub fn append_log(component: &str, line: &str) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
+    append_log_locked(component, line)
+}
+
+fn append_log_locked(component: &str, line: &str) -> std::io::Result<()> {
     ensure_layout()?;
-    let path = logs_dir().join(format!("{component}.log"));
+    let component_path = logs_dir().join(format!("{component}.log"));
+    append_line(&component_path, line)?;
+    let activity_path = logs_dir().join(ACTIVITY_LOG);
+    append_line(
+        &activity_path,
+        &format!("{}|{}|{}", activity_timestamp(), component, line),
+    )?;
+    Ok(())
+}
+
+pub fn summarize_transaction(tx: &Transaction, fee_atoms: Option<u64>) -> String {
+    let txid = hex::encode(tx.txid());
+    let wtxid = hex::encode(tx.wtxid());
+    let size_bytes = tx.full_bytes().len();
+    let weight_bytes = tx.weight_bytes();
+    let vsize_bytes = tx.vsize_bytes();
+    let witness_bytes = tx.witness_bytes();
+    let output_total_atoms = tx.output_value_atoms();
+    let fee_text = fee_atoms
+        .map(|fee| fee.to_string())
+        .unwrap_or_else(|| String::from("n/a"));
+    format!(
+        "txid={txid} wtxid={wtxid} version={} inputs={} outputs={} lock_time={} size={} weight={} vsize={} witness_bytes={} output_total_atoms={} fee_atoms={}",
+        tx.version,
+        tx.inputs.len(),
+        tx.outputs.len(),
+        tx.lock_time,
+        size_bytes,
+        weight_bytes,
+        vsize_bytes,
+        witness_bytes,
+        output_total_atoms,
+        fee_text
+    )
+}
+
+pub fn summarize_block(block: &Block) -> String {
+    format!(
+        "hash={} height={} prev={} merkle={} witness={} txs={} size={} weight={} vsize={} nonce={} target={} fees_total={} fees_miner={} fees_burned={} fees_pool={}",
+        hex::encode(block.header.block_hash()),
+        block.header.height,
+        hex::encode(block.header.previous_block_hash),
+        hex::encode(block.header.merkle_root),
+        hex::encode(block.header.witness_root),
+        block.transactions.len(),
+        block.size_bytes(),
+        block.weight_bytes(),
+        block.vsize_bytes(),
+        block.header.nonce,
+        hex::encode(block.header.difficulty_target_or_bits),
+        block.fees_total_atoms,
+        block.fees_miner_atoms,
+        block.fees_burned_atoms,
+        block.fees_pool_atoms
+    )
+}
+
+fn append_line(path: &PathBuf, line: &str) -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{line}")?;
     Ok(())
 }
 
+fn activity_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+}
+
 pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     ensure_layout()?;
+    append_log_locked(
+        "chain",
+        &format!("block accepted {}", summarize_block(block)),
+    )?;
+    for (index, tx) in block.transactions.iter().enumerate() {
+        append_log_locked(
+            "chain",
+            &format!("block tx index={index} {}", summarize_transaction(tx, None)),
+        )?;
+    }
     append_block_row(&chain_blocks_file(), height, block)?;
     append_transaction_rows(height, block)?;
     Ok(())
@@ -93,6 +185,7 @@ pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     remove_tree(&chain_dir())?;
     remove_tree(&wallet_dir())?;
+    remove_tree(&db_dir())?;
     remove_tree(&audit_dir())?;
     remove_tree(&logs_dir())?;
     ensure_layout()
@@ -106,20 +199,19 @@ fn remove_tree(path: &PathBuf) -> std::io::Result<()> {
         fs::remove_file(path)?;
         return Ok(());
     }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        if child.is_dir() {
-            remove_tree(&child)?;
-        } else {
-            fs::remove_file(&child)?;
+    for _ in 0..8 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
         }
     }
-    match fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
+    fs::remove_dir_all(path)
 }
 
 pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
@@ -129,7 +221,7 @@ pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
     copy_or_init(
         &chain_blocks_file(),
         &path,
-        "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count",
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms",
     )?;
     Ok(path)
 }
@@ -138,7 +230,7 @@ pub fn export_transactions(_chainstate: &Chainstate) -> std::io::Result<PathBuf>
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     ensure_layout()?;
     let path = audit_dir().join("transactions.tsv");
-    copy_or_init(&chain_transactions_file(), &path, "height\tblock_hash\ttx_index\ttxid\tversion\tlock_time\tinput_count\toutput_count\tcanonical_bytes_hex")?;
+    copy_or_init(&chain_transactions_file(), &path, "height\tblock_hash\ttx_index\ttxid\twtxid\tversion\tlock_time\tinput_count\toutput_count\tsize_bytes\tweight_bytes\tvsize_bytes\twitness_bytes\toutput_value_atoms\tcanonical_bytes_hex")?;
     Ok(path)
 }
 
@@ -166,9 +258,9 @@ pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, Pa
     copy_or_init(
         &chain_blocks_file(),
         &chain,
-        "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count",
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms",
     )?;
-    copy_or_init(&chain_transactions_file(), &txs, "height\tblock_hash\ttx_index\ttxid\tversion\tlock_time\tinput_count\toutput_count\tcanonical_bytes_hex")?;
+    copy_or_init(&chain_transactions_file(), &txs, "height\tblock_hash\ttx_index\ttxid\twtxid\tversion\tlock_time\tinput_count\toutput_count\tsize_bytes\tweight_bytes\tvsize_bytes\twitness_bytes\toutput_value_atoms\tcanonical_bytes_hex")?;
     copy_or_init(&chain_inputs_file(), &inputs, "height\tblock_hash\ttx_index\tinput_index\tprevious_txid\toutput_index\tunlocking_script_hex")?;
     copy_or_init(
         &chain_outputs_file(),
@@ -183,7 +275,7 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     ensure_layout()?;
     let target = initial_target_for_network(network);
     let clamped_target = clamp_target(target);
-    append_log(
+    append_log_locked(
         "p2p",
         &format!(
             "dev mine network={} target={} min={} max={} tx_alloc_bps={}",
@@ -195,17 +287,22 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
         ),
     )?;
 
-    let mut node = Node::new(NodeConfig::new(network));
+    let mut node = Node::load_or_new(NodeConfig::new(network));
     let (seed_txid, seed_value, seed_script) = seed_utxo(network);
-    node.chainstate
-        .insert_utxo(UtxoEntry {
+    node.dev_seed_chainstate(
+        6,
+        node.tip_hash(),
+        [UtxoEntry::new(
             network,
-            txid: seed_txid,
-            output_index: 0,
-            value_atoms: seed_value,
-            locking_script: vec![seed_script],
-        })
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+            seed_txid,
+            0,
+            seed_value,
+            vec![seed_script],
+            0,
+            false,
+        )],
+    )
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
     let tx = signed_spend_transaction(network, seed_txid, seed_value, seed_script)?;
     let tx_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
@@ -224,10 +321,10 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
 
     let relay = RelayLoop::new(network);
     relay.prime();
-    relay.sync_headers(node.chainstate.height);
+    relay.sync_headers(node.height());
     relay.relay_transaction(&txid);
     relay.relay_block(&block.header.block_hash(), block.transactions.len());
-    append_log(
+    append_log_locked(
         "athod",
         &format!(
             "dev mine connected network={} block={} txid={}",
@@ -361,20 +458,28 @@ fn append_block_row(path: &PathBuf, height: u64, block: &Block) -> std::io::Resu
     if !exists {
         writeln!(
             file,
-            "height\tblock_hash\tprevious_block_hash\tmerkle_root\ttimestamp\ttarget\tnonce\ttx_count"
+            "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms"
         )?;
     }
     writeln!(
         file,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         height,
         hex::encode(block.header.block_hash()),
         hex::encode(block.header.previous_block_hash),
         hex::encode(block.header.merkle_root),
+        hex::encode(block.header.witness_root),
         block.header.timestamp,
         hex::encode(block.header.difficulty_target_or_bits),
         block.header.nonce,
-        block.transactions.len()
+        block.transactions.len(),
+        block.size_bytes(),
+        block.weight_bytes(),
+        block.vsize_bytes(),
+        block.fees_total_atoms,
+        block.fees_miner_atoms,
+        block.fees_burned_atoms,
+        block.fees_pool_atoms
     )?;
     Ok(())
 }
@@ -391,22 +496,28 @@ fn append_tx_rows(path: &PathBuf, height: u64, block: &Block) -> std::io::Result
     if !exists {
         writeln!(
             file,
-            "height\tblock_hash\ttx_index\ttxid\tversion\tlock_time\tinput_count\toutput_count\tcanonical_bytes_hex"
+            "height\tblock_hash\ttx_index\ttxid\twtxid\tversion\tlock_time\tinput_count\toutput_count\tsize_bytes\tweight_bytes\tvsize_bytes\twitness_bytes\toutput_value_atoms\tcanonical_bytes_hex"
         )?;
     }
     let block_hash = hex::encode(block.header.block_hash());
     for (tx_index, tx) in block.transactions.iter().enumerate() {
         writeln!(
             file,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             height,
             block_hash,
             tx_index,
             hex::encode(tx.txid()),
+            hex::encode(tx.wtxid()),
             tx.version,
             tx.lock_time,
             tx.inputs.len(),
             tx.outputs.len(),
+            tx.full_bytes().len(),
+            tx.weight_bytes(),
+            tx.vsize_bytes(),
+            tx.witness_bytes(),
+            tx.output_value_atoms(),
             hex::encode(tx.canonical_bytes())
         )?;
     }
@@ -470,27 +581,84 @@ fn append_output_rows(path: &PathBuf, height: u64, block: &Block) -> std::io::Re
 
 pub fn watch_logs() -> std::io::Result<()> {
     ensure_layout()?;
-    let mut offsets: std::collections::BTreeMap<PathBuf, u64> = std::collections::BTreeMap::new();
+    let path = logs_dir().join(ACTIVITY_LOG);
+    let mut offset = 0u64;
     loop {
-        for entry in fs::read_dir(logs_dir())? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
-                continue;
-            }
-            let offset = offsets.entry(path.clone()).or_insert(0);
-            let mut file = File::open(&path)?;
-            file.seek(SeekFrom::Start(*offset))?;
+        if let Ok(mut file) = File::open(&path) {
+            file.seek(SeekFrom::Start(offset))?;
             let mut reader = BufReader::new(file);
             let mut line = String::new();
             while reader.read_line(&mut line)? > 0 {
                 print!("{}", line);
-                *offset += line.len() as u64;
+                offset += line.len() as u64;
                 line.clear();
             }
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+pub fn recent_activity_lines(limit: usize) -> std::io::Result<Vec<ActivityLine>> {
+    ensure_layout()?;
+    let path = logs_dir().join(ACTIVITY_LOG);
+    if !path.exists() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut offset = reader.get_ref().metadata()?.len();
+    let mut buffer = Vec::new();
+    let mut lines = std::collections::VecDeque::with_capacity(limit);
+
+    while offset > 0 && lines.len() < limit {
+        let step = offset.min(8 * 1024);
+        offset -= step;
+        reader.seek(SeekFrom::Start(offset))?;
+        buffer.resize(step as usize, 0);
+        reader.read_exact(&mut buffer)?;
+        let chunk = String::from_utf8_lossy(&buffer);
+        for raw in chunk.lines().rev() {
+            if let Some(line) = parse_activity_line(raw.trim_end_matches('\r')) {
+                lines.push_front(line);
+                if lines.len() == limit {
+                    break;
+                }
+            }
+        }
+        if offset == 0 {
+            break;
+        }
+    }
+
+    if lines.len() < limit {
+        let file = File::open(logs_dir().join(ACTIVITY_LOG))?;
+        let reader = BufReader::new(file);
+        lines.clear();
+        for raw in reader.lines() {
+            let raw = raw?;
+            if let Some(line) = parse_activity_line(&raw) {
+                if lines.len() == limit {
+                    let _ = lines.pop_front();
+                }
+                lines.push_back(line);
+            }
+        }
+    }
+
+    Ok(lines.into_iter().collect())
+}
+
+fn parse_activity_line(line: &str) -> Option<ActivityLine> {
+    let mut parts = line.splitn(3, '|');
+    let timestamp = parts.next()?.to_string();
+    let component = parts.next()?.to_string();
+    let message = parts.next()?.to_string();
+    Some(ActivityLine {
+        timestamp,
+        component,
+        line: message,
+    })
 }
 
 #[cfg(test)]

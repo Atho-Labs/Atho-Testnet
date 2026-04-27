@@ -1,4 +1,5 @@
 use crate::crypto::hash::sha3_384;
+use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,27 @@ impl TxWitness {
         out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.pubkey);
         out.extend_from_slice(&(self.input_refs.len() as u32).to_le_bytes());
+        for item in &self.input_refs {
+            out.extend_from_slice(&item.sig_ref_short);
+            out.extend_from_slice(&item.witness_commit_ref);
+        }
+        out
+    }
+
+    pub fn compact_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            compact_size_len(self.signature.len())
+                + self.signature.len()
+                + compact_size_len(self.pubkey.len())
+                + self.pubkey.len()
+                + compact_size_len(self.input_refs.len())
+                + self.input_refs.len() * 18,
+        );
+        write_compact_size(&mut out, self.signature.len());
+        out.extend_from_slice(&self.signature);
+        write_compact_size(&mut out, self.pubkey.len());
+        out.extend_from_slice(&self.pubkey);
+        write_compact_size(&mut out, self.input_refs.len());
         for item in &self.input_refs {
             out.extend_from_slice(&item.sig_ref_short);
             out.extend_from_slice(&item.witness_commit_ref);
@@ -158,6 +180,28 @@ impl Transaction {
         out
     }
 
+    pub fn compact_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.version.to_le_bytes());
+        write_compact_size(&mut out, self.inputs.len());
+        for input in &self.inputs {
+            out.extend_from_slice(&input.previous_txid);
+            out.extend_from_slice(&input.output_index.to_le_bytes());
+            write_compact_size(&mut out, input.unlocking_script.len());
+            out.extend_from_slice(&input.unlocking_script);
+        }
+        write_compact_size(&mut out, self.outputs.len());
+        for output in &self.outputs {
+            out.extend_from_slice(&output.value_atoms.to_le_bytes());
+            write_compact_size(&mut out, output.locking_script.len());
+            out.extend_from_slice(&output.locking_script);
+        }
+        out.extend_from_slice(&self.lock_time.to_le_bytes());
+        write_compact_size(&mut out, self.witness.len());
+        out.extend_from_slice(&self.witness);
+        out
+    }
+
     pub fn base_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -190,6 +234,11 @@ impl Transaction {
 
     pub fn vsize_bytes(&self) -> usize {
         (self.weight_bytes().saturating_add(3)) / 4
+    }
+
+    pub fn feerate_atoms_per_vbyte(&self, fee_atoms: u64) -> (u64, usize) {
+        let vsize = self.vsize_bytes().max(1);
+        (fee_atoms / vsize as u64, vsize)
     }
 
     pub fn txid(&self) -> [u8; 48] {
@@ -271,6 +320,26 @@ mod tests {
         assert_eq!(base.txid(), with_witness.txid());
         assert_eq!(base.signing_digest(), with_witness.signing_digest());
         assert_ne!(base.wtxid(), with_witness.wtxid());
+    }
+
+    #[test]
+    fn compact_bytes_are_not_larger_than_full_bytes() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 500,
+                locking_script: vec![4, 5],
+            }],
+            lock_time: 0,
+            witness: vec![9, 9, 9],
+        };
+
+        assert!(tx.compact_bytes().len() <= tx.full_bytes().len());
     }
 
     #[test]

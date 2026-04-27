@@ -1,7 +1,8 @@
 use atho_core::block::Block;
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    MAX_BLOCK_SIZE_BYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    BLOCK_TIME_SECONDS, MAX_BLOCK_SIZE_BYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_SIZE_BYTES,
+    MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -52,6 +53,10 @@ pub enum ValidationError {
     MissingUtxo,
     #[error("input ownership mismatch")]
     InputOwnershipMismatch,
+    #[error("input has insufficient confirmations")]
+    InsufficientConfirmations,
+    #[error("monetary supply exceeded")]
+    MonetarySupplyExceeded,
     #[error("witness input reference mismatch")]
     WitnessInputReferenceMismatch,
     #[error("fee mismatch")]
@@ -212,6 +217,7 @@ pub fn validate_transaction(tx: &Transaction, fee_atoms: u64) -> Result<(), Vali
 pub fn validate_transaction_with_context<F>(
     tx: &Transaction,
     fee_atoms: u64,
+    spend_height: u64,
     mut lookup: F,
 ) -> Result<u64, ValidationError>
 where
@@ -233,6 +239,9 @@ where
             lookup(&input.previous_txid, input.output_index).ok_or(ValidationError::MissingUtxo)?;
         if utxo.locking_script != input.unlocking_script {
             return Err(ValidationError::InputOwnershipMismatch);
+        }
+        if !utxo.is_spendable_at(spend_height) {
+            return Err(ValidationError::InsufficientConfirmations);
         }
         let expected_ref = derive_sig_ref_short(&txid, &witness.signature, index as u32);
         if witness.input_refs.get(index).map(|item| item.sig_ref_short) != Some(expected_ref) {
@@ -287,7 +296,12 @@ fn validate_block_impl(
     if block.header.height != height {
         return Err(ValidationError::InvalidBlockHeight);
     }
-    if block.header.timestamp == 0 {
+    let expected_timestamp = height.saturating_mul(BLOCK_TIME_SECONDS);
+    if height == 0 {
+        if block.header.timestamp == 0 {
+            return Err(ValidationError::InvalidBlockTimestamp);
+        }
+    } else if block.header.timestamp != expected_timestamp {
         return Err(ValidationError::InvalidBlockTimestamp);
     }
     if block.vsize_bytes() > MAX_BLOCK_SIZE_BYTES || block.weight_bytes() > MAX_BLOCK_WEIGHT {
@@ -309,6 +323,9 @@ fn validate_block_impl(
     }
 
     let subsidy = subsidy::block_subsidy_atoms(height);
+    if subsidy::cumulative_subsidy_atoms(height) > subsidy::max_supply_atoms() {
+        return Err(ValidationError::MonetarySupplyExceeded);
+    }
     let expected_coinbase_reward = subsidy.saturating_add(block.fees_miner_atoms);
     validate_coinbase_transaction(&block.transactions[0], expected_coinbase_reward)?;
     if block.transactions.len() > 1 {
@@ -374,7 +391,7 @@ pub fn validate_block_with_context(
 
     for tx in &block.transactions[1..] {
         let fee_rate = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let fee = validate_transaction_with_context(tx, fee_rate, |txid, output_index| {
+        let fee = validate_transaction_with_context(tx, fee_rate, height, |txid, output_index| {
             utxos.get(*txid, output_index).cloned()
         })?;
 
@@ -401,13 +418,15 @@ pub fn validate_block_with_context(
         sum_fees = sum_fees.saturating_add(fee);
         for (output_index, output) in tx.outputs.iter().enumerate() {
             utxos
-                .insert(UtxoEntry {
+                .insert(UtxoEntry::new(
                     network,
-                    txid: tx.txid(),
-                    output_index: output_index as u32,
-                    value_atoms: output.value_atoms,
-                    locking_script: output.locking_script.clone(),
-                })
+                    tx.txid(),
+                    output_index as u32,
+                    output.value_atoms,
+                    output.locking_script.clone(),
+                    height,
+                    tx.is_coinbase(),
+                ))
                 .map_err(|_| ValidationError::MempoolConflict)?;
         }
     }
@@ -428,10 +447,13 @@ mod tests {
     use super::*;
     use atho_core::block::{self, witness_root, Block, BlockHeader};
     use atho_core::consensus::pow;
-    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::constants::{
+        COINBASE_MATURITY_BLOCKS, MIN_TX_FEE_PER_VBYTE_ATOMS, STANDARD_TX_CONFIRMATIONS,
+    };
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
+    use atho_storage::utxo::UtxoEntry;
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
         let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
@@ -568,6 +590,97 @@ mod tests {
     }
 
     #[test]
+    fn block_validation_rejects_immature_coinbase_spends() {
+        let immature = UtxoEntry::coinbase(
+            Network::Mainnet,
+            [7; 48],
+            0,
+            subsidy::block_subsidy_atoms(0),
+            vec![1],
+            0,
+        );
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: immature.txid,
+                output_index: immature.output_index,
+                unlocking_script: immature.locking_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: immature.value_atoms.saturating_sub(1_000_000),
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let tx = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: immature.value_atoms.saturating_sub(fee_atoms),
+                locking_script: vec![2],
+            }],
+            ..tx
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+
+        let err = validate_transaction_with_context(
+            &tx,
+            fee_atoms,
+            COINBASE_MATURITY_BLOCKS - 2,
+            |_, _| Some(immature.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(err, ValidationError::InsufficientConfirmations);
+    }
+
+    #[test]
+    fn transaction_validation_rejects_immature_standard_spends() {
+        let mature_height = 10;
+        let utxo = UtxoEntry::new(
+            Network::Mainnet,
+            [9; 48],
+            0,
+            25_000_000,
+            vec![1],
+            mature_height,
+            false,
+        );
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: utxo.txid,
+                output_index: utxo.output_index,
+                unlocking_script: utxo.locking_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: utxo.value_atoms.saturating_sub(1_000),
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+
+        let spend_height = mature_height + STANDARD_TX_CONFIRMATIONS - 2;
+        let err = validate_transaction_with_context(&tx, fee_atoms, spend_height, |_, _| {
+            Some(utxo.clone())
+        })
+        .unwrap_err();
+        assert_eq!(err, ValidationError::InsufficientConfirmations);
+    }
+
+    #[test]
     fn transaction_validation_rejects_duplicates_and_zero_values() {
         let tx = Transaction {
             version: 1,
@@ -655,6 +768,38 @@ mod tests {
         block.fees_miner_atoms = 0;
 
         assert_eq!(validate_block(&block, 0, Network::Mainnet), Ok(()));
+    }
+
+    #[test]
+    fn block_validation_rejects_timestamp_warp() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let header = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
+            previous_block_hash: [0; 48],
+            merkle_root: block::merkle_root(std::slice::from_ref(&tx)),
+            witness_root: witness_root(std::slice::from_ref(&tx)),
+            timestamp: 76,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            nonce: 0,
+        };
+        let mut block = Block::new(header, vec![tx]);
+        block.fees_miner_atoms = 0;
+
+        assert_eq!(
+            validate_block(&block, 1, Network::Mainnet),
+            Err(ValidationError::InvalidBlockTimestamp)
+        );
     }
 
     #[test]
@@ -793,7 +938,7 @@ mod tests {
                 previous_block_hash: [2; 48],
                 merkle_root: block::merkle_root(&[coinbase.clone(), tx.clone()]),
                 witness_root: witness_root(&[coinbase.clone(), tx.clone()]),
-                timestamp: 150,
+                timestamp: 75,
                 difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
                 nonce: 0,
             },

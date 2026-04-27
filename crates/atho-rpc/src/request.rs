@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum RpcRequest {
     GetBlockCount,
     GetNetwork,
+    GetNodeStatus,
     GetBlockTemplate,
     SubmitBlock(Block),
     SubmitTransaction {
@@ -14,4 +15,5 @@ pub enum RpcRequest {
     },
     ListUtxos,
     GetMempoolInfo,
+    GetMempoolSpentInputs,
 }

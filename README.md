@@ -5,7 +5,8 @@ Atho is a from-scratch Rust payment system built around a full node, HD wallet, 
 It is designed to behave like a real blockchain payment stack:
 - transactions are signed, validated, and stored in atoms
 - blocks are mined against difficulty and only accepted after validation
-- chainstate and UTXO data are updated only after consensus checks pass
+- chainstate, UTXO, block archive, transaction archive, peer metadata, and address metadata are stored durably in per-network LMDB environments, one dataset per environment
+- the mempool stays in RAM and is rebuilt after restart
 - the desktop client stays thin and talks to the node over RPC
 
 The codebase is intentionally split into small crates so the trusted core stays simple, auditable, and fast.
@@ -28,7 +29,7 @@ The codebase is intentionally split into small crates so the trusted core stays 
 
 - `atho-core` - protocol constants, consensus, transaction, block, address, and genesis logic
 - `atho-crypto` - thin Falcon and Kyber boundary layer
-- `atho-storage` - chainstate and UTXO storage
+- `atho-storage` - LMDB-backed chainstate, UTXO, block archive, and peer/address storage
 - `atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
 - `atho-p2p` - wire codec, peer protocol, and sync state
 - `atho-rpc` - small RPC surface for the client and miner
@@ -105,7 +106,7 @@ The desktop client is intentionally thin and still depends on the node for heavy
 crates/
   atho-core/      consensus, tx, block, address, genesis
   atho-crypto/    Falcon and Kyber wrappers
-  atho-storage/   chainstate and UTXO storage
+  atho-storage/   LMDB-backed chainstate, UTXO, block archive, peer/address storage
   atho-wallet/    HD wallet and address generation
   atho-p2p/       peer protocol and sync
   atho-rpc/       node/client RPC surface

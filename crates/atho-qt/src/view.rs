@@ -7,7 +7,10 @@ pub struct ViewModel {
     pub network_label: String,
     pub block_count: u64,
     pub mempool_count: usize,
+    pub mempool_total_fee_atoms: u64,
     pub sync_best_height: u64,
+    pub running: bool,
+    pub headers_synced: bool,
     pub ui_state: UiState,
     pub sync_stage: String,
 }
@@ -24,12 +27,15 @@ impl ViewModel {
                 self.sync_stage = String::from("Online");
             }
             RpcResponse::BlockTemplate(_)
+            | RpcResponse::NodeStatus(_)
             | RpcResponse::BlockSubmitted { .. }
             | RpcResponse::TransactionSubmitted(_)
             | RpcResponse::Utxos(_)
-            | RpcResponse::MempoolInfo(_) => {}
+            | RpcResponse::MempoolInfo(_)
+            | RpcResponse::MempoolSpentInputs(_) => {}
             RpcResponse::Error(RpcError::MethodNotFound)
-            | RpcResponse::Error(RpcError::InvalidRequest)
+            | RpcResponse::Error(RpcError::InvalidRequest(_))
+            | RpcResponse::Error(RpcError::Validation(_))
             | RpcResponse::Error(RpcError::Internal) => {
                 self.sync_stage = String::from("Disconnected");
             }

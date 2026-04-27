@@ -10,6 +10,7 @@ pub mod miner;
 pub mod node;
 pub mod orchestrator;
 pub mod runtime;
+pub mod service;
 pub mod sync;
 pub mod system;
 pub mod validation;

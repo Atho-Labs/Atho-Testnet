@@ -236,4 +236,20 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
     }
+
+    #[test]
+    fn mnemonic_parse_rejects_bad_checksum() {
+        let phrase = MnemonicPhrase::from_entropy(&[0u8; 32], MnemonicLength::Words24).unwrap();
+        let mut words = phrase.words().to_vec();
+        words[0] = if words[0] == wordlist::index_to_word(0).unwrap() {
+            wordlist::index_to_word(1).unwrap().to_string()
+        } else {
+            wordlist::index_to_word(0).unwrap().to_string()
+        };
+        let altered = words.join(" ");
+        assert!(matches!(
+            MnemonicPhrase::parse(&altered),
+            Err(MnemonicError::ChecksumMismatch)
+        ));
+    }
 }

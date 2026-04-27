@@ -26,12 +26,27 @@ fn run() -> Result<(), String> {
     let miner = Miner::new(cores as u32);
     let rpc_address = rpc_addr_from_args(&args)?.unwrap_or_else(|| default_rpc_address(network));
     let client = RpcClient::new(rpc_address.clone());
+    let _ = atho_node::dev::append_log(
+        "miner",
+        &format!(
+            "cli mining request network={} rpc={} cores={cores}",
+            network.id(),
+            rpc_address
+        ),
+    );
+    println!(
+        "mining on {} rpc={} cores={cores}",
+        network.id(),
+        rpc_address
+    );
+    println!("requesting block template...");
     let template = match client.call(&RpcRequest::GetBlockTemplate) {
         Ok(RpcResponse::BlockTemplate(template)) => template,
         Ok(RpcResponse::Error(err)) => return Err(err.to_string()),
         Ok(other) => return Err(format!("unexpected rpc response: {other:?}")),
         Err(err) => return Err(err.to_string()),
     };
+    println!("solving block at height {}", template.height);
     let block = miner.solve_block(template.block);
     match client.call(&RpcRequest::SubmitBlock(block.clone())) {
         Ok(RpcResponse::BlockSubmitted { accepted: true, .. }) => {}
@@ -61,6 +76,14 @@ fn run() -> Result<(), String> {
     println!("nonce={}", block.header.nonce);
     println!("tx_count={}", block.transactions.len());
     println!("block_bytes_hex={}", hex::encode(block.full_bytes()));
+    let _ = atho_node::dev::append_log(
+        "miner",
+        &format!(
+            "cli mining complete hash={} height={}",
+            hex::encode(block.header.block_hash()),
+            block.header.height
+        ),
+    );
     Ok(())
 }
 
