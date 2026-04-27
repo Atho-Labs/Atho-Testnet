@@ -3,11 +3,21 @@ use atho_core::network::Network;
 fn main() {
     let _ = atho_node::dev::append_log("atho-qt", "starting atho-qt");
     let (network, rpc_address) = parse_args();
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("Atho")
+            .with_inner_size([1000.0, 660.0])
+            .with_min_inner_size([700.0, 440.0])
+            .with_icon(atho_qt::resources::app_icon()),
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Light,
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "Atho",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Box::new(atho_qt::app::DesktopApp::new_with_rpc(
                 network,
                 rpc_address.clone(),

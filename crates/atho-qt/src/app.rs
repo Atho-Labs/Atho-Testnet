@@ -1,142 +1,46 @@
-use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection};
+use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection, StatusMonitor};
 use crate::error::QtError;
 use crate::state::UiState;
 use crate::view::ViewModel;
 use atho_core::address::decode_base56_address;
-use atho_core::constants::{BLOCK_TIME_SECONDS, MIN_TX_FEE_ATOMS};
+use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
+use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+use atho_crypto::falcon::{
+    sign, FalconKeypair, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MAX_BYTES,
+};
 use atho_node::miner::Miner;
+use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
+use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
 use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::{Wallet, WalletAddress};
 use eframe::egui;
 use getrandom::getrandom;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NavTab {
-    Overview,
-    Send,
-    Receive,
-    Transactions,
-    Settings,
-}
-
-impl NavTab {
-    fn all() -> [NavTab; 5] {
-        [
-            NavTab::Overview,
-            NavTab::Send,
-            NavTab::Receive,
-            NavTab::Transactions,
-            NavTab::Settings,
-        ]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            NavTab::Overview => "Overview",
-            NavTab::Send => "Send",
-            NavTab::Receive => "Receive",
-            NavTab::Transactions => "Transactions",
-            NavTab::Settings => "Settings",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchPage {
-    Welcome,
-    CreateWallet,
-    ImportWallet,
-    OpenWallet,
-}
-
-#[derive(Debug)]
-struct CreateWalletForm {
-    wallet_path: String,
-    wallet_password: String,
-    wallet_password_confirm: String,
-    mnemonic_passphrase: String,
-    mnemonic_text: String,
-    acknowledged_backup: bool,
-}
-
-impl CreateWalletForm {
-    fn new(network: Network) -> Self {
-        Self {
-            wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
-            wallet_password: String::new(),
-            wallet_password_confirm: String::new(),
-            mnemonic_passphrase: String::new(),
-            mnemonic_text: String::new(),
-            acknowledged_backup: false,
-        }
-    }
-
-    fn reset_phrase(&mut self) {
-        self.mnemonic_text.clear();
-        self.acknowledged_backup = false;
-    }
-}
-
-#[derive(Debug)]
-struct ImportWalletForm {
-    wallet_path: String,
-    wallet_password: String,
-    wallet_password_confirm: String,
-    mnemonic_phrase: String,
-    mnemonic_passphrase: String,
-}
-
-impl ImportWalletForm {
-    fn new(network: Network) -> Self {
-        Self {
-            wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
-            wallet_password: String::new(),
-            wallet_password_confirm: String::new(),
-            mnemonic_phrase: String::new(),
-            mnemonic_passphrase: String::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct OpenWalletForm {
-    wallet_path: String,
-    wallet_password: String,
-}
-
-impl OpenWalletForm {
-    fn new(network: Network) -> Self {
-        Self {
-            wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
-            wallet_password: String::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct MiningOutcome {
-    height: u64,
-    block_hash: [u8; 48],
-    accepted: bool,
-    message: String,
-}
-
-struct MiningJob {
-    started_at: Instant,
-    receiver: mpsc::Receiver<Result<MiningOutcome, String>>,
-}
+mod dialogs;
+mod models;
+mod pages;
+mod shell;
+mod startup;
+mod theme;
+mod widgets;
+pub(crate) use models::{
+    CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningOutcome, NavTab,
+    OpenWalletForm, ReceiveRequestRecord, SendJob, SendOutcome, WalletActivityRow,
+};
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
+    status_monitor: StatusMonitor,
     pub ui_state: UiState,
     pub view_model: ViewModel,
     wallet: Option<Wallet>,
@@ -147,19 +51,33 @@ pub struct DesktopApp {
     create_form: CreateWalletForm,
     import_form: ImportWalletForm,
     open_form: OpenWalletForm,
-    needs_initial_refresh: bool,
     last_error: Option<String>,
     active_tab: NavTab,
     send_to: String,
     send_label: String,
     send_amount: String,
+    send_subtract_fee: bool,
     send_fee: String,
     receive_label: String,
+    receive_amount: String,
+    receive_message: String,
     send_status: String,
+    send_job: Option<SendJob>,
     mining_status: String,
     mining_job: Option<MiningJob>,
     last_mined_block_hash: Option<[u8; 48]>,
-    last_status_poll: Instant,
+    requested_payments: Vec<ReceiveRequestRecord>,
+    selected_receive_request: Option<usize>,
+    transaction_search: String,
+    transaction_min_amount: String,
+    transaction_date_filter: usize,
+    transaction_type_filter: usize,
+    show_about_dialog: bool,
+    wallet_utxos_cache: Vec<UtxoEntry>,
+    wallet_activity_cache: Vec<WalletActivityRow>,
+    wallet_balance_cache: u64,
+    theme_initialized: bool,
+    compact_viewport: bool,
 }
 
 impl DesktopApp {
@@ -172,15 +90,12 @@ impl DesktopApp {
             Some(address) => ReadOnlyNodeConnection::with_rpc_address(network, address),
             None => ReadOnlyNodeConnection::new(network),
         };
-        let default_wallet_path = default_wallet_path(network);
-        let launch_page = if default_wallet_path.exists() {
-            LaunchPage::OpenWallet
-        } else {
-            LaunchPage::CreateWallet
-        };
+        let status_monitor = connection.spawn_status_monitor(Duration::from_secs(1));
+        let launch_page = LaunchPage::Welcome;
 
-        Self {
+        let mut app = Self {
             connection,
+            status_monitor,
             ui_state: UiState {
                 mining_cores: 4,
                 ..UiState::default()
@@ -194,25 +109,51 @@ impl DesktopApp {
             create_form: CreateWalletForm::new(network),
             import_form: ImportWalletForm::new(network),
             open_form: OpenWalletForm::new(network),
-            needs_initial_refresh: true,
             last_error: None,
             active_tab: NavTab::Overview,
             send_to: String::new(),
             send_label: String::new(),
             send_amount: String::new(),
+            send_subtract_fee: false,
             send_fee: String::new(),
             receive_label: String::new(),
+            receive_amount: String::new(),
+            receive_message: String::new(),
             send_status: String::from("Enter a destination and integer atom amounts."),
+            send_job: None,
             mining_status: String::from("Idle"),
             mining_job: None,
             last_mined_block_hash: None,
-            last_status_poll: Instant::now(),
-        }
+            requested_payments: Vec::new(),
+            selected_receive_request: None,
+            transaction_search: String::new(),
+            transaction_min_amount: String::new(),
+            transaction_date_filter: 0,
+            transaction_type_filter: 0,
+            show_about_dialog: false,
+            wallet_utxos_cache: Vec::new(),
+            wallet_activity_cache: Vec::new(),
+            wallet_balance_cache: 0,
+            theme_initialized: false,
+            compact_viewport: false,
+        };
+
+        app.view_model.network_label = app.connection.network().id().to_string();
+        app.view_model.sync_stage = if app.connection.has_local_node() {
+            String::from("Starting node")
+        } else {
+            String::from("Disconnected")
+        };
+        app.try_open_existing_wallet_on_startup();
+        app
     }
 
     pub fn refresh(&mut self) -> Result<(), QtError> {
         let status = self.connection.status();
         self.apply_connection_status(status);
+        if self.wallet.is_some() {
+            self.refresh_wallet_cache();
+        }
         Ok(())
     }
 
@@ -242,6 +183,80 @@ impl DesktopApp {
 
     fn wallet_ref(&self) -> Option<&Wallet> {
         self.wallet.as_ref()
+    }
+
+    fn wallet_file_label(&self) -> String {
+        self.wallet_path
+            .as_ref()
+            .and_then(|path| {
+                PathBuf::from(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| String::from("wallet.dat"))
+    }
+
+    fn refresh_wallet_cache(&mut self) {
+        let Some(_wallet) = self.wallet_ref() else {
+            self.wallet_utxos_cache.clear();
+            self.wallet_activity_cache.clear();
+            self.wallet_balance_cache = 0;
+            return;
+        };
+        let RpcResponse::Utxos(utxos) = self.connection.request(RpcRequest::ListUtxos) else {
+            return;
+        };
+
+        let (owned, activities, balance) = {
+            let wallet = self.wallet_ref().expect("wallet checked above");
+            let mut owned = utxos
+                .into_iter()
+                .filter(|utxo| match utxo.locking_script.as_slice().try_into() {
+                    Ok(digest) => wallet.address_for_payment_digest(&digest).is_some(),
+                    Err(_) => false,
+                })
+                .collect::<Vec<_>>();
+            owned.sort_by(|left, right| {
+                right
+                    .txid
+                    .cmp(&left.txid)
+                    .then(right.output_index.cmp(&left.output_index))
+            });
+            let balance = owned.iter().map(|utxo| utxo.value_atoms).sum();
+            let activities = owned
+                .iter()
+                .map(|utxo| {
+                    let label = match utxo.locking_script.as_slice().try_into() {
+                        Ok(digest) => wallet
+                            .address_for_payment_digest(&digest)
+                            .map(|address| address.address)
+                            .unwrap_or_else(|| widgets::short_hash(&utxo.txid)),
+                        Err(_) => widgets::short_hash(&utxo.txid),
+                    };
+
+                    WalletActivityRow {
+                        when: String::from("Current"),
+                        kind: "Received",
+                        label,
+                        amount_atoms: utxo.value_atoms,
+                        reference: widgets::short_hash(&utxo.txid),
+                    }
+                })
+                .collect();
+            (owned, activities, balance)
+        };
+
+        self.wallet_utxos_cache = owned;
+        self.wallet_activity_cache = activities;
+        self.wallet_balance_cache = balance;
+    }
+
+    fn wallet_balance_atoms(&self) -> u64 {
+        self.wallet_balance_cache
+    }
+
+    fn wallet_activity_rows(&self) -> &[WalletActivityRow] {
+        &self.wallet_activity_cache
     }
 
     fn attach_wallet(&mut self, mut wallet: Wallet, wallet_path: String) {
@@ -274,6 +289,7 @@ impl DesktopApp {
         self.wallet_path = Some(wallet_path);
         self.wallet = Some(wallet);
         self.sync_wallet_state();
+        self.refresh_wallet_cache();
         self.active_tab = NavTab::Overview;
         self.launch_page = LaunchPage::Welcome;
     }
@@ -297,7 +313,7 @@ impl DesktopApp {
                 self.mining_status = format!("{} at height {}", outcome.message, outcome.height);
                 if outcome.accepted {
                     self.last_error = None;
-                    let _ = self.refresh();
+                    self.refresh_wallet_cache();
                     if self.ui_state.generate_coins {
                         self.start_mining_job();
                     }
@@ -320,6 +336,38 @@ impl DesktopApp {
         if self.mining_job.is_none() {
             let elapsed = job.started_at.elapsed();
             self.mining_status = format!("{} ({}s)", self.mining_status, elapsed.as_secs());
+        }
+    }
+
+    fn poll_send_job(&mut self) {
+        let Some(job) = self.send_job.take() else {
+            return;
+        };
+
+        match job.receiver.try_recv() {
+            Ok(Ok(outcome)) => {
+                self.send_fee = outcome.fee_atoms.to_string();
+                self.send_status = outcome.message;
+                self.last_error = None;
+                self.refresh_wallet_cache();
+            }
+            Ok(Err(err)) => {
+                self.send_status = String::from("Submission failed");
+                self.last_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.send_job = Some(job);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.send_status = String::from("Submission worker disconnected");
+                self.last_error = Some(String::from("submission worker disconnected"));
+            }
+        }
+
+        if self.send_job.is_none() {
+            let elapsed = job.started_at.elapsed();
+            self.send_status = format!("{} ({}s)", self.send_status, elapsed.as_secs());
         }
     }
 
@@ -391,6 +439,29 @@ impl DesktopApp {
         Ok(wallet)
     }
 
+    fn try_open_existing_wallet_on_startup(&mut self) {
+        let path = default_wallet_path(self.connection.network());
+        if !path.exists() {
+            self.launch_page = LaunchPage::Welcome;
+            return;
+        }
+
+        let wallet_path = path.to_string_lossy().into_owned();
+        self.open_form.wallet_path = wallet_path.clone();
+        self.open_form.wallet_password.clear();
+
+        match self.open_wallet_from_path(&wallet_path, "") {
+            Ok(wallet) => {
+                self.load_or_create_wallet(wallet, wallet_path);
+                self.last_error = None;
+            }
+            Err(_) => {
+                self.launch_page = LaunchPage::OpenWallet;
+                self.last_error = None;
+            }
+        }
+    }
+
     fn load_or_create_wallet(&mut self, wallet: Wallet, wallet_path: String) {
         self.attach_wallet(wallet, wallet_path);
         self.send_status = String::from("Wallet loaded");
@@ -421,6 +492,52 @@ impl DesktopApp {
         self.receive_label.clear();
     }
 
+    fn create_receive_request(&mut self) {
+        if self.wallet.is_none() {
+            self.last_error = Some(String::from("Load or create a wallet first"));
+            return;
+        }
+
+        let requested_amount = if self.receive_amount.trim().is_empty() {
+            None
+        } else {
+            match self.receive_amount.trim().parse::<u64>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => {
+                    self.last_error = Some(String::from(
+                        "Requested amount must be an integer atom value",
+                    ));
+                    return;
+                }
+            }
+        };
+
+        let label = self.receive_label.trim().to_owned();
+        let message = self.receive_message.trim().to_owned();
+        self.generate_receive_address();
+        let address = self.current_receive_address_text();
+        if address.is_empty() {
+            return;
+        }
+        let sequence = self
+            .requested_payments
+            .iter()
+            .map(|request| request.sequence)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.requested_payments.push(ReceiveRequestRecord {
+            sequence,
+            label,
+            message,
+            amount_atoms: requested_amount,
+            address,
+        });
+        self.selected_receive_request = Some(sequence);
+        self.receive_amount.clear();
+        self.receive_message.clear();
+    }
+
     #[allow(dead_code)]
     fn generate_change_address(&mut self) {
         let (address, snapshot) = {
@@ -438,6 +555,298 @@ impl DesktopApp {
         self.send_status = String::from("Change address generated");
     }
 
+    fn submit_send_transaction(&mut self) -> Result<(), String> {
+        if self.send_job.is_some() {
+            return Err(String::from("A send submission is already in progress"));
+        }
+
+        let destination = self.send_to.trim();
+        if destination.is_empty() {
+            return Err(String::from("Enter a destination address"));
+        }
+        let amount = self
+            .send_amount
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| String::from("Amount must be an integer atom value"))?;
+        if amount == 0 {
+            return Err(String::from("Amount must be greater than zero"));
+        }
+
+        let (recipient_digest, network) =
+            decode_base56_address(destination).map_err(|err| err.to_string())?;
+        if network != self.connection.network() {
+            return Err(format!("Address belongs to {}", network.id()));
+        }
+
+        if self.wallet_utxos_cache.is_empty() {
+            return Err(String::from(
+                "No cached wallet UTXOs available; refresh the wallet first",
+            ));
+        }
+
+        let (_selected_address, selected_utxos, keypair) = {
+            let wallet = self
+                .wallet_ref()
+                .ok_or_else(|| String::from("Load or create a wallet first"))?;
+            let mut grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)> = BTreeMap::new();
+            for utxo in self.wallet_utxos_cache.clone() {
+                let digest: [u8; 32] = match utxo.locking_script.as_slice().try_into() {
+                    Ok(digest) => digest,
+                    Err(_) => continue,
+                };
+                if let Some(address) = wallet.address_for_payment_digest(&digest) {
+                    let key = hex::encode(address.payment_digest);
+                    grouped
+                        .entry(key)
+                        .or_insert((address, Vec::new()))
+                        .1
+                        .push(utxo);
+                }
+            }
+
+            let Some((selected_address, selected_utxos)) =
+                Self::select_wallet_utxos(grouped, amount)?
+            else {
+                return Err(String::from("No spendable wallet UTXOs available"));
+            };
+
+            let keypair = wallet.keypair_for_path(selected_address.path);
+            (selected_address, selected_utxos, keypair)
+        };
+
+        let total_input_atoms: u64 = selected_utxos.iter().map(|utxo| utxo.value_atoms).sum();
+        let fee_with_change = Self::estimate_fee(selected_utxos.len(), 2);
+        if total_input_atoms < amount.saturating_add(fee_with_change) {
+            return Err(String::from("selected inputs do not cover amount plus fee"));
+        }
+        let change_address = Some(
+            self.wallet_mut()
+                .ok_or_else(|| String::from("Load or create a wallet first"))?
+                .checkout_change_address_with_label(None),
+        );
+        let provisional_change = total_input_atoms
+            .checked_sub(amount)
+            .and_then(|value| value.checked_sub(fee_with_change))
+            .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
+        let provisional = Self::build_signed_spend_transaction(
+            &keypair,
+            &selected_utxos,
+            recipient_digest,
+            amount,
+            provisional_change,
+            change_address.clone(),
+        )?;
+        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let final_change = total_input_atoms
+            .checked_sub(amount)
+            .and_then(|value: u64| value.checked_sub(fee_atoms))
+            .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
+        if final_change == 0 {
+            return Err(String::from(
+                "selected inputs do not leave change for privacy",
+            ));
+        }
+        let final_transaction = Self::build_signed_spend_transaction(
+            &keypair,
+            &selected_utxos,
+            recipient_digest,
+            amount,
+            final_change,
+            change_address,
+        )?;
+        let fee_atoms = final_transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let (sender, receiver) = mpsc::channel();
+        let rpc_address = self.connection.rpc_address().to_string();
+        std::thread::spawn(move || {
+            let client = RpcClient::new(rpc_address);
+            let result = match client.call(&RpcRequest::SubmitTransaction {
+                transaction: final_transaction,
+                fee_atoms,
+            }) {
+                Ok(RpcResponse::TransactionSubmitted(txid)) => Ok(SendOutcome {
+                    fee_atoms,
+                    message: format!("Transaction submitted {}", hex::encode(txid)),
+                }),
+                Ok(RpcResponse::Error(err)) => Err(err.to_string()),
+                Ok(other) => Err(format!("unexpected rpc response: {other:?}")),
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = sender.send(result);
+        });
+
+        self.send_fee = fee_atoms.to_string();
+        self.send_status = String::from("Submitting transaction...");
+        self.last_error = None;
+        self.send_job = Some(SendJob {
+            started_at: Instant::now(),
+            receiver,
+        });
+        Ok(())
+    }
+
+    fn select_wallet_utxos(
+        grouped: BTreeMap<String, (WalletAddress, Vec<UtxoEntry>)>,
+        amount_atoms: u64,
+    ) -> Result<Option<(WalletAddress, Vec<UtxoEntry>)>, String> {
+        let mut best: Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)> = None;
+
+        for (_key, (address, mut utxos)) in grouped {
+            utxos.sort_by(|a, b| b.value_atoms.cmp(&a.value_atoms).then(a.txid.cmp(&b.txid)));
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+            for utxo in utxos {
+                total = total.saturating_add(utxo.value_atoms);
+                selected.push(utxo);
+                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+                let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
+                if total >= amount_atoms.saturating_add(estimate_change_fee) {
+                    let candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize) =
+                        (address.clone(), selected.clone(), total, selected.len());
+                    best = Self::prefer_candidate(best, candidate);
+                    break;
+                }
+                if total >= amount_atoms.saturating_add(estimate_exact_fee) {
+                    let candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize) =
+                        (address.clone(), selected.clone(), total, selected.len());
+                    best = Self::prefer_candidate(best, candidate);
+                }
+            }
+        }
+
+        Ok(best.map(|(address, selected, _, _)| (address, selected)))
+    }
+
+    fn prefer_candidate(
+        current: Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)>,
+        candidate: (WalletAddress, Vec<UtxoEntry>, u64, usize),
+    ) -> Option<(WalletAddress, Vec<UtxoEntry>, u64, usize)> {
+        match current {
+            None => Some(candidate),
+            Some(existing) => {
+                let existing_inputs = existing.3;
+                let candidate_inputs = candidate.3;
+                if candidate_inputs < existing_inputs
+                    || (candidate_inputs == existing_inputs && candidate.2 < existing.2)
+                {
+                    Some(candidate)
+                } else {
+                    Some(existing)
+                }
+            }
+        }
+    }
+
+    fn estimate_fee(input_count: usize, output_count: usize) -> u64 {
+        let mut inputs = Vec::with_capacity(input_count);
+        for index in 0..input_count {
+            inputs.push(TxInput {
+                previous_txid: [0; 48],
+                output_index: index as u32,
+                unlocking_script: vec![0; 32],
+            });
+        }
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            outputs.push(TxOutput {
+                value_atoms: 1,
+                locking_script: vec![0; 32],
+            });
+        }
+        let witness = TxWitness {
+            signature: vec![0; FALCON_512_SIGNATURE_MAX_BYTES],
+            pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
+            input_refs: (0..input_count)
+                .map(|_| atho_core::transaction::WitnessInputRef {
+                    sig_ref_short: [0; 2],
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        }
+        .canonical_bytes();
+        Transaction {
+            version: 1,
+            inputs,
+            outputs,
+            lock_time: 0,
+            witness,
+        }
+        .vsize_bytes() as u64
+            * MIN_TX_FEE_PER_VBYTE_ATOMS
+    }
+
+    fn build_signed_spend_transaction(
+        keypair: &FalconKeypair,
+        selected_utxos: &[UtxoEntry],
+        recipient_digest: [u8; 32],
+        amount_atoms: u64,
+        change_atoms: u64,
+        change_address: Option<WalletAddress>,
+    ) -> Result<Transaction, String> {
+        let mut outputs = vec![TxOutput {
+            value_atoms: amount_atoms,
+            locking_script: recipient_digest.to_vec(),
+        }];
+        if change_atoms > 0 {
+            let change = change_address.ok_or_else(|| String::from("missing change address"))?;
+            outputs.push(TxOutput {
+                value_atoms: change_atoms,
+                locking_script: change.payment_digest.to_vec(),
+            });
+        }
+
+        let inputs: Vec<TxInput> = selected_utxos
+            .iter()
+            .map(|utxo| TxInput {
+                previous_txid: utxo.txid,
+                output_index: utxo.output_index,
+                unlocking_script: utxo.locking_script.clone(),
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs,
+            outputs,
+            lock_time: 0,
+            witness: vec![],
+        };
+        let digest = tx.signing_digest();
+        let signature = sign(&keypair.secret_key, &digest)
+            .map_err(|err: atho_crypto::error::CryptoError| err.to_string())?;
+        let txid = tx.txid();
+        let sig_bytes = signature.0.clone();
+        tx.witness = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: selected_utxos
+                .iter()
+                .enumerate()
+                .map(|(index, _utxo)| atho_core::transaction::WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        }
+        .canonical_bytes();
+        let witness_root = tx.witness_commitment_hash();
+        let input_refs = selected_utxos
+            .iter()
+            .enumerate()
+            .map(|(index, _utxo)| atho_core::transaction::WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, index as u32),
+            })
+            .collect();
+        tx.witness = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs,
+        }
+        .canonical_bytes();
+        Ok(tx)
+    }
+
     fn current_receive_address_text(&self) -> String {
         self.current_receive_address
             .as_ref()
@@ -445,41 +854,27 @@ impl DesktopApp {
             .unwrap_or_default()
     }
 
-    fn validate_send_draft(&mut self) {
-        let address = self.send_to.trim();
-        if address.is_empty() {
-            self.send_status = String::from("Enter a destination address");
+    fn selected_receive_request(&self) -> Option<&ReceiveRequestRecord> {
+        let selected = self.selected_receive_request?;
+        self.requested_payments
+            .iter()
+            .find(|request| request.sequence == selected)
+    }
+
+    fn select_receive_request(&mut self, sequence: usize) {
+        self.selected_receive_request = Some(sequence);
+    }
+
+    fn remove_selected_receive_request(&mut self) {
+        let Some(selected) = self.selected_receive_request else {
             return;
-        }
-
-        let amount = match self.send_amount.trim().parse::<u64>() {
-            Ok(value) if value > 0 => value,
-            _ => {
-                self.send_status = String::from("Amount must be an integer atom value");
-                return;
-            }
         };
-        let fee = match self.send_fee.trim().parse::<u64>() {
-            Ok(value) => value,
-            _ => {
-                self.send_status = String::from("Fee must be an integer atom value");
-                return;
-            }
-        };
-
-        match decode_base56_address(address) {
-            Ok((_digest, network)) if network == self.connection.network() => {
-                self.send_status =
-                    format!("Draft prepared for {} atoms with {} atom fee", amount, fee);
-                self.last_error = None;
-            }
-            Ok((_digest, network)) => {
-                self.send_status = format!("Address belongs to {}", network.id());
-            }
-            Err(err) => {
-                self.send_status = err.to_string();
-            }
-        }
+        self.requested_payments
+            .retain(|request| request.sequence != selected);
+        self.selected_receive_request = self
+            .requested_payments
+            .last()
+            .map(|request| request.sequence);
     }
 
     fn copy_text(ui: &mut egui::Ui, text: String) {
@@ -488,825 +883,49 @@ impl DesktopApp {
         });
     }
 
-    fn show_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            for tab in NavTab::all() {
-                let selected = self.active_tab == tab;
-                let mut button = egui::Button::new(tab.label());
-                if selected {
-                    button =
-                        button
-                            .fill(egui::Color32::from_rgb(72, 72, 72))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                egui::Color32::from_rgb(247, 147, 26),
-                            ));
-                }
-                if ui.add_sized([96.0, 28.0], button).clicked() {
-                    self.active_tab = tab;
-                }
-            }
-
-            ui.separator();
-            if ui.button("Refresh").clicked() {
-                if let Err(err) = self.refresh() {
-                    self.last_error = Some(err.to_string());
-                }
-            }
-        });
-    }
-
-    fn card<R>(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-        egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgb(50, 50, 50))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 24, 24)))
-            .rounding(egui::Rounding::same(8.0))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(title)
-                        .size(18.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(248, 248, 248)),
-                );
-                ui.add_space(6.0);
-                add_contents(ui)
-            })
-            .inner
-    }
-
-    fn apply_theme(&self, ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(45, 45, 45);
-        visuals.window_fill = egui::Color32::from_rgb(41, 41, 41);
-        visuals.extreme_bg_color = egui::Color32::from_rgb(24, 24, 24);
-        visuals.faint_bg_color = egui::Color32::from_rgb(56, 56, 56);
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(41, 41, 41);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(70, 70, 70);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(82, 82, 82);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(95, 95, 95);
-        visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(237, 237, 237);
-        visuals.widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(255, 255, 255);
-        visuals.widgets.active.fg_stroke.color = egui::Color32::from_rgb(255, 255, 255);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(247, 147, 26);
-        visuals.selection.stroke.color = egui::Color32::from_rgb(247, 147, 26);
-        visuals.override_text_color = Some(egui::Color32::from_rgb(236, 236, 236));
-        ctx.set_visuals(visuals);
-
-        let mut style = (*ctx.style()).clone();
-        let heading = egui::FontId::new(20.0, egui::FontFamily::Proportional);
-        let body = egui::FontId::new(14.0, egui::FontFamily::Proportional);
-        let button = egui::FontId::new(13.0, egui::FontFamily::Proportional);
-        let small = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-        style.text_styles.insert(egui::TextStyle::Heading, heading);
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, body.clone());
-        style.text_styles.insert(egui::TextStyle::Button, button);
-        style.text_styles.insert(egui::TextStyle::Monospace, body);
-        style.text_styles.insert(egui::TextStyle::Small, small);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.interact_size = egui::vec2(36.0, 24.0);
-        ctx.set_style(style);
-    }
-
-    fn show_welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(24.0);
-            ui.heading("Atho");
-            ui.label("A lightweight full node and HD wallet client.");
-            ui.add_space(16.0);
-            Self::card(ui, "Start", |ui| {
-                ui.label(format!("Network: {}", self.view_model.network_label));
-                ui.label(format!("RPC: {}", self.connection.rpc_address()));
-                ui.label(format!("Connected: {}", self.ui_state.connected));
-                ui.add_space(10.0);
-                if ui
-                    .add_sized([180.0, 30.0], egui::Button::new("Create Wallet"))
-                    .clicked()
-                {
-                    self.create_form = CreateWalletForm::new(self.connection.network());
-                    if let Err(err) = self.generate_create_mnemonic() {
-                        self.last_error = Some(err);
-                    }
-                    self.launch_page = LaunchPage::CreateWallet;
-                }
-                if ui
-                    .add_sized([180.0, 30.0], egui::Button::new("Import Wallet"))
-                    .clicked()
-                {
-                    self.import_form = ImportWalletForm::new(self.connection.network());
-                    self.launch_page = LaunchPage::ImportWallet;
-                }
-                if ui
-                    .add_sized([180.0, 30.0], egui::Button::new("Open Wallet"))
-                    .clicked()
-                {
-                    self.open_form = OpenWalletForm::new(self.connection.network());
-                    self.launch_page = LaunchPage::OpenWallet;
-                }
-            });
-        });
-    }
-
-    fn show_create_wallet(&mut self, ui: &mut egui::Ui) {
-        let mut create_clicked = false;
-        let mut cancel_clicked = false;
-        Self::card(ui, "Create Wallet", |ui| {
-            ui.label("Create a new HD wallet and encrypt it on disk.");
-            ui.add_space(6.0);
-            ui.label("Wallet file");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.create_form.wallet_path),
-            );
-            ui.label("Wallet password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.create_form.wallet_password).password(true),
-            );
-            ui.label("Confirm password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.create_form.wallet_password_confirm)
-                    .password(true),
-            );
-            ui.label("Seed passphrase (optional)");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.create_form.mnemonic_passphrase)
-                    .password(true),
-            );
-            ui.add_space(10.0);
-            if !self.create_form.mnemonic_text.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(247, 147, 26),
-                    "Write this recovery phrase down now. It is shown once.",
-                );
-                let mut phrase = self.create_form.mnemonic_text.clone();
-                ui.add(
-                    egui::TextEdit::multiline(&mut phrase)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .interactive(false),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Copy phrase").clicked() {
-                        Self::copy_text(ui, self.create_form.mnemonic_text.clone());
-                    }
-                    ui.checkbox(
-                        &mut self.create_form.acknowledged_backup,
-                        "I have backed up the recovery phrase",
-                    );
-                });
-            } else {
-                ui.label("Mnemonic generation failed. Go back and try again.");
-            }
-
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                let ready = !self.create_form.mnemonic_text.is_empty()
-                    && self.create_form.acknowledged_backup
-                    && !self.create_form.wallet_password.is_empty()
-                    && self.create_form.wallet_password == self.create_form.wallet_password_confirm;
-                if ui
-                    .add_enabled(ready, egui::Button::new("Create Wallet"))
-                    .clicked()
-                {
-                    create_clicked = true;
-                }
-                if ui.button("Back").clicked() {
-                    cancel_clicked = true;
-                }
-            });
-        });
-
-        if create_clicked {
-            if self.create_form.wallet_password != self.create_form.wallet_password_confirm {
-                self.last_error = Some(String::from("wallet passwords do not match"));
-                return;
-            }
-
-            let mnemonic = match MnemonicPhrase::parse(&self.create_form.mnemonic_text) {
-                Ok(mnemonic) => mnemonic,
-                Err(err) => {
-                    self.last_error = Some(err.to_string());
-                    return;
-                }
-            };
-            let wallet =
-                self.make_wallet_from_mnemonic(mnemonic, &self.create_form.mnemonic_passphrase);
-            match Self::save_wallet_to_path(
-                &wallet,
-                &self.create_form.wallet_path,
-                &self.create_form.wallet_password,
-            ) {
-                Ok(()) => {
-                    self.load_or_create_wallet(wallet, self.create_form.wallet_path.clone());
-                    self.last_error = None;
-                    self.create_form.wallet_password.clear();
-                    self.create_form.wallet_password_confirm.clear();
-                    self.create_form.mnemonic_passphrase.clear();
-                    self.create_form.reset_phrase();
-                }
-                Err(err) => {
-                    self.last_error = Some(err);
-                }
-            }
-        }
-
-        if cancel_clicked {
-            self.create_form.reset_phrase();
-            self.launch_page = LaunchPage::Welcome;
-        }
-    }
-
-    fn show_import_wallet(&mut self, ui: &mut egui::Ui) {
-        let mut import_clicked = false;
-        let mut cancel_clicked = false;
-        Self::card(ui, "Import Wallet", |ui| {
-            ui.label("Restore a wallet from an existing recovery phrase.");
-            ui.add_space(8.0);
-            ui.label("Wallet file");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.import_form.wallet_path),
-            );
-            ui.label("Mnemonic phrase");
-            ui.add(
-                egui::TextEdit::multiline(&mut self.import_form.mnemonic_phrase)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.label("Seed passphrase (optional)");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.import_form.mnemonic_passphrase),
-            );
-            ui.label("Wallet password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.import_form.wallet_password).password(true),
-            );
-            ui.label("Confirm password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.import_form.wallet_password_confirm)
-                    .password(true),
-            );
-
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                let ready = !self.import_form.wallet_password.is_empty()
-                    && self.import_form.wallet_password == self.import_form.wallet_password_confirm
-                    && !self.import_form.mnemonic_phrase.trim().is_empty();
-                if ui
-                    .add_enabled(ready, egui::Button::new("Import Wallet"))
-                    .clicked()
-                {
-                    import_clicked = true;
-                }
-                if ui.button("Back").clicked() {
-                    cancel_clicked = true;
-                }
-            });
-        });
-
-        if import_clicked {
-            if self.import_form.wallet_password != self.import_form.wallet_password_confirm {
-                self.last_error = Some(String::from("wallet passwords do not match"));
-                return;
-            }
-
-            let mnemonic = match MnemonicPhrase::parse(&self.import_form.mnemonic_phrase) {
-                Ok(mnemonic) => mnemonic,
-                Err(err) => {
-                    self.last_error = Some(err.to_string());
-                    return;
-                }
-            };
-
-            let wallet =
-                self.make_wallet_from_mnemonic(mnemonic, &self.import_form.mnemonic_passphrase);
-            match Self::save_wallet_to_path(
-                &wallet,
-                &self.import_form.wallet_path,
-                &self.import_form.wallet_password,
-            ) {
-                Ok(()) => {
-                    self.load_or_create_wallet(wallet, self.import_form.wallet_path.clone());
-                    self.last_error = None;
-                    self.import_form.wallet_password.clear();
-                    self.import_form.wallet_password_confirm.clear();
-                    self.import_form.mnemonic_phrase.clear();
-                    self.import_form.mnemonic_passphrase.clear();
-                }
-                Err(err) => {
-                    self.last_error = Some(err);
-                }
-            }
-        }
-
-        if cancel_clicked {
-            self.launch_page = LaunchPage::Welcome;
-        }
-    }
-
-    fn show_open_wallet(&mut self, ui: &mut egui::Ui) {
-        let mut open_clicked = false;
-        let mut cancel_clicked = false;
-        Self::card(ui, "Open Wallet", |ui| {
-            ui.label("Enter the wallet password to unlock your wallet.dat file.");
-            ui.add_space(8.0);
-            ui.label("Wallet file");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.open_form.wallet_path),
-            );
-            ui.label("Wallet password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.open_form.wallet_password)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
-
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.open_form.wallet_password.is_empty(),
-                        egui::Button::new("Open Wallet"),
-                    )
-                    .clicked()
-                {
-                    open_clicked = true;
-                }
-                if ui.button("Back").clicked() {
-                    cancel_clicked = true;
-                }
-            });
-        });
-
-        if open_clicked {
-            match self
-                .open_wallet_from_path(&self.open_form.wallet_path, &self.open_form.wallet_password)
-            {
-                Ok(wallet) => {
-                    self.load_or_create_wallet(wallet, self.open_form.wallet_path.clone());
-                    self.last_error = None;
-                    self.open_form.wallet_password.clear();
-                }
-                Err(err) => {
-                    self.last_error = Some(err);
-                }
-            }
-        }
-
-        if cancel_clicked {
-            self.launch_page = LaunchPage::Welcome;
-        }
-    }
-
-    fn show_overview(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() > 860.0;
-        if wide {
-            ui.columns(2, |columns| {
-                Self::card(&mut columns[0], "Balances", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Available:");
-                        ui.monospace("0 atoms");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Pending:");
-                        ui.monospace("0 atoms");
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Total:");
-                        ui.monospace("0 atoms");
-                    });
-                    ui.add_space(8.0);
-                    ui.label("Wallet file");
-                    ui.monospace(self.wallet_path.as_deref().unwrap_or("No wallet loaded"));
-                });
-                Self::card(&mut columns[1], "Recent Transactions", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("Date");
-                        ui.add_space(24.0);
-                        ui.strong("Type");
-                        ui.add_space(24.0);
-                        ui.strong("Label");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.strong("Amount");
-                        });
-                    });
-                    ui.separator();
-                    ui.label("No wallet activity indexed yet.");
-                    ui.add_space(6.0);
-                    ui.label("Wallet-specific transaction history will appear here.");
-                });
-            });
+    fn read_clipboard_text() -> Option<String> {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let text = clipboard.get_text().ok()?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
         } else {
-            Self::card(ui, "Balances", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Available:");
-                    ui.monospace("0 atoms");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Pending:");
-                    ui.monospace("0 atoms");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Total:");
-                    ui.monospace("0 atoms");
-                });
-                ui.add_space(8.0);
-                ui.label("Wallet file");
-                ui.monospace(self.wallet_path.as_deref().unwrap_or("No wallet loaded"));
-            });
-            ui.add_space(10.0);
-            Self::card(ui, "Recent Transactions", |ui| {
-                ui.label("No wallet activity indexed yet.");
-                ui.add_space(6.0);
-                ui.label("Wallet-specific transaction history will appear here.");
-            });
+            Some(trimmed.to_owned())
         }
-
-        ui.add_space(10.0);
-        if wide {
-            ui.columns(2, |columns| {
-                Self::card(&mut columns[0], "Node", |ui| {
-                    ui.label(format!("RPC: {}", self.connection.rpc_address()));
-                    ui.label(format!("Connected: {}", self.ui_state.connected));
-                    ui.label(format!("Sync: {}", self.view_model.sync_stage));
-                    ui.label(format!("Height: {}", self.view_model.block_count));
-                });
-                Self::card(&mut columns[1], "Policy", |ui| {
-                    ui.label(format!("Target block time: {}s", BLOCK_TIME_SECONDS));
-                    ui.label(format!("Minimum fee: {} atoms", MIN_TX_FEE_ATOMS));
-                    ui.label(format!(
-                        "Receive addresses: {}",
-                        self.ui_state.wallet_snapshot.receive_count
-                    ));
-                });
-            });
-        } else {
-            Self::card(ui, "Node", |ui| {
-                ui.label(format!("RPC: {}", self.connection.rpc_address()));
-                ui.label(format!("Connected: {}", self.ui_state.connected));
-                ui.label(format!("Sync: {}", self.view_model.sync_stage));
-                ui.label(format!("Height: {}", self.view_model.block_count));
-            });
-            ui.add_space(10.0);
-            Self::card(ui, "Policy", |ui| {
-                ui.label(format!("Target block time: {}s", BLOCK_TIME_SECONDS));
-                ui.label(format!("Minimum fee: {} atoms", MIN_TX_FEE_ATOMS));
-                ui.label(format!(
-                    "Receive addresses: {}",
-                    self.ui_state.wallet_snapshot.receive_count
-                ));
-            });
-        }
-    }
-
-    fn show_send(&mut self, ui: &mut egui::Ui) {
-        Self::card(ui, "Create Payment Draft", |ui| {
-            ui.label("Pay to");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.send_to)
-                    .hint_text("Enter an Atho base56 address"),
-            );
-            ui.label("Label");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.send_label)
-                    .hint_text("Optional label for this payment"),
-            );
-            ui.horizontal(|ui| {
-                ui.label("Amount (atoms)");
-                ui.add_sized(
-                    [160.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.send_amount),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label("Fee (atoms)");
-                ui.add_sized(
-                    [160.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.send_fee),
-                );
-            });
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Draft payment").clicked() {
-                    self.validate_send_draft();
-                }
-                if ui.button("Clear").clicked() {
-                    self.send_to.clear();
-                    self.send_label.clear();
-                    self.send_amount.clear();
-                    self.send_fee.clear();
-                    self.send_status.clear();
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(&self.send_status);
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Transaction Fee:");
-                ui.monospace(format!(
-                    "{} atoms/kB",
-                    self.send_fee.trim().parse::<u64>().unwrap_or(0)
-                ));
-                let _ = ui.button("Choose...");
-                ui.colored_label(
-                    egui::Color32::from_rgb(247, 147, 26),
-                    "Warning: Fee estimation is currently not possible.",
-                );
-            });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Send").clicked() {
-                    self.validate_send_draft();
-                }
-                if ui.button("Clear All").clicked() {
-                    self.send_to.clear();
-                    self.send_label.clear();
-                    self.send_amount.clear();
-                    self.send_fee.clear();
-                    self.send_status.clear();
-                }
-                let _ = ui.button("Add Recipient");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("Balance: {} atoms", 0u64));
-                });
-            });
-        });
-    }
-
-    fn show_receive(&mut self, ui: &mut egui::Ui) {
-        Self::card(ui, "Receive Address", |ui| {
-            ui.label("Label");
-            ui.add_sized(
-                [ui.available_width(), 24.0],
-                egui::TextEdit::singleline(&mut self.receive_label),
-            );
-            ui.add_space(8.0);
-            ui.label("Current base56 address");
-            ui.horizontal(|ui| {
-                let mut current = self.current_receive_address_text();
-                ui.add_enabled(
-                    false,
-                    egui::TextEdit::singleline(&mut current).desired_width(f32::INFINITY),
-                );
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("New address").clicked() {
-                    self.generate_receive_address();
-                }
-                if ui.button("Copy").clicked() {
-                    Self::copy_text(ui, self.current_receive_address_text());
-                    self.send_status = String::from("Address copied");
-                }
-            });
-        });
-
-        ui.add_space(12.0);
-        Self::card(ui, "Your Addresses", |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    if let Some(wallet) = self.wallet_ref() {
-                        for (index, record) in wallet
-                            .address_book
-                            .snapshot()
-                            .iter()
-                            .enumerate()
-                            .rev()
-                            .filter(|(_, record)| record.path.kind == AddressKind::Receive)
-                        {
-                            let address = wallet.address_for_path(record.path);
-                            ui.horizontal(|ui| {
-                                ui.label(format!("#{}", index + 1));
-                                ui.monospace(&address.address);
-                                if ui.small_button("Copy").clicked() {
-                                    Self::copy_text(ui, address.address.clone());
-                                }
-                            });
-                            ui.separator();
-                        }
-                    } else {
-                        ui.label("Load a wallet to view addresses.");
-                    }
-                });
-        });
-    }
-
-    fn show_transactions(&mut self, ui: &mut egui::Ui) {
-        Self::card(ui, "Wallet Transactions", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(false, |ui| {
-                    ui.label("All");
-                });
-                ui.add_enabled_ui(false, |ui| {
-                    ui.label("All");
-                });
-                ui.add_enabled_ui(false, |ui| {
-                    let mut search = String::new();
-                    ui.add_sized(
-                        [ui.available_width().min(260.0), 24.0],
-                        egui::TextEdit::singleline(&mut search)
-                            .hint_text("Enter address, transaction id, or label to search"),
-                    );
-                });
-                ui.add_enabled_ui(false, |ui| {
-                    ui.label("Min amount");
-                });
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("Date");
-                ui.add_space(32.0);
-                ui.strong("Type");
-                ui.add_space(32.0);
-                ui.strong("Label");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.strong("Amount");
-                });
-            });
-            ui.separator();
-            ui.label("No wallet activity indexed yet.");
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(format!("Network: {}", self.view_model.network_label));
-                ui.separator();
-                ui.label(format!("Height: {}", self.view_model.block_count));
-                ui.separator();
-                ui.label(format!("Mempool: {}", self.view_model.mempool_count));
-            });
-            ui.add_space(12.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let _ = ui.button("Export");
-            });
-        });
-    }
-
-    fn show_settings(&mut self, ui: &mut egui::Ui) {
-        let wallet_path = self
-            .wallet_path
-            .clone()
-            .unwrap_or_else(|| String::from("No wallet loaded"));
-        Self::card(ui, "Settings", |ui| {
-            ui.label(format!("Network: {}", self.view_model.network_label));
-            ui.label(format!("RPC address: {}", self.connection.rpc_address()));
-            ui.label(format!("Connected: {}", self.ui_state.connected));
-            ui.label(format!("Sync stage: {}", self.view_model.sync_stage));
-            ui.label(format!("Wallet file: {}", wallet_path));
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Mining threads");
-                ui.add(egui::Slider::new(&mut self.ui_state.mining_cores, 1..=64).show_value(true));
-            });
-            ui.horizontal_wrapped(|ui| {
-                let ready = self.ui_state.connected && self.wallet.is_some();
-                if ui
-                    .add_enabled(ready, egui::Button::new("Start Miner"))
-                    .clicked()
-                {
-                    self.start_mining_job();
-                }
-                if ui.button("Stop Miner").clicked() {
-                    self.ui_state.generate_coins = false;
-                }
-                ui.checkbox(&mut self.ui_state.generate_coins, "Mine continuously");
-            });
-            ui.label(format!("Miner status: {}", self.mining_status));
-            if let Some(job) = &self.mining_job {
-                ui.label(format!("Elapsed: {}s", job.started_at.elapsed().as_secs()));
-            }
-            ui.separator();
-            if ui.button("Open Wallet").clicked() {
-                self.launch_page = LaunchPage::OpenWallet;
-            }
-            if ui.button("Create Another Wallet").clicked() {
-                self.create_form = CreateWalletForm::new(self.connection.network());
-                self.create_form.wallet_path = alternate_wallet_path(self.connection.network())
-                    .to_string_lossy()
-                    .into_owned();
-                let _ = self.generate_create_mnemonic();
-                self.launch_page = LaunchPage::CreateWallet;
-            }
-        });
-    }
-
-    fn show_main_shell(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu_bar")
-            .exact_height(24.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("File");
-                    ui.label("Wallet");
-                    ui.label("Help");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("RPC {}", self.connection.rpc_address()));
-                    });
-                });
-            });
-
-        egui::TopBottomPanel::top("toolbar")
-            .exact_height(44.0)
-            .show(ctx, |ui| {
-                self.show_tabs(ui);
-            });
-
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("Network: {}", self.view_model.network_label));
-                ui.separator();
-                ui.label(format!("Height: {}", self.view_model.block_count));
-                ui.separator();
-                ui.label(format!("Mempool: {}", self.view_model.mempool_count));
-                ui.separator();
-                ui.label(format!("Connected: {}", self.ui_state.connected));
-                if let Some(error) = &self.last_error {
-                    ui.separator();
-                    ui.label(format!("Error: {}", error));
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match self.active_tab {
-                    NavTab::Overview => self.show_overview(ui),
-                    NavTab::Send => self.show_send(ui),
-                    NavTab::Receive => self.show_receive(ui),
-                    NavTab::Transactions => self.show_transactions(ui),
-                    NavTab::Settings => self.show_settings(ui),
-                });
-        });
-    }
-
-    fn show_startup_screen(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("Network: {}", self.view_model.network_label));
-                ui.separator();
-                ui.label(format!("RPC: {}", self.connection.rpc_address()));
-                ui.separator();
-                ui.label(format!("Connected: {}", self.ui_state.connected));
-                if let Some(error) = &self.last_error {
-                    ui.separator();
-                    ui.label(format!("Error: {}", error));
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(22.0);
-                        ui.heading("Atho");
-                        ui.label("Lightweight full node, HD wallet, and miner client.");
-                        ui.add_space(14.0);
-
-                        match self.launch_page {
-                            LaunchPage::Welcome => self.show_welcome(ui),
-                            LaunchPage::CreateWallet => self.show_create_wallet(ui),
-                            LaunchPage::ImportWallet => self.show_import_wallet(ui),
-                            LaunchPage::OpenWallet => self.show_open_wallet(ui),
-                        }
-                    });
-                });
-        });
     }
 }
 
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.apply_theme(ctx);
+        if !self.theme_initialized {
+            theme::install_fonts(ctx);
+            self.theme_initialized = true;
+        }
+        if self.wallet.is_none() && !self.compact_viewport {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(700.0, 440.0)));
+            self.compact_viewport = true;
+        } else if self.wallet.is_some() && self.compact_viewport {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 660.0)));
+            self.compact_viewport = false;
+        }
+        theme::apply_theme(ctx);
+        self.drain_status_updates();
+        self.poll_send_job();
         self.poll_mining_job();
         ctx.request_repaint_after(Duration::from_millis(200));
 
-        if self.needs_initial_refresh {
-            self.needs_initial_refresh = false;
-            if let Err(err) = self.refresh() {
-                self.last_error = Some(err.to_string());
-            }
-        }
-
-        if self.last_status_poll.elapsed() >= Duration::from_millis(750) {
-            self.last_status_poll = Instant::now();
-            if let Err(err) = self.refresh() {
-                self.last_error = Some(err.to_string());
-            }
-        }
-
         if self.wallet.is_some() {
-            self.show_main_shell(ctx);
+            shell::render_main_shell(self, ctx);
         } else {
-            self.show_startup_screen(ctx);
+            startup::render_startup_screen(self, ctx);
+        }
+    }
+}
+
+impl DesktopApp {
+    fn drain_status_updates(&mut self) {
+        while let Some(status) = self.status_monitor.try_recv_latest() {
+            self.apply_connection_status(status);
         }
     }
 }
@@ -1379,7 +998,10 @@ mod tests {
         app.refresh().unwrap();
         assert!(app.ui_state.connected);
         assert_eq!(app.view_model.network_label, "atho-mainnet");
-        assert!(app.wallet.is_none());
+        assert!(matches!(
+            app.launch_page,
+            LaunchPage::Welcome | LaunchPage::OpenWallet
+        ));
         std::env::remove_var("ATHO_QT_LOCAL");
     }
 }

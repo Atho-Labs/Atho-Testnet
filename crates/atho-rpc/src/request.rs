@@ -12,5 +12,6 @@ pub enum RpcRequest {
         transaction: Transaction,
         fee_atoms: u64,
     },
+    ListUtxos,
     GetMempoolInfo,
 }

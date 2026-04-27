@@ -24,6 +24,7 @@ impl RpcServer {
             RpcRequest::GetBlockTemplate
             | RpcRequest::SubmitBlock(_)
             | RpcRequest::SubmitTransaction { .. }
+            | RpcRequest::ListUtxos
             | RpcRequest::GetMempoolInfo => RpcResponse::Error(RpcError::InvalidRequest),
         }
     }

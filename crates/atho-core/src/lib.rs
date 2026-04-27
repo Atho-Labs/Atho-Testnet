@@ -18,7 +18,7 @@ mod tests {
     fn carries_forward_protocol_basics() {
         assert_eq!(MAX_SUPPLY_ATHO, 168_000_000);
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_680_000);
-        assert_eq!(MIN_TX_FEE_ATOMS, 500);
+        assert_eq!(MIN_TX_FEE_ATOMS, 1);
         assert_eq!(BLOCK_TIME_SECONDS, 75);
         assert_eq!(MAX_BLOCK_SIZE_BYTES, 2_000_000);
         assert_eq!(MAX_BLOCK_WEIGHT, 8_000_000);

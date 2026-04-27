@@ -2,9 +2,10 @@ use crate::config::NodeConfig;
 use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::node::Node;
-use crate::validation::encode_input_reference;
+use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
 use atho_core::block::Block;
 use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
+use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -90,16 +91,35 @@ pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
 
 pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    if chain_dir().exists() {
-        fs::remove_dir_all(chain_dir())?;
-    }
-    if wallet_dir().exists() {
-        fs::remove_dir_all(wallet_dir())?;
-    }
-    if audit_dir().exists() {
-        fs::remove_dir_all(audit_dir())?;
-    }
+    remove_tree(&chain_dir())?;
+    remove_tree(&wallet_dir())?;
+    remove_tree(&audit_dir())?;
+    remove_tree(&logs_dir())?;
     ensure_layout()
+}
+
+fn remove_tree(path: &PathBuf) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_file() || path.is_symlink() {
+        fs::remove_file(path)?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        if child.is_dir() {
+            remove_tree(&child)?;
+        } else {
+            fs::remove_file(&child)?;
+        }
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
@@ -188,11 +208,12 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
     let tx = signed_spend_transaction(network, seed_txid, seed_value, seed_script)?;
+    let tx_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
 
     let txid = node
         .admit_transaction(MempoolEntry {
             transaction: tx,
-            fee_atoms: 500,
+            fee_atoms: tx_fee,
         })
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
@@ -226,34 +247,77 @@ fn signed_spend_transaction(
     seed_script: u8,
 ) -> std::io::Result<Transaction> {
     let keypair = signing_keypair(network, seed_txid, seed_script)?;
-    let mut tx = Transaction {
-        version: 1,
-        inputs: vec![TxInput {
-            previous_txid: seed_txid,
-            output_index: 0,
-            unlocking_script: vec![seed_script],
-        }],
-        outputs: vec![TxOutput {
-            value_atoms: seed_value.saturating_sub(500),
-            locking_script: vec![seed_script.saturating_add(1)],
-        }],
-        lock_time: 0,
-        witness: vec![],
-    };
-    let digest = tx.signing_digest();
-    let signature = sign(&keypair.secret_key, &digest).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("falcon sign failed: {err:?}"),
-        )
-    })?;
-    tx.witness = TxWitness {
-        signature: signature.0,
-        pubkey: keypair.public_key.0,
-        input_refs: vec![encode_input_reference(&seed_txid, 0)],
+    let mut output_atoms = seed_value.saturating_sub(1);
+    let mut last_fee = 0u64;
+    for _ in 0..4 {
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: seed_txid,
+                output_index: 0,
+                unlocking_script: vec![seed_script],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: output_atoms,
+                locking_script: vec![seed_script.saturating_add(1)],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let digest = tx.signing_digest();
+        let signature = sign(&keypair.secret_key, &digest).map_err(
+            |err: atho_crypto::error::CryptoError| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("falcon sign failed: {err:?}"),
+                )
+            },
+        )?;
+        let txid = tx.txid();
+        let sig_bytes = signature.0.clone();
+        tx.witness = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: vec![atho_core::transaction::WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, 0),
+                witness_commit_ref: [0; 16],
+            }],
+        }
+        .canonical_bytes();
+        let witness_root = tx.witness_commitment_hash();
+        tx.witness = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: vec![atho_core::transaction::WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, 0),
+                witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, 0),
+            }],
+        }
+        .canonical_bytes();
+        let fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        if fee == last_fee {
+            if seed_value < fee {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "seed utxo too small for fee",
+                ));
+            }
+            tx.outputs[0].value_atoms = seed_value - fee;
+            return Ok(tx);
+        }
+        last_fee = fee;
+        if seed_value < fee {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "seed utxo too small for fee",
+            ));
+        }
+        output_atoms = seed_value - fee;
     }
-    .canonical_bytes();
-    Ok(tx)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "failed to stabilize dev spend fee",
+    ))
 }
 
 fn signing_keypair(

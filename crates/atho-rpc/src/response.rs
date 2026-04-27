@@ -1,6 +1,7 @@
 use crate::error::RpcError;
 use atho_core::block::Block;
 use atho_core::network::Network;
+use atho_storage::utxo::UtxoEntry;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,7 @@ pub enum RpcResponse {
         block_hash: [u8; 48],
     },
     TransactionSubmitted(#[serde(with = "serde_big_array::BigArray")] [u8; 48]),
+    Utxos(Vec<UtxoEntry>),
     MempoolInfo(MempoolInfo),
     Error(RpcError),
 }

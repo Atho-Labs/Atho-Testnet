@@ -161,14 +161,49 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MIN_BYTES};
 
-    fn witness_bytes(inputs: usize) -> Vec<u8> {
+    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
+        let txid = tx.txid();
+        let staged = TxWitness {
+            signature: signature.clone(),
+            pubkey: pubkey.clone(),
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: crate::validation::derive_sig_ref_short(
+                        &txid,
+                        &signature,
+                        index as u32,
+                    ),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        };
+        let staged_tx = Transaction {
+            witness: staged.canonical_bytes(),
+            ..tx.clone()
+        };
+        let witness_root = staged_tx.witness_commitment_hash();
         TxWitness {
-            signature: vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
-            pubkey: vec![8; FALCON_512_PUBLIC_KEY_BYTES],
-            input_refs: (0..inputs).map(|_| vec![7, 7]).collect(),
+            signature,
+            pubkey,
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: crate::validation::derive_sig_ref_short(
+                        &txid,
+                        &vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
+                        index as u32,
+                    ),
+                    witness_commit_ref: crate::validation::derive_witness_commit_ref(
+                        &txid,
+                        &witness_root,
+                        index as u32,
+                    ),
+                })
+                .collect(),
         }
         .canonical_bytes()
     }
@@ -188,7 +223,11 @@ mod tests {
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
 
         let txid = mempool
@@ -220,7 +259,11 @@ mod tests {
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
 
         let _ = mempool.spent_inputs.insert(([2; 48], 0));

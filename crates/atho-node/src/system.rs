@@ -56,6 +56,7 @@ impl AthoSystem {
                 transaction_count: self.orchestrator.runtime.node.mempool.len(),
                 total_fee_atoms: self.orchestrator.runtime.node.mempool.total_fee_atoms(),
             }),
+            RpcRequest::ListUtxos => RpcResponse::Utxos(self.list_utxos()),
             RpcRequest::GetBlockTemplate => {
                 let miner = Miner::new(1);
                 match self.orchestrator.runtime.node.build_candidate_block(&miner) {
@@ -104,6 +105,7 @@ impl AthoSystem {
                     Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 }
             }
+            RpcRequest::ListUtxos => RpcResponse::Utxos(self.list_utxos()),
             other => self.handle(other),
         }
     }
@@ -118,6 +120,17 @@ impl AthoSystem {
             fees_atoms: block.fees_total_atoms,
             block,
         }
+    }
+
+    fn list_utxos(&self) -> Vec<atho_storage::utxo::UtxoEntry> {
+        self.orchestrator
+            .runtime
+            .node
+            .chainstate
+            .utxo_snapshot()
+            .entries()
+            .cloned()
+            .collect()
     }
 
     pub fn status(&self) -> SystemStatus {

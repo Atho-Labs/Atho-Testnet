@@ -33,6 +33,7 @@ impl Node {
             working_utxos,
         )?;
         self.chainstate.connect_block(block)?;
+        self.mempool.remove_block_transactions(block);
         let updated_utxos = self.chainstate.utxo_snapshot();
         self.mempool
             .revalidate(|txid, output_index| updated_utxos.get(*txid, output_index).cloned());
@@ -85,28 +86,48 @@ mod tests {
     use super::*;
     use crate::mempool::MempoolEntry;
     use crate::miner::Miner;
-    use crate::validation::encode_input_reference;
+    use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::{pow, subsidy};
+    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
     use atho_core::network::Network;
-    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MIN_BYTES};
     use atho_storage::utxo::UtxoEntry;
 
-    fn witness_bytes(inputs: usize) -> Vec<u8> {
+    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
+        let txid = tx.txid();
+        let staged = TxWitness {
+            signature: signature.clone(),
+            pubkey: pubkey.clone(),
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        };
+        let staged_tx = Transaction {
+            witness: staged.canonical_bytes(),
+            ..tx.clone()
+        };
+        let witness_root = staged_tx.witness_commitment_hash();
+        let sig_bytes = signature.clone();
         TxWitness {
-            signature: vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
-            pubkey: vec![8; FALCON_512_PUBLIC_KEY_BYTES],
-            input_refs: (0..inputs).map(|_| vec![7, 7]).collect(),
-        }
-        .canonical_bytes()
-    }
-
-    fn witness_bytes_for_input(previous_txid: [u8; 48], output_index: u32) -> Vec<u8> {
-        TxWitness {
-            signature: vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
-            pubkey: vec![8; FALCON_512_PUBLIC_KEY_BYTES],
-            input_refs: vec![encode_input_reference(&previous_txid, output_index)],
+            signature: sig_bytes.clone(),
+            pubkey,
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                    witness_commit_ref: derive_witness_commit_ref(
+                        &txid,
+                        &witness_root,
+                        index as u32,
+                    ),
+                })
+                .collect(),
         }
         .canonical_bytes()
     }
@@ -136,7 +157,11 @@ mod tests {
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
         let transactions = vec![coinbase, tx];
         let header = BlockHeader {
@@ -184,7 +209,11 @@ mod tests {
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
         let transactions = vec![coinbase, tx];
         let header = BlockHeader {
@@ -227,15 +256,34 @@ mod tests {
                 unlocking_script: vec![1],
             }],
             outputs: vec![TxOutput {
-                value_atoms: 1_500,
+                value_atoms: 1_000,
                 locking_script: vec![2],
             }],
             lock_time: 0,
-            witness: witness_bytes_for_input([9; 48], 0),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let tx = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: 2_000 - fee_atoms,
+                locking_script: vec![2],
+            }],
+            ..Transaction {
+                witness: vec![],
+                ..tx
+            }
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
         node.admit_transaction(MempoolEntry {
             transaction: tx.clone(),
-            fee_atoms: 500,
+            fee_atoms,
         })
         .unwrap();
 
@@ -243,5 +291,6 @@ mod tests {
         let block = node.mine_and_connect_candidate_block(&miner).unwrap();
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(node.chainstate.height, 1);
+        assert_eq!(node.mempool.len(), 0);
     }
 }

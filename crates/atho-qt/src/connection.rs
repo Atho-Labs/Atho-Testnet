@@ -6,6 +6,9 @@ use atho_rpc::response::{MempoolInfo, RpcResponse};
 use atho_rpc::transport::RpcClient;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -18,11 +21,26 @@ pub struct ConnectionStatus {
 
 #[derive(Debug)]
 enum ConnectionBackend {
-    Local(AthoSystem),
+    Local(Mutex<AthoSystem>),
     Rpc {
         client: RpcClient,
         _node: Option<NodeProcess>,
     },
+}
+
+#[derive(Debug)]
+pub struct StatusMonitor {
+    receiver: mpsc::Receiver<ConnectionStatus>,
+}
+
+impl StatusMonitor {
+    pub fn try_recv_latest(&self) -> Option<ConnectionStatus> {
+        let mut latest = None;
+        while let Ok(status) = self.receiver.try_recv() {
+            latest = Some(status);
+        }
+        latest
+    }
 }
 
 #[derive(Debug)]
@@ -53,7 +71,7 @@ impl ReadOnlyNodeConnection {
         let backend = if cfg!(test) || std::env::var("ATHO_QT_LOCAL").ok().as_deref() == Some("1") {
             let mut system = AthoSystem::new(atho_node::config::NodeConfig::new(network));
             system.start();
-            ConnectionBackend::Local(system)
+            ConnectionBackend::Local(Mutex::new(system))
         } else {
             let node = start_local_node_if_needed(network, &rpc_address);
             ConnectionBackend::Rpc {
@@ -83,7 +101,17 @@ impl ReadOnlyNodeConnection {
 
     pub fn request(&self, request: RpcRequest) -> RpcResponse {
         match &self.backend {
-            ConnectionBackend::Local(system) => system.handle(request),
+            ConnectionBackend::Local(system) => {
+                let mut system = system.lock().expect("local node mutex poisoned");
+                if matches!(
+                    &request,
+                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. }
+                ) {
+                    system.handle_mut(request)
+                } else {
+                    system.handle(request)
+                }
+            }
             ConnectionBackend::Rpc { client, .. } => match client.call(&request) {
                 Ok(response) => response,
                 Err(err) => {
@@ -97,6 +125,7 @@ impl ReadOnlyNodeConnection {
     pub fn status(&self) -> ConnectionStatus {
         match &self.backend {
             ConnectionBackend::Local(system) => {
+                let system = system.lock().expect("local node mutex poisoned");
                 let status = system.status();
                 ConnectionStatus {
                     network: status.network,
@@ -107,30 +136,53 @@ impl ReadOnlyNodeConnection {
                 }
             }
             ConnectionBackend::Rpc { client, .. } => {
-                let network_ok = matches!(
-                    client.call(&RpcRequest::GetNetwork),
-                    Ok(RpcResponse::Network(_))
-                );
-                let block_count = match client.call(&RpcRequest::GetBlockCount) {
-                    Ok(RpcResponse::BlockCount(count)) => count,
-                    _ => 0,
-                };
-                let mempool_count = match client.call(&RpcRequest::GetMempoolInfo) {
-                    Ok(RpcResponse::MempoolInfo(MempoolInfo {
-                        transaction_count, ..
-                    })) => transaction_count,
-                    _ => 0,
-                };
-                let connected = network_ok || block_count > 0 || mempool_count > 0;
-                ConnectionStatus {
-                    network: self.network,
-                    rpc_address: self.rpc_address.clone(),
-                    block_count,
-                    mempool_count,
-                    connected,
-                }
+                collect_rpc_status(self.network, &self.rpc_address, client)
             }
         }
+    }
+
+    pub fn spawn_status_monitor(&self, interval: Duration) -> StatusMonitor {
+        let network = self.network;
+        let rpc_address = self.rpc_address.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let client = RpcClient::new(rpc_address.clone());
+            loop {
+                let status = collect_rpc_status(network, &rpc_address, &client);
+                if sender.send(status).is_err() {
+                    break;
+                }
+                thread::sleep(interval);
+            }
+        });
+
+        StatusMonitor { receiver }
+    }
+}
+
+fn collect_rpc_status(network: Network, rpc_address: &str, client: &RpcClient) -> ConnectionStatus {
+    let network_ok = match client.call(&RpcRequest::GetNetwork) {
+        Ok(RpcResponse::Network(label)) => label == network.id(),
+        _ => false,
+    };
+    let block_count = match client.call(&RpcRequest::GetBlockCount) {
+        Ok(RpcResponse::BlockCount(count)) => count,
+        _ => 0,
+    };
+    let mempool_count = match client.call(&RpcRequest::GetMempoolInfo) {
+        Ok(RpcResponse::MempoolInfo(MempoolInfo {
+            transaction_count, ..
+        })) => transaction_count,
+        _ => 0,
+    };
+    let connected = network_ok;
+    ConnectionStatus {
+        network,
+        rpc_address: rpc_address.to_string(),
+        block_count,
+        mempool_count,
+        connected,
     }
 }
 

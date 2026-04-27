@@ -1,0 +1,125 @@
+use crate::app::{widgets, DesktopApp, WalletActivityRow};
+use crate::resources;
+use eframe::egui;
+
+const DATE_FILTERS: &[&str] = &["All", "Current"];
+const TYPE_FILTERS: &[&str] = &["All", "Received"];
+
+pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
+    widgets::panel_frame().show(ui, |ui| {
+        ui.set_min_height(480.0);
+
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_source("tx_date_filter")
+                .selected_text(
+                    DATE_FILTERS[app.transaction_date_filter.min(DATE_FILTERS.len() - 1)],
+                )
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for (index, label) in DATE_FILTERS.iter().enumerate() {
+                        ui.selectable_value(&mut app.transaction_date_filter, index, *label);
+                    }
+                });
+
+            egui::ComboBox::from_id_source("tx_type_filter")
+                .selected_text(
+                    TYPE_FILTERS[app.transaction_type_filter.min(TYPE_FILTERS.len() - 1)],
+                )
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    for (index, label) in TYPE_FILTERS.iter().enumerate() {
+                        ui.selectable_value(&mut app.transaction_type_filter, index, *label);
+                    }
+                });
+
+            ui.add_sized(
+                [ui.available_width() - 170.0, 28.0],
+                egui::TextEdit::singleline(&mut app.transaction_search)
+                    .hint_text("Enter address, transaction id, or label to search"),
+            );
+            ui.add_sized(
+                [110.0, 28.0],
+                egui::TextEdit::singleline(&mut app.transaction_min_amount).hint_text("Min amount"),
+            );
+        });
+
+        ui.add_space(8.0);
+        widgets::table_header(ui, &["Date", "Type", "Label", "Amount (ATHO)"]);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let rows = filtered_rows(app);
+        if rows.is_empty() {
+            widgets::muted_label(ui, "No wallet transactions to display.");
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    for row in &rows {
+                        egui::Grid::new(ui.id().with(&row.reference))
+                            .num_columns(4)
+                            .spacing([12.0, 8.0])
+                            .min_col_width(80.0)
+                            .show(ui, |ui| {
+                                ui.label(&row.when);
+                                ui.label(row.kind);
+                                ui.label(&row.label);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        widgets::row_value(
+                                            ui,
+                                            &widgets::format_atoms(row.amount_atoms),
+                                        )
+                                    },
+                                );
+                                ui.end_row();
+                            });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
+                });
+        }
+
+        ui.add_space(10.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_sized(
+                    [90.0, 30.0],
+                    egui::Button::image_and_text(resources::export_icon(14.0), "Export"),
+                )
+                .clicked()
+            {
+                let mut export = String::from("date\ttype\tlabel\tamount_atoms\treference\n");
+                for row in rows {
+                    export.push_str(&format!(
+                        "{}\t{}\t{}\t{}\t{}\n",
+                        row.when, row.kind, row.label, row.amount_atoms, row.reference
+                    ));
+                }
+                DesktopApp::copy_text(ui, export);
+            }
+        });
+    });
+}
+
+fn filtered_rows(app: &DesktopApp) -> Vec<WalletActivityRow> {
+    let search = app.transaction_search.trim().to_ascii_lowercase();
+    let min_amount = app.transaction_min_amount.trim().parse::<u64>().ok();
+
+    app.wallet_activity_rows()
+        .iter()
+        .filter(|row| {
+            (app.transaction_type_filter == 0 || row.kind == "Received")
+                && min_amount
+                    .map(|min| row.amount_atoms >= min)
+                    .unwrap_or(true)
+                && (search.is_empty()
+                    || row.label.to_ascii_lowercase().contains(&search)
+                    || row.reference.to_ascii_lowercase().contains(&search))
+        })
+        .cloned()
+        .collect()
+}

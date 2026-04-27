@@ -18,7 +18,7 @@ The codebase is intentionally split into small crates so the trusted core stays 
 - Initial block reward: `50 ATHO`
 - Halving interval: `1,680,000` blocks
 - Target block time: `75` seconds
-- Minimum transaction fee: `500 atoms`
+- Minimum transaction fee: `1 atom/vbyte`
 - Proof of work hash: `SHA3-384`
 - Hash size: `384` bits / `96` hex characters
 - Consensus math uses integers only
@@ -55,6 +55,25 @@ The desktop client stays light and uses RPC instead of embedding the whole block
 - Genesis blocks are hardcoded per network
 - PoW is checked against the network target
 - Invalid blocks and transactions are rejected before they can mutate final state
+
+## Transaction Lifecycle
+
+The transaction path in Atho is:
+
+1. The wallet derives an address from the HD seed and keeps the wallet state in the local datafile.
+2. A spend transaction is assembled with explicit inputs, outputs, automatic 1 atom/vbyte fee policy, and witness data.
+3. The transaction digest is signed with Falcon.
+4. The node checks canonical serialization, duplicate inputs, fee policy, input ownership, and signature validity.
+5. Valid transactions enter the mempool.
+6. The miner pulls only valid mempool transactions into a block template.
+7. The block is mined against the network target.
+8. The node validates the full block again before accepting it.
+9. Accepted blocks update chainstate and remove confirmed transactions from the mempool.
+
+Current note:
+- The backend transaction path is implemented.
+- The Qt send screen now builds and submits a wallet spend using wallet-owned UTXOs, HD change, and RPC broadcast.
+- The remaining improvements are mostly UX polish and richer wallet history/indexing.
 
 ## Running Atho
 

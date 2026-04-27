@@ -189,7 +189,10 @@ pub fn witness_root(transactions: &[Transaction]) -> [u8; 48] {
         return [0; 48];
     }
 
-    let mut layer: Vec<[u8; 48]> = transactions.iter().map(Transaction::wtxid).collect();
+    let mut layer: Vec<[u8; 48]> = transactions
+        .iter()
+        .map(Transaction::witness_commitment_hash)
+        .collect();
     while layer.len() > 1 {
         let mut next = Vec::with_capacity((layer.len() + 1) / 2);
         for chunk in layer.chunks(2) {

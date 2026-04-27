@@ -29,7 +29,7 @@ mod tests {
         assert_eq!(CONSENSUS_PARAMS.max_supply_atho, 168_000_000);
         assert_eq!(CONSENSUS_PARAMS.initial_block_reward_atho, 50);
         assert_eq!(CONSENSUS_PARAMS.halving_interval_blocks, 1_680_000);
-        assert_eq!(CONSENSUS_PARAMS.min_tx_fee_atoms, 500);
+        assert_eq!(CONSENSUS_PARAMS.min_tx_fee_atoms, 1);
         assert_eq!(CONSENSUS_PARAMS.block_time_seconds, 75);
     }
 }

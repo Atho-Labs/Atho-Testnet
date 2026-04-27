@@ -6,7 +6,7 @@ use crate::snapshot::WalletSnapshot;
 use atho_core::address::address_parts_from_public_key;
 use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
-use atho_crypto::falcon;
+use atho_crypto::falcon::{self, FalconKeypair};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -121,6 +121,25 @@ impl Wallet {
         self.derive_address(path)
     }
 
+    pub fn keypair_for_path(&self, path: DerivationPath) -> FalconKeypair {
+        let mut bytes = Vec::with_capacity(32 + 4 + 1 + 4 + 1 + self.network.id().len());
+        bytes.extend_from_slice(self.hd_wallet.seed());
+        bytes.extend_from_slice(self.network.domain_tag().as_bytes());
+        bytes.extend_from_slice(&path.account.to_le_bytes());
+        bytes.push(match path.kind {
+            AddressKind::Receive => 0,
+            AddressKind::Change => 1,
+        });
+        bytes.extend_from_slice(&path.index.to_le_bytes());
+        falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available")
+    }
+
+    pub fn address_for_payment_digest(&self, digest: &[u8; 32]) -> Option<WalletAddress> {
+        self.all_addresses()
+            .into_iter()
+            .find(|address| &address.payment_digest == digest)
+    }
+
     pub fn all_addresses(&self) -> Vec<WalletAddress> {
         self.address_book
             .snapshot()
@@ -158,17 +177,7 @@ impl Wallet {
     }
 
     fn derive_address(&self, path: DerivationPath) -> WalletAddress {
-        let mut bytes = Vec::with_capacity(32 + 4 + 1 + 4 + 1 + self.network.id().len());
-        bytes.extend_from_slice(self.hd_wallet.seed());
-        bytes.extend_from_slice(self.network.domain_tag().as_bytes());
-        bytes.extend_from_slice(&path.account.to_le_bytes());
-        bytes.push(match path.kind {
-            AddressKind::Receive => 0,
-            AddressKind::Change => 1,
-        });
-        bytes.extend_from_slice(&path.index.to_le_bytes());
-        let keypair =
-            falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available");
+        let keypair = self.keypair_for_path(path);
         let public_key = keypair.public_key.as_bytes().to_vec();
         let parts = address_parts_from_public_key(self.network, &public_key);
         WalletAddress {

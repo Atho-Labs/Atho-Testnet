@@ -1,11 +1,19 @@
 use crate::crypto::hash::sha3_384;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessInputRef {
+    #[serde(with = "serde_big_array::BigArray")]
+    pub sig_ref_short: [u8; 2],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub witness_commit_ref: [u8; 16],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TxWitness {
     pub signature: Vec<u8>,
     pub pubkey: Vec<u8>,
-    pub input_refs: Vec<Vec<u8>>,
+    pub input_refs: Vec<WitnessInputRef>,
 }
 
 impl TxWitness {
@@ -21,9 +29,18 @@ impl TxWitness {
         out.extend_from_slice(&self.pubkey);
         out.extend_from_slice(&(self.input_refs.len() as u32).to_le_bytes());
         for item in &self.input_refs {
-            out.extend_from_slice(&(item.len() as u32).to_le_bytes());
-            out.extend_from_slice(item);
+            out.extend_from_slice(&item.sig_ref_short);
+            out.extend_from_slice(&item.witness_commit_ref);
         }
+        out
+    }
+
+    pub fn commitment_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.pubkey);
         out
     }
 
@@ -51,8 +68,24 @@ impl TxWitness {
         let ref_count = read_u32(bytes, &mut offset)? as usize;
         let mut input_refs = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
-            let len = read_u32(bytes, &mut offset)? as usize;
-            input_refs.push(read_vec(bytes, &mut offset, len)?);
+            let sig_ref_short = {
+                let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+                let mut out = [0u8; 2];
+                out.copy_from_slice(bytes);
+                offset += 2;
+                out
+            };
+            let witness_commit_ref = {
+                let bytes = bytes.get(offset..offset.checked_add(16)?)?;
+                let mut out = [0u8; 16];
+                out.copy_from_slice(bytes);
+                offset += 16;
+                out
+            };
+            input_refs.push(WitnessInputRef {
+                sig_ref_short,
+                witness_commit_ref,
+            });
         }
         if offset != bytes.len() {
             return None;
@@ -170,6 +203,14 @@ impl Transaction {
         sha3_384(&out)
     }
 
+    pub fn witness_commitment_hash(&self) -> [u8; 48] {
+        let mut out = self.base_bytes();
+        if let Some(witness) = self.witness_payload() {
+            out.extend_from_slice(&witness.commitment_bytes());
+        }
+        sha3_384(&out)
+    }
+
     pub fn signing_digest(&self) -> [u8; 48] {
         sha3_384(&self.base_bytes())
     }
@@ -237,7 +278,16 @@ mod tests {
         let payload = TxWitness {
             signature: vec![1, 2, 3],
             pubkey: vec![4, 5],
-            input_refs: vec![vec![6], vec![7, 8]],
+            input_refs: vec![
+                WitnessInputRef {
+                    sig_ref_short: [6, 7],
+                    witness_commit_ref: [8; 16],
+                },
+                WitnessInputRef {
+                    sig_ref_short: [9, 10],
+                    witness_commit_ref: [11; 16],
+                },
+            ],
         };
         let encoded = payload.canonical_bytes();
         let decoded = TxWitness::from_bytes(&encoded).unwrap();

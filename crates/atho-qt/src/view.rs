@@ -26,6 +26,7 @@ impl ViewModel {
             RpcResponse::BlockTemplate(_)
             | RpcResponse::BlockSubmitted { .. }
             | RpcResponse::TransactionSubmitted(_)
+            | RpcResponse::Utxos(_)
             | RpcResponse::MempoolInfo(_) => {}
             RpcResponse::Error(RpcError::MethodNotFound)
             | RpcResponse::Error(RpcError::InvalidRequest)

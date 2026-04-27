@@ -2,7 +2,7 @@ use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
-use atho_core::constants::GENESIS_COINBASE_ATOMS;
+use atho_core::constants::{GENESIS_COINBASE_ATOMS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
 
@@ -71,6 +71,7 @@ impl Chainstate {
             previous_tip_hash,
             block_undo: undo,
         });
+        self.prune_history();
         Ok(())
     }
 
@@ -106,20 +107,101 @@ impl Chainstate {
     pub fn insert_utxo(&mut self, entry: UtxoEntry) -> Result<(), StorageError> {
         self.utxos.insert(entry)
     }
+
+    fn prune_history(&mut self) {
+        self.prune_history_to_retain(PRUNE_DEPTH_BLOCKS as usize + 1);
+    }
+
+    fn prune_history_to_retain(&mut self, retain: usize) {
+        if self.blocks.len() <= retain || retain == 0 {
+            return;
+        }
+        let prune_count = self.blocks.len().saturating_sub(retain);
+        if prune_count == 0 {
+            return;
+        }
+        self.blocks.drain(1..1 + prune_count);
+        self.undo_stack.drain(0..prune_count);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+    use atho_core::crypto::hash::sha3_256;
     use atho_core::network::Network;
-    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
 
-    fn witness_bytes(inputs: usize) -> Vec<u8> {
+    fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
+        let mut preimage = Vec::with_capacity(
+            b"ATHO_SIG_REF_SHORT_V1".len()
+                + txid.len()
+                + signature.len()
+                + core::mem::size_of::<u32>(),
+        );
+        preimage.extend_from_slice(b"ATHO_SIG_REF_SHORT_V1");
+        preimage.extend_from_slice(txid);
+        preimage.extend_from_slice(signature);
+        preimage.extend_from_slice(&input_index.to_be_bytes());
+        let digest = sha3_256(&preimage);
+        [digest[0], digest[1]]
+    }
+
+    fn derive_witness_commit_ref(
+        txid: &[u8; 48],
+        witness_root: &[u8; 48],
+        input_index: u32,
+    ) -> [u8; 16] {
+        let mut preimage = Vec::with_capacity(
+            b"ATHO_WITNESS_COMMIT_REF_V1".len()
+                + txid.len()
+                + core::mem::size_of::<u32>()
+                + witness_root.len(),
+        );
+        preimage.extend_from_slice(b"ATHO_WITNESS_COMMIT_REF_V1");
+        preimage.extend_from_slice(txid);
+        preimage.extend_from_slice(&input_index.to_be_bytes());
+        preimage.extend_from_slice(witness_root);
+        let digest = sha3_256(&preimage);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
+    }
+
+    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+        let signature = vec![9, 9, 9];
+        let pubkey = vec![8, 8, 8];
+        let txid = tx.txid();
+        let staged = TxWitness {
+            signature: signature.clone(),
+            pubkey: pubkey.clone(),
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        };
+        let staged_tx = Transaction {
+            witness: staged.canonical_bytes(),
+            ..tx.clone()
+        };
+        let witness_root = staged_tx.witness_commitment_hash();
+        let sig_bytes = signature.clone();
         TxWitness {
-            signature: vec![9, 9, 9],
-            pubkey: vec![8, 8, 8],
-            input_refs: (0..inputs).map(|_| vec![7, 7]).collect(),
+            signature: sig_bytes.clone(),
+            pubkey,
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                    witness_commit_ref: derive_witness_commit_ref(
+                        &txid,
+                        &witness_root,
+                        index as u32,
+                    ),
+                })
+                .collect(),
         }
         .canonical_bytes()
     }
@@ -176,7 +258,11 @@ mod tests {
                 locking_script: vec![3],
             }],
             lock_time: 0,
-            witness: witness_bytes(1),
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
         };
         let coinbase = Transaction {
             version: 1,
@@ -216,5 +302,30 @@ mod tests {
         assert_eq!(state.height, 0);
         assert_eq!(state.utxo_count(), 2);
         assert_eq!(state.blocks().len(), 1);
+    }
+
+    #[test]
+    fn chainstate_prunes_old_history_after_retention_window() {
+        let mut state = Chainstate::new(Network::Mainnet);
+        state.blocks = vec![
+            state.blocks[0].clone(),
+            state.blocks[0].clone(),
+            state.blocks[0].clone(),
+        ];
+        state.undo_stack = vec![
+            ChainUndo {
+                previous_tip: None,
+                previous_tip_hash: [0; 48],
+                block_undo: BlockUndo::empty(),
+            },
+            ChainUndo {
+                previous_tip: None,
+                previous_tip_hash: [0; 48],
+                block_undo: BlockUndo::empty(),
+            },
+        ];
+        state.prune_history_to_retain(2);
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(state.undo_stack.len(), 1);
     }
 }
