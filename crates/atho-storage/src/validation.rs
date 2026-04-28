@@ -177,10 +177,19 @@ pub fn validate_transaction_for_height(
     fee_atoms: u64,
     height: u64,
 ) -> Result<(), ValidationError> {
+    validate_transaction_for_height_with_schedule(tx, fee_atoms, height, &rules::SCHEDULED_ACTIVATIONS)
+}
+
+pub fn validate_transaction_for_height_with_schedule(
+    tx: &Transaction,
+    fee_atoms: u64,
+    height: u64,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
     if tx.is_coinbase() {
         return Err(ValidationError::NoInputs);
     }
-    if !rules::is_supported_transaction_version(tx.version, height) {
+    if !rules::is_supported_transaction_version_with_schedule(tx.version, height, schedule) {
         return Err(ValidationError::InvalidTransactionVersion);
     }
     if tx.outputs.is_empty() {
@@ -226,12 +235,31 @@ pub fn validate_transaction_with_context<F>(
     tx: &Transaction,
     fee_atoms: u64,
     spend_height: u64,
-    mut lookup: F,
+    lookup: F,
 ) -> Result<u64, ValidationError>
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    validate_transaction_for_height(tx, fee_atoms, spend_height)?;
+    validate_transaction_with_context_and_schedule(
+        tx,
+        fee_atoms,
+        spend_height,
+        lookup,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
+}
+
+pub fn validate_transaction_with_context_and_schedule<F>(
+    tx: &Transaction,
+    fee_atoms: u64,
+    spend_height: u64,
+    mut lookup: F,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    validate_transaction_for_height_with_schedule(tx, fee_atoms, spend_height, schedule)?;
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
@@ -275,10 +303,24 @@ pub fn validate_coinbase_transaction(
     expected_reward_atoms: u64,
     height: u64,
 ) -> Result<(), ValidationError> {
+    validate_coinbase_transaction_with_schedule(
+        tx,
+        expected_reward_atoms,
+        height,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
+}
+
+pub fn validate_coinbase_transaction_with_schedule(
+    tx: &Transaction,
+    expected_reward_atoms: u64,
+    height: u64,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
     if !tx.is_coinbase() {
         return Err(ValidationError::InvalidCoinbase);
     }
-    if !rules::is_supported_transaction_version(tx.version, height) {
+    if !rules::is_supported_transaction_version_with_schedule(tx.version, height, schedule) {
         return Err(ValidationError::InvalidTransactionVersion);
     }
     if tx.outputs.len() != 1 {
@@ -296,10 +338,26 @@ fn validate_block_impl(
     network: Network,
     skip_pow: bool,
 ) -> Result<(), ValidationError> {
+    validate_block_impl_with_schedule(
+        block,
+        height,
+        network,
+        skip_pow,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
+}
+
+fn validate_block_impl_with_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    skip_pow: bool,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
     if block.transactions.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
-    if !rules::is_supported_block_version(block.header.version, height) {
+    if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
         return Err(ValidationError::InvalidBlockVersion);
     }
     if block.header.network_id != network {
@@ -333,17 +391,19 @@ fn validate_block_impl(
     if subsidy::cumulative_subsidy_atoms(height) > subsidy::max_supply_atoms() {
         return Err(ValidationError::MonetarySupplyExceeded);
     }
-    validate_coinbase_transaction(
+    validate_coinbase_transaction_with_schedule(
         &block.transactions[0],
         subsidy.saturating_add(block.fees_miner_atoms),
         height,
+        schedule,
     )?;
     if block.transactions.len() > 1 {
         for tx in &block.transactions[1..] {
-            validate_transaction_for_height(
+            validate_transaction_for_height_with_schedule(
                 tx,
                 tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS,
                 height,
+                schedule,
             )?;
         }
     }
@@ -369,9 +429,31 @@ pub fn validate_block_with_context(
     expected_previous_hash: [u8; 48],
     expected_target: [u8; 48],
     previous_blocks: &[Block],
-    mut utxos: UtxoSet,
+    utxos: UtxoSet,
 ) -> Result<(), ValidationError> {
-    validate_block(block, height, network)?;
+    validate_block_with_context_and_schedule(
+        block,
+        height,
+        network,
+        expected_previous_hash,
+        expected_target,
+        previous_blocks,
+        utxos,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
+}
+
+pub fn validate_block_with_context_and_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    expected_previous_hash: [u8; 48],
+    expected_target: [u8; 48],
+    previous_blocks: &[Block],
+    mut utxos: UtxoSet,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    validate_block_impl_with_schedule(block, height, network, false, schedule)?;
     if block.header.previous_block_hash != expected_previous_hash {
         return Err(ValidationError::BlockParentHashMismatch);
     }
@@ -389,10 +471,11 @@ pub fn validate_block_with_context(
         return Err(ValidationError::ProofOfWorkInvalid);
     }
 
-    validate_coinbase_transaction(
+    validate_coinbase_transaction_with_schedule(
         &block.transactions[0],
         subsidy::block_subsidy_atoms(height).saturating_add(block.fees_miner_atoms),
         height,
+        schedule,
     )?;
 
     let block_witness_root = block.header.witness_root;
@@ -406,9 +489,13 @@ pub fn validate_block_with_context(
 
         let txid = tx.txid();
         let fee_rate = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let fee = validate_transaction_with_context(tx, fee_rate, height, |txid, output_index| {
-            utxos.get(*txid, output_index).cloned()
-        })?;
+        let fee = validate_transaction_with_context_and_schedule(
+            tx,
+            fee_rate,
+            height,
+            |txid, output_index| utxos.get(*txid, output_index).cloned(),
+            schedule,
+        )?;
 
         for input in &tx.inputs {
             if !seen_inputs.insert((input.previous_txid, input.output_index)) {
@@ -461,7 +548,11 @@ pub fn validate_block_with_context(
 mod tests {
     use super::*;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
-    use atho_core::consensus::rules::BLOCK_VERSION_V2_PLACEHOLDER;
+    use atho_core::consensus::rules::{
+        ScheduledActivation, BLOCK_VERSION_V2_PLACEHOLDER, BLOCK_VERSION_V1,
+        RULESET_VERSION_V1, RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1,
+        TRANSACTION_VERSION_V2_PLACEHOLDER,
+    };
     use atho_core::crypto::hash::sha3_384;
     use atho_core::transaction::{Transaction, TxOutput};
 
@@ -591,6 +682,112 @@ mod tests {
                 UtxoSet::new(Network::Mainnet),
             ),
             Err(ValidationError::BlockTargetOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn scheduled_v2_activation_changes_block_and_transaction_acceptance() {
+        let schedule = [
+            ScheduledActivation {
+                name: "atho-ruleset-v1",
+                ruleset_version: RULESET_VERSION_V1,
+                block_version: BLOCK_VERSION_V1,
+                transaction_version: TRANSACTION_VERSION_V1,
+                activation_height: Some(0),
+            },
+            ScheduledActivation {
+                name: "atho-ruleset-v2",
+                ruleset_version: RULESET_VERSION_V2_PLACEHOLDER,
+                block_version: BLOCK_VERSION_V2_PLACEHOLDER,
+                transaction_version: TRANSACTION_VERSION_V2_PLACEHOLDER,
+                activation_height: Some(12),
+            },
+        ];
+
+        let coinbase_v1 = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(11),
+                locking_script: vec![1],
+            }],
+            lock_time: 1,
+            witness: vec![],
+        };
+        let pre_activation_block = Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Mainnet,
+                height: 11,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(std::slice::from_ref(&coinbase_v1)),
+                witness_root: witness_root(std::slice::from_ref(&coinbase_v1)),
+                timestamp: 1,
+                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+                nonce: 0,
+            },
+            vec![coinbase_v1.clone()],
+        );
+        assert_eq!(
+            validate_block_impl_with_schedule(
+                &pre_activation_block,
+                11,
+                Network::Mainnet,
+                true,
+                &schedule
+            ),
+            Ok(())
+        );
+
+        let coinbase_v2 = Transaction {
+            version: TRANSACTION_VERSION_V2_PLACEHOLDER,
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(12),
+                locking_script: vec![1],
+            }],
+            ..coinbase_v1.clone()
+        };
+        let activation_block = Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V2_PLACEHOLDER,
+                network_id: Network::Mainnet,
+                height: 12,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(std::slice::from_ref(&coinbase_v2)),
+                witness_root: witness_root(std::slice::from_ref(&coinbase_v2)),
+                timestamp: 1,
+                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+                nonce: 0,
+            },
+            vec![coinbase_v2.clone()],
+        );
+        assert_eq!(
+            validate_block_impl_with_schedule(
+                &activation_block,
+                12,
+                Network::Mainnet,
+                true,
+                &schedule
+            ),
+            Ok(())
+        );
+
+        let stale_v1_block = Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                ..activation_block.header.clone()
+            },
+            vec![coinbase_v1],
+        );
+        assert_eq!(
+            validate_block_impl_with_schedule(
+                &stale_v1_block,
+                12,
+                Network::Mainnet,
+                true,
+                &schedule
+            ),
+            Err(ValidationError::InvalidBlockVersion)
         );
     }
 }

@@ -35,6 +35,13 @@ struct BlockRecord {
     block_hash: [u8; 48],
 }
 
+#[derive(Debug, Clone)]
+pub struct ChainSnapshotBundle {
+    pub snapshot: ChainstateSnapshot,
+    pub utxos: Vec<UtxoEntry>,
+    pub blocks: Vec<Block>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSelectionOutcome {
     Extended,
@@ -257,6 +264,104 @@ impl Chainstate {
 
     pub fn utxo_entry(&self, txid: [u8; 48], output_index: u32) -> Option<UtxoEntry> {
         self.utxos.get(txid, output_index).cloned()
+    }
+
+    pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Result<Option<Block>, StorageError> {
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.block_hash() == block_hash)
+            .cloned()
+        {
+            return Ok(Some(block));
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_block(block_hash)
+    }
+
+    pub fn contains_block(&self, block_hash: [u8; 48]) -> Result<bool, StorageError> {
+        Ok(self.block_by_hash(block_hash)?.is_some())
+    }
+
+    pub fn export_snapshot_bundle(&self) -> Result<ChainSnapshotBundle, StorageError> {
+        Ok(ChainSnapshotBundle {
+            snapshot: ChainstateSnapshot {
+                height: self.height,
+                tip_hash: self.tip_hash,
+                tip_header: self.tip.clone(),
+            },
+            utxos: self.utxos.entries().cloned().collect(),
+            blocks: self.canonical_blocks()?,
+        })
+    }
+
+    pub fn import_snapshot_bundle(
+        &mut self,
+        bundle: ChainSnapshotBundle,
+    ) -> Result<(), StorageError> {
+        let Some(last) = bundle.blocks.last() else {
+            return Err(StorageError::IncompleteBlockHistory);
+        };
+        if last.header.height != bundle.snapshot.height
+            || last.header.block_hash() != bundle.snapshot.tip_hash
+        {
+            return Err(StorageError::PersistedTipMismatch);
+        }
+        let Some(first) = bundle.blocks.first() else {
+            return Err(StorageError::IncompleteBlockHistory);
+        };
+        if first.header.height != 0 || first.header.block_hash() != genesis::genesis_hash(self.network) {
+            return Err(StorageError::PersistedGenesisMismatch);
+        }
+
+        let mut utxos = UtxoSet::new(self.network);
+        for entry in &bundle.utxos {
+            utxos.insert(entry.clone())?;
+        }
+
+        if let Some(storage) = &self.storage {
+            storage.replace_chainstate(&bundle.snapshot, &bundle.utxos, &bundle.blocks)?;
+        }
+
+        self.tip = bundle.snapshot.tip_header;
+        self.tip_hash = bundle.snapshot.tip_hash;
+        self.height = bundle.snapshot.height;
+        self.blocks = bundle.blocks;
+        self.utxos = utxos;
+        self.undo_stack.clear();
+        self.prune_history();
+        Ok(())
+    }
+
+    pub fn canonical_blocks(&self) -> Result<Vec<Block>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(self.blocks.clone());
+        };
+
+        let mut remaining_height = self.height;
+        let mut next_hash = self.tip_hash;
+        let mut reversed = Vec::with_capacity(self.height.saturating_add(1) as usize);
+
+        loop {
+            let block = storage
+                .load_block(next_hash)?
+                .ok_or(StorageError::IncompleteBlockHistory)?;
+            if block.header.block_hash() != next_hash || block.header.height != remaining_height {
+                return Err(StorageError::IncompleteBlockHistory);
+            }
+            let is_genesis = block.header.height == 0;
+            next_hash = block.header.previous_block_hash;
+            reversed.push(block);
+            if is_genesis {
+                break;
+            }
+            remaining_height = remaining_height.saturating_sub(1);
+        }
+
+        reversed.reverse();
+        Ok(reversed)
     }
 
     pub fn disconnect_last_block(&mut self) -> Result<(), StorageError> {
@@ -980,7 +1085,7 @@ struct OutputRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ChainstateSnapshot, Database};
+    use crate::db::{ChainstateSnapshot, CommitFaultPoint, Database};
     use crate::error::StorageError;
     use crate::utxo::UtxoEntry;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
@@ -1158,6 +1263,59 @@ mod tests {
     }
 
     #[test]
+    fn commit_fault_injection_rolls_back_chainstate_mutation() {
+        let root = temp_workspace("fault-injection");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+        let before_height = state.height;
+        let before_tip_hash = state.tip_hash;
+        let before_utxo_count = state.utxo_count();
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![9],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let transactions = vec![coinbase];
+        let block = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: genesis::genesis_state(Network::Mainnet)
+                    .block
+                    .header
+                    .timestamp
+                    .saturating_add(1),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
+                nonce: 0,
+            },
+            transactions,
+        ));
+
+        Database::inject_commit_fault_for_test(CommitFaultPoint::BeforeCommit, 1);
+        let result = state.connect_block(&block);
+        Database::clear_commit_fault_for_test();
+
+        assert!(matches!(result, Err(StorageError::Io(_))));
+        assert_eq!(state.height, before_height);
+        assert_eq!(state.tip_hash, before_tip_hash);
+        assert_eq!(state.utxo_count(), before_utxo_count);
+        assert_eq!(state.blocks().len(), 1);
+    }
+
+    #[test]
     fn chainstate_prunes_old_history_after_retention_window() {
         let mut state = Chainstate::new(Network::Mainnet);
         state.blocks = vec![
@@ -1180,6 +1338,56 @@ mod tests {
         state.prune_history_to_retain(2);
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_bundle_uses_canonical_storage_after_pruning_memory_tail() {
+        let root = temp_workspace("snapshot-export");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let mut state = Chainstate::try_load_or_new(Network::Regnet).expect("state");
+
+        for height in 1..=4u64 {
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    locking_script: vec![height as u8],
+                }],
+                lock_time: 0,
+                witness: vec![],
+            };
+            let transactions = vec![coinbase];
+            let block = solve_block(Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Regnet,
+                    height,
+                    previous_block_hash: state.tip_hash,
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    timestamp: genesis::genesis_state(Network::Regnet)
+                        .block
+                        .header
+                        .timestamp
+                        .saturating_add(height),
+                    difficulty_target_or_bits: state.next_difficulty_target(),
+                    nonce: 0,
+                },
+                transactions,
+            ));
+            state.connect_block(&block).expect("connect block");
+        }
+
+        state.prune_history_to_retain(2);
+        assert_eq!(state.blocks().len(), 2);
+
+        let bundle = state.export_snapshot_bundle().expect("export bundle");
+        assert_eq!(bundle.snapshot.height, 4);
+        assert_eq!(bundle.blocks.len(), 5);
+        assert_eq!(bundle.blocks.first().expect("genesis").header.height, 0);
+        assert_eq!(bundle.blocks.last().expect("tip").header.height, 4);
     }
 
     #[test]

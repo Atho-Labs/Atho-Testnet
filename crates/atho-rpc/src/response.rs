@@ -30,6 +30,23 @@ pub struct MempoolSpentInput {
     pub output_index: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WalletActivityKind {
+    Mined,
+    Received,
+    Sent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletActivityEntry {
+    pub height: u64,
+    pub kind: WalletActivityKind,
+    pub label: String,
+    pub amount_atoms: i128,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub txid: [u8; 48],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub network: Network,
@@ -54,6 +71,7 @@ pub enum RpcResponse {
     },
     TransactionSubmitted(#[serde(with = "serde_big_array::BigArray")] [u8; 48]),
     Utxos(Vec<UtxoEntry>),
+    WalletActivity(Vec<WalletActivityEntry>),
     MempoolInfo(MempoolInfo),
     MempoolSpentInputs(Vec<MempoolSpentInput>),
     Error(RpcError),

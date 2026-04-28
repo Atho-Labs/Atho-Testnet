@@ -115,11 +115,30 @@ impl Wallet {
         datafile::WalletDataFile::save(self, password, path)
     }
 
+    #[doc(hidden)]
+    pub fn save_to_datafile_with_iterations(
+        &self,
+        path: &Path,
+        password: &str,
+        iterations: u32,
+    ) -> Result<(), datafile::WalletDatafileError> {
+        datafile::WalletDataFile::save_with_iterations(self, password, path, iterations)
+    }
+
     pub fn load_from_datafile(
         path: &Path,
         password: &str,
     ) -> Result<Self, datafile::WalletDatafileError> {
         datafile::WalletDataFile::load(path, password)
+    }
+
+    #[doc(hidden)]
+    pub fn load_from_datafile_with_iterations(
+        path: &Path,
+        password: &str,
+        iterations: u32,
+    ) -> Result<Self, datafile::WalletDatafileError> {
+        datafile::WalletDataFile::load_with_iterations(path, password, iterations)
     }
 
     pub fn load_from_datafile_with_progress<F>(

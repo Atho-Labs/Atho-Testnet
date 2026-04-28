@@ -5,10 +5,16 @@ use crate::error::NodeError;
 use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
+use crate::sync::{NodeSyncError, SyncNotice};
+use crate::wallet_history;
 use atho_core::block::Block;
 use atho_core::network::Network;
-use atho_rpc::request::RpcRequest;
-use atho_rpc::response::{BlockTemplate, MempoolInfo, MempoolSpentInput, NodeStatus, RpcResponse};
+use atho_p2p::connection::ConnectionEvent;
+use atho_p2p::protocol::NetworkMessage;
+use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
+use atho_rpc::response::{
+    BlockTemplate, MempoolInfo, MempoolSpentInput, NodeStatus, RpcResponse, WalletActivityEntry,
+};
 use atho_wallet::snapshot::WalletSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +39,18 @@ impl NodeService {
     pub fn new(config: NodeConfig) -> Self {
         Self {
             orchestrator: NodeOrchestrator::new(config),
+            wallet_snapshot: WalletSnapshot::default(),
+        }
+    }
+
+    pub fn new_ephemeral(config: NodeConfig) -> Self {
+        let network = config.network;
+        Self {
+            orchestrator: NodeOrchestrator {
+                runtime: crate::runtime::NodeRuntime::new(config),
+                sync: crate::sync::NodeSync::new(network),
+                rpc_server: atho_rpc::server::RpcServer::new(network),
+            },
             wallet_snapshot: WalletSnapshot::default(),
         }
     }
@@ -77,6 +95,10 @@ impl NodeService {
                     .collect(),
             ),
             RpcRequest::ListUtxos => RpcResponse::Utxos(self.list_utxos()),
+            RpcRequest::GetWalletActivity { addresses } => match self.wallet_activity(&addresses) {
+                Ok(activity) => RpcResponse::WalletActivity(activity),
+                Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+            },
             RpcRequest::GetBlockTemplate => {
                 let miner = Miner::new(1);
                 match self.orchestrator.runtime.node.build_candidate_block(&miner) {
@@ -147,6 +169,7 @@ impl NodeService {
                 let block_summary = dev::summarize_block(&block);
                 let response = match self.orchestrator.runtime.node.submit_block(&block) {
                     Ok(()) => {
+                        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
                         self.refresh_runtime_views();
                         RpcResponse::BlockSubmitted {
                             accepted: true,
@@ -202,6 +225,14 @@ impl NodeService {
             .collect()
     }
 
+    fn wallet_activity(
+        &self,
+        addresses: &[WalletHistoryAddress],
+    ) -> Result<Vec<WalletActivityEntry>, NodeError> {
+        let blocks = self.orchestrator.runtime.node.canonical_blocks()?;
+        Ok(wallet_history::derive_wallet_activity(&blocks, addresses))
+    }
+
     pub fn status(&self) -> SystemStatus {
         SystemStatus {
             network: self.network(),
@@ -236,8 +267,92 @@ impl NodeService {
         self.orchestrator.runtime.running
     }
 
-    fn refresh_runtime_views(&mut self) {
+    pub fn height(&self) -> u64 {
+        self.orchestrator.runtime.node.height()
+    }
+
+    pub fn tip_hash(&self) -> [u8; 48] {
+        self.orchestrator.runtime.node.tip_hash()
+    }
+
+    pub fn p2p_peer_count(&self) -> usize {
+        self.orchestrator.sync.connections().peer_count()
+    }
+
+    pub fn p2p_sync_best_height(&self) -> u64 {
+        self.orchestrator.sync.sync_state().best_height
+    }
+
+    pub fn p2p_headers_synced(&self) -> bool {
+        self.orchestrator.sync.sync_state().headers_synced
+    }
+
+    pub fn p2p_relay_compact_tip_message(&self) -> Option<NetworkMessage> {
+        let block = self
+            .orchestrator
+            .runtime
+            .node
+            .block_by_hash(self.orchestrator.runtime.node.tip_hash())?;
+        Some(self.orchestrator.sync.relay_compact_block_message(&block))
+    }
+
+    pub fn p2p_accept_inbound(
+        &mut self,
+        remote_addr: impl Into<String>,
+    ) -> Result<(), NodeError> {
+        self.orchestrator
+            .sync
+            .accept_inbound(remote_addr)
+            .map_err(sync_error_into_node)?;
+        self.refresh_runtime_views();
+        Ok(())
+    }
+
+    pub fn p2p_open_outbound(
+        &mut self,
+        remote_addr: impl Into<String>,
+    ) -> Result<Vec<ConnectionEvent>, NodeError> {
+        let events = self
+            .orchestrator
+            .sync
+            .open_outbound(remote_addr, &self.orchestrator.runtime.node)
+            .map_err(sync_error_into_node)?;
+        self.refresh_runtime_views();
+        Ok(events)
+    }
+
+    pub fn p2p_receive(
+        &mut self,
+        remote_addr: &str,
+        message: NetworkMessage,
+    ) -> Result<(Vec<ConnectionEvent>, Vec<SyncNotice>), NodeError> {
+        let result = self
+            .orchestrator
+            .sync
+            .receive(remote_addr, message, &mut self.orchestrator.runtime.node)
+            .map_err(sync_error_into_node)?;
+        self.refresh_runtime_views();
+        Ok(result)
+    }
+
+    pub fn p2p_prime(&mut self) {
         self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.refresh_runtime_views();
+    }
+
+    #[cfg(test)]
+    pub fn p2p_mine_local_block(&mut self) -> Result<[u8; 48], NodeError> {
+        let block = self
+            .orchestrator
+            .runtime
+            .node
+            .mine_and_connect_candidate_block(&Miner::new(1))?;
+        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.refresh_runtime_views();
+        Ok(block.header.block_hash())
+    }
+
+    fn refresh_runtime_views(&mut self) {
         self.orchestrator.rpc_server.block_count = self.orchestrator.runtime.node.height();
         self.orchestrator.rpc_server.mempool_count = self.orchestrator.runtime.node.mempool_len();
         self.orchestrator.rpc_server.mempool_total_fee_atoms =
@@ -250,11 +365,9 @@ impl NodeService {
     }
 
     #[doc(hidden)]
-    pub fn sandbox_with_node_mut<T>(
-        &mut self,
-        f: impl FnOnce(&mut crate::node::Node) -> T,
-    ) -> T {
+    pub fn sandbox_with_node_mut<T>(&mut self, f: impl FnOnce(&mut crate::node::Node) -> T) -> T {
         let result = f(&mut self.orchestrator.runtime.node);
+        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
         self.refresh_runtime_views();
         result
     }
@@ -263,5 +376,13 @@ impl NodeService {
 impl Drop for NodeService {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn sync_error_into_node(error: NodeSyncError) -> NodeError {
+    match error {
+        NodeSyncError::Node(error) => error,
+        NodeSyncError::Protocol(error) => NodeError::P2pProtocol(error),
+        NodeSyncError::Connection(error) => NodeError::P2pConnection(error),
     }
 }

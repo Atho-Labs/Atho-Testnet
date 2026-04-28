@@ -1,10 +1,12 @@
 use crate::config::{network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::rules;
+use atho_core::crypto::hash::sha3_256;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const NODE_NETWORK: u64 = 1 << 0;
@@ -50,6 +52,9 @@ pub enum MessageCommand {
     Block,
     Tx,
     MemPool,
+    CompactBlock,
+    GetBlockTxn,
+    BlockTxn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +99,38 @@ pub struct GetHeadersMessage {
     pub stop_hash: Hash48,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefilledTransaction {
+    pub index: u32,
+    pub transaction: Transaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactBlockMessage {
+    pub header: BlockHeader,
+    pub tx_count: usize,
+    pub short_ids: Vec<u64>,
+    pub prefilled_transactions: Vec<PrefilledTransaction>,
+    pub fees_total_atoms: u64,
+    pub fees_miner_atoms: u64,
+    pub fees_burned_atoms: u64,
+    pub fees_pool_atoms: u64,
+    pub cumulative_burned_atoms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetBlockTxnMessage {
+    pub block_hash: Hash48,
+    pub indexes: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockTxnMessage {
+    pub block_hash: Hash48,
+    pub indexes: Vec<u32>,
+    pub transactions: Vec<Transaction>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessagePayload {
     Version(VersionMessage),
@@ -110,6 +147,9 @@ pub enum MessagePayload {
     Block(Block),
     Tx(Transaction),
     MemPool,
+    CompactBlock(CompactBlockMessage),
+    GetBlockTxn(GetBlockTxnMessage),
+    BlockTxn(BlockTxnMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +190,8 @@ pub enum ProtocolError {
     HandshakeIncomplete,
     #[error("too many locator hashes")]
     TooManyLocatorHashes,
+    #[error("invalid compact block")]
+    InvalidCompactBlock,
 }
 
 impl MessageCommand {
@@ -169,6 +211,9 @@ impl MessageCommand {
             Self::Block => "block",
             Self::Tx => "tx",
             Self::MemPool => "mempool",
+            Self::CompactBlock => "cmpctblock",
+            Self::GetBlockTxn => "getblocktxn",
+            Self::BlockTxn => "blocktxn",
         }
     }
 
@@ -191,6 +236,9 @@ impl MessageCommand {
             "block" => Ok(Self::Block),
             "tx" => Ok(Self::Tx),
             "mempool" => Ok(Self::MemPool),
+            "cmpctblock" => Ok(Self::CompactBlock),
+            "getblocktxn" => Ok(Self::GetBlockTxn),
+            "blocktxn" => Ok(Self::BlockTxn),
             _ => Err(ProtocolError::UnknownMessageCommand),
         }
     }
@@ -220,6 +268,9 @@ impl MessagePayload {
             Self::Block(_) => MessageCommand::Block,
             Self::Tx(_) => MessageCommand::Tx,
             Self::MemPool => MessageCommand::MemPool,
+            Self::CompactBlock(_) => MessageCommand::CompactBlock,
+            Self::GetBlockTxn(_) => MessageCommand::GetBlockTxn,
+            Self::BlockTxn(_) => MessageCommand::BlockTxn,
         }
     }
 }
@@ -268,6 +319,9 @@ impl NetworkMessage {
             }
             MessagePayload::Block(block) => serialize(block),
             MessagePayload::Tx(transaction) => serialize(transaction),
+            MessagePayload::CompactBlock(message) => serialize(message),
+            MessagePayload::GetBlockTxn(message) => serialize(message),
+            MessagePayload::BlockTxn(message) => serialize(message),
         }
     }
 
@@ -340,9 +394,119 @@ impl NetworkMessage {
                 expect_empty(payload)?;
                 MessagePayload::MemPool
             }
+            MessageCommand::CompactBlock => MessagePayload::CompactBlock(deserialize(payload)?),
+            MessageCommand::GetBlockTxn => MessagePayload::GetBlockTxn(deserialize(payload)?),
+            MessageCommand::BlockTxn => MessagePayload::BlockTxn(deserialize(payload)?),
         };
         Ok(Self::new(network, payload))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactBlockReconstruction {
+    Complete(Block),
+    Missing { block_hash: [u8; 48], indexes: Vec<u32> },
+}
+
+pub fn compact_short_id(txid: [u8; 48]) -> u64 {
+    let mut preimage = Vec::with_capacity(b"ATHO_COMPACT_SHORTID_V1".len() + txid.len());
+    preimage.extend_from_slice(b"ATHO_COMPACT_SHORTID_V1");
+    preimage.extend_from_slice(&txid);
+    let digest = sha3_256(&preimage);
+    u64::from_le_bytes(digest[..8].try_into().expect("compact short id"))
+}
+
+pub fn compact_block_from_block(block: &Block) -> CompactBlockMessage {
+    CompactBlockMessage {
+        header: block.header.clone(),
+        tx_count: block.transactions.len(),
+        short_ids: block
+            .transactions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 0)
+            .map(|(_, tx)| compact_short_id(tx.txid()))
+            .collect(),
+        prefilled_transactions: block
+            .transactions
+            .first()
+            .cloned()
+            .map(|transaction| {
+                vec![PrefilledTransaction {
+                    index: 0,
+                    transaction,
+                }]
+            })
+            .unwrap_or_default(),
+        fees_total_atoms: block.fees_total_atoms,
+        fees_miner_atoms: block.fees_miner_atoms,
+        fees_burned_atoms: block.fees_burned_atoms,
+        fees_pool_atoms: block.fees_pool_atoms,
+        cumulative_burned_atoms: block.cumulative_burned_atoms,
+    }
+}
+
+pub fn reconstruct_compact_block<F>(
+    message: &CompactBlockMessage,
+    mut lookup_short_id: F,
+    overrides: &BTreeMap<u32, Transaction>,
+) -> Result<CompactBlockReconstruction, ProtocolError>
+where
+    F: FnMut(u64) -> Option<Transaction>,
+{
+    if message.tx_count == 0 {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+
+    let mut slots = vec![None; message.tx_count];
+    for prefilled in &message.prefilled_transactions {
+        let index = prefilled.index as usize;
+        if index >= slots.len() || slots[index].is_some() {
+            return Err(ProtocolError::InvalidCompactBlock);
+        }
+        slots[index] = Some(prefilled.transaction.clone());
+    }
+    let non_prefilled_indexes = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| slot.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    if non_prefilled_indexes.len() != message.short_ids.len() {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+
+    let mut missing = Vec::new();
+    for (index, short_id) in non_prefilled_indexes.into_iter().zip(message.short_ids.iter()) {
+        if let Some(transaction) = overrides.get(&(index as u32)).cloned() {
+            slots[index] = Some(transaction);
+        } else if let Some(transaction) = lookup_short_id(*short_id) {
+            slots[index] = Some(transaction);
+        } else {
+            missing.push(index as u32);
+        }
+    }
+
+    if !missing.is_empty() {
+        return Ok(CompactBlockReconstruction::Missing {
+            block_hash: message.header.block_hash(),
+            indexes: missing,
+        });
+    }
+
+    let transactions = slots
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ProtocolError::InvalidCompactBlock)?;
+    Ok(CompactBlockReconstruction::Complete(Block {
+        header: message.header.clone(),
+        transactions,
+        witnesses: Default::default(),
+        fees_total_atoms: message.fees_total_atoms,
+        fees_miner_atoms: message.fees_miner_atoms,
+        fees_burned_atoms: message.fees_burned_atoms,
+        fees_pool_atoms: message.fees_pool_atoms,
+        cumulative_burned_atoms: message.cumulative_burned_atoms,
+    }))
 }
 
 pub fn validate_version_message(
@@ -407,6 +571,9 @@ mod tests {
             MessageCommand::Block,
             MessageCommand::Tx,
             MessageCommand::MemPool,
+            MessageCommand::CompactBlock,
+            MessageCommand::GetBlockTxn,
+            MessageCommand::BlockTxn,
         ] {
             assert_eq!(
                 MessageCommand::from_bytes(command.as_padded_bytes()).expect("decode"),
@@ -450,5 +617,57 @@ mod tests {
             message.encode_payload(),
             Err(ProtocolError::TooManyLocatorHashes)
         );
+    }
+
+    #[test]
+    fn compact_block_round_trips_through_prefill_and_short_ids() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![atho_core::transaction::TxOutput {
+                value_atoms: 1,
+                locking_script: vec![0],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![atho_core::transaction::TxOutput {
+                value_atoms: 1,
+                locking_script: vec![1],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: [1; 48],
+                witness_root: [2; 48],
+                timestamp: 1,
+                difficulty_target_or_bits: [3; 48],
+                nonce: 4,
+            },
+            transactions: vec![coinbase, tx.clone()],
+            witnesses: Default::default(),
+            fees_total_atoms: 5,
+            fees_miner_atoms: 5,
+            fees_burned_atoms: 0,
+            fees_pool_atoms: 0,
+            cumulative_burned_atoms: 0,
+        };
+        let compact = compact_block_from_block(&block);
+        let reconstructed = reconstruct_compact_block(
+            &compact,
+            |short_id| (short_id == compact_short_id(tx.txid())).then_some(tx.clone()),
+            &BTreeMap::new(),
+        )
+        .expect("reconstruct");
+        assert_eq!(reconstructed, CompactBlockReconstruction::Complete(block));
     }
 }

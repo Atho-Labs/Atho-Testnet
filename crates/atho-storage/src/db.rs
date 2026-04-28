@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 const INITIAL_MAP_SIZE: usize = 1 << 30;
 const MAX_MAP_SIZE: usize = 1 << 40;
@@ -34,6 +36,10 @@ const LEGACY_ADDRESSES_DIR: &str = "addresses";
 
 const SNAPSHOT_KEY: &[u8; 10] = b"chainstate";
 const SCHEMA_VERSION_KEY: &[u8; 14] = b"schema_version";
+const SCHEMA_MIGRATION_LOG_KEY: &[u8; 20] = b"schema_migration_log";
+
+#[cfg(test)]
+static COMMIT_FAULT: OnceLock<Mutex<Option<CommitFault>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainstateSnapshot {
@@ -78,6 +84,19 @@ pub struct AddressRecord {
     pub label: Option<String>,
     pub first_seen_height: u64,
     pub last_seen_height: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFaultPoint {
+    BeforeCommit,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitFault {
+    point: CommitFaultPoint,
+    remaining_hits: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -227,6 +246,49 @@ impl Database {
                     WriteFlags::empty(),
                 )?;
             }
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::BeforeCommit)?;
+            txn.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn replace_chainstate(
+        &self,
+        snapshot: &ChainstateSnapshot,
+        utxos: &[UtxoEntry],
+        blocks: &[Block],
+    ) -> Result<(), StorageError> {
+        let snapshot_value = bincode::serialize(snapshot).map_err(|_| StorageError::CorruptData)?;
+        let mut serialized_utxos = Vec::with_capacity(utxos.len());
+        for utxo in utxos {
+            let key = utxo_key(utxo.txid, utxo.output_index);
+            let value = bincode::serialize(utxo).map_err(|_| StorageError::CorruptData)?;
+            serialized_utxos.push((key, value));
+        }
+
+        self.write_with_retry(|state| {
+            let mut txn = state.env.begin_rw_txn()?;
+            clear_db(&mut txn, state.blocks)?;
+            clear_db(&mut txn, state.transactions)?;
+            clear_db(&mut txn, state.utxos)?;
+            for block in blocks {
+                write_block_archive(&mut txn, state, block.header.height, block)?;
+            }
+            txn.put(
+                state.meta,
+                &SNAPSHOT_KEY,
+                &snapshot_value,
+                WriteFlags::empty(),
+            )?;
+            for (key, value) in &serialized_utxos {
+                txn.put(
+                    state.utxos,
+                    &key.as_slice(),
+                    &value.as_slice(),
+                    WriteFlags::empty(),
+                )?;
+            }
             txn.commit()?;
             Ok(())
         })
@@ -272,7 +334,10 @@ impl Database {
                     .try_into()
                     .map_err(|_| StorageError::CorruptData)?;
                 let found = u32::from_le_bytes(bytes);
-                if found != STORAGE_SCHEMA_VERSION {
+                if found == STORAGE_SCHEMA_VERSION {
+                    return Ok(());
+                }
+                if !self.try_migrate_schema(found)? {
                     return Err(StorageError::SchemaVersionMismatch {
                         expected: STORAGE_SCHEMA_VERSION,
                         found,
@@ -288,6 +353,33 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn try_migrate_schema(&self, found: u32) -> Result<bool, StorageError> {
+        match found {
+            2 => {
+                self.write_with_retry(|state| {
+                    let mut txn = state.env.begin_rw_txn()?;
+                    let migration_log = format!("{found}->{STORAGE_SCHEMA_VERSION}").into_bytes();
+                    txn.put(
+                        state.meta,
+                        &SCHEMA_VERSION_KEY,
+                        &STORAGE_SCHEMA_VERSION.to_le_bytes(),
+                        WriteFlags::empty(),
+                    )?;
+                    txn.put(
+                        state.meta,
+                        &SCHEMA_MIGRATION_LOG_KEY,
+                        &migration_log,
+                        WriteFlags::empty(),
+                    )?;
+                    txn.commit()?;
+                    Ok(())
+                })?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     fn get(&self, dataset: Dataset, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
@@ -376,6 +468,22 @@ impl Database {
             addresses,
         })
     }
+
+    #[cfg(test)]
+    pub fn inject_commit_fault_for_test(point: CommitFaultPoint, remaining_hits: usize) {
+        let fault = COMMIT_FAULT.get_or_init(|| Mutex::new(None));
+        *fault.lock().expect("commit fault mutex poisoned") = Some(CommitFault {
+            point,
+            remaining_hits,
+        });
+    }
+
+    #[cfg(test)]
+    pub fn clear_commit_fault_for_test() {
+        if let Some(fault) = COMMIT_FAULT.get() {
+            *fault.lock().expect("commit fault mutex poisoned") = None;
+        }
+    }
 }
 
 impl Dataset {
@@ -454,4 +562,110 @@ fn utxo_key(txid: [u8; 48], output_index: u32) -> Vec<u8> {
     key.extend_from_slice(&txid);
     key.extend_from_slice(&output_index.to_be_bytes());
     key
+}
+
+#[cfg(test)]
+fn maybe_inject_commit_fault(point: CommitFaultPoint) -> Result<(), StorageError> {
+    let Some(fault) = COMMIT_FAULT.get() else {
+        return Ok(());
+    };
+    let mut guard = fault.lock().expect("commit fault mutex poisoned");
+    let Some(active) = guard.as_mut() else {
+        return Ok(());
+    };
+    if active.point != point || active.remaining_hits == 0 {
+        return Ok(());
+    }
+    active.remaining_hits = active.remaining_hits.saturating_sub(1);
+    if active.remaining_hits == 0 {
+        *guard = None;
+    }
+    Err(StorageError::Io(std::io::Error::other(
+        "fault injected before LMDB commit",
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path::ATHO_DATA_DIR_ENV;
+    use std::ffi::OsString;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn temp_data_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-db-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn schema_version_two_migrates_forward_in_place() {
+        let root = temp_data_dir("schema-migrate");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open current db");
+        database
+            .put(Dataset::Meta, SCHEMA_VERSION_KEY, &2u32.to_le_bytes())
+            .expect("force schema v2");
+        drop(database);
+
+        let reopened = Database::open(Network::Regnet).expect("reopen migrated db");
+        let version = reopened
+            .get(Dataset::Meta, SCHEMA_VERSION_KEY)
+            .expect("schema bytes")
+            .expect("schema present");
+        assert_eq!(u32::from_le_bytes(version.try_into().expect("u32 bytes")), 3);
+        let migration_log = reopened
+            .get(Dataset::Meta, SCHEMA_MIGRATION_LOG_KEY)
+            .expect("migration log")
+            .expect("migration log present");
+        assert_eq!(migration_log, b"2->3");
+    }
+
+    #[test]
+    fn unsupported_schema_version_still_fails_closed() {
+        let root = temp_data_dir("schema-reject");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open current db");
+        database
+            .put(Dataset::Meta, SCHEMA_VERSION_KEY, &99u32.to_le_bytes())
+            .expect("force unknown schema");
+        drop(database);
+
+        let err = Database::open(Network::Regnet).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::SchemaVersionMismatch {
+                expected: STORAGE_SCHEMA_VERSION,
+                found: 99
+            }
+        ));
+    }
 }

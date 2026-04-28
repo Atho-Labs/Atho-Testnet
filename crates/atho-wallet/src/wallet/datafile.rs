@@ -55,8 +55,27 @@ impl WalletDataFile {
         save_impl(wallet, password, path, PASSWORD_ITERATIONS)
     }
 
+    #[doc(hidden)]
+    pub fn save_with_iterations(
+        wallet: &Wallet,
+        password: &str,
+        path: &Path,
+        iterations: u32,
+    ) -> Result<(), WalletDatafileError> {
+        save_impl(wallet, password, path, iterations)
+    }
+
     pub fn load(path: &Path, password: &str) -> Result<Wallet, WalletDatafileError> {
         load_impl(path, password, PASSWORD_ITERATIONS)
+    }
+
+    #[doc(hidden)]
+    pub fn load_with_iterations(
+        path: &Path,
+        password: &str,
+        iterations: u32,
+    ) -> Result<Wallet, WalletDatafileError> {
+        load_impl(path, password, iterations)
     }
 
     pub fn load_with_progress<F>(

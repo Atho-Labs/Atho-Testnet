@@ -10,4 +10,5 @@ pub mod handshake;
 pub mod peer;
 pub mod protocol;
 pub mod relay;
+pub mod downloader;
 pub mod sync;

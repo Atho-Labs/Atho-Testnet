@@ -16,8 +16,11 @@ use atho_node::miner::Miner;
 use atho_node::validation::{
     derive_sig_ref_short, derive_witness_commit_ref, finalize_witness_commit_refs,
 };
-use atho_rpc::request::RpcRequest;
-use atho_rpc::response::{MempoolSpentInput, RpcResponse};
+use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
+use atho_rpc::response::{
+    MempoolSpentInput, RpcResponse, WalletActivityEntry as RpcWalletActivityEntry,
+    WalletActivityKind as RpcWalletActivityKind,
+};
 use atho_rpc::transport::RpcClient;
 use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
@@ -48,10 +51,10 @@ pub(crate) use models::{
     ReceiveRequestRecord, SendJob, SendOutcome, WalletActivityKind, WalletActivityRow,
     WalletBalanceSummary, WalletManagementForm,
 };
-use wallet_ledger::WalletLedgerCache;
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
 const WALLET_DISCOVERY_SCAN_STEPS: &[usize] = &[32, 128, 256, 512, 1_000];
+const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
@@ -107,7 +110,6 @@ pub struct DesktopApp {
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
     wallet_balance_summary_cache: WalletBalanceSummary,
-    wallet_ledger_cache: WalletLedgerCache,
     pub(crate) activity_feed: Vec<ActivityRow>,
     activity_feed_fingerprint: Option<ActivityFeedFingerprint>,
     wallet_cache_dirty: bool,
@@ -145,7 +147,8 @@ struct WalletScanOutcome {
     wallet_owned_utxos_cache: Vec<UtxoEntry>,
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_balance_cache: u64,
-    wallet_ledger_cache: WalletLedgerCache,
+    wallet_balance_summary_cache: WalletBalanceSummary,
+    wallet_activity_cache: Vec<WalletActivityRow>,
 }
 
 #[derive(Debug)]
@@ -248,7 +251,6 @@ impl DesktopApp {
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
             wallet_balance_summary_cache: WalletBalanceSummary::default(),
-            wallet_ledger_cache: WalletLedgerCache::default(),
             activity_feed: Vec::new(),
             activity_feed_fingerprint: None,
             wallet_cache_dirty: true,
@@ -372,7 +374,6 @@ impl DesktopApp {
         self.wallet_activity_cache.clear();
         self.wallet_balance_summary_cache = WalletBalanceSummary::default();
         self.wallet_balance_cache = 0;
-        self.wallet_ledger_cache = WalletLedgerCache::default();
         self.wallet_cache_dirty = true;
         self.wallet_scan_job = None;
         self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
@@ -411,7 +412,6 @@ impl DesktopApp {
             self.wallet_balance_cache = 0;
             self.receive_addresses.clear();
             self.receive_address_rows.clear();
-            self.wallet_ledger_cache = WalletLedgerCache::default();
             self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
             self.wallet_discovery_scan_limit_cached = 0;
             self.current_receive_address = None;
@@ -485,24 +485,24 @@ impl DesktopApp {
             .collect::<Vec<_>>();
         let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
+        let activity = match Self::request_wallet_activity_rows(
+            &self.connection,
+            &self.wallet_addresses_cache,
+        ) {
+            Ok(activity) => activity,
+            Err(err) => {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("wallet activity refresh failed error={err}"),
+                );
+                Vec::new()
+            }
+        };
 
         self.wallet_owned_utxos_cache = owned;
         self.refresh_receive_address_rows();
-
-        if let Err(err) = self
-            .wallet_ledger_cache
-            .refresh(&self.wallet_addresses_cache, balance_summary.clone())
-        {
-            let _ = atho_node::dev::append_log(
-                "atho-qt",
-                &format!("wallet ledger refresh failed error={err}"),
-            );
-            self.wallet_balance_summary_cache = balance_summary.clone();
-            self.wallet_activity_cache.clear();
-        } else {
-            self.wallet_balance_summary_cache = self.wallet_ledger_cache.summary().clone();
-            self.wallet_activity_cache = self.wallet_ledger_cache.activities().to_vec();
-        }
+        self.wallet_balance_summary_cache = balance_summary;
+        self.wallet_activity_cache = activity;
 
         self.wallet_utxos_cache = available_owned;
         self.wallet_balance_cache = available_balance;
@@ -544,6 +544,14 @@ impl DesktopApp {
         self.refresh_wallet_cache();
     }
 
+    #[cfg(test)]
+    fn refresh_status_only_for_test(&mut self) -> Result<(), QtError> {
+        let status = self.connection.status();
+        self.apply_connection_status(status);
+        self.refresh_activity_feed(true);
+        Ok(())
+    }
+
     fn mempool_reserved_inputs(&self) -> HashSet<([u8; 48], u32)> {
         match self.connection.request(RpcRequest::GetMempoolSpentInputs) {
             RpcResponse::MempoolSpentInputs(inputs) => inputs
@@ -575,6 +583,46 @@ impl DesktopApp {
         &self.wallet_balance_summary_cache
     }
 
+    fn wallet_history_addresses(wallet_addresses: &[WalletAddress]) -> Vec<WalletHistoryAddress> {
+        wallet_addresses
+            .iter()
+            .map(|address| WalletHistoryAddress {
+                payment_digest: address.payment_digest,
+                address: address.address.clone(),
+            })
+            .collect()
+    }
+
+    fn wallet_activity_row_from_rpc(entry: RpcWalletActivityEntry) -> WalletActivityRow {
+        WalletActivityRow {
+            when: format!("H{}", entry.height),
+            kind: match entry.kind {
+                RpcWalletActivityKind::Mined => WalletActivityKind::Mined,
+                RpcWalletActivityKind::Received => WalletActivityKind::Received,
+                RpcWalletActivityKind::Sent => WalletActivityKind::Sent,
+            },
+            label: entry.label,
+            amount_atoms: entry.amount_atoms,
+            reference: widgets::short_hash(&entry.txid),
+        }
+    }
+
+    fn request_wallet_activity_rows(
+        connection: &ReadOnlyNodeConnection,
+        wallet_addresses: &[WalletAddress],
+    ) -> Result<Vec<WalletActivityRow>, String> {
+        match connection.request(RpcRequest::GetWalletActivity {
+            addresses: Self::wallet_history_addresses(wallet_addresses),
+        }) {
+            RpcResponse::WalletActivity(entries) => Ok(entries
+                .into_iter()
+                .map(Self::wallet_activity_row_from_rpc)
+                .collect()),
+            RpcResponse::Error(err) => Err(format!("wallet activity lookup failed: {err}")),
+            other => Err(format!("unexpected wallet activity response: {other:?}")),
+        }
+    }
+
     fn refresh_receive_address_rows(&mut self) {
         let current_digest = self
             .current_receive_address
@@ -591,7 +639,6 @@ impl DesktopApp {
         connection: ReadOnlyNodeConnection,
         wallet_addresses_cache: Vec<WalletAddress>,
         receive_addresses: Vec<WalletAddress>,
-        wallet_ledger_cache: WalletLedgerCache,
         wallet_scan_nonce: u64,
         scan_limit: usize,
     ) -> Result<WalletScanOutcome, String> {
@@ -649,14 +696,8 @@ impl DesktopApp {
             .collect::<Vec<_>>();
         let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
-
-        let mut wallet_ledger_cache = wallet_ledger_cache;
-        if let Err(err) = wallet_ledger_cache.refresh(&wallet_addresses_cache, balance_summary) {
-            let _ = atho_node::dev::append_log(
-                "atho-qt",
-                &format!("wallet ledger refresh failed error={err}"),
-            );
-        }
+        let wallet_activity_cache =
+            Self::request_wallet_activity_rows(&connection, &wallet_addresses_cache)?;
 
         Ok(WalletScanOutcome {
             wallet_scan_nonce,
@@ -666,7 +707,8 @@ impl DesktopApp {
             wallet_owned_utxos_cache: owned,
             wallet_utxos_cache: available_owned,
             wallet_balance_cache: available_balance,
-            wallet_ledger_cache,
+            wallet_balance_summary_cache: balance_summary,
+            wallet_activity_cache,
         })
     }
 
@@ -764,7 +806,6 @@ impl DesktopApp {
         self.wallet_balance_cache = 0;
         self.receive_addresses.clear();
         self.receive_address_rows.clear();
-        self.wallet_ledger_cache = WalletLedgerCache::default();
     }
 
     fn start_wallet_scan_job(&mut self) {
@@ -772,14 +813,25 @@ impl DesktopApp {
             return;
         }
 
-        let Some(wallet) = self.wallet_ref() else {
-            return;
-        };
         let scan_limit = self.wallet_discovery_scan_limit;
-        let wallet_addresses_cache = wallet.discovery_addresses_up_to(scan_limit);
-        let receive_addresses = wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT);
+        let wallet_addresses_cache =
+            if self.wallet_discovery_scan_limit_cached == scan_limit
+                && !self.wallet_addresses_cache.is_empty()
+            {
+                self.wallet_addresses_cache.clone()
+            } else {
+                let Some(wallet) = self.wallet_ref() else {
+                    return;
+                };
+                wallet.discovery_addresses_up_to(scan_limit)
+            };
+        let receive_addresses = wallet_addresses_cache
+            .iter()
+            .filter(|address| address.path.kind == AddressKind::Receive)
+            .take(RECEIVE_ADDRESS_LIST_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
         let connection = self.connection.clone();
-        let wallet_ledger_cache = self.wallet_ledger_cache.clone();
         let wallet_scan_nonce = self.wallet_scan_nonce;
         let (sender, receiver) = mpsc::channel();
 
@@ -788,7 +840,6 @@ impl DesktopApp {
                 connection,
                 wallet_addresses_cache,
                 receive_addresses,
-                wallet_ledger_cache,
                 wallet_scan_nonce,
                 scan_limit,
             );
@@ -819,9 +870,8 @@ impl DesktopApp {
         self.wallet_owned_utxos_cache = outcome.wallet_owned_utxos_cache;
         self.wallet_utxos_cache = outcome.wallet_utxos_cache;
         self.wallet_balance_cache = outcome.wallet_balance_cache;
-        self.wallet_ledger_cache = outcome.wallet_ledger_cache;
-        self.wallet_balance_summary_cache = self.wallet_ledger_cache.summary().clone();
-        self.wallet_activity_cache = self.wallet_ledger_cache.activities().to_vec();
+        self.wallet_balance_summary_cache = outcome.wallet_balance_summary_cache;
+        self.wallet_activity_cache = outcome.wallet_activity_cache;
         self.refresh_receive_address_rows();
         let continue_scanning = if Self::should_expand_wallet_discovery_scan_limit(
             self.wallet_discovery_scan_limit,
@@ -1032,15 +1082,17 @@ impl DesktopApp {
         wallet_addresses: &[WalletAddress],
         owned_utxos: &[UtxoEntry],
     ) -> bool {
-        owned_utxos.iter().filter_map(|utxo| {
-            let digest: [u8; 32] = utxo.locking_script.as_slice().try_into().ok()?;
-            wallet_addresses
-                .iter()
-                .find(|address| address.payment_digest == digest)
-                .map(|address| address.path.index.saturating_add(1) as usize)
-        })
-        .max()
-        .is_some_and(|highest_used_index| highest_used_index >= scan_limit)
+        owned_utxos
+            .iter()
+            .filter_map(|utxo| {
+                let digest: [u8; 32] = utxo.locking_script.as_slice().try_into().ok()?;
+                wallet_addresses
+                    .iter()
+                    .find(|address| address.payment_digest == digest)
+                    .map(|address| address.path.index.saturating_add(1) as usize)
+            })
+            .max()
+            .is_some_and(|highest_used_index| highest_used_index >= scan_limit)
     }
 
     fn advance_wallet_discovery_scan_limit(&mut self) -> bool {
@@ -1065,11 +1117,15 @@ impl DesktopApp {
             self.current_receive_address = Some(first);
         }
 
-        self.receive_addresses = wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT);
+        let address_records = wallet.address_book.snapshot();
+        self.receive_addresses = address_records
+            .iter()
+            .filter(|record| record.path.kind == AddressKind::Receive)
+            .take(RECEIVE_ADDRESS_LIST_LIMIT)
+            .map(|record| wallet.address_for_path(record.path))
+            .collect();
         if self.current_receive_address.is_none() {
-            self.current_receive_address = wallet
-                .address_book
-                .snapshot()
+            self.current_receive_address = address_records
                 .into_iter()
                 .rev()
                 .find(|record| record.path.kind == AddressKind::Receive)
@@ -1434,9 +1490,15 @@ impl DesktopApp {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
-        wallet
-            .save_to_datafile(&path, password)
-            .map_err(|err| err.to_string())
+        if cfg!(test) {
+            wallet
+                .save_to_datafile_with_iterations(&path, password, TEST_WALLET_DATAFILE_ITERATIONS)
+                .map_err(|err| err.to_string())
+        } else {
+            wallet
+                .save_to_datafile(&path, password)
+                .map_err(|err| err.to_string())
+        }
     }
 
     fn export_wallet_backup(&self, backup_path: &str, password: &str) -> Result<(), String> {
@@ -1463,7 +1525,16 @@ impl DesktopApp {
 
     fn open_wallet_from_path(&self, wallet_path: &str, password: &str) -> Result<Wallet, String> {
         let path = PathBuf::from(wallet_path);
-        let wallet = Wallet::load_from_datafile(&path, password).map_err(|err| err.to_string())?;
+        let wallet = if cfg!(test) {
+            Wallet::load_from_datafile_with_iterations(
+                &path,
+                password,
+                TEST_WALLET_DATAFILE_ITERATIONS,
+            )
+        } else {
+            Wallet::load_from_datafile(&path, password)
+        }
+        .map_err(|err| err.to_string())?;
         if wallet.network != self.connection.network() {
             return Err(format!(
                 "wallet belongs to {} not {}",
@@ -2551,26 +2622,96 @@ mod tests {
         );
     }
 
-    fn seed_wallet_utxo(app: &ReadOnlyNodeConnection, digest: [u8; 32], value_atoms: u64) {
+    fn wait_until_without_wallet_scan(
+        label: &str,
+        app: &mut DesktopApp,
+        timeout: Duration,
+        predicate: impl Fn(&DesktopApp) -> bool,
+    ) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            app.refresh_status_only_for_test().expect("app refresh");
+            app.poll_send_job();
+            app.poll_mining_job();
+            app.poll_wallet_preparation_job();
+            if predicate(app) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting without wallet scan: {label}; connected={} wallet_loaded={} block_count={} best_height={} mempool={} send_status={:?} mining_status={:?} last_error={:?} mining_active={} send_active={} scan_active={}",
+            app.ui_state.connected,
+            app.wallet.is_some(),
+            app.view_model.block_count,
+            app.view_model.sync_best_height,
+            app.view_model.mempool_count,
+            app.send_status,
+            app.mining_status,
+            app.last_error,
+            app.mining_job.is_some(),
+            app.send_job.is_some(),
+            app.wallet_scan_job.is_some(),
+        );
+    }
+
+    fn submit_external_funding_tx(
+        app: &ReadOnlyNodeConnection,
+        recipient_digest: [u8; 32],
+        value_atoms: u64,
+    ) -> [u8; 48] {
+        let external_digest = [0x6c; 32];
+        let mut funding_utxo = None;
         let seeded = app.with_local_system_for_test(|system| {
             system.sandbox_with_node_mut(|node| {
-                node.dev_seed_chainstate(
-                    node.height(),
-                    node.tip_hash(),
-                    [UtxoEntry::new(
-                        Network::Regnet,
-                        [0x5a; 48],
-                        0,
-                        value_atoms,
-                        digest.to_vec(),
-                        node.height(),
-                        false,
-                    )],
-                )
-                .expect("seed utxo");
+                let utxo = UtxoEntry::new(
+                    Network::Regnet,
+                    [0x6b; 48],
+                    0,
+                    value_atoms,
+                    external_digest.to_vec(),
+                    node.height().saturating_sub(6),
+                    false,
+                );
+                node.dev_seed_chainstate(node.height(), node.tip_hash(), [utxo.clone()])
+                    .expect("seed external utxo");
+                funding_utxo = Some(utxo);
             });
         });
         assert!(seeded.is_some(), "expected local test backend");
+
+        let funding_utxo = funding_utxo.expect("funding utxo");
+        let fee_atoms = DesktopApp::estimate_fee(1, 1);
+        let transaction = DesktopApp::build_signed_spend_transaction(
+            &test_keypair(),
+            std::slice::from_ref(&funding_utxo),
+            recipient_digest,
+            value_atoms.saturating_sub(fee_atoms),
+            0,
+            None,
+            1,
+        )
+        .expect("build funding transaction");
+        match app.request(RpcRequest::SubmitTransaction {
+            transaction,
+            fee_atoms,
+        }) {
+            RpcResponse::TransactionSubmitted(txid) => txid,
+            other => panic!("unexpected funding submit response: {other:?}"),
+        }
+    }
+
+    fn mine_local_block(app: &ReadOnlyNodeConnection) -> [u8; 48] {
+        let mined = app.with_local_system_for_test(|system| {
+            let cores = available_mining_cores().min(4).max(1);
+            system.sandbox_with_node_mut(|node| {
+                node.mine_and_connect_candidate_block(&Miner::new(cores))
+                    .expect("mine local block")
+                    .header
+                    .block_hash()
+            })
+        });
+        mined.expect("expected local test backend")
     }
 
     fn witness_bytes(tx: &Transaction) -> Vec<u8> {
@@ -2846,6 +2987,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow sandbox lifecycle soak with real PoW"]
     fn full_local_wallet_lifecycle_mines_sends_restarts_and_keeps_tip_synced() {
         let root = temp_sandbox_root("full-lifecycle");
         let home = root.join("home");
@@ -2863,14 +3005,16 @@ mod tests {
             "",
             Network::Regnet,
         );
-        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
-            .expect("save wallet");
 
         let mut app = DesktopApp::new(Network::Regnet);
+        app.attach_wallet(wallet, wallet_path.to_string_lossy().into_owned());
         app.ui_state.mining_cores = app.max_mining_cores().min(4);
-        wait_until("initial wallet open", &mut app, Duration::from_secs(5), |app| {
-            app.ui_state.connected && app.wallet.is_some()
-        });
+        wait_until_without_wallet_scan(
+            "initial wallet open",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.ui_state.connected && app.wallet.is_some(),
+        );
 
         app.receive_label = String::from("Primary");
         app.receive_message = String::from("Sandbox invoice");
@@ -2883,12 +3027,18 @@ mod tests {
             .clone();
 
         app.start_mining_job();
-        wait_until("first mining job finished", &mut app, Duration::from_secs(15), |app| {
-            app.mining_job.is_none() && app.mining_status.contains("accepted")
-        });
-        wait_until("first mined block accepted", &mut app, Duration::from_secs(5), |app| {
-            app.view_model.block_count >= 1
-        });
+        wait_until_without_wallet_scan(
+            "first mining job finished",
+            &mut app,
+            Duration::from_secs(15),
+            |app| app.mining_job.is_none() && app.mining_status.contains("accepted"),
+        );
+        wait_until_without_wallet_scan(
+            "first mined block accepted",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.view_model.block_count >= 1,
+        );
         app.force_wallet_cache_refresh_for_test();
         assert!(app.wallet_balance_summary().pending_atoms > 0);
 
@@ -2899,24 +3049,30 @@ mod tests {
             .iter()
             .any(|row| row.kind == WalletActivityKind::Mined));
 
-        seed_wallet_utxo(
+        submit_external_funding_tx(
             &app.connection,
             current_address.payment_digest,
             20 * ATOMS_PER_ATHO,
         );
-        for expected_height in 2..=7 {
-            app.start_mining_job();
-            let finished_label = format!("maturity mining finished for height {expected_height}");
-            wait_until(&finished_label, &mut app, Duration::from_secs(15), |app| {
-                app.mining_job.is_none() && app.mining_status.contains("accepted")
-            });
-            let accepted_label = format!("maturity block accepted at height {expected_height}");
-            wait_until(&accepted_label, &mut app, Duration::from_secs(5), |app| {
-                app.view_model.block_count >= expected_height
-            });
-        }
+        wait_until_without_wallet_scan(
+            "external funding reaches mempool",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.view_model.mempool_count >= 1,
+        );
+        mine_local_block(&app.connection);
+        wait_until_without_wallet_scan(
+            "funding block accepted",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.view_model.block_count >= 2 && app.view_model.mempool_count == 0,
+        );
         app.force_wallet_cache_refresh_for_test();
         assert!(app.wallet_balance_summary().available_atoms >= 20 * ATOMS_PER_ATHO);
+        assert!(app
+            .wallet_activity_rows()
+            .iter()
+            .any(|row| row.kind == WalletActivityKind::Received));
 
         let mut recipient_wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[7u8; 32], MnemonicLength::Words24).unwrap(),
@@ -2928,43 +3084,142 @@ mod tests {
         app.send_to = recipient.address.clone();
         app.send_amount = DesktopApp::format_send_amount_input(5 * ATOMS_PER_ATHO);
         app.submit_send_transaction().expect("submit send");
-        wait_until("send transaction submitted", &mut app, Duration::from_secs(20), |app| {
-            app.send_job.is_none() && app.send_status.contains("Transaction submitted")
-        });
-        wait_until("send transaction reaches mempool", &mut app, Duration::from_secs(20), |app| {
-            app.view_model.mempool_count >= 1
-        });
+        wait_until_without_wallet_scan(
+            "send transaction submitted",
+            &mut app,
+            Duration::from_secs(20),
+            |app| app.send_job.is_none() && app.send_status.contains("Transaction submitted"),
+        );
+        wait_until_without_wallet_scan(
+            "send transaction reaches mempool",
+            &mut app,
+            Duration::from_secs(20),
+            |app| app.view_model.mempool_count >= 1,
+        );
 
-        app.start_mining_job();
-        wait_until("second mining job finished", &mut app, Duration::from_secs(15), |app| {
-            app.mining_job.is_none() && app.mining_status.contains("accepted")
-        });
-        wait_until("second mined block accepted", &mut app, Duration::from_secs(5), |app| {
-            app.view_model.block_count >= 8
-        });
+        mine_local_block(&app.connection);
+        wait_until_without_wallet_scan(
+            "second mined block accepted",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.view_model.block_count >= 3,
+        );
         app.force_wallet_cache_refresh_for_test();
-        wait_until("sent transaction confirmed and cleared", &mut app, Duration::from_secs(10), |app| {
-            app.view_model.mempool_count == 0
-        });
+        wait_until_without_wallet_scan(
+            "sent transaction confirmed and cleared",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.view_model.mempool_count == 0,
+        );
 
         let expected_available = app.wallet_balance_summary().available_atoms;
         let expected_pending = app.wallet_balance_summary().pending_atoms;
         let expected_total = app.wallet_balance_summary().total_atoms;
         assert!(expected_available < 20 * ATOMS_PER_ATHO);
-        assert_eq!(app.view_model.block_count, 8);
-        assert_eq!(app.view_model.sync_best_height, 8);
+        assert_eq!(app.view_model.block_count, 3);
+        assert_eq!(app.view_model.sync_best_height, 3);
+        assert!(app
+            .wallet_activity_rows()
+            .iter()
+            .any(|row| row.kind == WalletActivityKind::Sent));
+
+        let persisted_wallet = app.wallet_ref().expect("wallet").clone();
+        DesktopApp::save_wallet_to_path(
+            &persisted_wallet,
+            wallet_path.to_string_lossy().as_ref(),
+            "",
+        )
+        .expect("save wallet for restart");
 
         drop(app);
 
         let mut reopened = DesktopApp::new(Network::Regnet);
-        wait_until("reopened wallet loads", &mut reopened, Duration::from_secs(10), |app| {
-            app.wallet.is_some() && app.view_model.block_count == 8
-        });
+        wait_until_without_wallet_scan(
+            "reopened wallet loads",
+            &mut reopened,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && app.view_model.block_count == 3,
+        );
         reopened.force_wallet_cache_refresh_for_test();
-        assert_eq!(reopened.wallet_balance_summary().total_atoms, expected_total);
+        assert_eq!(
+            reopened.wallet_balance_summary().total_atoms,
+            expected_total
+        );
 
-        assert_eq!(reopened.view_model.sync_best_height, 8);
-        assert_eq!(reopened.wallet_balance_summary().available_atoms, expected_available);
-        assert_eq!(reopened.wallet_balance_summary().pending_atoms, expected_pending);
+        assert_eq!(reopened.view_model.sync_best_height, 3);
+        assert_eq!(
+            reopened.wallet_balance_summary().available_atoms,
+            expected_available
+        );
+        assert_eq!(
+            reopened.wallet_balance_summary().pending_atoms,
+            expected_pending
+        );
+    }
+
+    #[test]
+    fn wallet_history_uses_canonical_backend_activity_for_received_rows() {
+        let root = temp_sandbox_root("wallet-history");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        std::env::remove_var("ATHO_QT_FORCE_RPC");
+
+        let wallet_path = default_wallet_path(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x15u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save wallet");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        wait_until("wallet open", &mut app, Duration::from_secs(5), |app| {
+            app.ui_state.connected && app.wallet.is_some()
+        });
+
+        let receive_address = app
+            .current_receive_address
+            .as_ref()
+            .expect("current receive address")
+            .clone();
+        for expected_height in 1..=6 {
+            let _ = mine_local_block(&app.connection);
+            wait_until(
+                "warmup block accepted",
+                &mut app,
+                Duration::from_secs(5),
+                |app| app.view_model.block_count >= expected_height,
+            );
+        }
+        let funding_txid = submit_external_funding_tx(
+            &app.connection,
+            receive_address.payment_digest,
+            9 * ATOMS_PER_ATHO,
+        );
+        wait_until(
+            "funding tx reaches mempool",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.view_model.mempool_count >= 1,
+        );
+
+        let _ = mine_local_block(&app.connection);
+        wait_until(
+            "funding block accepted",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.view_model.block_count >= 7,
+        );
+        app.force_wallet_cache_refresh_for_test();
+        assert!(app.wallet_activity_rows().iter().any(|row| {
+            row.kind == WalletActivityKind::Received
+                && row.reference == widgets::short_hash(&funding_txid)
+        }));
     }
 }

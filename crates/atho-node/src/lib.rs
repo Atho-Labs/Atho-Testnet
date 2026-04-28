@@ -13,4 +13,6 @@ pub mod runtime;
 pub mod service;
 pub mod sync;
 pub mod system;
+pub mod tcp_p2p;
 pub mod validation;
+pub mod wallet_history;

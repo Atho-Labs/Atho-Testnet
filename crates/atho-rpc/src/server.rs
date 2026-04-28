@@ -48,6 +48,7 @@ impl RpcServer {
             | RpcRequest::SubmitBlock(_)
             | RpcRequest::SubmitTransaction { .. }
             | RpcRequest::ListUtxos
+            | RpcRequest::GetWalletActivity { .. }
             | RpcRequest::GetMempoolInfo
             | RpcRequest::GetMempoolSpentInputs => RpcResponse::Error(RpcError::InvalidRequest(
                 String::from("method must be handled by the node runtime"),

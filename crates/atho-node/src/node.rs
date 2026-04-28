@@ -9,7 +9,8 @@ use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
 use atho_core::transaction::Transaction;
 use atho_storage::chainstate::{
-    ChainSelectionOutcome, ChainSelectionResult, Chainstate as StorageChainstate,
+    ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
+    Chainstate as StorageChainstate,
 };
 use atho_storage::error::StorageError;
 
@@ -65,19 +66,35 @@ impl Node {
         self.chainstate.blocks()
     }
 
-    pub fn contains_block(&self, block_hash: &[u8; 48]) -> bool {
+    pub fn canonical_blocks(&self) -> Result<Vec<Block>, NodeError> {
+        self.chainstate.canonical_blocks().map_err(NodeError::from)
+    }
+
+    pub fn export_snapshot_bundle(&self) -> Result<ChainSnapshotBundle, NodeError> {
+        self.chainstate.export_snapshot_bundle().map_err(NodeError::from)
+    }
+
+    pub fn import_snapshot_bundle(
+        &mut self,
+        bundle: ChainSnapshotBundle,
+    ) -> Result<(), NodeError> {
         self.chainstate
-            .blocks()
-            .iter()
-            .any(|block| block.header.block_hash() == *block_hash)
+            .import_snapshot_bundle(bundle)
+            .map_err(NodeError::from)?;
+        let updated_utxos = self.chainstate.utxo_snapshot();
+        self.mempool
+            .revalidate(self.chainstate.height, |txid, output_index| {
+                updated_utxos.get(*txid, output_index).cloned()
+            });
+        Ok(())
+    }
+
+    pub fn contains_block(&self, block_hash: &[u8; 48]) -> bool {
+        self.chainstate.contains_block(*block_hash).unwrap_or(false)
     }
 
     pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Option<Block> {
-        self.chainstate
-            .blocks()
-            .iter()
-            .find(|block| block.header.block_hash() == block_hash)
-            .cloned()
+        self.chainstate.block_by_hash(block_hash).ok().flatten()
     }
 
     pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {
@@ -670,5 +687,47 @@ mod tests {
         assert_eq!(reloaded.tip_hash(), tip_hash);
         assert_eq!(reloaded.difficulty_target_for_next_block(), next_target);
         assert_eq!(reloaded.utxo_count(), 2);
+    }
+
+    #[test]
+    fn node_imports_snapshot_bundle_and_keeps_mining_after_restart() {
+        let donor_root = temp_data_dir("snapshot-donor");
+        fs::create_dir_all(&donor_root).expect("donor root");
+        let donor_bundle = {
+            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &donor_root);
+            let mut donor = Node::load_or_new(NodeConfig::new(Network::Regnet));
+            donor
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine donor 1");
+            donor
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine donor 2");
+            donor
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine donor 3");
+            donor.export_snapshot_bundle().expect("export snapshot bundle")
+        };
+
+        let receiver_root = temp_data_dir("snapshot-receiver");
+        fs::create_dir_all(&receiver_root).expect("receiver root");
+        let imported_tip = donor_bundle.snapshot.tip_hash;
+        {
+            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
+            let mut receiver = Node::load_or_new(NodeConfig::new(Network::Regnet));
+            receiver
+                .import_snapshot_bundle(donor_bundle.clone())
+                .expect("import snapshot bundle");
+            assert_eq!(receiver.height(), 3);
+            assert_eq!(receiver.tip_hash(), imported_tip);
+            receiver
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine after import");
+            assert_eq!(receiver.height(), 4);
+        }
+
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
+        let reloaded = Node::load_or_new(NodeConfig::new(Network::Regnet));
+        assert_eq!(reloaded.height(), 4);
+        assert_eq!(reloaded.canonical_blocks().expect("canonical").len(), 5);
     }
 }

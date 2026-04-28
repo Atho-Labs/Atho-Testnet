@@ -3,12 +3,14 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
 use crate::system::AthoSystem;
+use crate::tcp_p2p::TcpP2pRuntime;
 use atho_core::network::Network;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
 use std::io::BufReader;
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -20,6 +22,8 @@ pub enum RuntimeError {
     InvalidNetwork,
     #[error("rpc bind failed: {0}")]
     RpcBindFailed(String),
+    #[error("p2p bind failed: {0}")]
+    P2pBindFailed(String),
 }
 
 #[derive(Debug)]
@@ -92,19 +96,40 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
 pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
-    let mut system = AthoSystem::try_new(config)?;
-    system.start();
+    let network = config.network;
+    let system = Arc::new(Mutex::new(AthoSystem::try_new(config)?));
+    {
+        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        guard.start();
+    }
+    let p2p_address = p2p_bind_address(network);
+    let p2p_runtime = TcpP2pRuntime::bind_shared(network, Arc::clone(&system), &p2p_address)
+        .map_err(|err| NodeError::Runtime(RuntimeError::P2pBindFailed(err.to_string())))?;
+    for peer in p2p_peer_addresses() {
+        if let Err(err) = p2p_runtime.connect_outbound(&peer) {
+            let _ = dev::append_log(
+                "p2p",
+                &format!("initial outbound connect failed peer={peer} error={err}"),
+            );
+        }
+    }
     let rpc_address = rpc_bind_address(config.network);
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
     println!("athod running on {} rpc={rpc_address}", config.network.id());
-    let status = system.status();
+    let status = {
+        let guard = system.lock().expect("node runtime mutex poisoned");
+        guard.status()
+    };
     println!(
         "node status height={} mempool={} synced={}",
         status.block_count, status.mempool_count, status.headers_synced
     );
-    let _ = dev::append_log("athod", &format!("runtime started rpc={rpc_address}"));
+    let _ = dev::append_log(
+        "athod",
+        &format!("runtime started rpc={rpc_address} p2p={p2p_address}"),
+    );
     for incoming in listener.incoming() {
         match incoming {
             Ok(mut stream) => {
@@ -136,7 +161,10 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                         continue;
                     }
                 };
-                let response: RpcResponse = system.handle_mut(request);
+                let response: RpcResponse = {
+                    let mut guard = system.lock().expect("node runtime mutex poisoned");
+                    guard.handle_mut(request)
+                };
                 if let Err(err) = write_message(&mut stream, &response) {
                     let _ = dev::append_log("athod", &format!("rpc write error: {err}"));
                 }
@@ -159,6 +187,27 @@ pub fn rpc_bind_address(network: Network) -> String {
         Network::Testnet => String::from("127.0.0.1:18444"),
         Network::Regnet => String::from("127.0.0.1:18445"),
     }
+}
+
+pub fn p2p_bind_address(network: Network) -> String {
+    if let Ok(address) = std::env::var("ATHO_P2P_ADDR") {
+        return address;
+    }
+    format!("127.0.0.1:{}", network.p2p_port())
+}
+
+pub fn p2p_peer_addresses() -> Vec<String> {
+    std::env::var("ATHO_P2P_PEERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn run() -> Result<(), NodeError> {

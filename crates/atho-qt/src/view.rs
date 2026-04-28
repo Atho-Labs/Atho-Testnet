@@ -31,6 +31,7 @@ impl ViewModel {
             | RpcResponse::BlockSubmitted { .. }
             | RpcResponse::TransactionSubmitted(_)
             | RpcResponse::Utxos(_)
+            | RpcResponse::WalletActivity(_)
             | RpcResponse::MempoolInfo(_)
             | RpcResponse::MempoolSpentInputs(_) => {}
             RpcResponse::Error(RpcError::MethodNotFound)

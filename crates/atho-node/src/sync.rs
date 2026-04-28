@@ -4,11 +4,15 @@ use atho_core::block::Block;
 use atho_core::network::Network;
 use atho_p2p::config::network_params;
 use atho_p2p::connection::{ConnectionEvent, ConnectionManager};
+use atho_p2p::downloader::BlockDownloadScheduler;
 use atho_p2p::protocol::{
-    Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage, ProtocolError,
+    compact_block_from_block, compact_short_id, reconstruct_compact_block, BlockTxnMessage,
+    CompactBlockMessage, CompactBlockReconstruction, GetBlockTxnMessage, Hash48, InventoryKind,
+    InventoryVector, MessagePayload, NetworkMessage, ProtocolError,
 };
 use atho_p2p::relay::RelayLoop;
 use atho_p2p::sync::SyncState;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -32,6 +36,14 @@ pub struct NodeSync {
     network: Network,
     relay: RelayLoop,
     connections: ConnectionManager,
+    downloader: BlockDownloadScheduler,
+    pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCompactBlock {
+    message: CompactBlockMessage,
+    overrides: BTreeMap<u32, atho_core::transaction::Transaction>,
 }
 
 impl NodeSync {
@@ -40,6 +52,8 @@ impl NodeSync {
             network,
             relay: RelayLoop::new(network),
             connections: ConnectionManager::new(network),
+            downloader: BlockDownloadScheduler::default(),
+            pending_compact_blocks: BTreeMap::new(),
         }
     }
 
@@ -108,6 +122,13 @@ impl NodeSync {
         self.relay.relay_transaction(&txid)
     }
 
+    pub fn relay_compact_block_message(&self, block: &Block) -> NetworkMessage {
+        NetworkMessage::new(
+            self.network,
+            MessagePayload::CompactBlock(compact_block_from_block(block)),
+        )
+    }
+
     fn expand_events(
         &mut self,
         events: Vec<ConnectionEvent>,
@@ -120,12 +141,14 @@ impl NodeSync {
             match event {
                 ConnectionEvent::Send { .. } => outbound.push(event),
                 ConnectionEvent::Disconnect { peer, reason } => {
+                    self.downloader.note_peer_disconnected(&peer);
                     notices.push(SyncNotice::Disconnected { peer, reason });
                 }
                 ConnectionEvent::Ready { peer, best_height } => {
                     if let Some(version) = self.connections.remote_version(&peer).cloned() {
                         self.relay.accept_version(peer.clone(), &version)?;
                     }
+                    self.downloader.note_peer_ready(peer.clone());
                     notices.push(SyncNotice::Ready {
                         peer: peer.clone(),
                         best_height,
@@ -157,6 +180,11 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         match message.payload {
             MessagePayload::Inv { inventory } => {
+                for vector in &inventory {
+                    if vector.kind == InventoryKind::Block {
+                        self.downloader.note_inventory(peer, vector.hash.into_inner());
+                    }
+                }
                 let requests = self.missing_inventory_requests(node, &inventory);
                 if !requests.is_empty() {
                     outbound.push(ConnectionEvent::Send {
@@ -191,26 +219,14 @@ impl NodeSync {
             }
             MessagePayload::Headers { headers } => {
                 self.relay.accept_headers(&headers)?;
-                let inventory = headers
-                    .iter()
-                    .filter_map(|header| {
-                        let hash = header.block_hash();
-                        (!node.contains_block(&hash)).then_some(InventoryVector {
-                            kind: InventoryKind::Block,
-                            hash: Hash48::from(hash),
-                        })
-                    })
-                    .take(network_params(self.network).limits.max_blocks_in_flight)
-                    .collect::<Vec<_>>();
-                if !inventory.is_empty() {
-                    outbound.push(ConnectionEvent::Send {
-                        peer: peer.to_string(),
-                        message: NetworkMessage::new(
-                            self.network,
-                            MessagePayload::GetData { inventory },
-                        ),
-                    });
-                }
+                self.downloader.note_headers(
+                    peer,
+                    headers
+                        .iter()
+                        .map(|header| header.block_hash())
+                        .filter(|hash| !node.contains_block(hash)),
+                );
+                self.push_scheduled_block_requests(outbound);
                 if !self.relay.sync_state().headers_synced {
                     outbound.push(ConnectionEvent::Send {
                         peer: peer.to_string(),
@@ -224,6 +240,18 @@ impl NodeSync {
                     node.submit_block(&block)?;
                     self.relay.prime(node.blocks());
                 }
+                self.downloader.note_block_received(block_hash);
+                self.pending_compact_blocks.remove(&block_hash);
+                self.push_scheduled_block_requests(outbound);
+            }
+            MessagePayload::CompactBlock(message) => {
+                self.handle_compact_block(peer, message, node, outbound)?;
+            }
+            MessagePayload::GetBlockTxn(request) => {
+                self.serve_getblocktxn(peer, request, node, outbound);
+            }
+            MessagePayload::BlockTxn(response) => {
+                self.handle_blocktxn(peer, response, node, outbound)?;
             }
             MessagePayload::Tx(transaction) => {
                 let txid = transaction.txid();
@@ -251,13 +279,188 @@ impl NodeSync {
                     });
                 }
             }
-            MessagePayload::NotFound { .. } | MessagePayload::Pong { .. } => {}
+            MessagePayload::NotFound { inventory } => {
+                let hashes = inventory
+                    .iter()
+                    .filter(|vector| vector.kind == InventoryKind::Block)
+                    .map(|vector| vector.hash.into_inner())
+                    .collect::<Vec<_>>();
+                self.downloader.note_not_found(peer, &hashes);
+                self.push_scheduled_block_requests(outbound);
+            }
+            MessagePayload::Pong { .. } => {}
             MessagePayload::Version(_)
             | MessagePayload::Verack
             | MessagePayload::Ping { .. }
             | MessagePayload::GetAddr
             | MessagePayload::Addr { .. } => {
                 return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_scheduled_block_requests(&mut self, outbound: &mut Vec<ConnectionEvent>) {
+        let limits = network_params(self.network).limits;
+        for assignment in self
+            .downloader
+            .assignments(limits.max_blocks_in_flight, limits.max_requests_per_peer)
+        {
+            outbound.push(ConnectionEvent::Send {
+                peer: assignment.peer,
+                message: NetworkMessage::new(
+                    self.network,
+                    MessagePayload::GetData {
+                        inventory: assignment.inventory,
+                    },
+                ),
+            });
+        }
+    }
+
+    fn handle_compact_block(
+        &mut self,
+        peer: &str,
+        message: CompactBlockMessage,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        let block_hash = message.header.block_hash();
+        let mempool_by_short_id = node
+            .mempool_transactions()
+            .into_iter()
+            .map(|tx| (compact_short_id(tx.txid()), tx))
+            .collect::<BTreeMap<_, _>>();
+        match reconstruct_compact_block(
+            &message,
+            |short_id| mempool_by_short_id.get(&short_id).cloned(),
+            &BTreeMap::new(),
+        )? {
+            CompactBlockReconstruction::Complete(block) => {
+                if !node.contains_block(&block_hash) {
+                    node.submit_block(&block)?;
+                    self.relay.prime(node.blocks());
+                }
+                self.downloader.note_block_received(block_hash);
+                self.pending_compact_blocks.remove(&block_hash);
+                self.push_scheduled_block_requests(outbound);
+            }
+            CompactBlockReconstruction::Missing { indexes, .. } => {
+                self.pending_compact_blocks.insert(
+                    block_hash,
+                    PendingCompactBlock {
+                        message,
+                        overrides: BTreeMap::new(),
+                    },
+                );
+                outbound.push(ConnectionEvent::Send {
+                    peer: peer.to_string(),
+                    message: NetworkMessage::new(
+                        self.network,
+                        MessagePayload::GetBlockTxn(GetBlockTxnMessage {
+                            block_hash: Hash48::from(block_hash),
+                            indexes,
+                        }),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn serve_getblocktxn(
+        &self,
+        peer: &str,
+        request: GetBlockTxnMessage,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        let block_hash = request.block_hash.into_inner();
+        let Some(block) = node.block_by_hash(block_hash) else {
+            outbound.push(ConnectionEvent::Send {
+                peer: peer.to_string(),
+                message: NetworkMessage::new(
+                    self.network,
+                    MessagePayload::NotFound {
+                        inventory: vec![InventoryVector {
+                            kind: InventoryKind::Block,
+                            hash: Hash48::from(block_hash),
+                        }],
+                    },
+                ),
+            });
+            return;
+        };
+
+        let mut indexes = Vec::new();
+        let mut transactions = Vec::new();
+        for index in request.indexes {
+            let Some(transaction) = block.transactions.get(index as usize).cloned() else {
+                continue;
+            };
+            indexes.push(index);
+            transactions.push(transaction);
+        }
+        outbound.push(ConnectionEvent::Send {
+            peer: peer.to_string(),
+            message: NetworkMessage::new(
+                self.network,
+                MessagePayload::BlockTxn(BlockTxnMessage {
+                    block_hash: Hash48::from(block_hash),
+                    indexes,
+                    transactions,
+                }),
+            ),
+        });
+    }
+
+    fn handle_blocktxn(
+        &mut self,
+        peer: &str,
+        response: BlockTxnMessage,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        if response.indexes.len() != response.transactions.len() {
+            return Err(NodeSyncError::Protocol(ProtocolError::InvalidCompactBlock));
+        }
+        let block_hash = response.block_hash.into_inner();
+        let Some(pending) = self.pending_compact_blocks.get_mut(&block_hash) else {
+            return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
+        };
+        for (index, transaction) in response.indexes.into_iter().zip(response.transactions) {
+            pending.overrides.insert(index, transaction);
+        }
+        let mempool_by_short_id = node
+            .mempool_transactions()
+            .into_iter()
+            .map(|tx| (compact_short_id(tx.txid()), tx))
+            .collect::<BTreeMap<_, _>>();
+        match reconstruct_compact_block(
+            &pending.message,
+            |short_id| mempool_by_short_id.get(&short_id).cloned(),
+            &pending.overrides,
+        )? {
+            CompactBlockReconstruction::Complete(block) => {
+                self.pending_compact_blocks.remove(&block_hash);
+                if !node.contains_block(&block_hash) {
+                    node.submit_block(&block)?;
+                    self.relay.prime(node.blocks());
+                }
+                self.downloader.note_block_received(block_hash);
+                self.push_scheduled_block_requests(outbound);
+            }
+            CompactBlockReconstruction::Missing { indexes, .. } => {
+                outbound.push(ConnectionEvent::Send {
+                    peer: peer.to_string(),
+                    message: NetworkMessage::new(
+                        self.network,
+                        MessagePayload::GetBlockTxn(GetBlockTxnMessage {
+                            block_hash: Hash48::from(block_hash),
+                            indexes,
+                        }),
+                    ),
+                });
             }
         }
         Ok(())
@@ -659,5 +862,90 @@ mod tests {
             notice,
             SyncNotice::Disconnected { peer, .. } if peer == "left"
         )));
+    }
+
+    #[test]
+    fn sandbox_compact_block_recovers_missing_transactions() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let seed_txid = [5; 48];
+        let seed_value = 2_000u64;
+        let seed_script = vec![1];
+        for peer in [&mut left, &mut right] {
+            peer.node
+                .dev_seed_chainstate(
+                    6,
+                    peer.node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        seed_txid,
+                        0,
+                        seed_value,
+                        seed_script.clone(),
+                        0,
+                        false,
+                    )],
+                )
+                .expect("seed utxo");
+            peer.sync.prime(&peer.node);
+        }
+
+        let template = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: seed_txid,
+                output_index: 0,
+                unlocking_script: seed_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let provisional = Transaction {
+            witness: witness_bytes_for_tx(&template),
+            ..template
+        };
+        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let signed = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: seed_value.saturating_sub(fee_atoms),
+                locking_script: vec![2],
+            }],
+            ..Transaction {
+                witness: vec![],
+                ..provisional
+            }
+        };
+        let signed = Transaction {
+            witness: witness_bytes_for_tx(&signed),
+            ..signed
+        };
+        right
+            .node
+            .submit_transaction(MempoolEntry::new(signed.clone(), fee_atoms))
+            .expect("submit tx");
+
+        let miner = Miner::new(1);
+        let block = right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine compact block");
+        right.sync.prime(&right.node);
+
+        let mut queue = VecDeque::from([QueuedSend {
+            from: right.id.clone(),
+            to: left.id.clone(),
+            message: right.sync.relay_compact_block_message(&block),
+        }]);
+        let _ = drain(&mut left, &mut right, &mut queue);
+
+        assert_eq!(left.node.height(), right.node.height());
+        assert_eq!(left.node.tip_hash(), right.node.tip_hash());
+        assert!(left.node.block_by_hash(block.header.block_hash()).is_some());
     }
 }
