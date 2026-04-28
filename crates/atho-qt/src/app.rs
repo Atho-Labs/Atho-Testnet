@@ -3103,12 +3103,8 @@ mod tests {
             .iter()
             .any(|row| row.kind == WalletActivityKind::Received));
 
-        let maturity_target_height =
-            pre_funding_ready_height + STANDARD_TX_CONFIRMATIONS;
-        mine_local_blocks(
-            &app.connection,
-            STANDARD_TX_CONFIRMATIONS.saturating_sub(1),
-        );
+        let maturity_target_height = pre_funding_ready_height + STANDARD_TX_CONFIRMATIONS;
+        mine_local_blocks(&app.connection, STANDARD_TX_CONFIRMATIONS.saturating_sub(1));
         wait_until_without_wallet_scan(
             "funding matures under standard confirmation rules",
             &mut app,
@@ -3191,7 +3187,10 @@ mod tests {
             expected_total
         );
 
-        assert_eq!(reopened.view_model.sync_best_height, maturity_target_height + 1);
+        assert_eq!(
+            reopened.view_model.sync_best_height,
+            maturity_target_height + 1
+        );
         assert_eq!(
             reopened.wallet_balance_summary().available_atoms,
             expected_available

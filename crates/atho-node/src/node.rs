@@ -12,6 +12,7 @@ use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
+use atho_storage::db::PeerHealthRecord;
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -94,6 +95,21 @@ impl Node {
 
     pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Option<Block> {
         self.chainstate.block_by_hash(block_hash).ok().flatten()
+    }
+
+    pub fn load_peer_health(
+        &self,
+        remote_addr: &str,
+    ) -> Result<Option<PeerHealthRecord>, NodeError> {
+        self.chainstate
+            .load_peer_health(remote_addr)
+            .map_err(NodeError::from)
+    }
+
+    pub fn save_peer_health(&self, record: &PeerHealthRecord) -> Result<(), NodeError> {
+        self.chainstate
+            .save_peer_health(record)
+            .map_err(NodeError::from)
     }
 
     pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {

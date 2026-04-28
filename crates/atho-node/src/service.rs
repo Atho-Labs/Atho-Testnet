@@ -15,6 +15,7 @@ use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
     BlockTemplate, MempoolInfo, MempoolSpentInput, NodeStatus, RpcResponse, WalletActivityEntry,
 };
+use atho_storage::db::PeerHealthRecord;
 use atho_wallet::snapshot::WalletSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +292,27 @@ impl NodeService {
 
     pub fn p2p_headers_synced(&self) -> bool {
         self.orchestrator.sync.sync_state().headers_synced
+    }
+
+    pub fn p2p_peer_health(&self, remote_addr: &str) -> Option<PeerHealthRecord> {
+        self.orchestrator
+            .runtime
+            .node
+            .load_peer_health(remote_addr)
+            .ok()
+            .flatten()
+    }
+
+    pub fn p2p_save_peer_health(&self, record: &PeerHealthRecord) {
+        if let Err(err) = self.orchestrator.runtime.node.save_peer_health(record) {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "peer health persist failed peer={} error={err}",
+                    record.remote_addr
+                ),
+            );
+        }
     }
 
     pub fn p2p_relay_compact_tip_message(&self) -> Option<NetworkMessage> {

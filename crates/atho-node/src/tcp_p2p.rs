@@ -7,17 +7,22 @@ use atho_core::network::Network;
 use atho_p2p::codec::{CodecError, WireCodec};
 use atho_p2p::connection::ConnectionEvent;
 use atho_p2p::protocol::NetworkMessage;
+use atho_storage::db::PeerHealthRecord;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const FRAME_HEADER_BYTES: usize = 24;
 const OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const OUTBOUND_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(32);
+const PEER_QUALITY_MAX_SCORE: u32 = 100;
+const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
+const PEER_QUALITY_SUCCESS_RECOVERY: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum TcpP2pError {
@@ -235,8 +240,20 @@ fn spawn_outbound_maintainer(
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let network = {
+            let state = state.lock().expect("p2p runtime state poisoned");
+            state.network()
+        };
+        let mut health = load_peer_health_snapshot(&state, network, &remote_addr);
         let mut last_failure = None::<String>;
         while !stop_requested.load(Ordering::Acquire) {
+            let now_unix = unix_timestamp();
+            if health.backoff_until_unix > now_unix {
+                let remaining = health.backoff_until_unix.saturating_sub(now_unix).max(1);
+                sleep_with_stop(&stop_requested, Duration::from_secs(remaining.min(1)));
+                continue;
+            }
+
             // Keep configured outbound peers sticky. This closes the common startup-order race
             // where one node launches before another and would otherwise never retry.
             let already_connected = {
@@ -245,7 +262,7 @@ fn spawn_outbound_maintainer(
             };
             if already_connected {
                 last_failure = None;
-                thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                sleep_with_stop(&stop_requested, OUTBOUND_RETRY_INTERVAL);
                 continue;
             }
 
@@ -257,35 +274,67 @@ fn spawn_outbound_maintainer(
                     Arc::clone(&peer_threads),
                 ) {
                     Ok(()) => {
+                        health.quality_score = health
+                            .quality_score
+                            .saturating_add(PEER_QUALITY_SUCCESS_RECOVERY)
+                            .min(PEER_QUALITY_MAX_SCORE);
+                        health.consecutive_failures = 0;
+                        health.backoff_until_unix = 0;
+                        health.last_success_unix = Some(now_unix);
+                        persist_peer_health(&state, &health);
                         if last_failure.take().is_some() {
                             let _ = dev::append_log(
                                 "p2p",
-                                &format!("outbound connect recovered peer={remote_addr}"),
+                                &format!(
+                                    "outbound connect recovered peer={remote_addr} quality={} backoff_cleared=true",
+                                    health.quality_score
+                                ),
                             );
                         }
-                        thread::sleep(Duration::from_millis(250));
+                        sleep_with_stop(&stop_requested, Duration::from_millis(250));
                     }
                     Err(err) => {
                         let failure = err.to_string();
+                        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+                        let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
+                        health.backoff_until_unix =
+                            now_unix.saturating_add(retry_delay.as_secs().max(1));
+                        health.quality_score = health
+                            .quality_score
+                            .saturating_sub(PEER_QUALITY_FAILURE_PENALTY);
+                        health.last_failure_unix = Some(now_unix);
+                        persist_peer_health(&state, &health);
                         if last_failure.as_deref() != Some(failure.as_str()) {
                             let _ = dev::append_log(
                                 "p2p",
                                 &format!(
-                                    "outbound connect retry failed peer={remote_addr} error={failure}"
+                                    "outbound connect retry failed peer={remote_addr} error={failure} retry_in_secs={} failures={} quality={}",
+                                    retry_delay.as_secs().max(1),
+                                    health.consecutive_failures,
+                                    health.quality_score
                                 ),
                             );
                             last_failure = Some(failure);
                         }
-                        thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                        sleep_with_stop(&stop_requested, retry_delay);
                     }
                 },
                 Err(_) => {
                     let failure = format!("invalid peer address: {remote_addr}");
+                    health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+                    let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
+                    health.backoff_until_unix =
+                        now_unix.saturating_add(retry_delay.as_secs().max(1));
+                    health.quality_score = health
+                        .quality_score
+                        .saturating_sub(PEER_QUALITY_FAILURE_PENALTY);
+                    health.last_failure_unix = Some(now_unix);
+                    persist_peer_health(&state, &health);
                     if last_failure.as_deref() != Some(failure.as_str()) {
                         let _ = dev::append_log("p2p", &failure);
                         last_failure = Some(failure);
                     }
-                    thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                    sleep_with_stop(&stop_requested, retry_delay);
                 }
             }
         }
@@ -500,12 +549,89 @@ fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bo
     Ok(true)
 }
 
+fn load_peer_health_snapshot(
+    state: &Arc<Mutex<NodeService>>,
+    network: Network,
+    remote_addr: &str,
+) -> PeerHealthRecord {
+    let state = state.lock().expect("p2p runtime state poisoned");
+    state
+        .p2p_peer_health(remote_addr)
+        .unwrap_or(PeerHealthRecord {
+            network,
+            remote_addr: remote_addr.to_string(),
+            quality_score: PEER_QUALITY_MAX_SCORE,
+            consecutive_failures: 0,
+            backoff_until_unix: 0,
+            last_failure_unix: None,
+            last_success_unix: None,
+        })
+}
+
+fn persist_peer_health(state: &Arc<Mutex<NodeService>>, health: &PeerHealthRecord) {
+    let state = state.lock().expect("p2p runtime state poisoned");
+    state.p2p_save_peer_health(health);
+}
+
+fn next_outbound_retry_delay(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(5);
+    let factor = 1u64 << shift;
+    OUTBOUND_RETRY_INTERVAL
+        .checked_mul(factor as u32)
+        .unwrap_or(OUTBOUND_MAX_RETRY_INTERVAL)
+        .min(OUTBOUND_MAX_RETRY_INTERVAL)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn sleep_with_stop(stop_requested: &Arc<AtomicBool>, duration: Duration) {
+    let started = SystemTime::now();
+    while !stop_requested.load(Ordering::Acquire) {
+        let elapsed = started.elapsed().unwrap_or_default();
+        if elapsed >= duration {
+            break;
+        }
+        let remaining = duration.saturating_sub(elapsed);
+        thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use std::ffi::OsString;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn wait_until(label: &str, timeout: Duration, predicate: impl Fn() -> bool) {
         let started = Instant::now();
@@ -611,5 +737,89 @@ mod tests {
                     && right_snapshot.headers_synced
             },
         );
+    }
+
+    #[test]
+    fn outbound_retry_delay_grows_exponentially_and_caps() {
+        assert_eq!(next_outbound_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(next_outbound_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(next_outbound_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(next_outbound_retry_delay(4), Duration::from_secs(8));
+        assert_eq!(next_outbound_retry_delay(8), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn tcp_runtime_persists_peer_health_after_failed_outbound_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "atho-p2p-health-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let delayed_addr = reserved.local_addr().expect("reserved addr");
+        drop(reserved);
+
+        let right = TcpP2pRuntime::bind_service(
+            Network::Regnet,
+            NodeService::try_new(NodeConfig::new(Network::Regnet)).expect("service"),
+            "127.0.0.1:0",
+        )
+        .expect("runtime");
+        right.maintain_outbound(delayed_addr.to_string());
+
+        wait_until(
+            "peer health persisted after failures",
+            Duration::from_secs(5),
+            || {
+                let state = right.state.lock().expect("state");
+                state
+                    .p2p_peer_health(&delayed_addr.to_string())
+                    .is_some_and(|record| {
+                        record.consecutive_failures >= 1
+                            && record.quality_score < PEER_QUALITY_MAX_SCORE
+                            && record.backoff_until_unix >= unix_timestamp()
+                    })
+            },
+        );
+    }
+
+    #[test]
+    fn tcp_runtime_three_nodes_follow_same_tip_after_burst_mining() {
+        let leader = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("leader");
+        let follower_a =
+            TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("follower a");
+        let follower_b =
+            TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("follower b");
+
+        follower_a.maintain_outbound(leader.bind_addr().to_string());
+        follower_b.maintain_outbound(leader.bind_addr().to_string());
+
+        wait_until("followers connected", Duration::from_secs(20), || {
+            let leader_snapshot = leader.snapshot();
+            let a_snapshot = follower_a.snapshot();
+            let b_snapshot = follower_b.snapshot();
+            leader_snapshot.peer_count == 2
+                && a_snapshot.peer_count == 1
+                && b_snapshot.peer_count == 1
+        });
+
+        for _ in 0..3 {
+            leader.mine_local_block().expect("mine burst block");
+        }
+
+        wait_until("followers catch burst tip", Duration::from_secs(30), || {
+            let leader_snapshot = leader.snapshot();
+            let a_snapshot = follower_a.snapshot();
+            let b_snapshot = follower_b.snapshot();
+            a_snapshot.height == leader_snapshot.height
+                && b_snapshot.height == leader_snapshot.height
+                && a_snapshot.tip_hash == leader_snapshot.tip_hash
+                && b_snapshot.tip_hash == leader_snapshot.tip_hash
+                && a_snapshot.headers_synced
+                && b_snapshot.headers_synced
+        });
     }
 }

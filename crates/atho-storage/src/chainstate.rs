@@ -1,4 +1,4 @@
-use crate::db::{ChainstateSnapshot, Database};
+use crate::db::{ChainstateSnapshot, Database, PeerHealthRecord};
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use crate::validation;
@@ -335,6 +335,23 @@ impl Chainstate {
         self.undo_stack.clear();
         self.prune_history();
         Ok(())
+    }
+
+    pub fn load_peer_health(
+        &self,
+        remote_addr: &str,
+    ) -> Result<Option<PeerHealthRecord>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_peer_health(remote_addr)
+    }
+
+    pub fn save_peer_health(&self, record: &PeerHealthRecord) -> Result<(), StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        storage.upsert_peer_health(record)
     }
 
     pub fn canonical_blocks(&self) -> Result<Vec<Block>, StorageError> {

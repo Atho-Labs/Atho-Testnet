@@ -26,6 +26,7 @@ const TRANSACTIONS_DB: &str = "transactions";
 const UTXOS_DB: &str = "utxos";
 const PEERS_DB: &str = "peers";
 const ADDRESSES_DB: &str = "addresses";
+const PEER_HEALTH_DB: &str = "peer_health";
 
 const LEGACY_META_DIR: &str = "meta";
 const LEGACY_BLOCKS_DIR: &str = "blocks";
@@ -86,6 +87,17 @@ pub struct AddressRecord {
     pub last_seen_height: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHealthRecord {
+    pub network: Network,
+    pub remote_addr: String,
+    pub quality_score: u32,
+    pub consecutive_failures: u32,
+    pub backoff_until_unix: u64,
+    pub last_failure_unix: Option<u64>,
+    pub last_success_unix: Option<u64>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFaultPoint {
@@ -107,6 +119,7 @@ enum Dataset {
     Utxos,
     Peers,
     Addresses,
+    PeerHealth,
 }
 
 #[derive(Debug)]
@@ -126,6 +139,7 @@ struct DatabaseState {
     utxos: LmdbDatabase,
     peers: LmdbDatabase,
     addresses: LmdbDatabase,
+    peer_health: LmdbDatabase,
 }
 
 impl Database {
@@ -329,6 +343,36 @@ impl Database {
         Ok(addresses)
     }
 
+    pub fn upsert_peer_health(&self, record: &PeerHealthRecord) -> Result<(), StorageError> {
+        let key = record.remote_addr.as_bytes().to_vec();
+        let value = bincode::serialize(record).map_err(|_| StorageError::CorruptData)?;
+        self.put(Dataset::PeerHealth, &key, &value)
+    }
+
+    pub fn load_peer_health(
+        &self,
+        remote_addr: &str,
+    ) -> Result<Option<PeerHealthRecord>, StorageError> {
+        match self.get(Dataset::PeerHealth, remote_addr.as_bytes())? {
+            Some(bytes) => {
+                let record: PeerHealthRecord =
+                    bincode::deserialize(&bytes).map_err(|_| StorageError::CorruptData)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_peer_health(&self) -> Result<Vec<PeerHealthRecord>, StorageError> {
+        let mut records = Vec::new();
+        for (_, value) in self.entries(Dataset::PeerHealth)? {
+            let record: PeerHealthRecord =
+                bincode::deserialize(&value).map_err(|_| StorageError::CorruptData)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     fn ensure_schema_version(&self) -> Result<(), StorageError> {
         match self.get(Dataset::Meta, SCHEMA_VERSION_KEY)? {
             Some(bytes) => {
@@ -460,6 +504,7 @@ impl Database {
         let utxos = env.create_db(Some(UTXOS_DB), DatabaseFlags::empty())?;
         let peers = env.create_db(Some(PEERS_DB), DatabaseFlags::empty())?;
         let addresses = env.create_db(Some(ADDRESSES_DB), DatabaseFlags::empty())?;
+        let peer_health = env.create_db(Some(PEER_HEALTH_DB), DatabaseFlags::empty())?;
         Ok(DatabaseState {
             env,
             map_size,
@@ -469,6 +514,7 @@ impl Database {
             utxos,
             peers,
             addresses,
+            peer_health,
         })
     }
 
@@ -498,6 +544,7 @@ impl Dataset {
             Dataset::Utxos => state.utxos,
             Dataset::Peers => state.peers,
             Dataset::Addresses => state.addresses,
+            Dataset::PeerHealth => state.peer_health,
         }
     }
 }
@@ -673,5 +720,33 @@ mod tests {
                 found: 99
             }
         ));
+    }
+
+    #[test]
+    fn peer_health_round_trips_through_storage() {
+        let root = temp_data_dir("peer-health");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+        let record = PeerHealthRecord {
+            network: Network::Regnet,
+            remote_addr: String::from("127.0.0.1:18445"),
+            quality_score: 72,
+            consecutive_failures: 3,
+            backoff_until_unix: 1_700_000_123,
+            last_failure_unix: Some(1_700_000_120),
+            last_success_unix: Some(1_700_000_000),
+        };
+        database
+            .upsert_peer_health(&record)
+            .expect("persist peer health");
+
+        let loaded = database
+            .load_peer_health(&record.remote_addr)
+            .expect("load peer health")
+            .expect("peer health present");
+        assert_eq!(loaded.remote_addr, record.remote_addr);
+        assert_eq!(loaded.quality_score, 72);
+        assert_eq!(loaded.consecutive_failures, 3);
+        assert_eq!(loaded.backoff_until_unix, 1_700_000_123);
     }
 }

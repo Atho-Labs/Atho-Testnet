@@ -9,7 +9,7 @@ use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
 use std::io::BufReader;
-use std::net::TcpListener;
+use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -20,6 +20,8 @@ const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum RuntimeError {
     #[error("invalid network")]
     InvalidNetwork,
+    #[error("refusing to bind RPC on a non-loopback address without ATHO_RPC_ALLOW_PUBLIC=1: {0}")]
+    PublicRpcDenied(String),
     #[error("rpc bind failed: {0}")]
     RpcBindFailed(String),
     #[error("p2p bind failed: {0}")]
@@ -109,6 +111,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         p2p_runtime.maintain_outbound(peer);
     }
     let rpc_address = rpc_bind_address(config.network);
+    validate_rpc_bind_address(&rpc_address)?;
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
@@ -184,6 +187,33 @@ pub fn rpc_bind_address(network: Network) -> String {
     }
 }
 
+fn validate_rpc_bind_address(address: &str) -> Result<(), NodeError> {
+    if std::env::var("ATHO_RPC_ALLOW_PUBLIC").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    let resolved = address.to_socket_addrs().map_err(|err| {
+        NodeError::Runtime(RuntimeError::RpcBindFailed(format!(
+            "invalid rpc bind address {address}: {err}"
+        )))
+    })?;
+    for socket_addr in resolved {
+        if !is_loopback_addr(socket_addr) {
+            return Err(NodeError::Runtime(RuntimeError::PublicRpcDenied(
+                address.to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback_addr(address: SocketAddr) -> bool {
+    match address.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
 pub fn p2p_bind_address(network: Network) -> String {
     if let Ok(address) = std::env::var("ATHO_P2P_ADDR") {
         return address;
@@ -221,6 +251,28 @@ mod tests {
         assert!(runtime.running);
         runtime.stop();
         assert!(!runtime.running);
+    }
+
+    #[test]
+    fn rpc_bind_validation_rejects_public_addresses_by_default() {
+        let err = validate_rpc_bind_address("0.0.0.0:18443").unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::Runtime(RuntimeError::PublicRpcDenied(_))
+        ));
+    }
+
+    #[test]
+    fn rpc_bind_validation_accepts_public_addresses_when_explicitly_allowed() {
+        std::env::set_var("ATHO_RPC_ALLOW_PUBLIC", "1");
+        let result = validate_rpc_bind_address("0.0.0.0:18443");
+        std::env::remove_var("ATHO_RPC_ALLOW_PUBLIC");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rpc_bind_validation_accepts_loopback_addresses() {
+        assert!(validate_rpc_bind_address("127.0.0.1:18443").is_ok());
     }
 
     #[test]

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NETWORK="${ATHO_UI_NETWORK:-regnet}"
 APP_NAME="${ATHO_UI_APP_NAME:-Atho}"
+APP_PROCESS_NAME="${ATHO_UI_PROCESS_NAME:-atho-qt}"
 LOG_FILE="${ATHO_UI_LOG_FILE:-/tmp/atho-qt-ui-smoke.log}"
 
 if ! command -v osascript >/dev/null 2>&1; then
@@ -43,10 +44,17 @@ mkdir -p "$HOME" "$ATHO_DATA_DIR"
 
 cleanup() {
   if [[ -n "${APP_PID:-}" ]]; then
+    pkill -TERM -P "$APP_PID" >/dev/null 2>&1 || true
     kill "$APP_PID" >/dev/null 2>&1 || true
     wait "$APP_PID" >/dev/null 2>&1 || true
+    pkill -KILL -P "$APP_PID" >/dev/null 2>&1 || true
   fi
-  rm -rf "$TMP_ROOT"
+  for _ in 1 2 3; do
+    if rm -rf "$TMP_ROOT" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
 }
 trap cleanup EXIT
 
@@ -58,9 +66,11 @@ APP_PID=$!
 
 sleep 8
 
-osascript <<APPLESCRIPT
+if ! osascript - "$APP_PROCESS_NAME" <<'APPLESCRIPT'
+on run argv
+  set processName to item 1 of argv
 tell application "System Events"
-  tell process "atho-qt"
+  tell process processName
     set frontmost to true
     repeat 60 times
       if exists window 1 then exit repeat
@@ -83,6 +93,11 @@ tell application "System Events"
     end try
   end tell
 end tell
+end run
 APPLESCRIPT
+then
+  echo "skip: UI automation could not drive the Qt process on this machine" >&2
+  exit 2
+fi
 
 echo "qt ui smoke ok"

@@ -151,4 +151,12 @@ mod tests {
         let err = read_message::<_, TestMessage>(&mut reader).unwrap_err();
         assert!(matches!(err, RpcTransportError::MessageTooLarge));
     }
+
+    #[test]
+    fn read_message_rejects_invalid_json() {
+        let payload = br#"{"value":"atho""#;
+        let mut reader = BufReader::new(&payload[..]);
+        let err = read_message::<_, TestMessage>(&mut reader).unwrap_err();
+        assert!(matches!(err, RpcTransportError::Serialization(_)));
+    }
 }
