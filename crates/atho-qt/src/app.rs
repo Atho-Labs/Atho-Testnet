@@ -2532,7 +2532,7 @@ mod tests {
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::pow;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-    use atho_core::constants::ATOMS_PER_ATHO;
+    use atho_core::constants::{ATOMS_PER_ATHO, STANDARD_TX_CONFIRMATIONS};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -2658,7 +2658,7 @@ mod tests {
         app: &ReadOnlyNodeConnection,
         recipient_digest: [u8; 32],
         value_atoms: u64,
-    ) -> [u8; 48] {
+    ) -> ([u8; 48], u64) {
         let external_digest = [0x6c; 32];
         let mut funding_utxo = None;
         let seeded = app.with_local_system_for_test(|system| {
@@ -2669,7 +2669,8 @@ mod tests {
                     0,
                     value_atoms,
                     external_digest.to_vec(),
-                    node.height().saturating_sub(6),
+                    node.height()
+                        .saturating_sub(STANDARD_TX_CONFIRMATIONS.saturating_sub(1)),
                     false,
                 );
                 node.dev_seed_chainstate(node.height(), node.tip_hash(), [utxo.clone()])
@@ -2681,11 +2682,12 @@ mod tests {
 
         let funding_utxo = funding_utxo.expect("funding utxo");
         let fee_atoms = DesktopApp::estimate_fee(1, 1);
+        let credited_atoms = value_atoms.saturating_sub(fee_atoms);
         let transaction = DesktopApp::build_signed_spend_transaction(
             &test_keypair(),
             std::slice::from_ref(&funding_utxo),
             recipient_digest,
-            value_atoms.saturating_sub(fee_atoms),
+            credited_atoms,
             0,
             None,
             1,
@@ -2695,7 +2697,7 @@ mod tests {
             transaction,
             fee_atoms,
         }) {
-            RpcResponse::TransactionSubmitted(txid) => txid,
+            RpcResponse::TransactionSubmitted(txid) => (txid, credited_atoms),
             other => panic!("unexpected funding submit response: {other:?}"),
         }
     }
@@ -2711,6 +2713,12 @@ mod tests {
             })
         });
         mined.expect("expected local test backend")
+    }
+
+    fn mine_local_blocks(app: &ReadOnlyNodeConnection, count: u64) {
+        for _ in 0..count {
+            let _ = mine_local_block(app);
+        }
     }
 
     fn witness_bytes(tx: &Transaction) -> Vec<u8> {
@@ -3048,10 +3056,25 @@ mod tests {
             .iter()
             .any(|row| row.kind == WalletActivityKind::Mined));
 
-        submit_external_funding_tx(
+        let pre_funding_ready_height = STANDARD_TX_CONFIRMATIONS.saturating_sub(1).max(1);
+        if app.view_model.block_count < pre_funding_ready_height {
+            mine_local_blocks(
+                &app.connection,
+                pre_funding_ready_height.saturating_sub(app.view_model.block_count),
+            );
+            wait_until_without_wallet_scan(
+                "external funding source reaches standard spendability height",
+                &mut app,
+                Duration::from_secs(20),
+                |app| app.view_model.block_count >= pre_funding_ready_height,
+            );
+        }
+
+        let funding_atoms = 20 * ATOMS_PER_ATHO;
+        let (_, credited_funding_atoms) = submit_external_funding_tx(
             &app.connection,
             current_address.payment_digest,
-            20 * ATOMS_PER_ATHO,
+            funding_atoms,
         );
         wait_until_without_wallet_scan(
             "external funding reaches mempool",
@@ -3064,14 +3087,37 @@ mod tests {
             "funding block accepted",
             &mut app,
             Duration::from_secs(5),
-            |app| app.view_model.block_count >= 2 && app.view_model.mempool_count == 0,
+            |app| {
+                app.view_model.block_count >= pre_funding_ready_height + 1
+                    && app.view_model.mempool_count == 0
+            },
         );
         app.force_wallet_cache_refresh_for_test();
-        assert!(app.wallet_balance_summary().available_atoms >= 20 * ATOMS_PER_ATHO);
+        // Standard transactions are intentionally not spendable immediately. Keep this lifecycle
+        // test aligned with consensus by asserting the inbound payment is pending until the
+        // configured confirmation threshold is crossed.
+        assert!(app.wallet_balance_summary().pending_atoms >= credited_funding_atoms);
+        assert!(app.wallet_balance_summary().available_atoms < credited_funding_atoms);
         assert!(app
             .wallet_activity_rows()
             .iter()
             .any(|row| row.kind == WalletActivityKind::Received));
+
+        let maturity_target_height =
+            pre_funding_ready_height + STANDARD_TX_CONFIRMATIONS;
+        mine_local_blocks(
+            &app.connection,
+            STANDARD_TX_CONFIRMATIONS.saturating_sub(1),
+        );
+        wait_until_without_wallet_scan(
+            "funding matures under standard confirmation rules",
+            &mut app,
+            Duration::from_secs(20),
+            |app| app.view_model.block_count >= maturity_target_height,
+        );
+        app.force_wallet_cache_refresh_for_test();
+        assert!(app.wallet_balance_summary().available_atoms >= credited_funding_atoms);
+        let available_before_send = app.wallet_balance_summary().available_atoms;
 
         let mut recipient_wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[7u8; 32], MnemonicLength::Words24).unwrap(),
@@ -3101,7 +3147,7 @@ mod tests {
             "second mined block accepted",
             &mut app,
             Duration::from_secs(5),
-            |app| app.view_model.block_count >= 3,
+            |app| app.view_model.block_count >= maturity_target_height + 1,
         );
         app.force_wallet_cache_refresh_for_test();
         wait_until_without_wallet_scan(
@@ -3114,9 +3160,9 @@ mod tests {
         let expected_available = app.wallet_balance_summary().available_atoms;
         let expected_pending = app.wallet_balance_summary().pending_atoms;
         let expected_total = app.wallet_balance_summary().total_atoms;
-        assert!(expected_available < 20 * ATOMS_PER_ATHO);
-        assert_eq!(app.view_model.block_count, 3);
-        assert_eq!(app.view_model.sync_best_height, 3);
+        assert!(expected_available < available_before_send);
+        assert_eq!(app.view_model.block_count, maturity_target_height + 1);
+        assert_eq!(app.view_model.sync_best_height, maturity_target_height + 1);
         assert!(app
             .wallet_activity_rows()
             .iter()
@@ -3137,7 +3183,7 @@ mod tests {
             "reopened wallet loads",
             &mut reopened,
             Duration::from_secs(10),
-            |app| app.wallet.is_some() && app.view_model.block_count == 3,
+            |app| app.wallet.is_some() && app.view_model.block_count == maturity_target_height + 1,
         );
         reopened.force_wallet_cache_refresh_for_test();
         assert_eq!(
@@ -3145,7 +3191,7 @@ mod tests {
             expected_total
         );
 
-        assert_eq!(reopened.view_model.sync_best_height, 3);
+        assert_eq!(reopened.view_model.sync_best_height, maturity_target_height + 1);
         assert_eq!(
             reopened.wallet_balance_summary().available_atoms,
             expected_available
@@ -3196,7 +3242,7 @@ mod tests {
                 |app| app.view_model.block_count >= expected_height,
             );
         }
-        let funding_txid = submit_external_funding_tx(
+        let (funding_txid, _) = submit_external_funding_tx(
             &app.connection,
             receive_address.payment_digest,
             9 * ATOMS_PER_ATHO,
