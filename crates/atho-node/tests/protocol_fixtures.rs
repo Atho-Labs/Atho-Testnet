@@ -1,6 +1,7 @@
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::params::CONSENSUS_PARAMS;
 use atho_core::consensus::pow;
+use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::subsidy;
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
@@ -18,8 +19,13 @@ fn signing_keypair() -> FalconKeypair {
 fn witness_bytes(tx: &Transaction) -> Vec<u8> {
     let keypair = signing_keypair();
     let txid = tx.txid();
-    let digest = tx.signing_digest();
-    let signature = sign(&keypair.secret_key, &digest).expect("deterministic falcon signature");
+    let digest = transaction_signing_digest(&tx);
+    let signature = sign(
+        AthoSignatureDomain::Transaction,
+        &keypair.secret_key,
+        &digest,
+    )
+    .expect("deterministic falcon signature");
     let sig_bytes = signature.0.clone();
     let staged = TxWitness {
         signature: sig_bytes.clone(),

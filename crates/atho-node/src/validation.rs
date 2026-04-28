@@ -1,4 +1,5 @@
 use atho_core::block::Block;
+use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
     BLOCK_TIME_SECONDS, MAX_BLOCK_SIZE_BYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_SIZE_BYTES,
@@ -8,8 +9,7 @@ use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_crypto::falcon::{
-    self, FalconPublicKey, FalconSignature, FALCON_512_PUBLIC_KEY_BYTES,
-    FALCON_512_SIGNATURE_MAX_BYTES, FALCON_512_SIGNATURE_MIN_BYTES,
+    self, FalconPublicKey, FalconSignature, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
 };
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use std::collections::BTreeSet;
@@ -149,13 +149,12 @@ pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationEr
     if witness.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
         return Err(ValidationError::InvalidWitness);
     }
-    if witness.signature.len() < FALCON_512_SIGNATURE_MIN_BYTES
-        || witness.signature.len() > FALCON_512_SIGNATURE_MAX_BYTES
-    {
+    if witness.signature.len() != FALCON_512_SIGNATURE_BYTES {
         return Err(ValidationError::InvalidWitness);
     }
-    let signing_digest = tx.signing_digest();
+    let signing_digest = transaction_signing_digest(tx);
     let verified = falcon::verify(
+        AthoSignatureDomain::Transaction,
         &FalconPublicKey(witness.pubkey),
         &signing_digest,
         &FalconSignature(witness.signature),
@@ -456,7 +455,7 @@ mod tests {
     use atho_storage::utxo::UtxoEntry;
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
         let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
         let txid = tx.txid();
         let staged = TxWitness {
@@ -508,7 +507,12 @@ mod tests {
             lock_time: 0,
             witness: vec![],
         };
-        let signature = sign(&keypair.secret_key, &tx.signing_digest()).expect("signature");
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(&tx),
+        )
+        .expect("signature");
         let witness = TxWitness {
             signature: signature.0.clone(),
             pubkey: keypair.public_key.0.clone(),
@@ -527,7 +531,7 @@ mod tests {
 
     #[test]
     fn input_reference_has_fixed_collision_resistant_size() {
-        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
         let first = derive_sig_ref_short(&[3; 48], &signature, 7);
         let same = derive_sig_ref_short(&[3; 48], &signature, 7);
         let different = derive_sig_ref_short(&[3; 48], &signature, 8);

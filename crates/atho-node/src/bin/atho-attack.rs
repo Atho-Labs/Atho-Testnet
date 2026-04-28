@@ -1,4 +1,5 @@
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
     BLOCK_TIME_SECONDS, MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES,
@@ -434,7 +435,12 @@ fn tx_duplicate_input() -> BuiltTransaction {
         lock_time: 0,
         witness: vec![],
     };
-    let signature = sign(&keypair.secret_key, &tx.signing_digest()).expect("falcon signature");
+    let signature = sign(
+        AthoSignatureDomain::Transaction,
+        &keypair.secret_key,
+        &transaction_signing_digest(&tx),
+    )
+    .expect("falcon signature");
     let signature_bytes = signature.0.clone();
     let witness = TxWitness {
         signature: signature_bytes.clone(),
@@ -506,7 +512,12 @@ fn make_spend_tx(
         witness: vec![],
     };
 
-    let signature = sign(&keypair.secret_key, &tx.signing_digest()).expect("falcon signature");
+    let signature = sign(
+        AthoSignatureDomain::Transaction,
+        &keypair.secret_key,
+        &transaction_signing_digest(&tx),
+    )
+    .expect("falcon signature");
     let mut signature_bytes = signature.0.clone();
     if mutate_signature {
         signature_bytes[0] ^= 0xff;

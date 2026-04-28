@@ -1,6 +1,5 @@
 use super::models::{WalletActivityKind, WalletActivityRow, WalletBalanceSummary};
 use super::widgets::short_hash;
-use atho_core::crypto::hash::sha3_256;
 use atho_node::dev::chain_dir;
 use atho_storage::utxo::UtxoEntry;
 use atho_wallet::wallet::WalletAddress;
@@ -21,7 +20,6 @@ struct LedgerFingerprint {
     tx_bytes: u64,
     input_bytes: u64,
     output_bytes: u64,
-    address_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -69,7 +67,7 @@ impl WalletLedgerCache {
         addresses: &[WalletAddress],
         summary: WalletBalanceSummary,
     ) -> io::Result<()> {
-        let fingerprint = LedgerFingerprint::capture(addresses)?;
+        let fingerprint = LedgerFingerprint::capture()?;
         if self.fingerprint.as_ref() == Some(&fingerprint) {
             self.snapshot.summary = summary;
             return Ok(());
@@ -92,35 +90,15 @@ impl WalletLedgerCache {
 }
 
 impl LedgerFingerprint {
-    fn capture(addresses: &[WalletAddress]) -> io::Result<Self> {
-        let mut state = Vec::with_capacity(addresses.len().saturating_mul(48));
-        let mut sorted = addresses.to_vec();
-        sorted.sort_by(|left, right| {
-            left.payment_digest
-                .cmp(&right.payment_digest)
-                .then(left.path.account.cmp(&right.path.account))
-                .then(left.path.index.cmp(&right.path.index))
-        });
-        for address in sorted {
-            state.extend_from_slice(&address.payment_digest);
-            state.extend_from_slice(&address.path.account.to_le_bytes());
-            state.push(match address.path.kind {
-                atho_wallet::hd::AddressKind::Receive => 0,
-                atho_wallet::hd::AddressKind::Change => 1,
-            });
-            state.extend_from_slice(&address.path.index.to_le_bytes());
-        }
-
-        let mut fingerprint = Self::default();
-        fingerprint.address_hash = sha3_256(&state);
-
+    fn capture() -> io::Result<Self> {
         let txs = ledger_file_size("transactions.tsv")?;
         let inputs = ledger_file_size("transaction_inputs.tsv")?;
         let outputs = ledger_file_size("transaction_outputs.tsv")?;
-        fingerprint.tx_bytes = txs;
-        fingerprint.input_bytes = inputs;
-        fingerprint.output_bytes = outputs;
-        Ok(fingerprint)
+        Ok(Self {
+            tx_bytes: txs,
+            input_bytes: inputs,
+            output_bytes: outputs,
+        })
     }
 }
 

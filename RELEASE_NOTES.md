@@ -4,6 +4,9 @@
 
 - Rust workspace builds cleanly
 - Core protocol constants and consensus scaffolding are in place
+- Falcon-512 RS is the only active post-quantum signature path
+- Atho transaction signing uses the frozen `ATHO_TX_SIG_V1` domain with fixed-size 666-byte signatures
+- Kyber has been removed from the active wallet/crypto path
 - Wallet mnemonic, datafile persistence, and password encryption are in place
 - Node RPC now exposes live node status, block template, block submission, transaction submission, UTXO listing, and mempool info
 - Qt status now reflects real node data and includes a live activity feed from the shared dev log stream

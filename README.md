@@ -22,13 +22,17 @@ The codebase is intentionally split into small crates so the trusted core stays 
 - Minimum transaction fee: `1 atom/vbyte`
 - Proof of work hash: `SHA3-384`
 - Hash size: `384` bits / `96` hex characters
+- Falcon-512 RS public keys: `897` bytes
+- Falcon-512 RS secret keys: `1,281` bytes
+- Falcon-512 RS signatures: `666` bytes
+- Transaction signature domain: `ATHO_TX_SIG_V1`
 - Consensus math uses integers only
 - Mainnet, testnet, and regnet have separate network identities, genesis data, and RPC defaults
 
 ## What Atho Includes
 
 - `atho-core` - protocol constants, consensus, transaction, block, address, and genesis logic
-- `atho-crypto` - thin Falcon and Kyber boundary layer
+- `atho-crypto` - Falcon-512 RS boundary layer
 - `atho-storage` - LMDB-backed chainstate, UTXO, block archive, and peer/address storage
 - `atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
 - `atho-p2p` - wire codec, peer protocol, and sync state
@@ -63,7 +67,7 @@ The transaction path in Atho is:
 
 1. The wallet derives an address from the HD seed and keeps the wallet state in the local datafile.
 2. A spend transaction is assembled with explicit inputs, outputs, automatic 1 atom/vbyte fee policy, and witness data.
-3. The transaction digest is signed with Falcon.
+3. The transaction digest is signed with Atho's frozen Falcon-512 RS domain (`ATHO_TX_SIG_V1`).
 4. The node checks canonical serialization, duplicate inputs, fee policy, input ownership, and signature validity.
 5. Valid transactions enter the mempool.
 6. The miner pulls only valid mempool transactions into a block template.
@@ -105,7 +109,7 @@ The desktop client is intentionally thin and still depends on the node for heavy
 ```text
 crates/
   atho-core/      consensus, tx, block, address, genesis
-  atho-crypto/    Falcon and Kyber wrappers
+  atho-crypto/    Falcon-512 RS wrapper
   atho-storage/   LMDB-backed chainstate, UTXO, block archive, peer/address storage
   atho-wallet/    HD wallet and address generation
   atho-p2p/       peer protocol and sync

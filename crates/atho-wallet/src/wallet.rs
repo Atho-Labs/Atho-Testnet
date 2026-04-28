@@ -412,8 +412,9 @@ mod tests {
     fn wallet_restore_reproduces_first_hundred_receive_and_change_addresses() {
         let phrase = phrase();
         let mut original = Wallet::from_mnemonic(phrase.clone(), "pass", Network::Mainnet);
-        let mut restored = Wallet::restore_from_phrase(&phrase.as_sentence(), "pass", Network::Mainnet)
-            .expect("wallet restore");
+        let mut restored =
+            Wallet::restore_from_phrase(&phrase.as_sentence(), "pass", Network::Mainnet)
+                .expect("wallet restore");
 
         let original_receive: Vec<String> = (0..100)
             .map(|_| original.checkout_receive_address().address)

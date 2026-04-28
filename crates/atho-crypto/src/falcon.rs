@@ -1,67 +1,20 @@
 use crate::error::CryptoError;
 use crate::secret::SecretBytes;
+use atho_core::consensus::signatures::AthoSignatureDomain;
 use atho_core::crypto::hash::sha3_384;
+use fn_dsa::{
+    sign_key_size, signature_size, vrfy_key_size, CryptoRng, DomainContext, KeyPairGenerator,
+    KeyPairGenerator512, RngCore, SigningKey, SigningKey512, VerifyingKey, VerifyingKey512,
+    FN_DSA_LOGN_512, HASH_ID_SHA3_384,
+};
 use getrandom::getrandom;
-use std::ffi::c_void;
+use std::cmp::min;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const FALCON_512_PUBLIC_KEY_BYTES: usize = 897;
-pub const FALCON_512_SECRET_KEY_BYTES: usize = 1_281;
-pub const FALCON_512_SIGNATURE_MIN_BYTES: usize = 600;
-pub const FALCON_512_SIGNATURE_MAX_BYTES: usize = 752;
-pub const FALCON_512_TMP_KEYGEN_BYTES: usize = 65_536;
-pub const FALCON_512_TMP_SIGN_BYTES: usize = 65_536;
-pub const FALCON_512_TMP_VERIFY_BYTES: usize = 8_192;
-const FALCON_512_LOGN: u32 = 9;
-const FALCON_SIG_COMPRESSED: i32 = 1;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Shake256Context {
-    opaque_contents: [u64; 26],
-}
-
-unsafe extern "C" {
-    fn shake256_init_prng_from_seed(sc: *mut Shake256Context, seed: *const c_void, seed_len: usize);
-    fn falcon_keygen_make(
-        rng: *mut Shake256Context,
-        logn: u32,
-        privkey: *mut c_void,
-        privkey_len: usize,
-        pubkey: *mut c_void,
-        pubkey_len: usize,
-        tmp: *mut c_void,
-        tmp_len: usize,
-    ) -> i32;
-    fn falcon_sign_dyn(
-        rng: *mut Shake256Context,
-        sig: *mut c_void,
-        sig_len: *mut usize,
-        sig_type: i32,
-        privkey: *const c_void,
-        privkey_len: usize,
-        data: *const c_void,
-        data_len: usize,
-        tmp: *mut c_void,
-        tmp_len: usize,
-    ) -> i32;
-    fn falcon_verify(
-        sig: *const c_void,
-        sig_len: usize,
-        sig_type: i32,
-        pubkey: *const c_void,
-        pubkey_len: usize,
-        data: *const c_void,
-        data_len: usize,
-        tmp: *mut c_void,
-        tmp_len: usize,
-    ) -> i32;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FalconVariant {
-    Falcon512,
-}
+pub const FALCON_512_LOGN: u32 = FN_DSA_LOGN_512;
+pub const FALCON_512_PUBLIC_KEY_BYTES: usize = vrfy_key_size(FALCON_512_LOGN);
+pub const FALCON_512_SECRET_KEY_BYTES: usize = sign_key_size(FALCON_512_LOGN);
+pub const FALCON_512_SIGNATURE_BYTES: usize = signature_size(FALCON_512_LOGN);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconPublicKey(pub Vec<u8>);
@@ -96,34 +49,114 @@ pub struct FalconKeypair {
     pub secret_key: FalconSecretKey,
 }
 
-pub fn available() -> bool {
-    true
+#[derive(Clone)]
+struct SeededRng {
+    seed: [u8; 48],
+    buffer: [u8; 48],
+    offset: usize,
+    counter: u64,
 }
 
-pub fn validate_key_lengths(
-    public_key: &[u8],
-    secret_key: &[u8],
-    variant: FalconVariant,
-) -> Result<(), CryptoError> {
-    match variant {
-        FalconVariant::Falcon512 => {
-            if public_key.len() != FALCON_512_PUBLIC_KEY_BYTES
-                || secret_key.len() != FALCON_512_SECRET_KEY_BYTES
-            {
-                Err(CryptoError::InvalidKeyLength)
-            } else {
-                Ok(())
-            }
+impl SeededRng {
+    fn new(seed: &[u8]) -> Self {
+        Self {
+            seed: falcon_seed(seed),
+            buffer: [0u8; 48],
+            offset: 48,
+            counter: 0,
         }
     }
+
+    fn refill(&mut self) {
+        let mut input = [0u8; 56];
+        input[..48].copy_from_slice(&self.seed);
+        input[48..].copy_from_slice(&self.counter.to_le_bytes());
+        self.buffer = sha3_384(&input);
+        self.offset = 0;
+        self.counter = self.counter.wrapping_add(1);
+    }
+
+    fn clear(&mut self) {
+        self.seed.zeroize();
+        self.buffer.zeroize();
+        self.offset = self.buffer.len();
+        self.counter = 0;
+    }
+}
+
+impl CryptoRng for SeededRng {}
+
+impl RngCore for SeededRng {
+    fn next_u32(&mut self) -> u32 {
+        if self.offset > self.buffer.len().saturating_sub(4) {
+            let mut bytes = [0u8; 4];
+            self.fill_bytes(&mut bytes);
+            return u32::from_le_bytes(bytes);
+        }
+
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&self.buffer[self.offset..self.offset + 4]);
+        self.offset += 4;
+        u32::from_le_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        if self.offset > self.buffer.len().saturating_sub(8) {
+            let mut bytes = [0u8; 8];
+            self.fill_bytes(&mut bytes);
+            return u64::from_le_bytes(bytes);
+        }
+
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.buffer[self.offset..self.offset + 8]);
+        self.offset += 8;
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut filled = 0usize;
+        while filled < dest.len() {
+            if self.offset >= self.buffer.len() {
+                self.refill();
+            }
+            let available = self.buffer.len() - self.offset;
+            let remaining = dest.len() - filled;
+            let count = min(available, remaining);
+            dest[filled..filled + count]
+                .copy_from_slice(&self.buffer[self.offset..self.offset + count]);
+            self.offset += count;
+            filled += count;
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), fn_dsa::RngError> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+pub fn available() -> bool {
+    true
 }
 
 pub fn public_key_len_ok(len: usize) -> bool {
     len == FALCON_512_PUBLIC_KEY_BYTES
 }
 
+pub fn secret_key_len_ok(len: usize) -> bool {
+    len == FALCON_512_SECRET_KEY_BYTES
+}
+
 pub fn signature_len_ok(len: usize) -> bool {
-    (FALCON_512_SIGNATURE_MIN_BYTES..=FALCON_512_SIGNATURE_MAX_BYTES).contains(&len)
+    len == FALCON_512_SIGNATURE_BYTES
+}
+
+pub fn validate_key_lengths(public_key: &[u8], secret_key: &[u8]) -> Result<(), CryptoError> {
+    if !public_key_len_ok(public_key.len()) || !secret_key_len_ok(secret_key.len()) {
+        Err(CryptoError::InvalidKeyLength)
+    } else {
+        Ok(())
+    }
 }
 
 fn falcon_seed(seed: &[u8]) -> [u8; 48] {
@@ -136,24 +169,8 @@ fn falcon_seed(seed: &[u8]) -> [u8; 48] {
     out
 }
 
-fn init_rng(seed: &[u8]) -> Shake256Context {
-    let mut rng = unsafe { std::mem::zeroed::<Shake256Context>() };
-    let mut seed = falcon_seed(seed);
-    unsafe {
-        shake256_init_prng_from_seed(&mut rng, seed.as_ptr().cast(), seed.len());
-    }
-    seed.zeroize();
-    rng
-}
-
-fn zeroize_rng(rng: &mut Shake256Context) {
-    unsafe {
-        std::ptr::write_bytes(
-            rng as *mut Shake256Context as *mut u8,
-            0,
-            std::mem::size_of::<Shake256Context>(),
-        );
-    }
+fn init_rng(seed: &[u8]) -> SeededRng {
+    SeededRng::new(seed)
 }
 
 pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
@@ -164,23 +181,14 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
     let mut rng = init_rng(seed);
     let mut public_key = vec![0u8; FALCON_512_PUBLIC_KEY_BYTES];
     let mut secret_key = Zeroizing::new(vec![0u8; FALCON_512_SECRET_KEY_BYTES]);
-    let mut tmp = Zeroizing::new(vec![0u8; FALCON_512_TMP_KEYGEN_BYTES]);
-    let rc = unsafe {
-        falcon_keygen_make(
-            &mut rng,
-            FALCON_512_LOGN,
-            secret_key.as_mut_ptr().cast(),
-            secret_key.len(),
-            public_key.as_mut_ptr().cast(),
-            public_key.len(),
-            tmp.as_mut_ptr().cast(),
-            tmp.len(),
-        )
-    };
-    zeroize_rng(&mut rng);
-    if rc != 0 {
-        return Err(CryptoError::OperationFailed);
-    }
+    let mut keygen = KeyPairGenerator512::default();
+    keygen.keygen(
+        FALCON_512_LOGN,
+        &mut rng,
+        secret_key.as_mut_slice(),
+        public_key.as_mut_slice(),
+    );
+    rng.clear();
 
     Ok(FalconKeypair {
         public_key: FalconPublicKey(public_key),
@@ -188,53 +196,43 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
     })
 }
 
-pub fn generate(variant: FalconVariant) -> Result<FalconKeypair, CryptoError> {
-    match variant {
-        FalconVariant::Falcon512 => {
-            let mut seed = [0u8; 48];
-            getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
-            let keypair = generate_from_seed(&seed);
-            seed.zeroize();
-            keypair
-        }
-    }
+pub fn generate() -> Result<FalconKeypair, CryptoError> {
+    let mut seed = [0u8; 48];
+    getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
+    let keypair = generate_from_seed(&seed);
+    seed.zeroize();
+    keypair
 }
 
-pub fn sign(secret_key: &FalconSecretKey, message: &[u8]) -> Result<FalconSignature, CryptoError> {
-    if secret_key.as_bytes().len() != FALCON_512_SECRET_KEY_BYTES {
+pub fn sign(
+    domain: AthoSignatureDomain,
+    secret_key: &FalconSecretKey,
+    message: &[u8],
+) -> Result<FalconSignature, CryptoError> {
+    if !secret_key_len_ok(secret_key.as_bytes().len()) {
         return Err(CryptoError::InvalidKeyLength);
     }
 
+    let mut signing_key =
+        SigningKey512::decode(secret_key.as_bytes()).ok_or(CryptoError::OperationFailed)?;
     let mut seed = [0u8; 48];
     getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
     let mut rng = init_rng(&seed);
     seed.zeroize();
-    let mut signature = vec![0u8; FALCON_512_SIGNATURE_MAX_BYTES];
-    let mut sig_len = signature.len();
-    let mut tmp = Zeroizing::new(vec![0u8; FALCON_512_TMP_SIGN_BYTES]);
-    let rc = unsafe {
-        falcon_sign_dyn(
-            &mut rng,
-            signature.as_mut_ptr().cast(),
-            &mut sig_len,
-            FALCON_SIG_COMPRESSED,
-            secret_key.as_bytes().as_ptr().cast(),
-            secret_key.as_bytes().len(),
-            message.as_ptr().cast(),
-            message.len(),
-            tmp.as_mut_ptr().cast(),
-            tmp.len(),
-        )
-    };
-    zeroize_rng(&mut rng);
-    if rc != 0 {
-        return Err(CryptoError::OperationFailed);
-    }
-    signature.truncate(sig_len);
+    let mut signature = vec![0u8; FALCON_512_SIGNATURE_BYTES];
+    signing_key.sign(
+        &mut rng,
+        &DomainContext(domain.label().as_bytes()),
+        &HASH_ID_SHA3_384,
+        message,
+        &mut signature,
+    );
+    rng.clear();
     Ok(FalconSignature(signature))
 }
 
 pub fn verify(
+    domain: AthoSignatureDomain,
     public_key: &FalconPublicKey,
     message: &[u8],
     signature: &FalconSignature,
@@ -245,46 +243,72 @@ pub fn verify(
         return Ok(false);
     }
 
-    let mut tmp = vec![0u8; FALCON_512_TMP_VERIFY_BYTES];
-    let rc = unsafe {
-        falcon_verify(
-            signature.as_bytes().as_ptr().cast(),
-            signature.as_bytes().len(),
-            FALCON_SIG_COMPRESSED,
-            public_key.as_bytes().as_ptr().cast(),
-            public_key.as_bytes().len(),
-            message.as_ptr().cast(),
-            message.len(),
-            tmp.as_mut_ptr().cast(),
-            tmp.len(),
-        )
+    let verifying_key = match VerifyingKey512::decode(public_key.as_bytes()) {
+        Some(key) => key,
+        None => return Ok(false),
     };
-    tmp.zeroize();
-    Ok(rc == 0)
+
+    Ok(verifying_key.verify(
+        signature.as_bytes(),
+        &DomainContext(domain.label().as_bytes()),
+        &HASH_ID_SHA3_384,
+        message,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput};
 
     #[test]
     fn falcon512_lengths_are_frozen() {
+        assert_eq!(FALCON_512_LOGN, 9);
         assert_eq!(FALCON_512_PUBLIC_KEY_BYTES, 897);
         assert_eq!(FALCON_512_SECRET_KEY_BYTES, 1_281);
-        assert_eq!(FALCON_512_SIGNATURE_MIN_BYTES, 600);
-        assert_eq!(FALCON_512_SIGNATURE_MAX_BYTES, 752);
-        assert_eq!(FALCON_512_TMP_KEYGEN_BYTES, 65_536);
-        assert_eq!(FALCON_512_TMP_SIGN_BYTES, 65_536);
-        assert_eq!(FALCON_512_TMP_VERIFY_BYTES, 8_192);
+        assert_eq!(FALCON_512_SIGNATURE_BYTES, 666);
     }
 
     #[test]
     fn falcon_keygen_sign_and_verify_round_trip() {
         let keypair = generate_from_seed(b"atho-falcon-seed").unwrap();
-        let message = b"atho signing message";
-        let signature = sign(&keypair.secret_key, message).unwrap();
-        assert!(verify(&keypair.public_key, message, &signature).unwrap());
-        assert!(!verify(&keypair.public_key, b"wrong message", &signature).unwrap());
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 500,
+                locking_script: vec![4, 5],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let digest = transaction_signing_digest(&tx);
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(signature.as_bytes().len(), FALCON_512_SIGNATURE_BYTES);
+        assert!(verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            &digest,
+            &signature,
+        )
+        .unwrap());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            b"wrong message",
+            &signature,
+        )
+        .unwrap());
     }
 
     #[test]
@@ -292,13 +316,26 @@ mod tests {
         let signer = generate_from_seed(b"atho-falcon-signer").unwrap();
         let other = generate_from_seed(b"atho-falcon-other").unwrap();
         let message = b"atho signing message";
-        let signature = sign(&signer.secret_key, message).unwrap();
-        assert!(!verify(&other.public_key, message, &signature).unwrap());
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &signer.secret_key,
+            message,
+        )
+        .unwrap();
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &other.public_key,
+            message,
+            &signature,
+        )
+        .unwrap());
     }
 
     #[test]
     fn falcon_length_validation_rejects_wrong_sizes() {
-        let err = validate_key_lengths(&[], &[], FalconVariant::Falcon512).unwrap_err();
+        let err = validate_key_lengths(&[], &[]).unwrap_err();
         assert_eq!(err, CryptoError::InvalidKeyLength);
+        assert!(!signature_len_ok(665));
+        assert!(!public_key_len_ok(896));
     }
 }

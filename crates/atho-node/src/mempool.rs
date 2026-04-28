@@ -213,10 +213,10 @@ impl Mempool {
 mod tests {
     use super::*;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MIN_BYTES};
+    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
         let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
         let txid = tx.txid();
         let staged = TxWitness {
@@ -245,7 +245,7 @@ mod tests {
                 .map(|index| WitnessInputRef {
                     sig_ref_short: crate::validation::derive_sig_ref_short(
                         &txid,
-                        &vec![9; FALCON_512_SIGNATURE_MIN_BYTES],
+                        &vec![9; FALCON_512_SIGNATURE_BYTES],
                         index as u32,
                     ),
                     witness_commit_ref: crate::validation::derive_witness_commit_ref(

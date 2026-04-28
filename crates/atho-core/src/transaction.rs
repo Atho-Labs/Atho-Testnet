@@ -260,6 +260,11 @@ impl Transaction {
         sha3_384(&out)
     }
 
+    /// Canonical prehash for Atho transaction signatures.
+    ///
+    /// This is the exact message digest signed under the
+    /// `ATHO_TX_SIG_V1` domain: `SHA3-384(base_bytes())`, where
+    /// `base_bytes()` excludes witness data.
     pub fn signing_digest(&self) -> [u8; 48] {
         sha3_384(&self.base_bytes())
     }

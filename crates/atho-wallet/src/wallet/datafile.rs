@@ -21,7 +21,6 @@ const DEFAULT_PASSWORD_SCHEME: &str = "atho-wallet-password-v1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletEncryptionMode {
     PasswordAes256Gcm = 1,
-    KyberAes256Gcm = 2,
 }
 
 #[derive(Debug, Error)]
@@ -95,7 +94,6 @@ impl WalletDataFile {
 
         let encryption_mode = match bytes[11] {
             1 => WalletEncryptionMode::PasswordAes256Gcm,
-            2 => WalletEncryptionMode::KyberAes256Gcm,
             _ => return Err(WalletDatafileError::InvalidHeader),
         };
 

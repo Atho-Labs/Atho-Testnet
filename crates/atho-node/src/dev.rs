@@ -5,6 +5,7 @@ use crate::node::Node;
 use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
 use atho_core::block::Block;
 use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
+use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
@@ -361,15 +362,18 @@ fn signed_spend_transaction(
             lock_time: 0,
             witness: vec![],
         };
-        let digest = tx.signing_digest();
-        let signature = sign(&keypair.secret_key, &digest).map_err(
-            |err: atho_crypto::error::CryptoError| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("falcon sign failed: {err:?}"),
-                )
-            },
-        )?;
+        let digest = transaction_signing_digest(&tx);
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &digest,
+        )
+        .map_err(|err: atho_crypto::error::CryptoError| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("falcon-512 rs sign failed: {err:?}"),
+            )
+        })?;
         let txid = tx.txid();
         let sig_bytes = signature.0.clone();
         tx.witness = TxWitness {
@@ -429,7 +433,7 @@ fn signing_keypair(
     generate_from_seed(&seed).map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("falcon keygen failed: {err:?}"),
+            format!("falcon-512 rs keygen failed: {err:?}"),
         )
     })
 }

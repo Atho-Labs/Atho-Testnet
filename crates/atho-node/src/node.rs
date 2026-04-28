@@ -182,11 +182,11 @@ mod tests {
     use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_MIN_BYTES};
+    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
     use atho_storage::utxo::UtxoEntry;
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9; FALCON_512_SIGNATURE_MIN_BYTES];
+        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
         let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
         let txid = tx.txid();
         let staged = TxWitness {

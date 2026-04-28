@@ -34,8 +34,9 @@ Rules:
 
 ## Phase 2: Crypto Boundary
 - [x] Create `atho-crypto` crate
-- [x] Add thin Falcon C FFI boundary
-- [x] Add thin Kyber C FFI boundary
+- [x] Add Falcon-512 RS boundary
+- [x] Freeze Atho Falcon-512 RS consensus rules and domain labels
+- [x] Remove Kyber from the active crypto path
 - [x] Add zeroization and secret handling rules
 - [x] Add minimal crypto self-tests and linkage checks
 

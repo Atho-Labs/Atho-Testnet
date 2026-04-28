@@ -51,7 +51,7 @@ pub(crate) fn toolbar_tab(
         egui::Button::image_and_text(icon, egui::RichText::new(label).size(12.0).color(TEXT))
             .fill(fill)
             .stroke(stroke)
-        .frame(true),
+            .frame(true),
     )
 }
 
