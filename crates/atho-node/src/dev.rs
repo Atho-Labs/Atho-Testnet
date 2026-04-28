@@ -20,7 +20,6 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-const DEV_ROOT: &str = "dev";
 const ACTIVITY_LOG: &str = "activity.log";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +35,7 @@ fn dev_lock() -> &'static Mutex<()> {
 }
 
 pub fn dev_root() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(DEV_ROOT)
+    atho_storage::path::sandbox_root()
 }
 
 pub fn logs_dir() -> PathBuf {

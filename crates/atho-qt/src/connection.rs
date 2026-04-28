@@ -371,6 +371,21 @@ impl ReadOnlyNodeConnection {
 
         StatusMonitor { receiver }
     }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn with_local_system_for_test<T>(
+        &self,
+        f: impl FnOnce(&mut AthoSystem) -> T,
+    ) -> Option<T> {
+        match &self.backend {
+            ConnectionBackend::Local(system) => {
+                let mut system = system.lock().expect("local node mutex poisoned");
+                Some(f(&mut system))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn collect_rpc_status(
@@ -486,7 +501,26 @@ fn start_local_node_if_needed(
         return Ok(None);
     }
 
-    let mut command = if let Some(binary) = node_binary_path() {
+    let mut command = if prefer_workspace_node_command() {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            "using cargo-run managed node path for source-matched local testing",
+        );
+        let manifest_path = workspace_manifest_path();
+        let mut command = Command::new("cargo");
+        command
+            .arg("run")
+            .arg("--manifest-path")
+            .arg(manifest_path)
+            .arg("-p")
+            .arg("atho-node")
+            .arg("--bin")
+            .arg("athod")
+            .arg("--")
+            .arg("run")
+            .arg(network.cli_arg());
+        command
+    } else if let Some(binary) = node_binary_path() {
         let mut command = Command::new(binary);
         command.arg("run").arg(network.cli_arg());
         command
@@ -539,6 +573,13 @@ fn start_local_node_if_needed(
             Err(startup_error)
         }
     }
+}
+
+fn prefer_workspace_node_command() -> bool {
+    if std::env::var_os("ATHO_NODE_BIN").is_some() {
+        return false;
+    }
+    cfg!(debug_assertions) && workspace_manifest_path().exists()
 }
 
 fn spawn_bootstrap_watcher(
@@ -644,11 +685,13 @@ fn workspace_manifest_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_node::miner::Miner;
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::{MempoolInfo, NodeStatus, RpcResponse};
     use atho_rpc::transport::{read_message, write_message};
     use atho_storage::db::{ChainstateSnapshot, Database};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use atho_storage::utxo::UtxoEntry;
     use std::ffi::OsString;
     use std::fs;
     use std::io::BufReader;
@@ -735,6 +778,27 @@ mod tests {
         (address, handle)
     }
 
+    fn wait_for_status(
+        conn: &ReadOnlyNodeConnection,
+        predicate: impl Fn(&ConnectionStatus) -> bool,
+    ) -> ConnectionStatus {
+        for _ in 0..200 {
+            let status = conn.status();
+            if predicate(&status) {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for connection status");
+    }
+
+    fn free_rpc_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let address = listener.local_addr().expect("local addr").to_string();
+        drop(listener);
+        address
+    }
+
     #[test]
     fn read_only_connection_forwards_rpc_requests() {
         let conn = ReadOnlyNodeConnection::new(Network::Mainnet);
@@ -791,5 +855,93 @@ mod tests {
         );
 
         handle.join().expect("mock rpc server");
+    }
+
+    #[test]
+    fn managed_local_node_rpc_status_tracks_real_chain_tip() {
+        let root = temp_data_dir("real-rpc");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let rpc_address = free_rpc_address();
+
+        let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Regnet, rpc_address);
+        let status = wait_for_status(&conn, |status| status.connected && status.running);
+        assert_eq!(status.block_count, 0);
+
+        let template = match conn.request(RpcRequest::GetBlockTemplate) {
+            RpcResponse::BlockTemplate(template) => template,
+            other => panic!("expected block template, got {other:?}"),
+        };
+        let block = Miner::new(1).solve_block(template.block);
+        match conn.request(RpcRequest::SubmitBlock(block)) {
+            RpcResponse::BlockSubmitted { accepted: true, .. } => {}
+            other => panic!("expected accepted block submission, got {other:?}"),
+        }
+
+        let status = wait_for_status(&conn, |status| status.block_count >= 1);
+        assert!(status.connected);
+        assert!(status.running);
+        assert_eq!(status.block_count, 1);
+        assert_eq!(status.sync_best_height, 1);
+    }
+
+    #[test]
+    fn local_backend_seeded_utxo_keeps_block_height_progressing() {
+        let root = temp_data_dir("local-seed-followup");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        std::env::remove_var(ATHO_QT_FORCE_RPC_ENV);
+
+        let conn = ReadOnlyNodeConnection::new(Network::Regnet);
+        let status = wait_for_status(&conn, |status| status.connected && status.running);
+        assert_eq!(status.block_count, 0);
+
+        let first_template = match conn.request(RpcRequest::GetBlockTemplate) {
+            RpcResponse::BlockTemplate(template) => template,
+            other => panic!("expected block template, got {other:?}"),
+        };
+        let first_block = Miner::new(1).solve_block(first_template.block);
+        match conn.request(RpcRequest::SubmitBlock(first_block)) {
+            RpcResponse::BlockSubmitted { accepted: true, .. } => {}
+            other => panic!("expected accepted first block submission, got {other:?}"),
+        }
+        let status = wait_for_status(&conn, |status| status.block_count >= 1);
+        assert_eq!(status.block_count, 1);
+
+        let seeded = conn.with_local_system_for_test(|system| {
+            system.sandbox_with_node_mut(|node| {
+                node.dev_seed_chainstate(
+                    node.height(),
+                    node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        [0x5a; 48],
+                        0,
+                        20 * atho_core::constants::ATOMS_PER_ATHO,
+                        vec![0x42; 32],
+                        node.height(),
+                        false,
+                    )],
+                )
+                .expect("seed utxo");
+            });
+        });
+        assert!(seeded.is_some(), "expected local backend");
+
+        let second_template = match conn.request(RpcRequest::GetBlockTemplate) {
+            RpcResponse::BlockTemplate(template) => template,
+            other => panic!("expected second block template, got {other:?}"),
+        };
+        let second_block = Miner::new(1).solve_block(second_template.block);
+        match conn.request(RpcRequest::SubmitBlock(second_block)) {
+            RpcResponse::BlockSubmitted { accepted: true, .. } => {}
+            other => panic!("expected accepted second block submission, got {other:?}"),
+        }
+        let status = wait_for_status(&conn, |status| status.block_count >= 2);
+        assert_eq!(status.block_count, 2);
+        assert_eq!(status.sync_best_height, 2);
     }
 }

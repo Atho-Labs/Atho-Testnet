@@ -11,7 +11,7 @@ cargo build --release -p atho-node -p atho-qt --manifest-path "${root_dir}/Cargo
 
 cp "${root_dir}/target/release/athod" "${target_dir}/athod"
 cp "${root_dir}/target/release/atho-qt" "${target_dir}/atho-qt"
-cp "${root_dir}/RELEASE_NOTES.md" "${target_dir}/RELEASE_NOTES.md"
-cp "${root_dir}/PACKAGING.md" "${target_dir}/PACKAGING.md"
+cp "${root_dir}/docs/production-readiness/release-notes.md" "${target_dir}/RELEASE_NOTES.md"
+cp "${root_dir}/docs/build-deployment/packaging.md" "${target_dir}/PACKAGING.md"
 
 echo "staged release artifacts in ${target_dir}"

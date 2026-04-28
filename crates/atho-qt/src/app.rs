@@ -519,13 +519,29 @@ impl DesktopApp {
                 current_height
             ),
         );
-        let continue_scanning = self.advance_wallet_discovery_scan_limit();
+        let continue_scanning = if Self::should_expand_wallet_discovery_scan_limit(
+            self.wallet_discovery_scan_limit,
+            &self.wallet_addresses_cache,
+            &self.wallet_owned_utxos_cache,
+        ) {
+            self.advance_wallet_discovery_scan_limit()
+        } else {
+            false
+        };
         self.last_wallet_refresh_at = Instant::now();
         self.wallet_cache_dirty = continue_scanning;
     }
 
     fn wallet_balance_atoms(&self) -> u64 {
         self.wallet_balance_cache
+    }
+
+    #[cfg(test)]
+    fn force_wallet_cache_refresh_for_test(&mut self) {
+        self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
+        self.wallet_scan_job = None;
+        self.wallet_cache_dirty = false;
+        self.refresh_wallet_cache();
     }
 
     fn mempool_reserved_inputs(&self) -> HashSet<([u8; 48], u32)> {
@@ -573,7 +589,8 @@ impl DesktopApp {
 
     fn build_wallet_scan_snapshot(
         connection: ReadOnlyNodeConnection,
-        wallet: Wallet,
+        wallet_addresses_cache: Vec<WalletAddress>,
+        receive_addresses: Vec<WalletAddress>,
         wallet_ledger_cache: WalletLedgerCache,
         wallet_scan_nonce: u64,
         scan_limit: usize,
@@ -602,8 +619,6 @@ impl DesktopApp {
             }
         };
 
-        let wallet_addresses_cache = wallet.discovery_addresses_up_to(scan_limit);
-        let receive_addresses = wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT);
         let address_digests = wallet_addresses_cache
             .iter()
             .map(|address| address.payment_digest)
@@ -757,19 +772,22 @@ impl DesktopApp {
             return;
         }
 
-        let Some(wallet) = self.wallet_ref().cloned() else {
+        let Some(wallet) = self.wallet_ref() else {
             return;
         };
+        let scan_limit = self.wallet_discovery_scan_limit;
+        let wallet_addresses_cache = wallet.discovery_addresses_up_to(scan_limit);
+        let receive_addresses = wallet.receive_addresses(RECEIVE_ADDRESS_LIST_LIMIT);
         let connection = self.connection.clone();
         let wallet_ledger_cache = self.wallet_ledger_cache.clone();
         let wallet_scan_nonce = self.wallet_scan_nonce;
-        let scan_limit = self.wallet_discovery_scan_limit;
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
             let result = Self::build_wallet_scan_snapshot(
                 connection,
-                wallet,
+                wallet_addresses_cache,
+                receive_addresses,
                 wallet_ledger_cache,
                 wallet_scan_nonce,
                 scan_limit,
@@ -805,7 +823,15 @@ impl DesktopApp {
         self.wallet_balance_summary_cache = self.wallet_ledger_cache.summary().clone();
         self.wallet_activity_cache = self.wallet_ledger_cache.activities().to_vec();
         self.refresh_receive_address_rows();
-        let continue_scanning = self.advance_wallet_discovery_scan_limit();
+        let continue_scanning = if Self::should_expand_wallet_discovery_scan_limit(
+            self.wallet_discovery_scan_limit,
+            &self.wallet_addresses_cache,
+            &self.wallet_owned_utxos_cache,
+        ) {
+            self.advance_wallet_discovery_scan_limit()
+        } else {
+            false
+        };
         self.wallet_cache_dirty = self.wallet_cache_dirty || continue_scanning;
         self.last_wallet_refresh_at = Instant::now();
         let _ = atho_node::dev::append_log(
@@ -999,6 +1025,22 @@ impl DesktopApp {
                 );
             }
         }
+    }
+
+    fn should_expand_wallet_discovery_scan_limit(
+        scan_limit: usize,
+        wallet_addresses: &[WalletAddress],
+        owned_utxos: &[UtxoEntry],
+    ) -> bool {
+        owned_utxos.iter().filter_map(|utxo| {
+            let digest: [u8; 32] = utxo.locking_script.as_slice().try_into().ok()?;
+            wallet_addresses
+                .iter()
+                .find(|address| address.payment_digest == digest)
+                .map(|address| address.path.index.saturating_add(1) as usize)
+        })
+        .max()
+        .is_some_and(|highest_used_index| highest_used_index >= scan_limit)
     }
 
     fn advance_wallet_discovery_scan_limit(&mut self) -> bool {
@@ -2425,9 +2467,110 @@ mod tests {
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
     use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn test_keypair() -> FalconKeypair {
         generate_from_seed(b"atho-qt-rewrite-reward").expect("deterministic keypair")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn set_value(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn temp_sandbox_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-qt-app-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    fn wait_until(
+        label: &str,
+        app: &mut DesktopApp,
+        timeout: Duration,
+        predicate: impl Fn(&DesktopApp) -> bool,
+    ) {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            app.refresh().expect("app refresh");
+            app.poll_send_job();
+            app.poll_mining_job();
+            app.poll_wallet_scan_job();
+            app.poll_wallet_preparation_job();
+            if predicate(app) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for app lifecycle condition: {label}; connected={} wallet_loaded={} block_count={} best_height={} mempool={} send_status={:?} mining_status={:?} last_error={:?} mining_active={} send_active={} scan_active={}",
+            app.ui_state.connected,
+            app.wallet.is_some(),
+            app.view_model.block_count,
+            app.view_model.sync_best_height,
+            app.view_model.mempool_count,
+            app.send_status,
+            app.mining_status,
+            app.last_error,
+            app.mining_job.is_some(),
+            app.send_job.is_some(),
+            app.wallet_scan_job.is_some(),
+        );
+    }
+
+    fn seed_wallet_utxo(app: &ReadOnlyNodeConnection, digest: [u8; 32], value_atoms: u64) {
+        let seeded = app.with_local_system_for_test(|system| {
+            system.sandbox_with_node_mut(|node| {
+                node.dev_seed_chainstate(
+                    node.height(),
+                    node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        [0x5a; 48],
+                        0,
+                        value_atoms,
+                        digest.to_vec(),
+                        node.height(),
+                        false,
+                    )],
+                )
+                .expect("seed utxo");
+            });
+        });
+        assert!(seeded.is_some(), "expected local test backend");
     }
 
     fn witness_bytes(tx: &Transaction) -> Vec<u8> {
@@ -2700,5 +2843,128 @@ mod tests {
         assert!(app.wallet_cache_dirty);
 
         std::env::remove_var("ATHO_QT_FORCE_RPC");
+    }
+
+    #[test]
+    fn full_local_wallet_lifecycle_mines_sends_restarts_and_keeps_tip_synced() {
+        let root = temp_sandbox_root("full-lifecycle");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        std::env::remove_var("ATHO_QT_FORCE_RPC");
+
+        let wallet_path = default_wallet_path(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[9u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save wallet");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.ui_state.mining_cores = app.max_mining_cores().min(4);
+        wait_until("initial wallet open", &mut app, Duration::from_secs(5), |app| {
+            app.ui_state.connected && app.wallet.is_some()
+        });
+
+        app.receive_label = String::from("Primary");
+        app.receive_message = String::from("Sandbox invoice");
+        app.create_receive_request();
+        assert_eq!(app.requested_payments.len(), 1);
+        let current_address = app
+            .current_receive_address
+            .as_ref()
+            .expect("current receive address")
+            .clone();
+
+        app.start_mining_job();
+        wait_until("first mining job finished", &mut app, Duration::from_secs(15), |app| {
+            app.mining_job.is_none() && app.mining_status.contains("accepted")
+        });
+        wait_until("first mined block accepted", &mut app, Duration::from_secs(5), |app| {
+            app.view_model.block_count >= 1
+        });
+        app.force_wallet_cache_refresh_for_test();
+        assert!(app.wallet_balance_summary().pending_atoms > 0);
+
+        assert_eq!(app.view_model.block_count, 1);
+        assert_eq!(app.view_model.sync_best_height, 1);
+        assert!(app
+            .wallet_activity_rows()
+            .iter()
+            .any(|row| row.kind == WalletActivityKind::Mined));
+
+        seed_wallet_utxo(
+            &app.connection,
+            current_address.payment_digest,
+            20 * ATOMS_PER_ATHO,
+        );
+        for expected_height in 2..=7 {
+            app.start_mining_job();
+            let finished_label = format!("maturity mining finished for height {expected_height}");
+            wait_until(&finished_label, &mut app, Duration::from_secs(15), |app| {
+                app.mining_job.is_none() && app.mining_status.contains("accepted")
+            });
+            let accepted_label = format!("maturity block accepted at height {expected_height}");
+            wait_until(&accepted_label, &mut app, Duration::from_secs(5), |app| {
+                app.view_model.block_count >= expected_height
+            });
+        }
+        app.force_wallet_cache_refresh_for_test();
+        assert!(app.wallet_balance_summary().available_atoms >= 20 * ATOMS_PER_ATHO);
+
+        let mut recipient_wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[7u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let recipient = recipient_wallet.checkout_receive_address();
+
+        app.send_to = recipient.address.clone();
+        app.send_amount = DesktopApp::format_send_amount_input(5 * ATOMS_PER_ATHO);
+        app.submit_send_transaction().expect("submit send");
+        wait_until("send transaction submitted", &mut app, Duration::from_secs(20), |app| {
+            app.send_job.is_none() && app.send_status.contains("Transaction submitted")
+        });
+        wait_until("send transaction reaches mempool", &mut app, Duration::from_secs(20), |app| {
+            app.view_model.mempool_count >= 1
+        });
+
+        app.start_mining_job();
+        wait_until("second mining job finished", &mut app, Duration::from_secs(15), |app| {
+            app.mining_job.is_none() && app.mining_status.contains("accepted")
+        });
+        wait_until("second mined block accepted", &mut app, Duration::from_secs(5), |app| {
+            app.view_model.block_count >= 8
+        });
+        app.force_wallet_cache_refresh_for_test();
+        wait_until("sent transaction confirmed and cleared", &mut app, Duration::from_secs(10), |app| {
+            app.view_model.mempool_count == 0
+        });
+
+        let expected_available = app.wallet_balance_summary().available_atoms;
+        let expected_pending = app.wallet_balance_summary().pending_atoms;
+        let expected_total = app.wallet_balance_summary().total_atoms;
+        assert!(expected_available < 20 * ATOMS_PER_ATHO);
+        assert_eq!(app.view_model.block_count, 8);
+        assert_eq!(app.view_model.sync_best_height, 8);
+
+        drop(app);
+
+        let mut reopened = DesktopApp::new(Network::Regnet);
+        wait_until("reopened wallet loads", &mut reopened, Duration::from_secs(10), |app| {
+            app.wallet.is_some() && app.view_model.block_count == 8
+        });
+        reopened.force_wallet_cache_refresh_for_test();
+        assert_eq!(reopened.wallet_balance_summary().total_atoms, expected_total);
+
+        assert_eq!(reopened.view_model.sync_best_height, 8);
+        assert_eq!(reopened.wallet_balance_summary().available_atoms, expected_available);
+        assert_eq!(reopened.wallet_balance_summary().pending_atoms, expected_pending);
     }
 }

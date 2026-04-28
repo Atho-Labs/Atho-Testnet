@@ -116,7 +116,10 @@ impl NodeService {
                     .node
                     .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
                 {
-                    Ok(txid) => RpcResponse::TransactionSubmitted(txid),
+                    Ok(txid) => {
+                        self.refresh_runtime_views();
+                        RpcResponse::TransactionSubmitted(txid)
+                    }
                     Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 };
                 match &response {
@@ -143,10 +146,13 @@ impl NodeService {
                 let block_hash = block.header.block_hash();
                 let block_summary = dev::summarize_block(&block);
                 let response = match self.orchestrator.runtime.node.submit_block(&block) {
-                    Ok(()) => RpcResponse::BlockSubmitted {
-                        accepted: true,
-                        block_hash,
-                    },
+                    Ok(()) => {
+                        self.refresh_runtime_views();
+                        RpcResponse::BlockSubmitted {
+                            accepted: true,
+                            block_hash,
+                        }
+                    }
                     Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 };
                 match &response {
@@ -228,6 +234,29 @@ impl NodeService {
 
     pub fn is_running(&self) -> bool {
         self.orchestrator.runtime.running
+    }
+
+    fn refresh_runtime_views(&mut self) {
+        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.orchestrator.rpc_server.block_count = self.orchestrator.runtime.node.height();
+        self.orchestrator.rpc_server.mempool_count = self.orchestrator.runtime.node.mempool_len();
+        self.orchestrator.rpc_server.mempool_total_fee_atoms =
+            self.orchestrator.runtime.node.mempool_total_fee_atoms();
+        self.orchestrator.rpc_server.running = self.orchestrator.runtime.running;
+        self.orchestrator.rpc_server.headers_synced =
+            self.orchestrator.sync.sync_state().headers_synced;
+        self.orchestrator.rpc_server.sync_best_height =
+            self.orchestrator.sync.sync_state().best_height;
+    }
+
+    #[doc(hidden)]
+    pub fn sandbox_with_node_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut crate::node::Node) -> T,
+    ) -> T {
+        let result = f(&mut self.orchestrator.runtime.node);
+        self.refresh_runtime_views();
+        result
     }
 }
 

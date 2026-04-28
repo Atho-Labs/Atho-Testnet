@@ -1,0 +1,141 @@
+# Node Runtime and P2P
+
+## Purpose
+
+The node runtime composes validation, storage, mempool, mining, sync state, and RPC-facing service behavior into one operational backend.
+
+Implemented in:
+
+- `crates/atho-node/src/`
+- `crates/atho-p2p/src/`
+
+## Runtime Components
+
+Primary node-side owners:
+
+- `Node`: chainstate + mempool owner
+- `NodeRuntime`: running/stopped lifecycle owner
+- `NodeOrchestrator`: runtime + sync + rpc-server composition
+- `NodeService` / `AthoSystem`: frontend-facing control surface
+- `NodeSync`: network-message integration owner
+
+Why:
+
+- one composed runtime is easier to test than scattered free functions and global state
+
+## P2P Foundation
+
+The network layer currently includes:
+
+- network parameters and limits
+- message commands and typed payloads
+- Bitcoin-style frame codec
+- handshake state machine
+- address manager
+- ban score tracking
+- connection/session manager
+- headers-first sync state
+- block/tx inventory relay logic
+
+Implemented in:
+
+- `crates/atho-p2p/src/config.rs`
+- `crates/atho-p2p/src/protocol.rs`
+- `crates/atho-p2p/src/codec.rs`
+- `crates/atho-p2p/src/handshake.rs`
+- `crates/atho-p2p/src/connection.rs`
+- `crates/atho-p2p/src/sync.rs`
+- `crates/atho-p2p/src/relay.rs`
+
+## Message Surface
+
+Current message set:
+
+- `version`
+- `verack`
+- `ping`
+- `pong`
+- `getaddr`
+- `addr`
+- `inv`
+- `getdata`
+- `notfound`
+- `getheaders`
+- `headers`
+- `block`
+- `tx`
+- `mempool`
+
+Why:
+
+- the message set is intentionally small and Bitcoin-shaped while the live network runtime is still being hardened
+
+## Limits
+
+Current P2P defaults include:
+
+- max message size: `8 MiB`
+- max addresses per message: `1,000`
+- max inventory entries: `50,000`
+- max headers per message: `2,000`
+- max blocks in flight: `128`
+- max requests per peer: `256`
+- inbound peers: `32`
+- outbound peers: `8`
+- ban threshold: `100`
+
+Implemented in:
+
+- `crates/atho-p2p/src/config.rs`
+
+Why:
+
+- hard bounds need to exist before the public peer runtime is considered trustworthy
+
+## Handshake Model
+
+Handshake requires:
+
+- matching network
+- supported protocol version
+- matching genesis hash
+- matching active ruleset
+- `version` then `verack`
+
+Why:
+
+- a peer should be rejected before sync work begins if it cannot validate the same chain
+
+## Headers-First Sync
+
+The current sync layer:
+
+- primes a block locator from local history
+- sends `getheaders`
+- validates returned header linkage
+- requests missing blocks by inventory
+
+Why:
+
+- header-first sync is the safest minimal foundation for future downloader work
+
+## Current Network Limitations
+
+The current implementation is a protocol foundation, not a finished peer runtime.
+
+Not yet complete:
+
+- live TCP inbound/outbound loop in the daemon
+- DNS seed bootstrap
+- parallel block downloader
+- compact block relay
+- snapshot sync
+- public peer mesh hardening
+
+That is an intentional documentation point, not a hidden omission.
+
+## Related Documentation
+
+- [RPC and Client Backend](rpc-and-client.md)
+- [Mining and Mempool](mining-and-mempool.md)
+- [Current Production Status](../production-readiness/current-status.md)

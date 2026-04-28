@@ -1,126 +1,130 @@
 # Atho
 
-Atho is a from-scratch Rust payment system built around a full node, HD wallet, miner, RPC layer, storage engine, and thin desktop client.
+Atho is a from-scratch Rust blockchain payment stack built around a small trusted core, explicit consensus rules, a durable chainstate, a thin desktop client, and a Bitcoin-style architecture adapted to Atho’s own hashing, signature, and address choices.
 
-It is designed to behave like a real blockchain payment stack:
-- transactions are signed, validated, and stored in atoms
-- blocks are mined against difficulty and only accepted after validation
-- chainstate, UTXO, block archive, transaction archive, peer metadata, and address metadata are stored durably in per-network LMDB environments, one dataset per environment
-- the mempool stays in RAM and is rebuilt after restart
-- the desktop client stays thin and talks to the node over RPC
+The repository is organized as a multi-crate workspace:
 
-The codebase is intentionally split into small crates so the trusted core stays simple, auditable, and fast.
-
-## Core Specs
-
-- Currency unit: `atoms`
-- `1 ATHO = 100,000,000 atoms`
-- Max supply: `168,000,000 ATHO`
-- Initial block reward: `50 ATHO`
-- Halving interval: `1,680,000` blocks
-- Target block time: `75` seconds
-- Minimum transaction fee: `1 atom/vbyte`
-- Proof of work hash: `SHA3-384`
-- Hash size: `384` bits / `96` hex characters
-- Falcon-512 RS public keys: `897` bytes
-- Falcon-512 RS secret keys: `1,281` bytes
-- Falcon-512 RS signatures: `666` bytes
-- Transaction signature domain: `ATHO_TX_SIG_V1`
-- Consensus math uses integers only
-- Mainnet, testnet, and regnet have separate network identities, genesis data, and RPC defaults
-
-## What Atho Includes
-
-- `atho-core` - protocol constants, consensus, transaction, block, address, and genesis logic
-- `atho-crypto` - Falcon-512 RS boundary layer
-- `atho-storage` - LMDB-backed chainstate, UTXO, block archive, and peer/address storage
-- `atho-wallet` - HD wallet, mnemonic, keypool, wallet datafile handling, and address generation CLI
-- `atho-p2p` - wire codec, peer protocol, and sync state
-- `atho-rpc` - small RPC surface for the client and miner
-- `atho-node` - node runtime, validation, mempool, mining, and orchestration
-- `atho-qt` - thin desktop wallet/client
-
-## Architecture
-
-Atho follows a Bitcoin-style split:
-
-- `athod` is the always-on node daemon
-- `atho-mine` is the standalone miner client
-- `atho-qt` is the desktop wallet client
-- `atho-address` is the address inspection and generation tool
-
-The node owns validation, consensus, mempool admission, block acceptance, and chainstate updates.
-The desktop client stays light and uses RPC instead of embedding the whole blockchain stack in the UI process.
-
-## Consensus Summary
-
-- Transactions use canonical serialization and txid generation
-- Witness data is committed separately for pruning-safe verification
-- Blocks are validated before chain acceptance
-- Genesis blocks are hardcoded per network
-- PoW is checked against the network target
-- Invalid blocks and transactions are rejected before they can mutate final state
-
-## Transaction Lifecycle
-
-The transaction path in Atho is:
-
-1. The wallet derives an address from the HD seed and keeps the wallet state in the local datafile.
-2. A spend transaction is assembled with explicit inputs, outputs, automatic 1 atom/vbyte fee policy, and witness data.
-3. The transaction digest is signed with Atho's frozen Falcon-512 RS domain (`ATHO_TX_SIG_V1`).
-4. The node checks canonical serialization, duplicate inputs, fee policy, input ownership, and signature validity.
-5. Valid transactions enter the mempool.
-6. The miner pulls only valid mempool transactions into a block template.
-7. The block is mined against the network target.
-8. The node validates the full block again before accepting it.
-9. Accepted blocks update chainstate and remove confirmed transactions from the mempool.
-
-Current note:
-- The backend transaction path is implemented.
-- The Qt send screen now builds and submits a wallet spend using wallet-owned UTXOs, HD change, and RPC broadcast.
-- The remaining improvements are mostly UX polish and richer wallet history/indexing.
-
-## Running Atho
-
-Use [COMMANDS.md](/Users/eyeanonymous/Desktop/Atho-Alpha /COMMANDS.md) for the exact commands.
-
-Quick start:
-
-```bash
-cargo check
-cargo run -p atho-node --bin athod -- run mainnet
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:18443
-```
-
-## Development Docs
-
-- [COMMANDS.md](/Users/eyeanonymous/Desktop/Atho-Alpha /COMMANDS.md) - build, run, mine, and wallet commands
-- [PACKAGING.md](/Users/eyeanonymous/Desktop/Atho-Alpha /PACKAGING.md) - release artifacts and package layout
-- [dev/README.md](/Users/eyeanonymous/Desktop/Atho-Alpha /dev/README.md) - local wipe workflow and log locations
-- [TODO.md](/Users/eyeanonymous/Desktop/Atho-Alpha /TODO.md) - current build order and remaining work
+- `atho-core` for protocol types, constants, addresses, blocks, transactions, genesis, and consensus rules
+- `atho-crypto` for the Falcon boundary and secret-handling primitives
+- `atho-storage` for chainstate, UTXO state, validation, LMDB persistence, and recovery
+- `atho-wallet` for HD wallet logic, mnemonic handling, keypooling, and encrypted wallet datafiles
+- `atho-p2p` for the wire protocol, handshake state machine, peer/session logic, and headers-first sync scaffolding
+- `atho-rpc` for the local RPC surface and transport
+- `atho-node` for runtime orchestration, mining, mempool, service ownership, and integration
+- `atho-qt` for the thin desktop client
 
 ## Status
 
-The core protocol, wallet, storage, node, RPC, and Qt client crates build and test cleanly.
-The desktop client is intentionally thin and still depends on the node for heavy work.
+Atho is an active buildout, not a finished production network.
+
+Current posture:
+
+- local consensus, storage, mining, wallet, RPC, and Qt lifecycle paths have substantial sandbox coverage
+- the repo now has a centralized documentation system under [`docs/`](docs/index.md)
+- the local node and Qt client run through a real RPC path instead of UI-owned chainstate shortcuts
+- the network layer has a real protocol foundation, but the live TCP peer runtime is still incomplete
+
+Production-readiness summary:
+
+- overall readiness: `7/10`
+- local core consensus path: `strong`
+- full product readiness: `not yet production ready`
+
+The detailed status, open blockers, and remaining risks live in:
+
+- [`docs/production-readiness/current-status.md`](docs/production-readiness/current-status.md)
+- [`docs/production-readiness/roadmap.md`](docs/production-readiness/roadmap.md)
+
+## Design Principles
+
+- keep the trusted core small
+- keep consensus deterministic and explicit
+- keep validation on one canonical path
+- keep the GUI thin and backend-owned
+- keep storage durable and fail-closed
+- keep the stack boring, compact, and auditable
+- keep protocol evolution explicit through versioning and activation heights
+
+## Quick Start
+
+Build the workspace:
+
+```bash
+cargo check
+```
+
+Run tests:
+
+```bash
+cargo test
+```
+
+Run the node daemon:
+
+```bash
+cargo run -p atho-node --bin athod -- run mainnet
+```
+
+Run the Qt client against a local managed node:
+
+```bash
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+```
+
+More operational commands live in [`docs/operations/commands.md`](docs/operations/commands.md).
 
 ## Repository Layout
 
 ```text
 crates/
-  atho-core/      consensus, tx, block, address, genesis
-  atho-crypto/    Falcon-512 RS wrapper
-  atho-storage/   LMDB-backed chainstate, UTXO, block archive, peer/address storage
-  atho-wallet/    HD wallet and address generation
-  atho-p2p/       peer protocol and sync
-  atho-rpc/       node/client RPC surface
-  atho-node/     daemon, validation, mempool, mining
-  atho-qt/       desktop client
+  atho-core/      protocol types, consensus rules, genesis, blocks, txs, addresses
+  atho-crypto/    Falcon boundary and secret handling
+  atho-storage/   LMDB storage, chainstate, validation, UTXO state
+  atho-wallet/    HD wallet, mnemonic, keypool, encrypted wallet datafiles
+  atho-p2p/       wire protocol, handshake, peer/session logic, sync scaffolding
+  atho-rpc/       local RPC request/response and transport
+  atho-node/      runtime, service, miner, mempool, orchestration
+  atho-qt/        thin desktop client
+docs/             all project documentation, specs, readiness notes, and whitepaper
+scripts/          build and packaging helpers
+dev/              local sandbox state, logs, databases, chain exports, quarantine
+dist/             staged release artifacts
 ```
 
-## Notes
+## Documentation Map
 
-- Keep consensus math integer-only.
-- Keep the node authoritative.
-- Keep the client thin.
-- Keep the trusted core small.
+Start here:
+
+- [`docs/index.md`](docs/index.md)
+
+Key sections:
+
+- [`docs/overview/project-overview.md`](docs/overview/project-overview.md)
+- [`docs/architecture/system-architecture.md`](docs/architecture/system-architecture.md)
+- [`docs/protocol/network-and-identity.md`](docs/protocol/network-and-identity.md)
+- [`docs/consensus/consensus-rules.md`](docs/consensus/consensus-rules.md)
+- [`docs/storage/chainstate-and-persistence.md`](docs/storage/chainstate-and-persistence.md)
+- [`docs/node-runtime/node-runtime-and-p2p.md`](docs/node-runtime/node-runtime-and-p2p.md)
+- [`docs/wallet/wallet-model.md`](docs/wallet/wallet-model.md)
+- [`docs/gui-client/qt-client.md`](docs/gui-client/qt-client.md)
+- [`docs/testing-audits/testing-and-hardening.md`](docs/testing-audits/testing-and-hardening.md)
+- [`docs/whitepaper/atho-whitepaper-apa.md`](docs/whitepaper/atho-whitepaper-apa.md)
+
+## Production Notes
+
+The strongest parts of the stack today are the local validation core, storage integrity checks, replay/restart handling, and RPC-driven Qt synchronization.
+
+The weakest parts are still:
+
+- live TCP peer runtime completeness
+- compact-block and downloader work
+- pruning and snapshot lifecycle coverage
+- schema migration tooling
+- canonical wallet history sourcing
+- OS-level GUI automation
+
+Those are documented explicitly instead of being hidden or overstated.
+
+## Reference Materials
+
+Historical PDFs, planning references, and vendored third-party documentation are centralized under [`docs/reference/`](docs/reference/reference-materials.md). The detailed whitepaper and subsystem manuals live under `docs/`, not at repo root.
