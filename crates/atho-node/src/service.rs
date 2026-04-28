@@ -360,16 +360,10 @@ impl NodeService {
         Ok(result)
     }
 
-    pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) {
-        if let Some(notice) = self.orchestrator.sync.disconnect_peer(remote_addr, reason) {
-            if let SyncNotice::Disconnected { peer, reason } = notice {
-                let _ = dev::append_log(
-                    "p2p",
-                    &format!("peer disconnected peer={peer} reason={reason}"),
-                );
-            }
-        }
+    pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
+        let notice = self.orchestrator.sync.disconnect_peer(remote_addr, reason);
         self.refresh_runtime_views();
+        notice
     }
 
     pub fn p2p_prime(&mut self) {

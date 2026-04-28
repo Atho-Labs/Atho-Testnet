@@ -123,6 +123,13 @@ Why:
 
 The current implementation has a real live runtime, but it is not yet a finished production peer mesh.
 
+Already exercised live:
+
+- public P2P bind on a real VPS node
+- wrong-network rejection on unsolicited internet traffic
+- remote full-node reconnect after VPS restart
+- one-block propagation from a remote peer into the VPS node
+
 Still incomplete:
 
 - DNS seed bootstrap

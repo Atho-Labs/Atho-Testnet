@@ -12,13 +12,14 @@ Current posture:
 - the node, miner, and desktop client now have a cleaner operator command model
 - the default runtime root is OS-native instead of working-directory driven
 - the live TCP peer runtime exists and is sandbox-tested over real sockets
+- the public VPS node path now has live restart/recovery and one-block propagation coverage
 - DNS seeds are still intentionally blank, so live bootstrap still needs manual peers
 
 Production-readiness summary:
 
 - overall readiness: `8/10`
 - local core lifecycle: `strong`
-- public-network and delivery hardening: `still incomplete`
+- public-network hardening: `materially improved, but still needs longer multi-peer soak coverage`
 
 Detailed status lives in:
 

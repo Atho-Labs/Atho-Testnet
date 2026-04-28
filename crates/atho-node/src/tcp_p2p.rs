@@ -3,16 +3,16 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::service::NodeService;
 use crate::sync::SyncNotice;
-use atho_p2p::config::network_params;
 use atho_core::network::Network;
 use atho_p2p::codec::{CodecError, WireCodec};
+use atho_p2p::config::network_params;
 use atho_p2p::connection::ConnectionEvent;
 use atho_p2p::protocol::NetworkMessage;
 use atho_storage::db::PeerHealthRecord;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,6 +56,8 @@ pub struct TcpP2pRuntime {
     bind_addr: SocketAddr,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    active_inbound_threads: Arc<AtomicUsize>,
     listener_thread: Option<JoinHandle<()>>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     maintenance_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -80,23 +82,35 @@ impl TcpP2pRuntime {
         listener.set_nonblocking(true).map_err(TcpP2pError::Io)?;
         let local_addr = listener.local_addr().map_err(TcpP2pError::Io)?;
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let active_inbound_threads = Arc::new(AtomicUsize::new(0));
         let peer_threads = Arc::new(Mutex::new(Vec::new()));
         let maintenance_threads = Arc::new(Mutex::new(Vec::new()));
         let listener_state = Arc::clone(&state);
         let listener_stop = Arc::clone(&stop_requested);
+        let listener_active_inbound = Arc::clone(&active_inbound_threads);
         let listener_peers = Arc::clone(&peer_threads);
+        let inbound_limit = network_params(network).limits.max_inbound_peers;
         let listener_thread = thread::spawn(move || loop {
             if listener_stop.load(Ordering::Acquire) {
                 break;
             }
+            reap_finished_threads(&listener_peers);
             match listener.accept() {
                 Ok((stream, remote_addr)) => {
+                    // Bound raw inbound socket handling before protocol handshake. Public internet
+                    // noise can otherwise create an unbounded number of worker threads before the
+                    // higher-level connection manager has a chance to reject the peer.
+                    if !try_acquire_inbound_slot(&listener_active_inbound, inbound_limit) {
+                        drop(stream);
+                        continue;
+                    }
                     let thread = spawn_peer_thread(
                         ConnectionRole::Inbound,
                         stream,
                         remote_addr,
                         Arc::clone(&listener_state),
                         Arc::clone(&listener_stop),
+                        Some(Arc::clone(&listener_active_inbound)),
                     );
                     listener_peers
                         .lock()
@@ -118,6 +132,7 @@ impl TcpP2pRuntime {
             bind_addr: local_addr,
             state,
             stop_requested,
+            active_inbound_threads,
             listener_thread: Some(listener_thread),
             peer_threads,
             maintenance_threads,
@@ -189,6 +204,11 @@ impl TcpP2pRuntime {
         let mut state = self.state.lock().expect("p2p runtime state poisoned");
         state.p2p_mine_local_block()
     }
+
+    #[cfg(test)]
+    fn active_inbound_threads(&self) -> usize {
+        self.active_inbound_threads.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for TcpP2pRuntime {
@@ -226,6 +246,7 @@ fn spawn_outbound_session(
         remote_addr,
         state,
         stop_requested,
+        None,
     );
     peer_threads
         .lock()
@@ -354,8 +375,10 @@ fn spawn_peer_thread(
     remote_addr: SocketAddr,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
+    inbound_slot_counter: Option<Arc<AtomicUsize>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let _inbound_slot = inbound_slot_counter.map(InboundThreadGuard::new);
         let peer_id = remote_addr.to_string();
         let disconnect_reason = (|| -> String {
             if let Err(err) = configure_stream(&stream) {
@@ -391,14 +414,29 @@ fn spawn_peer_thread(
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.tip_hash()
             };
+            let peer_network = {
+                let state = state.lock().expect("p2p runtime state poisoned");
+                state.network()
+            };
+            let handshake_timeout =
+                Duration::from_millis(network_params(peer_network).limits.handshake_timeout_ms);
+            let handshake_started = SystemTime::now();
+            let mut handshake_ready = false;
 
             loop {
                 if stop_requested.load(Ordering::Acquire) {
                     return String::from("runtime stopping");
                 }
-                let message = match read_message(&mut stream, state.lock().expect("p2p runtime state poisoned").network()) {
+                let message = match read_message(&mut stream, peer_network) {
                     Ok(Some(message)) => message,
                     Ok(None) => {
+                        if !handshake_ready {
+                            if handshake_started.elapsed().unwrap_or_default() >= handshake_timeout
+                            {
+                                return format!("handshake timeout peer={peer_id}");
+                            }
+                            continue;
+                        }
                         if let Some(message) =
                             poll_tip_announcement(&state, &mut last_announced_tip)
                         {
@@ -426,6 +464,7 @@ fn spawn_peer_thread(
                 for notice in notices {
                     match notice {
                         SyncNotice::Ready { best_height, .. } => {
+                            handshake_ready = true;
                             let _ = dev::append_log(
                                 "p2p",
                                 &format!("peer ready peer={peer_id} best_height={best_height}"),
@@ -442,11 +481,23 @@ fn spawn_peer_thread(
             }
         })();
 
-        if disconnect_reason != "runtime stopping" {
+        if disconnect_reason != "runtime stopping"
+            && should_log_disconnect_reason(&disconnect_reason)
+        {
             let _ = dev::append_log("p2p", &disconnect_reason);
         }
-        let mut state = state.lock().expect("p2p runtime state poisoned");
-        state.p2p_disconnect_peer(&peer_id, disconnect_reason);
+        let disconnect_notice = {
+            let mut state = state.lock().expect("p2p runtime state poisoned");
+            state.p2p_disconnect_peer(&peer_id, disconnect_reason)
+        };
+        if let Some(SyncNotice::Disconnected { peer, reason }) = disconnect_notice {
+            if should_log_disconnect_reason(&reason) {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!("peer disconnected peer={peer} reason={reason}"),
+                );
+            }
+        }
     })
 }
 
@@ -591,6 +642,59 @@ fn load_peer_health_snapshot(
 fn persist_peer_health(state: &Arc<Mutex<NodeService>>, health: &PeerHealthRecord) {
     let state = state.lock().expect("p2p runtime state poisoned");
     state.p2p_save_peer_health(health);
+}
+
+fn reap_finished_threads(peer_threads: &Arc<Mutex<Vec<JoinHandle<()>>>>) {
+    let mut peer_threads = peer_threads.lock().expect("peer thread list poisoned");
+    let mut index = 0usize;
+    while index < peer_threads.len() {
+        if peer_threads[index].is_finished() {
+            let thread = peer_threads.swap_remove(index);
+            let _ = thread.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn try_acquire_inbound_slot(active_inbound_threads: &Arc<AtomicUsize>, limit: usize) -> bool {
+    let mut current = active_inbound_threads.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match active_inbound_threads.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn should_log_disconnect_reason(reason: &str) -> bool {
+    !reason.contains("invalid network magic") && !reason.starts_with("handshake timeout peer=")
+}
+
+struct InboundThreadGuard {
+    active_inbound_threads: Arc<AtomicUsize>,
+}
+
+impl InboundThreadGuard {
+    fn new(active_inbound_threads: Arc<AtomicUsize>) -> Self {
+        Self {
+            active_inbound_threads,
+        }
+    }
+}
+
+impl Drop for InboundThreadGuard {
+    fn drop(&mut self) {
+        self.active_inbound_threads.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn next_outbound_retry_delay(consecutive_failures: u32) -> Duration {
@@ -856,5 +960,68 @@ mod tests {
             validated_payload_len(&header, Network::Mainnet),
             Err(TcpP2pError::Codec(CodecError::PayloadTooLarge))
         ));
+    }
+
+    #[test]
+    fn established_idle_peer_does_not_hold_state_mutex() {
+        let left = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("left");
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+
+        right
+            .connect_outbound(left.bind_addr().to_string())
+            .expect("connect outbound");
+
+        wait_until("peer handshake", Duration::from_secs(10), || {
+            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+        });
+
+        // Allow the idle read path to cycle after handshake. This used to deadlock the peer
+        // thread by holding the shared state mutex across the `read_message(...).network()`
+        // temporary and then re-locking inside `poll_tip_announcement`.
+        thread::sleep(Duration::from_millis(600));
+
+        assert!(
+            right.state.try_lock().is_ok(),
+            "state mutex should not stay locked"
+        );
+        assert!(right.snapshot().headers_synced);
+    }
+
+    #[test]
+    fn silent_inbound_peer_times_out_before_handshake() {
+        let runtime = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("node");
+        let _silent_peer = TcpStream::connect(runtime.bind_addr()).expect("connect silent peer");
+
+        wait_until("silent inbound accepted", Duration::from_secs(2), || {
+            runtime.active_inbound_threads() == 1 && runtime.snapshot().peer_count == 1
+        });
+
+        wait_until(
+            "silent inbound disconnected after handshake timeout",
+            Duration::from_secs(8),
+            || runtime.active_inbound_threads() == 0 && runtime.snapshot().peer_count == 0,
+        );
+    }
+
+    #[test]
+    fn raw_inbound_threads_are_capped_before_protocol_handshake() {
+        let runtime = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("node");
+        let limit = network_params(Network::Regnet).limits.max_inbound_peers;
+        let mut peers = Vec::new();
+        for _ in 0..(limit + 16) {
+            peers.push(TcpStream::connect(runtime.bind_addr()).expect("connect raw inbound"));
+        }
+
+        wait_until("inbound slots filled", Duration::from_secs(2), || {
+            runtime.active_inbound_threads() > 0
+        });
+
+        assert!(runtime.active_inbound_threads() <= limit);
+        assert!(runtime.snapshot().peer_count <= limit);
+
+        drop(peers);
+        wait_until("raw inbound peers drained", Duration::from_secs(8), || {
+            runtime.active_inbound_threads() == 0 && runtime.snapshot().peer_count == 0
+        });
     }
 }

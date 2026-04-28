@@ -40,7 +40,7 @@ Use an explicit path instead of relying on the default:
 Example:
 
 ```bash
-./athod --network mainnet --data-dir /var/lib/atho
+./athod --network mainnet --data-dir /var/lib/atho --rpc-addr 127.0.0.1:9010 --p2p-addr 0.0.0.0:56000
 ```
 
 Because DNS seeds are still blank, add at least one manual peer for live bootstrap:
@@ -58,17 +58,17 @@ Recommended defaults:
 
 Do not expose RPC publicly unless you have an intentional reverse-proxy or access-control design. Atho now refuses public RPC binds unless the operator explicitly opts in.
 
-## Pre-Launch Safe Mode
+## Emergency Loopback Rollback
 
-If you need the VPS node online before final public-wire hardening is complete, keep the node in
-headless mainnet mode with loopback-only P2P:
+If the public P2P surface has to be withdrawn quickly during pre-launch troubleshooting, fall back
+to loopback-only P2P temporarily:
 
 ```bash
 ./athod --network mainnet --data-dir /var/lib/atho --rpc-addr 127.0.0.1:9010 --p2p-addr 127.0.0.1:56000
 ```
 
-That keeps the node stable, restartable, and ready for local verification without exposing the
-public P2P surface early.
+That keeps the node online for local verification while removing public peer traffic from the
+equation.
 
 ## Example `systemd` Unit
 
@@ -129,8 +129,8 @@ Under the runtime root:
 ## Current Caveats
 
 - DNS seeds are still blank, so peer bootstrap is manual
-- public-node hardening is improved, but the network layer still needs more long-run soak coverage
-- public internet P2P exposure should stay disabled until the remaining inbound wire-decoder hardening is complete
+- public P2P bind, restart/recovery, and one-block propagation have been exercised against a real VPS node
+- longer multi-peer public soak coverage is still pending
 - snapshot sync is not yet a peer-served protocol
 - every operator workstation should verify the VPS SSH host key out of band before managing the node
 
