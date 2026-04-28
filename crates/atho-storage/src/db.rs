@@ -218,6 +218,9 @@ impl Database {
         utxos: &[UtxoEntry],
         appended_block: Option<(u64, &Block)>,
     ) -> Result<(), StorageError> {
+        // Consensus-visible persistence must move as one unit. The snapshot, canonical block
+        // archive, transaction archive, and UTXO set are written in one LMDB transaction so a
+        // crash cannot expose a mixed-height state.
         let snapshot_value = bincode::serialize(snapshot).map_err(|_| StorageError::CorruptData)?;
         let mut serialized_utxos = Vec::with_capacity(utxos.len());
         for utxo in utxos {
@@ -641,7 +644,10 @@ mod tests {
             .get(Dataset::Meta, SCHEMA_VERSION_KEY)
             .expect("schema bytes")
             .expect("schema present");
-        assert_eq!(u32::from_le_bytes(version.try_into().expect("u32 bytes")), 3);
+        assert_eq!(
+            u32::from_le_bytes(version.try_into().expect("u32 bytes")),
+            3
+        );
         let migration_log = reopened
             .get(Dataset::Meta, SCHEMA_MIGRATION_LOG_KEY)
             .expect("migration log")

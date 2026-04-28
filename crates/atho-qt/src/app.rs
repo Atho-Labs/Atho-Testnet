@@ -814,17 +814,16 @@ impl DesktopApp {
         }
 
         let scan_limit = self.wallet_discovery_scan_limit;
-        let wallet_addresses_cache =
-            if self.wallet_discovery_scan_limit_cached == scan_limit
-                && !self.wallet_addresses_cache.is_empty()
-            {
-                self.wallet_addresses_cache.clone()
-            } else {
-                let Some(wallet) = self.wallet_ref() else {
-                    return;
-                };
-                wallet.discovery_addresses_up_to(scan_limit)
+        let wallet_addresses_cache = if self.wallet_discovery_scan_limit_cached == scan_limit
+            && !self.wallet_addresses_cache.is_empty()
+        {
+            self.wallet_addresses_cache.clone()
+        } else {
+            let Some(wallet) = self.wallet_ref() else {
+                return;
             };
+            wallet.discovery_addresses_up_to(scan_limit)
+        };
         let receive_addresses = wallet_addresses_cache
             .iter()
             .filter(|address| address.path.kind == AddressKind::Receive)

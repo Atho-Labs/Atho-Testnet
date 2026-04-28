@@ -71,13 +71,12 @@ impl Node {
     }
 
     pub fn export_snapshot_bundle(&self) -> Result<ChainSnapshotBundle, NodeError> {
-        self.chainstate.export_snapshot_bundle().map_err(NodeError::from)
+        self.chainstate
+            .export_snapshot_bundle()
+            .map_err(NodeError::from)
     }
 
-    pub fn import_snapshot_bundle(
-        &mut self,
-        bundle: ChainSnapshotBundle,
-    ) -> Result<(), NodeError> {
+    pub fn import_snapshot_bundle(&mut self, bundle: ChainSnapshotBundle) -> Result<(), NodeError> {
         self.chainstate
             .import_snapshot_bundle(bundle)
             .map_err(NodeError::from)?;
@@ -705,7 +704,9 @@ mod tests {
             donor
                 .mine_and_connect_candidate_block(&Miner::new(1))
                 .expect("mine donor 3");
-            donor.export_snapshot_bundle().expect("export snapshot bundle")
+            donor
+                .export_snapshot_bundle()
+                .expect("export snapshot bundle")
         };
 
         let receiver_root = temp_data_dir("snapshot-receiver");

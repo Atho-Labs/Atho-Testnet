@@ -169,7 +169,9 @@ impl NodeService {
                 let block_summary = dev::summarize_block(&block);
                 let response = match self.orchestrator.runtime.node.submit_block(&block) {
                     Ok(()) => {
-                        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+                        self.orchestrator
+                            .sync
+                            .prime(&self.orchestrator.runtime.node);
                         self.refresh_runtime_views();
                         RpcResponse::BlockSubmitted {
                             accepted: true,
@@ -279,6 +281,10 @@ impl NodeService {
         self.orchestrator.sync.connections().peer_count()
     }
 
+    pub fn p2p_has_peer(&self, remote_addr: &str) -> bool {
+        self.orchestrator.sync.has_peer(remote_addr)
+    }
+
     pub fn p2p_sync_best_height(&self) -> u64 {
         self.orchestrator.sync.sync_state().best_height
     }
@@ -296,10 +302,7 @@ impl NodeService {
         Some(self.orchestrator.sync.relay_compact_block_message(&block))
     }
 
-    pub fn p2p_accept_inbound(
-        &mut self,
-        remote_addr: impl Into<String>,
-    ) -> Result<(), NodeError> {
+    pub fn p2p_accept_inbound(&mut self, remote_addr: impl Into<String>) -> Result<(), NodeError> {
         self.orchestrator
             .sync
             .accept_inbound(remote_addr)
@@ -335,8 +338,22 @@ impl NodeService {
         Ok(result)
     }
 
+    pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) {
+        if let Some(notice) = self.orchestrator.sync.disconnect_peer(remote_addr, reason) {
+            if let SyncNotice::Disconnected { peer, reason } = notice {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!("peer disconnected peer={peer} reason={reason}"),
+                );
+            }
+        }
+        self.refresh_runtime_views();
+    }
+
     pub fn p2p_prime(&mut self) {
-        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.orchestrator
+            .sync
+            .prime(&self.orchestrator.runtime.node);
         self.refresh_runtime_views();
     }
 
@@ -347,7 +364,9 @@ impl NodeService {
             .runtime
             .node
             .mine_and_connect_candidate_block(&Miner::new(1))?;
-        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.orchestrator
+            .sync
+            .prime(&self.orchestrator.runtime.node);
         self.refresh_runtime_views();
         Ok(block.header.block_hash())
     }
@@ -367,7 +386,9 @@ impl NodeService {
     #[doc(hidden)]
     pub fn sandbox_with_node_mut<T>(&mut self, f: impl FnOnce(&mut crate::node::Node) -> T) -> T {
         let result = f(&mut self.orchestrator.runtime.node);
-        self.orchestrator.sync.prime(&self.orchestrator.runtime.node);
+        self.orchestrator
+            .sync
+            .prime(&self.orchestrator.runtime.node);
         self.refresh_runtime_views();
         result
     }

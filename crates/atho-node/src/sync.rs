@@ -69,6 +69,10 @@ impl NodeSync {
         &self.connections
     }
 
+    pub fn has_peer(&self, remote_addr: &str) -> bool {
+        self.connections.has_peer(remote_addr)
+    }
+
     pub fn add_manual_peer(&mut self, remote_addr: impl Into<String>) {
         self.connections.add_manual_peer(remote_addr);
     }
@@ -129,6 +133,17 @@ impl NodeSync {
         )
     }
 
+    pub fn disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
+        if !self.connections.disconnect(remote_addr) {
+            return None;
+        }
+        self.downloader.note_peer_disconnected(remote_addr);
+        Some(SyncNotice::Disconnected {
+            peer: remote_addr.to_string(),
+            reason,
+        })
+    }
+
     fn expand_events(
         &mut self,
         events: Vec<ConnectionEvent>,
@@ -182,7 +197,8 @@ impl NodeSync {
             MessagePayload::Inv { inventory } => {
                 for vector in &inventory {
                     if vector.kind == InventoryKind::Block {
-                        self.downloader.note_inventory(peer, vector.hash.into_inner());
+                        self.downloader
+                            .note_inventory(peer, vector.hash.into_inner());
                     }
                 }
                 let requests = self.missing_inventory_requests(node, &inventory);

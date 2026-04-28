@@ -312,7 +312,9 @@ impl Chainstate {
         let Some(first) = bundle.blocks.first() else {
             return Err(StorageError::IncompleteBlockHistory);
         };
-        if first.header.height != 0 || first.header.block_hash() != genesis::genesis_hash(self.network) {
+        if first.header.height != 0
+            || first.header.block_hash() != genesis::genesis_hash(self.network)
+        {
             return Err(StorageError::PersistedGenesisMismatch);
         }
 

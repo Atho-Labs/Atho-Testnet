@@ -177,7 +177,12 @@ pub fn validate_transaction_for_height(
     fee_atoms: u64,
     height: u64,
 ) -> Result<(), ValidationError> {
-    validate_transaction_for_height_with_schedule(tx, fee_atoms, height, &rules::SCHEDULED_ACTIVATIONS)
+    validate_transaction_for_height_with_schedule(
+        tx,
+        fee_atoms,
+        height,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
 }
 
 pub fn validate_transaction_for_height_with_schedule(
@@ -549,9 +554,8 @@ mod tests {
     use super::*;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::rules::{
-        ScheduledActivation, BLOCK_VERSION_V2_PLACEHOLDER, BLOCK_VERSION_V1,
-        RULESET_VERSION_V1, RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1,
-        TRANSACTION_VERSION_V2_PLACEHOLDER,
+        ScheduledActivation, BLOCK_VERSION_V1, BLOCK_VERSION_V2_PLACEHOLDER, RULESET_VERSION_V1,
+        RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1, TRANSACTION_VERSION_V2_PLACEHOLDER,
     };
     use atho_core::crypto::hash::sha3_384;
     use atho_core::transaction::{Transaction, TxOutput};

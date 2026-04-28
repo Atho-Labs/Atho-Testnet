@@ -234,6 +234,14 @@ impl ConnectionManager {
             .and_then(|session| session.handshake.remote_version())
     }
 
+    pub fn has_peer(&self, remote_addr: &str) -> bool {
+        self.sessions.contains_key(remote_addr)
+    }
+
+    pub fn disconnect(&mut self, remote_addr: &str) -> bool {
+        self.sessions.remove(remote_addr).is_some()
+    }
+
     pub fn address_manager(&self) -> &AddressManager {
         &self.address_manager
     }

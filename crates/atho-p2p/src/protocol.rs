@@ -405,7 +405,10 @@ impl NetworkMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactBlockReconstruction {
     Complete(Block),
-    Missing { block_hash: [u8; 48], indexes: Vec<u32> },
+    Missing {
+        block_hash: [u8; 48],
+        indexes: Vec<u32>,
+    },
 }
 
 pub fn compact_short_id(txid: [u8; 48]) -> u64 {
@@ -476,7 +479,10 @@ where
     }
 
     let mut missing = Vec::new();
-    for (index, short_id) in non_prefilled_indexes.into_iter().zip(message.short_ids.iter()) {
+    for (index, short_id) in non_prefilled_indexes
+        .into_iter()
+        .zip(message.short_ids.iter())
+    {
         if let Some(transaction) = overrides.get(&(index as u32)).cloned() {
             slots[index] = Some(transaction);
         } else if let Some(transaction) = lookup_short_id(*short_id) {

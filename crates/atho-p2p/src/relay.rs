@@ -83,7 +83,9 @@ impl RelayLoop {
     ) -> Result<(), ProtocolError> {
         let remote_addr = remote_addr.into();
         self.peers.accept_version(remote_addr.clone(), version)?;
+        let local_best_height = self.sync.best_height;
         self.sync.best_height = self.sync.best_height.max(version.best_height);
+        self.sync.headers_synced = version.best_height <= local_best_height;
         crate::audit::append_log(
             "p2p",
             &format!(

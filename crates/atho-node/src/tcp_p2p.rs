@@ -17,6 +17,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const FRAME_HEADER_BYTES: usize = 24;
+const OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum TcpP2pError {
@@ -51,6 +52,7 @@ pub struct TcpP2pRuntime {
     stop_requested: Arc<AtomicBool>,
     listener_thread: Option<JoinHandle<()>>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    maintenance_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TcpP2pRuntime {
@@ -73,6 +75,7 @@ impl TcpP2pRuntime {
         let local_addr = listener.local_addr().map_err(TcpP2pError::Io)?;
         let stop_requested = Arc::new(AtomicBool::new(false));
         let peer_threads = Arc::new(Mutex::new(Vec::new()));
+        let maintenance_threads = Arc::new(Mutex::new(Vec::new()));
         let listener_state = Arc::clone(&state);
         let listener_stop = Arc::clone(&stop_requested);
         let listener_peers = Arc::clone(&peer_threads);
@@ -111,6 +114,7 @@ impl TcpP2pRuntime {
             stop_requested,
             listener_thread: Some(listener_thread),
             peer_threads,
+            maintenance_threads,
         })
     }
 
@@ -140,19 +144,25 @@ impl TcpP2pRuntime {
     pub fn connect_outbound(&self, remote_addr: impl AsRef<str>) -> Result<(), TcpP2pError> {
         let remote_addr = SocketAddr::from_str(remote_addr.as_ref())
             .map_err(|_| TcpP2pError::InvalidPeerAddress(remote_addr.as_ref().to_string()))?;
-        let stream = TcpStream::connect(remote_addr)?;
-        let thread = spawn_peer_thread(
-            ConnectionRole::Outbound,
-            stream,
+        spawn_outbound_session(
             remote_addr,
             Arc::clone(&self.state),
             Arc::clone(&self.stop_requested),
+            Arc::clone(&self.peer_threads),
+        )
+    }
+
+    pub fn maintain_outbound(&self, remote_addr: impl Into<String>) {
+        let thread = spawn_outbound_maintainer(
+            remote_addr.into(),
+            Arc::clone(&self.state),
+            Arc::clone(&self.stop_requested),
+            Arc::clone(&self.peer_threads),
         );
-        self.peer_threads
+        self.maintenance_threads
             .lock()
-            .expect("peer thread list poisoned")
+            .expect("maintenance thread list poisoned")
             .push(thread);
-        Ok(())
     }
 
     pub fn snapshot(&self) -> TcpP2pSnapshot {
@@ -182,11 +192,104 @@ impl Drop for TcpP2pRuntime {
         if let Some(listener) = self.listener_thread.take() {
             let _ = listener.join();
         }
+        let mut maintenance_threads = self
+            .maintenance_threads
+            .lock()
+            .expect("maintenance thread list poisoned");
+        while let Some(thread) = maintenance_threads.pop() {
+            let _ = thread.join();
+        }
+        drop(maintenance_threads);
         let mut peer_threads = self.peer_threads.lock().expect("peer thread list poisoned");
         while let Some(thread) = peer_threads.pop() {
             let _ = thread.join();
         }
     }
+}
+
+fn spawn_outbound_session(
+    remote_addr: SocketAddr,
+    state: Arc<Mutex<NodeService>>,
+    stop_requested: Arc<AtomicBool>,
+    peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) -> Result<(), TcpP2pError> {
+    let stream = TcpStream::connect(remote_addr)?;
+    let thread = spawn_peer_thread(
+        ConnectionRole::Outbound,
+        stream,
+        remote_addr,
+        state,
+        stop_requested,
+    );
+    peer_threads
+        .lock()
+        .expect("peer thread list poisoned")
+        .push(thread);
+    Ok(())
+}
+
+fn spawn_outbound_maintainer(
+    remote_addr: String,
+    state: Arc<Mutex<NodeService>>,
+    stop_requested: Arc<AtomicBool>,
+    peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_failure = None::<String>;
+        while !stop_requested.load(Ordering::Acquire) {
+            // Keep configured outbound peers sticky. This closes the common startup-order race
+            // where one node launches before another and would otherwise never retry.
+            let already_connected = {
+                let state = state.lock().expect("p2p runtime state poisoned");
+                state.p2p_has_peer(&remote_addr)
+            };
+            if already_connected {
+                last_failure = None;
+                thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                continue;
+            }
+
+            match SocketAddr::from_str(&remote_addr) {
+                Ok(socket_addr) => match spawn_outbound_session(
+                    socket_addr,
+                    Arc::clone(&state),
+                    Arc::clone(&stop_requested),
+                    Arc::clone(&peer_threads),
+                ) {
+                    Ok(()) => {
+                        if last_failure.take().is_some() {
+                            let _ = dev::append_log(
+                                "p2p",
+                                &format!("outbound connect recovered peer={remote_addr}"),
+                            );
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(err) => {
+                        let failure = err.to_string();
+                        if last_failure.as_deref() != Some(failure.as_str()) {
+                            let _ = dev::append_log(
+                                "p2p",
+                                &format!(
+                                    "outbound connect retry failed peer={remote_addr} error={failure}"
+                                ),
+                            );
+                            last_failure = Some(failure);
+                        }
+                        thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                    }
+                },
+                Err(_) => {
+                    let failure = format!("invalid peer address: {remote_addr}");
+                    if last_failure.as_deref() != Some(failure.as_str()) {
+                        let _ = dev::append_log("p2p", &failure);
+                        last_failure = Some(failure);
+                    }
+                    thread::sleep(OUTBOUND_RETRY_INTERVAL);
+                }
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,115 +306,97 @@ fn spawn_peer_thread(
     stop_requested: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(err) = configure_stream(&stream) {
-            let _ = dev::append_log("p2p", &format!("stream configure error: {err}"));
-            return;
-        }
         let peer_id = remote_addr.to_string();
+        let disconnect_reason = (|| -> String {
+            if let Err(err) = configure_stream(&stream) {
+                return format!("stream configure error: {err}");
+            }
 
-        match role {
-            ConnectionRole::Inbound => {
-                let mut state = state.lock().expect("p2p runtime state poisoned");
-                if let Err(err) = state.p2p_accept_inbound(peer_id.clone()) {
-                    let _ = dev::append_log(
-                        "p2p",
-                        &format!("accept inbound rejected peer={peer_id} error={err}"),
-                    );
-                    return;
+            match role {
+                ConnectionRole::Inbound => {
+                    let mut state = state.lock().expect("p2p runtime state poisoned");
+                    if let Err(err) = state.p2p_accept_inbound(peer_id.clone()) {
+                        return format!("accept inbound rejected peer={peer_id} error={err}");
+                    }
+                }
+                ConnectionRole::Outbound => {
+                    let events = {
+                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        match state.p2p_open_outbound(peer_id.clone()) {
+                            Ok(events) => events,
+                            Err(err) => {
+                                return format!("open outbound failed peer={peer_id} error={err}");
+                            }
+                        }
+                    };
+                    if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
+                        return format!(
+                            "outbound handshake send failed peer={peer_id} error={err}"
+                        );
+                    }
                 }
             }
-            ConnectionRole::Outbound => {
-                let events = {
+
+            let mut last_announced_tip = {
+                let state = state.lock().expect("p2p runtime state poisoned");
+                state.tip_hash()
+            };
+
+            loop {
+                if stop_requested.load(Ordering::Acquire) {
+                    return String::from("runtime stopping");
+                }
+                let message = match read_message(&mut stream) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        if let Some(message) =
+                            poll_tip_announcement(&state, &mut last_announced_tip)
+                        {
+                            if let Err(err) = write_message(&mut stream, &message) {
+                                return format!(
+                                    "tip announcement failed peer={peer_id} error={err}"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        return format!("peer read failed peer={peer_id} error={err}");
+                    }
+                };
+                let (events, notices) = {
                     let mut state = state.lock().expect("p2p runtime state poisoned");
-                    match state.p2p_open_outbound(peer_id.clone()) {
-                        Ok(events) => events,
+                    match state.p2p_receive(&peer_id, message) {
+                        Ok(result) => result,
                         Err(err) => {
-                            let _ = dev::append_log(
-                                "p2p",
-                                &format!("open outbound failed peer={peer_id} error={err}"),
-                            );
-                            return;
+                            return format!("peer receive failed peer={peer_id} error={err}");
                         }
                     }
                 };
-                if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
-                    let _ = dev::append_log(
-                        "p2p",
-                        &format!("outbound handshake send failed peer={peer_id} error={err}"),
-                    );
-                    return;
-                }
-            }
-        }
-
-        let mut last_announced_tip = {
-            let state = state.lock().expect("p2p runtime state poisoned");
-            state.tip_hash()
-        };
-
-        loop {
-            if stop_requested.load(Ordering::Acquire) {
-                break;
-            }
-            let message = match read_message(&mut stream) {
-                Ok(Some(message)) => message,
-                Ok(None) => {
-                    if let Some(message) = poll_tip_announcement(&state, &mut last_announced_tip) {
-                        if let Err(err) = write_message(&mut stream, &message) {
+                for notice in notices {
+                    match notice {
+                        SyncNotice::Ready { best_height, .. } => {
                             let _ = dev::append_log(
                                 "p2p",
-                                &format!("tip announcement failed peer={peer_id} error={err}"),
+                                &format!("peer ready peer={peer_id} best_height={best_height}"),
                             );
-                            break;
+                        }
+                        SyncNotice::Disconnected { reason, .. } => {
+                            return format!("protocol disconnect peer={peer_id} reason={reason}");
                         }
                     }
-                    continue;
                 }
-                Err(err) => {
-                    let _ = dev::append_log(
-                        "p2p",
-                        &format!("peer read failed peer={peer_id} error={err}"),
-                    );
-                    break;
-                }
-            };
-            let (events, notices) = {
-                let mut state = state.lock().expect("p2p runtime state poisoned");
-                match state.p2p_receive(&peer_id, message) {
-                    Ok(result) => result,
-                    Err(err) => {
-                        let _ = dev::append_log(
-                            "p2p",
-                            &format!("peer receive failed peer={peer_id} error={err}"),
-                        );
-                        break;
-                    }
-                }
-            };
-            for notice in notices {
-                match notice {
-                    SyncNotice::Ready { best_height, .. } => {
-                        let _ = dev::append_log(
-                            "p2p",
-                            &format!("peer ready peer={peer_id} best_height={best_height}"),
-                        );
-                    }
-                    SyncNotice::Disconnected { reason, .. } => {
-                        let _ = dev::append_log(
-                            "p2p",
-                            &format!("peer disconnected peer={peer_id} reason={reason}"),
-                        );
-                    }
+                if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
+                    return format!("peer send failed peer={peer_id} error={err}");
                 }
             }
-            if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
-                let _ = dev::append_log(
-                    "p2p",
-                    &format!("peer send failed peer={peer_id} error={err}"),
-                );
-                break;
-            }
+        })();
+
+        if disconnect_reason != "runtime stopping" {
+            let _ = dev::append_log("p2p", &disconnect_reason);
         }
+        let mut state = state.lock().expect("p2p runtime state poisoned");
+        state.p2p_disconnect_peer(&peer_id, disconnect_reason);
     })
 }
 
@@ -418,6 +503,7 @@ fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -447,18 +533,19 @@ mod tests {
             let right_snapshot = right.snapshot();
             right_snapshot.height == left_snapshot.height
                 && right_snapshot.tip_hash == left_snapshot.tip_hash
+                && left_snapshot.headers_synced
+                && right_snapshot.headers_synced
         });
     }
 
     #[test]
     fn tcp_runtime_shared_service_keeps_status_and_tip_in_lockstep() {
-        let service = Arc::new(Mutex::new(NodeService::new(NodeConfig::new(Network::Regnet))));
-        let runtime = TcpP2pRuntime::bind_shared(
+        let service = Arc::new(Mutex::new(NodeService::new(NodeConfig::new(
             Network::Regnet,
-            Arc::clone(&service),
-            "127.0.0.1:0",
-        )
-        .expect("bind shared runtime");
+        ))));
+        let runtime =
+            TcpP2pRuntime::bind_shared(Network::Regnet, Arc::clone(&service), "127.0.0.1:0")
+                .expect("bind shared runtime");
 
         runtime.mine_local_block().expect("mine shared block");
 
@@ -466,7 +553,10 @@ mod tests {
         let status = service.lock().expect("service lock").status();
         assert!(snapshot.height >= 1);
         assert_eq!(snapshot.height, status.block_count);
-        assert_eq!(snapshot.tip_hash, service.lock().expect("service lock").tip_hash());
+        assert_eq!(
+            snapshot.tip_hash,
+            service.lock().expect("service lock").tip_hash()
+        );
     }
 
     #[test]
@@ -486,7 +576,40 @@ mod tests {
 
         wait_until("tip announcement", Duration::from_secs(30), || {
             let right_snapshot = right.snapshot();
-            right_snapshot.tip_hash == mined_hash && right_snapshot.height == 1
+            right_snapshot.tip_hash == mined_hash
+                && right_snapshot.height == 1
+                && right_snapshot.headers_synced
         });
+    }
+
+    #[test]
+    fn tcp_runtime_retries_outbound_until_peer_comes_online() {
+        let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let delayed_addr = reserved.local_addr().expect("reserved addr");
+        drop(reserved);
+
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+        right.maintain_outbound(delayed_addr.to_string());
+
+        // Allow at least one failed dial before the peer becomes available.
+        thread::sleep(Duration::from_millis(1200));
+
+        let left =
+            TcpP2pRuntime::new_in_memory(Network::Regnet, delayed_addr.to_string()).expect("left");
+        left.mine_local_block().expect("mine delayed peer block");
+
+        wait_until(
+            "delayed outbound reconnect",
+            Duration::from_secs(30),
+            || {
+                let left_snapshot = left.snapshot();
+                let right_snapshot = right.snapshot();
+                left_snapshot.peer_count == 1
+                    && right_snapshot.peer_count == 1
+                    && right_snapshot.height == left_snapshot.height
+                    && right_snapshot.tip_hash == left_snapshot.tip_hash
+                    && right_snapshot.headers_synced
+            },
+        );
     }
 }

@@ -13,6 +13,8 @@ pub fn derive_wallet_activity(
     blocks: &[Block],
     addresses: &[WalletHistoryAddress],
 ) -> Vec<WalletActivityEntry> {
+    // Wallet history is derived from canonical blocks instead of dev TSV exports so the UI and
+    // RPC paths see the same on-chain truth that consensus accepted.
     if blocks.is_empty() || addresses.is_empty() {
         return Vec::new();
     }

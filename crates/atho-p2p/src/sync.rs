@@ -19,7 +19,7 @@ impl SyncState {
             .last()
             .map(|block| Hash48::from(block.header.block_hash()));
         self.locator_hashes = block_locator(blocks);
-        self.headers_synced = false;
+        self.headers_synced = true;
         crate::audit::append_log(
             "p2p",
             &format!(

@@ -122,7 +122,11 @@ impl BlockDownloadScheduler {
             let Some(hash) = self.pending.pop_front() else {
                 break;
             };
-            let Some(peer) = self.select_peer_for_hash(&peers, cursor, &hash, max_requests_per_peer)
+            // Prefer hinted peers when possible, but never let one peer monopolize the queue.
+            // The scheduler balances by current in-flight load first, then uses hash hints and
+            // round-robin rotation to keep propagation and catch-up work spread out.
+            let Some(peer) =
+                self.select_peer_for_hash(&peers, cursor, &hash, max_requests_per_peer)
             else {
                 self.pending.push_front(hash);
                 break;
@@ -137,13 +141,10 @@ impl BlockDownloadScheduler {
                 .or_default()
                 .insert(hash);
             self.inflight_owner.insert(hash, peer.clone());
-            staged
-                .entry(peer)
-                .or_default()
-                .push(InventoryVector {
-                    kind: InventoryKind::Block,
-                    hash,
-                });
+            staged.entry(peer).or_default().push(InventoryVector {
+                kind: InventoryKind::Block,
+                hash,
+            });
             total_inflight = total_inflight.saturating_add(1);
         }
 
@@ -169,7 +170,11 @@ impl BlockDownloadScheduler {
             .iter()
             .enumerate()
             .filter_map(|(index, peer)| {
-                let inflight = self.inflight_by_peer.get(peer).map(BTreeSet::len).unwrap_or(0);
+                let inflight = self
+                    .inflight_by_peer
+                    .get(peer)
+                    .map(BTreeSet::len)
+                    .unwrap_or(0);
                 (inflight < max_requests_per_peer).then_some((
                     inflight,
                     hinted.is_none_or(|hints| hints.contains(peer)),
@@ -228,6 +233,12 @@ mod tests {
 
         let assignments = scheduler.assignments(4, 4);
         assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments.iter().map(|item| item.inventory.len()).sum::<usize>(), 4);
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|item| item.inventory.len())
+                .sum::<usize>(),
+            4
+        );
     }
 }

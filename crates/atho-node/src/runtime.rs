@@ -106,12 +106,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let p2p_runtime = TcpP2pRuntime::bind_shared(network, Arc::clone(&system), &p2p_address)
         .map_err(|err| NodeError::Runtime(RuntimeError::P2pBindFailed(err.to_string())))?;
     for peer in p2p_peer_addresses() {
-        if let Err(err) = p2p_runtime.connect_outbound(&peer) {
-            let _ = dev::append_log(
-                "p2p",
-                &format!("initial outbound connect failed peer={peer} error={err}"),
-            );
-        }
+        p2p_runtime.maintain_outbound(peer);
     }
     let rpc_address = rpc_bind_address(config.network);
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
