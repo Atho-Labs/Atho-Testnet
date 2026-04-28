@@ -47,12 +47,13 @@ Do not proceed until all of these are true:
 1. the VPS SSH host key is verified out of band
 2. the deployment operator confirms the intended public P2P port exposure
 3. the initial bootstrap peer plan is finalized
-4. DNS seeds are added only after the node software and deployment path are confirmed stable
+4. the public P2P wire path is hardened enough for internet exposure
+5. DNS seeds are added only after the node software and deployment path are confirmed stable
 
 ## What Still Remains Before Public Launch
 
 1. verify and update the VPS SSH host key for `74.208.219.116`
-2. deploy the full node to the VPS with the documented service layout
+2. finish the remaining public-wire hardening needed for an internet-facing P2P bind
 3. add DNS seeds
 4. bring the network online
 

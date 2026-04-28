@@ -3,6 +3,7 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::service::NodeService;
 use crate::sync::SyncNotice;
+use atho_p2p::config::network_params;
 use atho_core::network::Network;
 use atho_p2p::codec::{CodecError, WireCodec};
 use atho_p2p::connection::ConnectionEvent;
@@ -395,7 +396,7 @@ fn spawn_peer_thread(
                 if stop_requested.load(Ordering::Acquire) {
                     return String::from("runtime stopping");
                 }
-                let message = match read_message(&mut stream) {
+                let message = match read_message(&mut stream, state.lock().expect("p2p runtime state poisoned").network()) {
                     Ok(Some(message)) => message,
                     Ok(None) => {
                         if let Some(message) =
@@ -492,18 +493,37 @@ fn write_message(stream: &mut TcpStream, message: &NetworkMessage) -> Result<(),
     Ok(())
 }
 
-fn read_message(stream: &mut TcpStream) -> Result<Option<NetworkMessage>, TcpP2pError> {
+fn read_message(
+    stream: &mut TcpStream,
+    expected_network: Network,
+) -> Result<Option<NetworkMessage>, TcpP2pError> {
     let mut header = [0u8; FRAME_HEADER_BYTES];
     if !read_exact_with_timeouts(stream, &mut header)? {
         return Ok(None);
     }
 
-    let payload_len =
-        u32::from_le_bytes(header[16..20].try_into().expect("payload length slice")) as usize;
-    let mut frame = header.to_vec();
+    let payload_len = validated_payload_len(&header, expected_network)?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + payload_len);
+    frame.extend_from_slice(&header);
     frame.resize(FRAME_HEADER_BYTES + payload_len, 0);
     read_exact_with_timeouts(stream, &mut frame[FRAME_HEADER_BYTES..])?;
     Ok(Some(WireCodec::decode(&frame)?))
+}
+
+fn validated_payload_len(
+    header: &[u8; FRAME_HEADER_BYTES],
+    expected_network: Network,
+) -> Result<usize, TcpP2pError> {
+    let magic: [u8; 4] = header[..4].try_into().expect("header magic slice");
+    if magic != network_params(expected_network).magic {
+        return Err(TcpP2pError::Codec(CodecError::InvalidMagic));
+    }
+    let payload_len =
+        u32::from_le_bytes(header[16..20].try_into().expect("payload length slice")) as usize;
+    if payload_len > network_params(expected_network).limits.max_message_size as usize {
+        return Err(TcpP2pError::Codec(CodecError::PayloadTooLarge));
+    }
+    Ok(payload_len)
 }
 
 fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bool, TcpP2pError> {
@@ -821,5 +841,20 @@ mod tests {
                 && a_snapshot.headers_synced
                 && b_snapshot.headers_synced
         });
+    }
+
+    #[test]
+    fn payload_length_is_bounded_before_frame_allocation() {
+        let mut header = [0u8; FRAME_HEADER_BYTES];
+        header[..4].copy_from_slice(&network_params(Network::Mainnet).magic);
+        let oversized = network_params(Network::Mainnet)
+            .limits
+            .max_message_size
+            .saturating_add(1);
+        header[16..20].copy_from_slice(&oversized.to_le_bytes());
+        assert!(matches!(
+            validated_payload_len(&header, Network::Mainnet),
+            Err(TcpP2pError::Codec(CodecError::PayloadTooLarge))
+        ));
     }
 }

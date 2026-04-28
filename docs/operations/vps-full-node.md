@@ -58,6 +58,18 @@ Recommended defaults:
 
 Do not expose RPC publicly unless you have an intentional reverse-proxy or access-control design. Atho now refuses public RPC binds unless the operator explicitly opts in.
 
+## Pre-Launch Safe Mode
+
+If you need the VPS node online before final public-wire hardening is complete, keep the node in
+headless mainnet mode with loopback-only P2P:
+
+```bash
+./athod --network mainnet --data-dir /var/lib/atho --rpc-addr 127.0.0.1:9010 --p2p-addr 127.0.0.1:56000
+```
+
+That keeps the node stable, restartable, and ready for local verification without exposing the
+public P2P surface early.
+
 ## Example `systemd` Unit
 
 ```ini
@@ -118,8 +130,9 @@ Under the runtime root:
 
 - DNS seeds are still blank, so peer bootstrap is manual
 - public-node hardening is improved, but the network layer still needs more long-run soak coverage
+- public internet P2P exposure should stay disabled until the remaining inbound wire-decoder hardening is complete
 - snapshot sync is not yet a peer-served protocol
-- deployment to `74.208.219.116` is blocked from this shell until the changed SSH host key is verified out of band
+- every operator workstation should verify the VPS SSH host key out of band before managing the node
 
 ## Related Documentation
 
