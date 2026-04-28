@@ -1,6 +1,6 @@
 use crate::error::RpcError;
 use crate::request::RpcRequest;
-use crate::response::{NodeStatus, RpcResponse};
+use crate::response::{NetworkDiagnostics, NodeStatus, RpcResponse};
 use atho_core::network::Network;
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,7 @@ impl RpcServer {
             running: self.running,
             headers_synced: self.headers_synced,
             sync_best_height: self.sync_best_height,
+            network_diagnostics: NetworkDiagnostics::default(),
         }
     }
 

@@ -10,6 +10,8 @@ Current posture:
 
 - local consensus, storage, wallet, miner, RPC, and Qt lifecycle paths have strong sandbox coverage
 - the node, miner, and desktop client now have a cleaner operator command model
+- `athod status` now reports peer counts, per-peer direction, and byte counters
+- the Qt settings page now includes Bitcoin-Core-style peer and traffic diagnostics
 - the default runtime root is OS-native instead of working-directory driven
 - the live TCP peer runtime exists and is sandbox-tested over real sockets
 - the public VPS node path now has live restart/recovery and one-block propagation coverage
@@ -107,6 +109,8 @@ cargo build --release -p atho-node -p atho-qt
 
 Full Windows instructions:
 
+- [`docs/operations/linux-quick-start.md`](docs/operations/linux-quick-start.md)
+- [`docs/operations/macos-quick-start.md`](docs/operations/macos-quick-start.md)
 - [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
 - [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)
 
@@ -156,6 +160,8 @@ Key sections:
 
 - [`docs/operations/runtime-model.md`](docs/operations/runtime-model.md)
 - [`docs/operations/commands.md`](docs/operations/commands.md)
+- [`docs/operations/linux-quick-start.md`](docs/operations/linux-quick-start.md)
+- [`docs/operations/macos-quick-start.md`](docs/operations/macos-quick-start.md)
 - [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
 - [`docs/operations/vps-full-node.md`](docs/operations/vps-full-node.md)
 - [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)

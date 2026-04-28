@@ -32,6 +32,7 @@ Current major surfaces:
 - receive page
 - transaction history
 - settings and mining controls
+- settings/network diagnostics with peer and traffic visibility
 - activity feed
 - status bar with block height, best height, mempool count, and connectivity state
 
@@ -83,6 +84,25 @@ The current hardening work specifically targeted:
 Why:
 
 - incorrect tip display is a product-level trust failure even if the backend is correct
+
+## Network Diagnostics
+
+The settings page now exposes a local operator diagnostics view with:
+
+- connected peer count
+- inbound/outbound split
+- total bytes sent and received
+- per-peer endpoint
+- handshake-ready state
+- peer-reported height
+- protocol version and user agent
+- recent receive time
+- persisted peer-quality information when available
+
+Why:
+
+- Atho needs Bitcoin-Core-like operator visibility for a fast-block network
+- the peer view belongs in an intentional diagnostics surface, not in public-facing RPC defaults
 
 ## Current Limitations
 

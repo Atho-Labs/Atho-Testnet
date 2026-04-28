@@ -42,6 +42,8 @@ It is designed to answer three questions clearly:
 
 - [Commands](operations/commands.md)
 - [Runtime Model](operations/runtime-model.md)
+- [Linux Quick Start](operations/linux-quick-start.md)
+- [macOS Quick Start](operations/macos-quick-start.md)
 - [Windows Quick Start](operations/windows-quick-start.md)
 - [VPS Full Node](operations/vps-full-node.md)
 - [Launch Checklist](operations/launch-checklist.md)
@@ -68,6 +70,7 @@ As of the latest sandbox hardening pass:
 
 - local consensus and storage paths are heavily tested
 - the Qt client follows the real backend tip through RPC
+- the Qt settings page now exposes operator-local peer and traffic diagnostics
 - the node can mine, validate, persist, reload, and reorg locally
 - DNS seeds are intentionally blank
 - the live TCP peer runtime exists, but still needs broader public-network hardening and soak coverage

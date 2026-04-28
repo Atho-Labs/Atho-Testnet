@@ -131,6 +131,13 @@ cargo run -p atho-node --bin athod -- status --network mainnet
 cargo run -p atho-node --bin athod -- status --rpc-addr 127.0.0.1:9010
 ```
 
+The status command now reports:
+
+- connected peer count
+- inbound/outbound split
+- total bytes sent and received
+- a peer diagnostics section with endpoint, direction, height, protocol version, and traffic totals
+
 Verification:
 
 ```bash
@@ -171,6 +178,13 @@ Useful flags:
 - `--peer HOST:PORT` (repeatable)
 - `--p2p-addr HOST:PORT`
 - `--data-dir PATH`
+
+The settings page includes a controlled network diagnostics view with:
+
+- chain height and sync state
+- connected peer counts
+- sent/received byte counters
+- per-peer endpoint, direction, protocol, and traffic details
 
 ## Miner
 
@@ -261,6 +275,8 @@ athod --network mainnet
 
 - [Runtime Model](runtime-model.md)
 - [Windows Quick Start](windows-quick-start.md)
+- [Linux Quick Start](linux-quick-start.md)
+- [macOS Quick Start](macos-quick-start.md)
 - [VPS Full Node](vps-full-node.md)
 - [Dev Workspace](dev-workspace.md)
 - [Build and Packaging](../build-deployment/packaging.md)

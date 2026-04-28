@@ -402,10 +402,17 @@ fn spawn_peer_thread(
                             }
                         }
                     };
-                    if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
-                        return format!(
-                            "outbound handshake send failed peer={peer_id} error={err}"
-                        );
+                    let bytes_sent = match flush_send_events(&mut stream, &peer_id, events) {
+                        Ok(bytes_sent) => bytes_sent,
+                        Err(err) => {
+                            return format!(
+                                "outbound handshake send failed peer={peer_id} error={err}"
+                            );
+                        }
+                    };
+                    if bytes_sent > 0 {
+                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                     }
                 }
             }
@@ -428,7 +435,13 @@ fn spawn_peer_thread(
                     return String::from("runtime stopping");
                 }
                 let message = match read_message(&mut stream, peer_network) {
-                    Ok(Some(message)) => message,
+                    Ok(Some((message, bytes_received))) => {
+                        if bytes_received > 0 {
+                            let mut state = state.lock().expect("p2p runtime state poisoned");
+                            state.p2p_note_bytes_received(&peer_id, bytes_received);
+                        }
+                        message
+                    }
                     Ok(None) => {
                         if !handshake_ready {
                             if handshake_started.elapsed().unwrap_or_default() >= handshake_timeout
@@ -440,10 +453,17 @@ fn spawn_peer_thread(
                         if let Some(message) =
                             poll_tip_announcement(&state, &mut last_announced_tip)
                         {
-                            if let Err(err) = write_message(&mut stream, &message) {
-                                return format!(
-                                    "tip announcement failed peer={peer_id} error={err}"
-                                );
+                            let bytes_sent = match write_message(&mut stream, &message) {
+                                Ok(bytes_sent) => bytes_sent,
+                                Err(err) => {
+                                    return format!(
+                                        "tip announcement failed peer={peer_id} error={err}"
+                                    );
+                                }
+                            };
+                            if bytes_sent > 0 {
+                                let mut state = state.lock().expect("p2p runtime state poisoned");
+                                state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                             }
                         }
                         continue;
@@ -475,8 +495,15 @@ fn spawn_peer_thread(
                         }
                     }
                 }
-                if let Err(err) = flush_send_events(&mut stream, &peer_id, events) {
-                    return format!("peer send failed peer={peer_id} error={err}");
+                let bytes_sent = match flush_send_events(&mut stream, &peer_id, events) {
+                    Ok(bytes_sent) => bytes_sent,
+                    Err(err) => {
+                        return format!("peer send failed peer={peer_id} error={err}");
+                    }
+                };
+                if bytes_sent > 0 {
+                    let mut state = state.lock().expect("p2p runtime state poisoned");
+                    state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                 }
             }
         })();
@@ -526,28 +553,29 @@ fn flush_send_events(
     stream: &mut TcpStream,
     peer_id: &str,
     events: Vec<ConnectionEvent>,
-) -> Result<(), TcpP2pError> {
+) -> Result<usize, TcpP2pError> {
+    let mut bytes_sent = 0usize;
     for event in events {
         if let ConnectionEvent::Send { peer, message } = event {
             if peer == peer_id {
-                write_message(stream, &message)?;
+                bytes_sent = bytes_sent.saturating_add(write_message(stream, &message)?);
             }
         }
     }
-    Ok(())
+    Ok(bytes_sent)
 }
 
-fn write_message(stream: &mut TcpStream, message: &NetworkMessage) -> Result<(), TcpP2pError> {
+fn write_message(stream: &mut TcpStream, message: &NetworkMessage) -> Result<usize, TcpP2pError> {
     let bytes = WireCodec::encode(message)?;
     stream.write_all(&bytes)?;
     stream.flush()?;
-    Ok(())
+    Ok(bytes.len())
 }
 
 fn read_message(
     stream: &mut TcpStream,
     expected_network: Network,
-) -> Result<Option<NetworkMessage>, TcpP2pError> {
+) -> Result<Option<(NetworkMessage, usize)>, TcpP2pError> {
     let mut header = [0u8; FRAME_HEADER_BYTES];
     if !read_exact_with_timeouts(stream, &mut header)? {
         return Ok(None);
@@ -558,7 +586,8 @@ fn read_message(
     frame.extend_from_slice(&header);
     frame.resize(FRAME_HEADER_BYTES + payload_len, 0);
     read_exact_with_timeouts(stream, &mut frame[FRAME_HEADER_BYTES..])?;
-    Ok(Some(WireCodec::decode(&frame)?))
+    let frame_len = frame.len();
+    Ok(Some((WireCodec::decode(&frame)?, frame_len)))
 }
 
 fn validated_payload_len(
@@ -625,7 +654,7 @@ fn load_peer_health_snapshot(
     network: Network,
     remote_addr: &str,
 ) -> PeerHealthRecord {
-    let state = state.lock().expect("p2p runtime state poisoned");
+    let mut state = state.lock().expect("p2p runtime state poisoned");
     state
         .p2p_peer_health(remote_addr)
         .unwrap_or(PeerHealthRecord {
@@ -640,7 +669,7 @@ fn load_peer_health_snapshot(
 }
 
 fn persist_peer_health(state: &Arc<Mutex<NodeService>>, health: &PeerHealthRecord) {
-    let state = state.lock().expect("p2p runtime state poisoned");
+    let mut state = state.lock().expect("p2p runtime state poisoned");
     state.p2p_save_peer_health(health);
 }
 
@@ -833,6 +862,49 @@ mod tests {
     }
 
     #[test]
+    fn tcp_runtime_reports_peer_directions_and_traffic_in_network_diagnostics() {
+        let left = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("left");
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+
+        right
+            .connect_outbound(left.bind_addr().to_string())
+            .expect("connect outbound");
+
+        wait_until("peer handshake", Duration::from_secs(10), || {
+            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+        });
+
+        let left_diagnostics = {
+            let state = left.state.lock().expect("left state");
+            state.network_diagnostics()
+        };
+        let right_diagnostics = {
+            let state = right.state.lock().expect("right state");
+            state.network_diagnostics()
+        };
+
+        assert_eq!(left_diagnostics.peer_count, 1);
+        assert_eq!(left_diagnostics.inbound_peer_count, 1);
+        assert_eq!(left_diagnostics.outbound_peer_count, 0);
+        assert_eq!(
+            left_diagnostics.peers[0].direction,
+            atho_rpc::response::NetworkPeerDirection::Inbound
+        );
+        assert!(left_diagnostics.bytes_received > 0);
+        assert!(left_diagnostics.peers[0].bytes_received > 0);
+
+        assert_eq!(right_diagnostics.peer_count, 1);
+        assert_eq!(right_diagnostics.inbound_peer_count, 0);
+        assert_eq!(right_diagnostics.outbound_peer_count, 1);
+        assert_eq!(
+            right_diagnostics.peers[0].direction,
+            atho_rpc::response::NetworkPeerDirection::Outbound
+        );
+        assert!(right_diagnostics.bytes_sent > 0);
+        assert!(right_diagnostics.peers[0].bytes_sent > 0);
+    }
+
+    #[test]
     fn tcp_runtime_retries_outbound_until_peer_comes_online() {
         let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let delayed_addr = reserved.local_addr().expect("reserved addr");
@@ -898,7 +970,7 @@ mod tests {
             "peer health persisted after failures",
             Duration::from_secs(5),
             || {
-                let state = right.state.lock().expect("state");
+                let mut state = right.state.lock().expect("state");
                 state
                     .p2p_peer_health(&delayed_addr.to_string())
                     .is_some_and(|record| {

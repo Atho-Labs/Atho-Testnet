@@ -20,6 +20,18 @@ struct PeerSession {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSessionSnapshot {
+    pub remote_addr: String,
+    pub direction: ConnectionDirection,
+    pub handshake_ready: bool,
+    pub best_height: Option<u64>,
+    pub protocol_version: Option<u32>,
+    pub services: Option<u64>,
+    pub user_agent: Option<String>,
+    pub ruleset_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Send {
         peer: String,
@@ -250,18 +262,37 @@ impl ConnectionManager {
         self.sessions.len()
     }
 
-    fn inbound_count(&self) -> usize {
+    pub fn inbound_count(&self) -> usize {
         self.sessions
             .values()
             .filter(|session| session.direction == ConnectionDirection::Inbound)
             .count()
     }
 
-    fn outbound_count(&self) -> usize {
+    pub fn outbound_count(&self) -> usize {
         self.sessions
             .values()
             .filter(|session| session.direction == ConnectionDirection::Outbound)
             .count()
+    }
+
+    pub fn peer_snapshots(&self) -> Vec<PeerSessionSnapshot> {
+        self.sessions
+            .iter()
+            .map(|(remote_addr, session)| {
+                let remote_version = session.handshake.remote_version();
+                PeerSessionSnapshot {
+                    remote_addr: remote_addr.clone(),
+                    direction: session.direction,
+                    handshake_ready: session.handshake.is_ready(),
+                    best_height: remote_version.map(|version| version.best_height),
+                    protocol_version: remote_version.map(|version| version.protocol_version),
+                    services: remote_version.map(|version| version.services),
+                    user_agent: remote_version.map(|version| version.user_agent.clone()),
+                    ruleset_version: remote_version.map(|version| version.ruleset_version),
+                }
+            })
+            .collect()
     }
 }
 

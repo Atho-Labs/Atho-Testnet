@@ -9,14 +9,16 @@ use crate::sync::{NodeSyncError, SyncNotice};
 use crate::wallet_history;
 use atho_core::block::Block;
 use atho_core::network::Network;
-use atho_p2p::connection::ConnectionEvent;
+use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
 use atho_p2p::protocol::NetworkMessage;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
-    BlockTemplate, MempoolInfo, MempoolSpentInput, NodeStatus, RpcResponse, WalletActivityEntry,
+    BlockTemplate, MempoolInfo, MempoolSpentInput, NetworkDiagnostics, NetworkPeerDiagnostics,
+    NetworkPeerDirection, NodeStatus, RpcResponse, WalletActivityEntry,
 };
 use atho_storage::db::PeerHealthRecord;
 use atho_wallet::snapshot::WalletSnapshot;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemStatus {
@@ -30,10 +32,27 @@ pub struct SystemStatus {
     pub sync_best_height: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerTrafficStats {
+    bytes_sent: u64,
+    bytes_received: u64,
+    last_send_unix: Option<u64>,
+    last_receive_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkRuntimeView {
+    bytes_sent: u64,
+    bytes_received: u64,
+    peers: BTreeMap<String, PeerTrafficStats>,
+}
+
 #[derive(Debug)]
 pub struct NodeService {
     orchestrator: NodeOrchestrator,
     wallet_snapshot: WalletSnapshot,
+    network_runtime: NetworkRuntimeView,
+    peer_health_cache: BTreeMap<String, PeerHealthRecord>,
 }
 
 impl NodeService {
@@ -41,6 +60,8 @@ impl NodeService {
         Self {
             orchestrator: NodeOrchestrator::new(config),
             wallet_snapshot: WalletSnapshot::default(),
+            network_runtime: NetworkRuntimeView::default(),
+            peer_health_cache: BTreeMap::new(),
         }
     }
 
@@ -53,6 +74,8 @@ impl NodeService {
                 rpc_server: atho_rpc::server::RpcServer::new(network),
             },
             wallet_snapshot: WalletSnapshot::default(),
+            network_runtime: NetworkRuntimeView::default(),
+            peer_health_cache: BTreeMap::new(),
         }
     }
 
@@ -60,6 +83,8 @@ impl NodeService {
         Ok(Self {
             orchestrator: NodeOrchestrator::try_new(config)?,
             wallet_snapshot: WalletSnapshot::default(),
+            network_runtime: NetworkRuntimeView::default(),
+            peer_health_cache: BTreeMap::new(),
         })
     }
 
@@ -259,6 +284,52 @@ impl NodeService {
             running: status.running,
             headers_synced: status.headers_synced,
             sync_best_height: status.sync_best_height,
+            network_diagnostics: self.network_diagnostics(),
+        }
+    }
+
+    pub fn network_diagnostics(&self) -> NetworkDiagnostics {
+        let connections = self.orchestrator.sync.connections();
+        let peers = connections
+            .peer_snapshots()
+            .into_iter()
+            .map(|peer| {
+                let traffic = self
+                    .network_runtime
+                    .peers
+                    .get(&peer.remote_addr)
+                    .cloned()
+                    .unwrap_or_default();
+                let health = self.peer_health_cache.get(&peer.remote_addr);
+                NetworkPeerDiagnostics {
+                    remote_addr: peer.remote_addr,
+                    direction: match peer.direction {
+                        ConnectionDirection::Inbound => NetworkPeerDirection::Inbound,
+                        ConnectionDirection::Outbound => NetworkPeerDirection::Outbound,
+                    },
+                    handshake_ready: peer.handshake_ready,
+                    best_height: peer.best_height,
+                    protocol_version: peer.protocol_version,
+                    services: peer.services,
+                    user_agent: peer.user_agent,
+                    ruleset_version: peer.ruleset_version,
+                    bytes_sent: traffic.bytes_sent,
+                    bytes_received: traffic.bytes_received,
+                    last_send_unix: traffic.last_send_unix,
+                    last_receive_unix: traffic.last_receive_unix,
+                    quality_score: health.map(|record| record.quality_score),
+                    consecutive_failures: health.map(|record| record.consecutive_failures),
+                }
+            })
+            .collect();
+
+        NetworkDiagnostics {
+            peer_count: connections.peer_count(),
+            inbound_peer_count: connections.inbound_count(),
+            outbound_peer_count: connections.outbound_count(),
+            bytes_sent: self.network_runtime.bytes_sent,
+            bytes_received: self.network_runtime.bytes_received,
+            peers,
         }
     }
 
@@ -294,16 +365,27 @@ impl NodeService {
         self.orchestrator.sync.sync_state().headers_synced
     }
 
-    pub fn p2p_peer_health(&self, remote_addr: &str) -> Option<PeerHealthRecord> {
-        self.orchestrator
+    pub fn p2p_peer_health(&mut self, remote_addr: &str) -> Option<PeerHealthRecord> {
+        if let Some(record) = self.peer_health_cache.get(remote_addr) {
+            return Some(record.clone());
+        }
+        let record = self
+            .orchestrator
             .runtime
             .node
             .load_peer_health(remote_addr)
             .ok()
-            .flatten()
+            .flatten();
+        if let Some(record) = record.as_ref() {
+            self.peer_health_cache
+                .insert(remote_addr.to_string(), record.clone());
+        }
+        record
     }
 
-    pub fn p2p_save_peer_health(&self, record: &PeerHealthRecord) {
+    pub fn p2p_save_peer_health(&mut self, record: &PeerHealthRecord) {
+        self.peer_health_cache
+            .insert(record.remote_addr.clone(), record.clone());
         if let Err(err) = self.orchestrator.runtime.node.save_peer_health(record) {
             let _ = dev::append_log(
                 "p2p",
@@ -313,6 +395,39 @@ impl NodeService {
                 ),
             );
         }
+    }
+
+    pub fn p2p_note_bytes_sent(&mut self, remote_addr: &str, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = unix_timestamp();
+        let bytes = bytes as u64;
+        self.network_runtime.bytes_sent = self.network_runtime.bytes_sent.saturating_add(bytes);
+        let peer = self
+            .network_runtime
+            .peers
+            .entry(remote_addr.to_string())
+            .or_default();
+        peer.bytes_sent = peer.bytes_sent.saturating_add(bytes);
+        peer.last_send_unix = Some(now);
+    }
+
+    pub fn p2p_note_bytes_received(&mut self, remote_addr: &str, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let now = unix_timestamp();
+        let bytes = bytes as u64;
+        self.network_runtime.bytes_received =
+            self.network_runtime.bytes_received.saturating_add(bytes);
+        let peer = self
+            .network_runtime
+            .peers
+            .entry(remote_addr.to_string())
+            .or_default();
+        peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+        peer.last_receive_unix = Some(now);
     }
 
     pub fn p2p_relay_compact_tip_message(&self) -> Option<NetworkMessage> {
@@ -362,6 +477,7 @@ impl NodeService {
 
     pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
         let notice = self.orchestrator.sync.disconnect_peer(remote_addr, reason);
+        self.network_runtime.peers.remove(remote_addr);
         self.refresh_runtime_views();
         notice
     }
@@ -422,4 +538,11 @@ fn sync_error_into_node(error: NodeSyncError) -> NodeError {
         NodeSyncError::Protocol(error) => NodeError::P2pProtocol(error),
         NodeSyncError::Connection(error) => NodeError::P2pConnection(error),
     }
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

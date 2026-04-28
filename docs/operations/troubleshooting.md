@@ -70,6 +70,12 @@ For the desktop client:
 cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 198.51.100.10:56000
 ```
 
+What to check after that:
+
+1. `athod status` shows `peer_count > 0`
+2. `bytes_received` is increasing
+3. the Qt settings page shows at least one ready peer
+
 ## Local State Rebuild Happened Unexpectedly
 
 If Atho quarantines local state on startup, it found a recoverable local storage problem such as:

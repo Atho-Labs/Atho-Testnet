@@ -1,6 +1,6 @@
 use crate::state::UiState;
 use atho_rpc::error::RpcError;
-use atho_rpc::response::RpcResponse;
+use atho_rpc::response::{NetworkPeerDiagnostics, RpcResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViewModel {
@@ -8,6 +8,12 @@ pub struct ViewModel {
     pub block_count: u64,
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
+    pub peer_count: usize,
+    pub inbound_peer_count: usize,
+    pub outbound_peer_count: usize,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub peers: Vec<NetworkPeerDiagnostics>,
     pub sync_best_height: u64,
     pub running: bool,
     pub headers_synced: bool,

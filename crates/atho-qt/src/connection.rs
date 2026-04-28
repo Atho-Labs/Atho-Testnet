@@ -2,7 +2,7 @@ use atho_core::network::Network;
 use atho_node::system::AthoSystem;
 use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
-use atho_rpc::response::{MempoolInfo, RpcResponse};
+use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcResponse};
 use atho_rpc::transport::RpcClient;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -21,6 +21,12 @@ pub struct ConnectionStatus {
     pub block_count: u64,
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
+    pub peer_count: usize,
+    pub inbound_peer_count: usize,
+    pub outbound_peer_count: usize,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub peers: Vec<NetworkPeerDiagnostics>,
     pub running: bool,
     pub headers_synced: bool,
     pub sync_best_height: u64,
@@ -267,19 +273,11 @@ impl ReadOnlyNodeConnection {
         match &self.backend {
             ConnectionBackend::Local(system) => {
                 let system = system.lock().expect("local node mutex poisoned");
-                let status = system.status();
-                ConnectionStatus {
-                    network: status.network,
-                    rpc_address: self.rpc_address.clone(),
-                    block_count: status.block_count,
-                    mempool_count: status.mempool_count,
-                    mempool_total_fee_atoms: status.mempool_total_fee_atoms,
-                    running: status.running,
-                    headers_synced: status.headers_synced,
-                    sync_best_height: status.sync_best_height,
-                    connected: status.running,
-                    startup_error: None,
-                }
+                connection_status_from_node_status(
+                    self.network,
+                    self.rpc_address.clone(),
+                    system.node_status(),
+                )
             }
             ConnectionBackend::Unavailable { startup_error } => ConnectionStatus {
                 network: self.network,
@@ -287,6 +285,12 @@ impl ReadOnlyNodeConnection {
                 block_count: 0,
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
+                peer_count: 0,
+                inbound_peer_count: 0,
+                outbound_peer_count: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                peers: Vec::new(),
                 running: false,
                 headers_synced: false,
                 sync_best_height: 0,
@@ -309,19 +313,11 @@ impl ReadOnlyNodeConnection {
                 thread::spawn(move || loop {
                     let status = {
                         let system = system.lock().expect("local node mutex poisoned");
-                        let status = system.status();
-                        ConnectionStatus {
-                            network: status.network,
-                            rpc_address: rpc_address.clone(),
-                            block_count: status.block_count,
-                            mempool_count: status.mempool_count,
-                            mempool_total_fee_atoms: status.mempool_total_fee_atoms,
-                            running: status.running,
-                            headers_synced: status.headers_synced,
-                            sync_best_height: status.sync_best_height,
-                            connected: status.running,
-                            startup_error: None,
-                        }
+                        connection_status_from_node_status(
+                            system.network(),
+                            rpc_address.clone(),
+                            system.node_status(),
+                        )
                     };
                     if sender.send(status).is_err() {
                         break;
@@ -355,6 +351,12 @@ impl ReadOnlyNodeConnection {
                         block_count: 0,
                         mempool_count: 0,
                         mempool_total_fee_atoms: 0,
+                        peer_count: 0,
+                        inbound_peer_count: 0,
+                        outbound_peer_count: 0,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        peers: Vec::new(),
                         running: false,
                         headers_synced: false,
                         sync_best_height: 0,
@@ -402,6 +404,12 @@ fn collect_rpc_status(
                 block_count: 0,
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
+                peer_count: 0,
+                inbound_peer_count: 0,
+                outbound_peer_count: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                peers: Vec::new(),
                 running: false,
                 headers_synced: false,
                 sync_best_height: 0,
@@ -412,19 +420,7 @@ fn collect_rpc_status(
     }
 
     if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
-        let connected = status.network == network && status.running;
-        return ConnectionStatus {
-            network: status.network,
-            rpc_address: rpc_address.to_string(),
-            block_count: status.block_count,
-            mempool_count: status.mempool_count,
-            mempool_total_fee_atoms: status.mempool_total_fee_atoms,
-            running: status.running,
-            headers_synced: status.headers_synced,
-            sync_best_height: status.sync_best_height,
-            connected,
-            startup_error: None,
-        };
+        return connection_status_from_node_status(network, rpc_address.to_string(), status);
     }
 
     if let Some(node) = managed_node {
@@ -434,6 +430,12 @@ fn collect_rpc_status(
             block_count: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
+            peer_count: 0,
+            inbound_peer_count: 0,
+            outbound_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
             running: false,
             headers_synced: false,
             sync_best_height: 0,
@@ -462,10 +464,42 @@ fn collect_rpc_status(
         block_count,
         mempool_count,
         mempool_total_fee_atoms: 0,
+        peer_count: 0,
+        inbound_peer_count: 0,
+        outbound_peer_count: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        peers: Vec::new(),
         running: network_ok,
         headers_synced: network_ok,
         sync_best_height: block_count,
         connected: network_ok,
+        startup_error: None,
+    }
+}
+
+fn connection_status_from_node_status(
+    expected_network: Network,
+    rpc_address: String,
+    status: NodeStatus,
+) -> ConnectionStatus {
+    let connected = status.network == expected_network && status.running;
+    ConnectionStatus {
+        network: status.network,
+        rpc_address,
+        block_count: status.block_count,
+        mempool_count: status.mempool_count,
+        mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+        peer_count: status.network_diagnostics.peer_count,
+        inbound_peer_count: status.network_diagnostics.inbound_peer_count,
+        outbound_peer_count: status.network_diagnostics.outbound_peer_count,
+        bytes_sent: status.network_diagnostics.bytes_sent,
+        bytes_received: status.network_diagnostics.bytes_received,
+        peers: status.network_diagnostics.peers,
+        running: status.running,
+        headers_synced: status.headers_synced,
+        sync_best_height: status.sync_best_height,
+        connected,
         startup_error: None,
     }
 }
@@ -695,7 +729,10 @@ mod tests {
     use super::*;
     use atho_node::miner::Miner;
     use atho_rpc::request::RpcRequest;
-    use atho_rpc::response::{MempoolInfo, NodeStatus, RpcResponse};
+    use atho_rpc::response::{
+        MempoolInfo, NetworkDiagnostics, NetworkPeerDiagnostics, NetworkPeerDirection, NodeStatus,
+        RpcResponse,
+    };
     use atho_rpc::transport::{read_message, write_message};
     use atho_storage::db::{ChainstateSnapshot, Database};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
@@ -769,6 +806,29 @@ mod tests {
                         running: true,
                         headers_synced: true,
                         sync_best_height: block_count,
+                        network_diagnostics: NetworkDiagnostics {
+                            peer_count: 1,
+                            inbound_peer_count: 0,
+                            outbound_peer_count: 1,
+                            bytes_sent: 2_048,
+                            bytes_received: 4_096,
+                            peers: vec![NetworkPeerDiagnostics {
+                                remote_addr: String::from("74.208.219.116:56000"),
+                                direction: NetworkPeerDirection::Outbound,
+                                handshake_ready: true,
+                                best_height: Some(block_count),
+                                protocol_version: Some(1),
+                                services: Some(9),
+                                user_agent: Some(String::from("/Atho:0.1.0/")),
+                                ruleset_version: Some(1),
+                                bytes_sent: 2_048,
+                                bytes_received: 4_096,
+                                last_send_unix: Some(1_777_416_445),
+                                last_receive_unix: Some(1_777_416_445),
+                                quality_score: Some(100),
+                                consecutive_failures: Some(0),
+                            }],
+                        },
                     }),
                     RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
                     RpcRequest::GetBlockCount => RpcResponse::BlockCount(block_count),
@@ -857,6 +917,12 @@ mod tests {
         assert_eq!(status.mempool_count, 3);
         assert_eq!(status.mempool_total_fee_atoms, 55);
         assert_eq!(status.sync_best_height, 42);
+        assert_eq!(status.peer_count, 1);
+        assert_eq!(status.outbound_peer_count, 1);
+        assert_eq!(status.bytes_sent, 2_048);
+        assert_eq!(status.bytes_received, 4_096);
+        assert_eq!(status.peers.len(), 1);
+        assert_eq!(status.peers[0].remote_addr, "74.208.219.116:56000");
         assert_eq!(
             conn.request(RpcRequest::GetNetwork),
             RpcResponse::Network(String::from("atho-mainnet"))

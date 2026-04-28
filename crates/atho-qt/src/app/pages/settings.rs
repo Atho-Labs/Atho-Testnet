@@ -1,7 +1,9 @@
 use crate::app::{
     widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage, OpenWalletForm,
 };
+use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
@@ -221,5 +223,129 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             "Mempool fees: {} atoms",
             app.view_model.mempool_total_fee_atoms
         ));
+        ui.label(format!(
+            "Connected peers: {} (inbound {} / outbound {})",
+            app.view_model.peer_count,
+            app.view_model.inbound_peer_count,
+            app.view_model.outbound_peer_count
+        ));
+        ui.label(format!(
+            "Network traffic: sent {} / received {}",
+            format_bytes(app.view_model.bytes_sent),
+            format_bytes(app.view_model.bytes_received)
+        ));
     });
+
+    ui.add_space(14.0);
+    widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Peer Diagnostics");
+        ui.add_space(12.0);
+        widgets::muted_label(
+            ui,
+            "Peer details are shown only in this local diagnostics view. Public RPC remains loopback-only by default.",
+        );
+        ui.add_space(12.0);
+        if app.view_model.peers.is_empty() {
+            widgets::muted_label(ui, "No connected peers.");
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .max_height(260.0)
+            .show(ui, |ui| {
+                egui::Grid::new("peer_diagnostics_grid")
+                    .num_columns(10)
+                    .spacing([12.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Dir");
+                        ui.strong("Endpoint");
+                        ui.strong("State");
+                        ui.strong("Height");
+                        ui.strong("Proto");
+                        ui.strong("Agent");
+                        ui.strong("Sent");
+                        ui.strong("Recv");
+                        ui.strong("Last Rx");
+                        ui.strong("Quality");
+                        ui.end_row();
+
+                        for peer in &app.view_model.peers {
+                            ui.label(peer_direction_label(peer.direction));
+                            ui.label(&peer.remote_addr);
+                            ui.label(if peer.handshake_ready {
+                                "Ready"
+                            } else {
+                                "Handshake"
+                            });
+                            ui.label(
+                                peer.best_height
+                                    .map(|height| height.to_string())
+                                    .unwrap_or_else(|| String::from("-")),
+                            );
+                            ui.label(
+                                peer.protocol_version
+                                    .map(|version| version.to_string())
+                                    .unwrap_or_else(|| String::from("-")),
+                            );
+                            ui.label(
+                                peer.user_agent
+                                    .clone()
+                                    .unwrap_or_else(|| String::from("-")),
+                            );
+                            ui.label(format_bytes(peer.bytes_sent));
+                            ui.label(format_bytes(peer.bytes_received));
+                            ui.label(format_recent(peer.last_receive_unix));
+                            ui.label(format_quality(peer));
+                            ui.end_row();
+                        }
+                    });
+            });
+    });
+}
+
+fn peer_direction_label(direction: NetworkPeerDirection) -> &'static str {
+    match direction {
+        NetworkPeerDirection::Inbound => "In",
+        NetworkPeerDirection::Outbound => "Out",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+
+    if bytes >= MIB as u64 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= KIB as u64 {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_recent(last_unix: Option<u64>) -> String {
+    let Some(last_unix) = last_unix else {
+        return String::from("-");
+    };
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let age = now_unix.saturating_sub(last_unix);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else {
+        format!("{}h ago", age / 3600)
+    }
+}
+
+fn format_quality(peer: &NetworkPeerDiagnostics) -> String {
+    match (peer.quality_score, peer.consecutive_failures) {
+        (Some(score), Some(failures)) => format!("{score} / fail {failures}"),
+        (Some(score), None) => score.to_string(),
+        _ => String::from("-"),
+    }
 }

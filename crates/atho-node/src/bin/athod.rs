@@ -181,6 +181,36 @@ fn show_status(args: &[String]) -> Result<(), String> {
     println!("mempool_count={}", status.mempool_count);
     println!("mempool_total_fee_atoms={}", status.mempool_total_fee_atoms);
     println!("sync_best_height={}", status.sync_best_height);
+    println!("peer_count={}", status.network_diagnostics.peer_count);
+    println!(
+        "peer_count_inbound={}",
+        status.network_diagnostics.inbound_peer_count
+    );
+    println!(
+        "peer_count_outbound={}",
+        status.network_diagnostics.outbound_peer_count
+    );
+    println!("bytes_sent={}", status.network_diagnostics.bytes_sent);
+    println!(
+        "bytes_received={}",
+        status.network_diagnostics.bytes_received
+    );
+    if !status.network_diagnostics.peers.is_empty() {
+        println!("peers:");
+        for peer in &status.network_diagnostics.peers {
+            println!(
+                "- {} dir={:?} ready={} height={:?} proto={:?} sent={} recv={} quality={:?}",
+                peer.remote_addr,
+                peer.direction,
+                peer.handshake_ready,
+                peer.best_height,
+                peer.protocol_version,
+                peer.bytes_sent,
+                peer.bytes_received,
+                peer.quality_score
+            );
+        }
+    }
 
     if let Ok(lines) = atho_node::dev::recent_activity_lines(8) {
         if !lines.is_empty() {

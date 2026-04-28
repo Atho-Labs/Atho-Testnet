@@ -73,6 +73,7 @@ Why:
 
 - normal users should have a one-command desktop path
 - operators should still be able to point the client at a separately managed node
+- the settings page should expose local diagnostics similar in spirit to Bitcoin Core without turning public RPC into a topology leak
 
 ## Runtime Root
 
@@ -126,6 +127,8 @@ Why:
 ## Related Documentation
 
 - [Commands](commands.md)
+- [Linux Quick Start](linux-quick-start.md)
+- [macOS Quick Start](macos-quick-start.md)
 - [Windows Quick Start](windows-quick-start.md)
 - [VPS Full Node](vps-full-node.md)
 - [RPC and Client Backend](../node-runtime/rpc-and-client.md)

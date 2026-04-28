@@ -299,6 +299,12 @@ impl DesktopApp {
         self.view_model.block_count = status.block_count;
         self.view_model.mempool_count = status.mempool_count;
         self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
+        self.view_model.peer_count = status.peer_count;
+        self.view_model.inbound_peer_count = status.inbound_peer_count;
+        self.view_model.outbound_peer_count = status.outbound_peer_count;
+        self.view_model.bytes_sent = status.bytes_sent;
+        self.view_model.bytes_received = status.bytes_received;
+        self.view_model.peers = status.peers.clone();
         self.view_model.running = status.running;
         self.view_model.headers_synced = status.headers_synced;
         self.view_model.sync_best_height = status.sync_best_height.max(status.block_count);
@@ -2530,6 +2536,7 @@ mod tests {
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
     use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use std::ffi::OsString;
     use std::fs;
@@ -2813,6 +2820,52 @@ mod tests {
             LaunchPage::Welcome | LaunchPage::OpenWallet
         ));
         std::env::remove_var("ATHO_QT_LOCAL");
+    }
+
+    #[test]
+    fn desktop_app_applies_peer_diagnostics_from_connection_status() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.apply_connection_status(ConnectionStatus {
+            network: Network::Regnet,
+            rpc_address: String::from("127.0.0.1:18445"),
+            block_count: 12,
+            mempool_count: 1,
+            mempool_total_fee_atoms: 44,
+            peer_count: 2,
+            inbound_peer_count: 1,
+            outbound_peer_count: 1,
+            bytes_sent: 8_192,
+            bytes_received: 16_384,
+            peers: vec![NetworkPeerDiagnostics {
+                remote_addr: String::from("74.208.219.116:56000"),
+                direction: NetworkPeerDirection::Outbound,
+                handshake_ready: true,
+                best_height: Some(12),
+                protocol_version: Some(1),
+                services: Some(9),
+                user_agent: Some(String::from("/Atho:0.1.0/")),
+                ruleset_version: Some(1),
+                bytes_sent: 4_096,
+                bytes_received: 12_288,
+                last_send_unix: Some(1_777_416_445),
+                last_receive_unix: Some(1_777_416_445),
+                quality_score: Some(100),
+                consecutive_failures: Some(0),
+            }],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 12,
+            connected: true,
+            startup_error: None,
+        });
+        assert_eq!(app.view_model.peer_count, 2);
+        assert_eq!(app.view_model.inbound_peer_count, 1);
+        assert_eq!(app.view_model.outbound_peer_count, 1);
+        assert_eq!(app.view_model.bytes_sent, 8_192);
+        assert_eq!(app.view_model.bytes_received, 16_384);
+        assert_eq!(app.view_model.peers.len(), 1);
+        assert_eq!(app.view_model.peers[0].remote_addr, "74.208.219.116:56000");
     }
 
     #[test]

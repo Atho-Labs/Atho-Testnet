@@ -129,6 +129,7 @@ Already exercised live:
 - wrong-network rejection on unsolicited internet traffic
 - remote full-node reconnect after VPS restart
 - one-block propagation from a remote peer into the VPS node
+- operator-local peer and traffic diagnostics over a real WAN peer
 
 Still incomplete:
 
@@ -137,6 +138,31 @@ Still incomplete:
 - compact block burst hardening
 - peer-served snapshot sync
 - long-run public peer mesh soak coverage
+
+## Operator Diagnostics
+
+Operator-local diagnostics currently surface:
+
+- total connected peers
+- inbound/outbound split
+- per-peer endpoint
+- per-peer handshake-ready state
+- per-peer best height
+- per-peer protocol metadata
+- cumulative sent and received bytes
+
+Implemented in:
+
+- `crates/atho-node/src/service.rs`
+- `crates/atho-node/src/tcp_p2p.rs`
+- `crates/atho-node/src/bin/athod.rs`
+- `crates/atho-qt/src/connection.rs`
+- `crates/atho-qt/src/app/pages/settings.rs`
+
+Why:
+
+- operators need enough visibility to diagnose sync and propagation problems
+- public RPC still stays loopback-only by default so these details are not exposed to the network by accident
 
 That is an intentional documentation point, not a hidden omission.
 

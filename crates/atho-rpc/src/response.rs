@@ -47,6 +47,40 @@ pub struct WalletActivityEntry {
     pub txid: [u8; 48],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkPeerDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPeerDiagnostics {
+    pub remote_addr: String,
+    pub direction: NetworkPeerDirection,
+    pub handshake_ready: bool,
+    pub best_height: Option<u64>,
+    pub protocol_version: Option<u32>,
+    pub services: Option<u64>,
+    pub user_agent: Option<String>,
+    pub ruleset_version: Option<u32>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub last_send_unix: Option<u64>,
+    pub last_receive_unix: Option<u64>,
+    pub quality_score: Option<u32>,
+    pub consecutive_failures: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NetworkDiagnostics {
+    pub peer_count: usize,
+    pub inbound_peer_count: usize,
+    pub outbound_peer_count: usize,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub peers: Vec<NetworkPeerDiagnostics>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub network: Network,
@@ -56,6 +90,7 @@ pub struct NodeStatus {
     pub running: bool,
     pub headers_synced: bool,
     pub sync_best_height: u64,
+    pub network_diagnostics: NetworkDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
