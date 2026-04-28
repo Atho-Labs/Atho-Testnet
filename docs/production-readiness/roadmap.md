@@ -2,50 +2,38 @@
 
 ## Priority Order
 
-This roadmap is ordered by risk reduction and payoff, not by novelty.
+This roadmap is ordered by operational risk reduction and payoff, not by novelty.
 
-## 1. Finish The Live Peer Runtime
+## 1. Harden The Live Peer Runtime
 
 Build:
 
-- TCP inbound/outbound loop
-- timeouts and disconnect handling
-- handshake integration
-- real headers-first sync across processes
+- long multi-peer soak coverage
+- latency and packet-loss harnesses
+- ban/subnet enforcement integration tests
+- broader propagation benchmarks
 
 Why first:
 
-- the current network layer is a strong foundation, but public-node claims are premature without a real runtime
+- the real runtime exists now, but public-node claims are still premature without broader churn and soak coverage
 
-## 2. Replace Wallet Ledger Reconstruction
-
-Build:
-
-- canonical backend history API
-- wallet-history queries that do not depend on TSV exports
-- Qt history sourced from backend truth
-
-Why second:
-
-- it is the biggest remaining product-integrity gap in the wallet/GUI boundary
-
-## 3. Harden Pruning And Snapshot Paths
+## 2. Harden Pruning And Snapshot Paths
 
 Build:
 
-- execution coverage for pruning
-- snapshot sync scaffolding
+- deeper pruning execution coverage
+- peer-served snapshot sync scaffolding
 - pruning/reorg interaction tests
 
 Why:
 
 - storage maturity is incomplete without state-lifecycle coverage beyond the full-history path
 
-## 4. Add Schema Migration And Repair Tooling
+## 3. Expand Schema Migration And Repair Tooling
 
 Build:
 
-- versioned migrations
+- broader versioned migrations
 - reindex/repair commands
 - explicit operator guidance for upgrade failures
 
@@ -53,20 +41,19 @@ Why:
 
 - reject-and-quarantine is safe, but not sufficient for long-lived deployments
 
-## 5. Add Live Multi-Node Integration Tests
+## 4. Add Live Multi-Node Integration Soaks
 
 Build:
 
-- two-node TCP handshake
-- block relay
-- tx relay
 - reorg over live peers
+- multi-peer propagation races
+- long reconnect churn coverage
 
 Why:
 
-- the network layer needs end-to-end proof, not just module-level tests
+- the network layer now needs scale and churn proof, not just existence proof
 
-## 6. Add OS-Level Qt Automation
+## 5. Add OS-Level Qt Automation
 
 Build:
 
@@ -78,7 +65,7 @@ Why:
 
 - method-level UI tests are not a full product verification substitute
 
-## 7. Activate A Real V2 Test Ruleset
+## 6. Activate A Real V2 Test Ruleset
 
 Build:
 
@@ -90,7 +77,7 @@ Why:
 
 - upgrade scaffolding is only proven once a real rule passes through it
 
-## 8. Strengthen Delivery And Release Discipline
+## 7. Strengthen Delivery And Release Discipline
 
 Build:
 

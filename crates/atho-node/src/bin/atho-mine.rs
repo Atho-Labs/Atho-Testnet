@@ -4,6 +4,28 @@ use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MinerCli {
+    network: Option<Network>,
+    rpc_addr: Option<String>,
+    data_dir: Option<String>,
+    cores: Option<usize>,
+}
+
+impl MinerCli {
+    fn apply_env(&self) {
+        if let Some(network) = self.network {
+            std::env::set_var("ATHO_NETWORK", network.cli_arg());
+        }
+        if let Some(data_dir) = &self.data_dir {
+            std::env::set_var(atho_storage::path::ATHO_DATA_DIR_ENV, data_dir);
+        }
+        if let Some(rpc_addr) = &self.rpc_addr {
+            std::env::set_var("ATHO_RPC_ADDR", rpc_addr);
+        }
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -17,14 +39,19 @@ fn run() -> Result<(), String> {
         print_usage();
         return Ok(());
     }
-    let network = network_from_args(&args)?.unwrap_or_else(default_network);
-    let cores = cores_from_args(&args)?.unwrap_or_else(|| {
+    let cli = parse_cli(&args)?;
+    cli.apply_env();
+    let network = cli.network.unwrap_or_else(default_network);
+    let cores = cli.cores.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
     });
     let miner = Miner::new(cores as u32);
-    let rpc_address = rpc_addr_from_args(&args)?.unwrap_or_else(|| default_rpc_address(network));
+    let rpc_address = cli
+        .rpc_addr
+        .clone()
+        .unwrap_or_else(|| default_rpc_address(network));
     let client = RpcClient::new(rpc_address.clone());
     let _ = atho_node::dev::append_log(
         "miner",
@@ -87,43 +114,25 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn network_from_args(args: &[String]) -> Result<Option<Network>, String> {
+fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
+    let mut cli = MinerCli::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
             "mainnet" | "testnet" | "regnet" | "regtest" => {
-                return Ok(parse_network(&args[i]));
+                cli.network = parse_network(&args[i]);
+                i += 1;
             }
             "--network" | "-n" => {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "missing network value".to_string())?;
-                return parse_network(value)
-                    .ok_or_else(|| format!("invalid network {value}"))
-                    .map(Some);
-            }
-            "--cores" | "-c" => {
+                cli.network = parse_network(value);
+                if cli.network.is_none() {
+                    return Err(format!("invalid network {value}"));
+                }
                 i += 2;
             }
-            value if value.starts_with('-') => {
-                return Err(format!("unrecognized argument {value}"));
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn parse_network(value: &str) -> Option<Network> {
-    Network::parse(value)
-}
-
-fn cores_from_args(args: &[String]) -> Result<Option<usize>, String> {
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
             "--cores" | "-c" => {
                 let value = args
                     .get(i + 1)
@@ -134,28 +143,35 @@ fn cores_from_args(args: &[String]) -> Result<Option<usize>, String> {
                 if cores == 0 {
                     return Err("cores must be at least 1".to_string());
                 }
-                return Ok(Some(cores));
+                cli.cores = Some(cores);
+                i += 2;
             }
-            _ => i += 1,
+            "--rpc-addr" => {
+                cli.rpc_addr = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| "missing rpc address value".to_string())?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--data-dir" => {
+                cli.data_dir = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| "missing data directory value".to_string())?
+                        .clone(),
+                );
+                i += 2;
+            }
+            value => {
+                return Err(format!("unrecognized argument {value}"));
+            }
         }
     }
-    Ok(None)
+    Ok(cli)
 }
 
-fn rpc_addr_from_args(args: &[String]) -> Result<Option<String>, String> {
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--rpc-addr" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "missing rpc address value".to_string())?;
-                return Ok(Some(value.clone()));
-            }
-            _ => i += 1,
-        }
-    }
-    Ok(None)
+fn parse_network(value: &str) -> Option<Network> {
+    Network::parse(value)
 }
 
 fn default_network() -> Network {
@@ -165,11 +181,33 @@ fn default_network() -> Network {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  atho-mine [mainnet|testnet|regnet]");
-    eprintln!("  atho-mine --network <mainnet|testnet|regnet> [--cores N] [--rpc-addr HOST:PORT]");
-    eprintln!("  ATHO_NETWORK=<network> atho-mine [--cores N]");
+    eprintln!("  atho-mine [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH]");
 }
 
 fn default_rpc_address(network: Network) -> String {
     atho_node::runtime::rpc_bind_address(network)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn miner_cli_parses_runtime_flags() {
+        let args = vec![
+            String::from("--network"),
+            String::from("regnet"),
+            String::from("--rpc-addr"),
+            String::from("127.0.0.1:9210"),
+            String::from("--cores"),
+            String::from("4"),
+            String::from("--data-dir"),
+            String::from("/tmp/atho"),
+        ];
+        let parsed = parse_cli(&args).expect("parse");
+        assert_eq!(parsed.network, Some(Network::Regnet));
+        assert_eq!(parsed.rpc_addr.as_deref(), Some("127.0.0.1:9210"));
+        assert_eq!(parsed.cores, Some(4));
+        assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
+    }
 }

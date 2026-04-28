@@ -517,12 +517,18 @@ fn start_local_node_if_needed(
             .arg("--bin")
             .arg("athod")
             .arg("--")
-            .arg("run")
-            .arg(network.cli_arg());
+            .arg("--network")
+            .arg(network.cli_arg())
+            .arg("--rpc-addr")
+            .arg(rpc_address);
         command
     } else if let Some(binary) = node_binary_path() {
         let mut command = Command::new(binary);
-        command.arg("run").arg(network.cli_arg());
+        command
+            .arg("--network")
+            .arg(network.cli_arg())
+            .arg("--rpc-addr")
+            .arg(rpc_address);
         command
     } else {
         let _ = atho_node::dev::append_log(
@@ -540,8 +546,10 @@ fn start_local_node_if_needed(
             .arg("--bin")
             .arg("athod")
             .arg("--")
-            .arg("run")
-            .arg(network.cli_arg());
+            .arg("--network")
+            .arg(network.cli_arg())
+            .arg("--rpc-addr")
+            .arg(rpc_address);
         command
     };
     let (stdout, stderr) = local_node_stdio(network)?;

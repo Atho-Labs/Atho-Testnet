@@ -14,11 +14,7 @@ pub fn data_dir(network: Network) -> &'static str {
 pub fn sandbox_root() -> PathBuf {
     std::env::var_os(ATHO_DATA_DIR_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("dev")
-        })
+        .unwrap_or_else(default_operator_root)
 }
 
 pub fn data_root() -> PathBuf {
@@ -39,4 +35,56 @@ pub fn chain_dir() -> PathBuf {
 
 pub fn quarantine_dir() -> PathBuf {
     sandbox_root().join("quarantine")
+}
+
+fn default_operator_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("dev");
+    }
+
+    #[cfg(not(test))]
+    {
+        platform_data_home().join("Atho")
+    }
+}
+
+#[cfg(not(test))]
+fn platform_data_home() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .map(|path| path.join("AppData").join("Roaming"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library")
+            .join("Application Support")
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|path| path.join(".local").join("share")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+#[cfg(not(test))]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }

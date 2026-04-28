@@ -180,6 +180,10 @@ pub fn rpc_bind_address(network: Network) -> String {
     if let Ok(address) = std::env::var("ATHO_RPC_ADDR") {
         return address;
     }
+    default_rpc_bind_address(network)
+}
+
+pub fn default_rpc_bind_address(network: Network) -> String {
     match network {
         Network::Mainnet => String::from("127.0.0.1:18443"),
         Network::Testnet => String::from("127.0.0.1:18444"),
@@ -218,7 +222,13 @@ pub fn p2p_bind_address(network: Network) -> String {
     if let Ok(address) = std::env::var("ATHO_P2P_ADDR") {
         return address;
     }
-    format!("127.0.0.1:{}", network.p2p_port())
+    default_p2p_bind_address(network)
+}
+
+pub fn default_p2p_bind_address(network: Network) -> String {
+    // P2P is the public node interface. Defaulting it to a routable bind makes a freshly
+    // deployed VPS node actually reachable without extra operator discovery.
+    format!("0.0.0.0:{}", network.p2p_port())
 }
 
 pub fn p2p_peer_addresses() -> Vec<String> {
@@ -273,6 +283,12 @@ mod tests {
     #[test]
     fn rpc_bind_validation_accepts_loopback_addresses() {
         assert!(validate_rpc_bind_address("127.0.0.1:18443").is_ok());
+    }
+
+    #[test]
+    fn default_p2p_bind_is_public_for_vps_nodes() {
+        std::env::remove_var("ATHO_P2P_ADDR");
+        assert_eq!(p2p_bind_address(Network::Mainnet), "0.0.0.0:56000");
     }
 
     #[test]

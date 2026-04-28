@@ -9,7 +9,7 @@ That means:
 - the protocol core lives in dedicated crates
 - storage, wallet, networking, RPC, node runtime, and GUI are separated
 - operational docs are centralized under `docs/`
-- local runtime artifacts stay under `dev/`
+- repo-local sandbox artifacts can stay under `dev/` when explicitly requested
 - staged release artifacts stay under `dist/`
 
 This keeps the trusted core auditable and avoids mixing design notes, runtime state, and build outputs at repo root.
@@ -98,7 +98,7 @@ Owns project automation such as release staging.
 
 ### `dev/`
 
-Owns sandbox runtime state only:
+Owns optional repo-local sandbox state only:
 
 - logs
 - local databases
@@ -106,7 +106,7 @@ Owns sandbox runtime state only:
 - wallet files
 - quarantine output
 
-It is not a documentation source.
+It is not the default operator root and it is not a documentation source.
 
 ### `dist/`
 

@@ -121,16 +121,15 @@ Why:
 
 ## Current Network Limitations
 
-The current implementation is a protocol foundation, not a finished peer runtime.
+The current implementation has a real live runtime, but it is not yet a finished production peer mesh.
 
-Not yet complete:
+Still incomplete:
 
-- live TCP inbound/outbound loop in the daemon
 - DNS seed bootstrap
-- parallel block downloader
-- compact block relay
-- snapshot sync
-- public peer mesh hardening
+- broader parallel downloader stress coverage
+- compact block burst hardening
+- peer-served snapshot sync
+- long-run public peer mesh soak coverage
 
 That is an intentional documentation point, not a hidden omission.
 

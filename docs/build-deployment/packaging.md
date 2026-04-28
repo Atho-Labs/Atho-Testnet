@@ -9,7 +9,10 @@ The packaging flow stages a minimal local release bundle without pretending to b
 The local package script stages:
 
 - `athod`
+- `atho-mine`
 - `atho-qt`
+- `README.md`
+- `COMMANDS.md`
 - `RELEASE_NOTES.md`
 - `PACKAGING.md`
 

@@ -45,6 +45,18 @@ Why:
 
 - for a local-first client/backend boundary, simple framed JSON is easier to debug and stabilize than a custom binary API
 
+## Runtime Security Defaults
+
+Current operator defaults:
+
+- RPC binds to loopback
+- public RPC binds are refused unless the operator explicitly opts in
+- desktop local-node startup stays on the same RPC path as external clients
+
+Why:
+
+- a private-by-default RPC surface is the correct operational default for VPS nodes and local desktop users
+
 ## Service Ownership
 
 Mutable node actions are handled by `NodeService`, which:
@@ -81,6 +93,7 @@ Why:
 - authentication is still local-development-oriented, not production-hardened
 - there is no public API profile intended for hostile networks
 - request-rate hardening is still light
+- malformed-request fuzz coverage is started, but not yet broad
 
 ## Related Documentation
 

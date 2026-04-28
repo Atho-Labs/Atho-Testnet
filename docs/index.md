@@ -41,6 +41,9 @@ It is designed to answer three questions clearly:
 ## Operations And Delivery
 
 - [Commands](operations/commands.md)
+- [Runtime Model](operations/runtime-model.md)
+- [Windows Quick Start](operations/windows-quick-start.md)
+- [VPS Full Node](operations/vps-full-node.md)
 - [Dev Workspace](operations/dev-workspace.md)
 - [Troubleshooting](operations/troubleshooting.md)
 - [Build and Packaging](build-deployment/packaging.md)
@@ -66,6 +69,6 @@ As of the latest sandbox hardening pass:
 - the Qt client follows the real backend tip through RPC
 - the node can mine, validate, persist, reload, and reorg locally
 - DNS seeds are intentionally blank
-- the live TCP peer runtime is still a remaining buildout item
+- the live TCP peer runtime exists, but still needs broader public-network hardening and soak coverage
 
 For the explicit rating, blockers, and missing pieces, use the production-readiness section instead of inferring from the code layout.

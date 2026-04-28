@@ -2408,8 +2408,7 @@ impl DesktopApp {
 }
 
 fn default_wallet_path(network: Network) -> PathBuf {
-    let base = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join(".atho")
+    atho_node::dev::wallet_dir()
         .join(network.id())
         .join(Wallet::datafile_name())
 }
@@ -2423,12 +2422,6 @@ fn alternate_wallet_path(network: Network) -> PathBuf {
 
 fn backup_wallet_path(wallet_path: &str) -> String {
     format!("{wallet_path}.backup")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn available_mining_cores() -> u32 {

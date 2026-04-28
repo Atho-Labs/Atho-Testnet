@@ -1,19 +1,82 @@
 # Commands
 
-This is the operator guide for building, testing, running, resetting, mining, and packaging Atho.
+This is the canonical operator command guide for Atho.
+
+## Stable Entry Points
+
+There are three primary binaries:
+
+1. `athod`
+2. `atho-mine`
+3. `atho-qt`
+
+Recommended roles:
+
+- `athod`: full node / daemon / VPS node
+- `atho-mine`: standalone miner process
+- `atho-qt`: desktop wallet and client
+
+## Quick Start
+
+Full node:
+
+```bash
+cargo run -p atho-node --bin athod -- --network mainnet
+```
+
+Desktop client with a managed local node:
+
+```bash
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+```
+
+Standalone miner:
+
+```bash
+cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:9210
+```
+
+## Data Root
+
+Default Atho runtime root:
+
+- macOS: `~/Library/Application Support/Atho`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/Atho`
+- Windows: `%APPDATA%\\Atho`
+
+Override it explicitly:
+
+```bash
+--data-dir /absolute/path
+```
+
+or:
+
+```bash
+export ATHO_DATA_DIR=/absolute/path
+```
+
+The runtime root contains:
+
+- `db/`
+- `logs/`
+- `wallet/`
+- `chain/`
+- `audit/`
+- `quarantine/`
 
 ## Build
 
-Check the full workspace:
+Check the workspace:
 
 ```bash
 cargo check
 ```
 
-Compile tests without executing them:
+Build release binaries:
 
 ```bash
-cargo test --workspace --no-run
+cargo build --release -p atho-node -p atho-qt
 ```
 
 ## Test
@@ -22,12 +85,6 @@ Run the full workspace:
 
 ```bash
 cargo test
-```
-
-Run the main crates only:
-
-```bash
-cargo test -p atho-core -p atho-crypto -p atho-storage -p atho-wallet -p atho-p2p -p atho-rpc -p atho-node -p atho-qt
 ```
 
 Run the adversarial campaign:
@@ -42,54 +99,94 @@ Run the targeted attack sweep:
 cargo run -p atho-node --bin atho-attack -- --network regnet
 ```
 
-## Node
+## Full Node
 
-Run the node on a specific network:
-
-```bash
-cargo run -p atho-node --bin athod -- run mainnet
-cargo run -p atho-node --bin athod -- run testnet
-cargo run -p atho-node --bin athod -- run regnet
-```
-
-Inspect node status:
+Preferred command:
 
 ```bash
-cargo run -p atho-node --bin athod -- status mainnet
+cargo run -p atho-node --bin athod -- --network mainnet
 ```
 
-Verify hardcoded genesis/bootstrap state:
+Useful flags:
+
+- `--network <mainnet|testnet|regnet>`
+- `--data-dir PATH`
+- `--rpc-addr HOST:PORT`
+- `--p2p-addr HOST:PORT`
+- `--peer HOST:PORT` (repeatable)
+- `--public-rpc`
+
+Examples:
 
 ```bash
-cargo run -p atho-node --bin athod -- verify mainnet
-cargo run -p atho-node --bin athod -- verify testnet
-cargo run -p atho-node --bin athod -- verify regnet
+cargo run -p atho-node --bin athod -- --network regnet --data-dir /tmp/atho-regnet
+cargo run -p atho-node --bin athod -- --network mainnet --peer 198.51.100.10:56000 --peer 198.51.100.11:56000
+cargo run -p atho-node --bin athod -- --network mainnet --rpc-addr 127.0.0.1:9010
 ```
 
-## Qt Client
+Status:
 
-Run against an explicit RPC address:
+```bash
+cargo run -p atho-node --bin athod -- status --network mainnet
+cargo run -p atho-node --bin athod -- status --rpc-addr 127.0.0.1:9010
+```
+
+Verification:
+
+```bash
+cargo run -p atho-node --bin athod -- verify --network mainnet
+```
+
+Important:
+
+- RPC is local-only by default
+- P2P listens publicly by default
+- DNS seeds are still blank, so use `--peer` for live bootstrap
+
+## Desktop Client
+
+Attach to an existing node:
 
 ```bash
 cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:9010
 ```
 
-Run with a managed local node:
+Start a managed local node:
 
 ```bash
 cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
 ```
 
-Use `testnet` or `regnet` for faster sandbox work.
+Managed local node with explicit bootstrap peers:
+
+```bash
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 198.51.100.10:56000
+```
+
+Useful flags:
+
+- `--network <mainnet|testnet|regnet>`
+- `--rpc-addr HOST:PORT`
+- `--local-node`
+- `--peer HOST:PORT` (repeatable)
+- `--p2p-addr HOST:PORT`
+- `--data-dir PATH`
 
 ## Miner
 
-Run the daemon and standalone miner:
+Run the node first, then the miner:
 
 ```bash
-cargo run -p atho-node --bin athod -- run regnet
+cargo run -p atho-node --bin athod -- --network regnet
 cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:9210
 ```
+
+Useful flags:
+
+- `--network <mainnet|testnet|regnet>`
+- `--rpc-addr HOST:PORT`
+- `--cores N`
+- `--data-dir PATH`
 
 ## Wallet Tools
 
@@ -103,31 +200,29 @@ cargo run -p atho-wallet --bin atho-address -- inspect A...
 
 ## Dev Workspace
 
-Wipe disposable local state:
+Wipe disposable state:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev wipe
+cargo run -p atho-node --bin athod -- dev wipe --data-dir /tmp/atho-dev
 ```
 
-Reset a network from genesis:
+Reset from genesis:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev reset mainnet
-cargo run -p atho-node --bin athod -- dev reset testnet
-cargo run -p atho-node --bin athod -- dev reset regnet
+cargo run -p atho-node --bin athod -- dev reset --network regnet --data-dir /tmp/atho-dev
 ```
 
-Watch the shared activity log:
+Watch logs:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev watch
+cargo run -p atho-node --bin athod -- dev watch --data-dir /tmp/atho-dev
 ```
 
-Export chain and transaction TSVs:
+Export TSV audit views:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev export chain
-cargo run -p atho-node --bin athod -- dev export tx
+cargo run -p atho-node --bin athod -- dev export chain --data-dir /tmp/atho-dev
+cargo run -p atho-node --bin athod -- dev export tx --data-dir /tmp/atho-dev
 ```
 
 ## Packaging
@@ -138,31 +233,35 @@ Stage local release artifacts:
 ./scripts/package.sh
 ```
 
-## Environment
+Current staged files:
 
-Override the sandbox root:
+- `athod`
+- `atho-mine`
+- `atho-qt`
+- `README.md`
+- `COMMANDS.md`
+- `RELEASE_NOTES.md`
+- `PACKAGING.md`
+
+## Deprecated Launch Forms
+
+Still supported for compatibility, but no longer recommended:
+
+- `athod run mainnet`
+- `athod run testnet`
+- `athod run regnet`
+
+Preferred form:
 
 ```bash
-export ATHO_DATA_DIR=/absolute/path/to/sandbox
+athod --network mainnet
 ```
-
-This controls where Atho writes local databases, logs, chain exports, wallet files, and quarantine output.
 
 ## Related Documentation
 
+- [Runtime Model](runtime-model.md)
+- [Windows Quick Start](windows-quick-start.md)
+- [VPS Full Node](vps-full-node.md)
 - [Dev Workspace](dev-workspace.md)
 - [Build and Packaging](../build-deployment/packaging.md)
 - [Troubleshooting](troubleshooting.md)
-
-```bash
-cargo run -p atho-node --bin athod -- run mainnet
-cargo run -p atho-node --bin atho-mine -- --network mainnet --rpc-addr 127.0.0.1:18443
-```
-
-## Consensus Notes
-
-- All amounts are integer atoms.
-- Minimum transaction fee policy is `1 atom/vbyte`.
-- Witness input references are fixed-size and collision-resistant.
-- The block pruning retention target is `70,000` blocks.
-- Mainnet, testnet, and regnet initial targets are hardcoded in `consensus::pow`.

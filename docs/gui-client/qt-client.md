@@ -45,6 +45,7 @@ Current behavior:
 
 - runtime uses RPC for real node interaction
 - `--local-node` can manage a local node child process
+- `--peer` and `--p2p-addr` can be passed through when DNS seeds are unavailable
 - tests can still use an in-process backend hook for deterministic lifecycle coverage
 
 Why:
@@ -83,14 +84,13 @@ Why:
 
 - incorrect tip display is a product-level trust failure even if the backend is correct
 
-## Current Limitation
+## Current Limitations
 
-The biggest remaining GUI-model issue is wallet history:
+The biggest remaining GUI limitations are now:
 
-- balances and UTXO ownership are backend-backed
-- transaction history still depends on TSV ledger reconstruction in `wallet_ledger.rs`
-
-That means the Qt client is operationally useful but not yet at a Bitcoin-Core-grade wallet-model separation.
+- no full OS-level automation in CI
+- the client module is still larger than ideal
+- local-node bootstrap still depends on manual peers until DNS seeds exist
 
 ## Related Documentation
 

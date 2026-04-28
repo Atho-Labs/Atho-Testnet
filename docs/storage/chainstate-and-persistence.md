@@ -123,8 +123,14 @@ Why:
 
 Current data-root logic:
 
-- if `ATHO_DATA_DIR` is set, use it as the sandbox root
-- otherwise, use `./dev`
+- if `ATHO_DATA_DIR` is set, use it as the explicit Atho runtime root
+- otherwise, use an OS-native Atho application directory
+
+Default root by platform:
+
+- macOS: `~/Library/Application Support/Atho`
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/Atho`
+- Windows: `%APPDATA%\\Atho`
 
 Derived subpaths:
 
@@ -134,11 +140,8 @@ Derived subpaths:
 
 Why:
 
-- sandboxed local runs need predictable, isolated state
-
-Current limitation:
-
-- the default still depends on the current working directory when `ATHO_DATA_DIR` is unset
+- operators need a stable data location by default
+- developers still need an explicit override for disposable sandbox runs
 
 ## Chain Exports
 
@@ -155,7 +158,7 @@ Why:
 
 ## Current Limitations
 
-- no schema migration framework yet
+- schema migration coverage is still narrow
 - no offline repair/reindex tool beyond quarantine and rebuild
 - pruning-depth recovery is conservative
 
