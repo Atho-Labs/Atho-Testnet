@@ -1,5 +1,6 @@
 use crate::block::{merkle_root, witness_root, Block, BlockHeader};
 use crate::consensus::pow;
+use crate::consensus::rules::{BLOCK_VERSION_V1, TRANSACTION_VERSION_V1};
 use crate::constants::GENESIS_COINBASE_ATOMS;
 use crate::network::Network;
 use crate::transaction::{Transaction, TxOutput};
@@ -9,8 +10,8 @@ const MAINNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHO9529a6358612b193cc100b4150f46235505a948caacf331b15a171993ad3124c008f45d692886ecc6417aa6ab964488c";
 const MAINNET_GENESIS_REWARD_SCRIPT: [u8; 48] =
     hex!("9529a6358612b193cc100b4150f46235505a948caacf331b15a171993ad3124c008f45d692886ecc6417aa6ab964488c");
-const MAINNET_GENESIS_BLOCK_VERSION: u16 = 1;
-const MAINNET_GENESIS_TX_VERSION: u16 = 1;
+const MAINNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
+const MAINNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const MAINNET_GENESIS_LOCK_TIME: u32 = 0;
 const MAINNET_GENESIS_TIMESTAMP: u64 = 1_773_360_488;
 const MAINNET_GENESIS_NONCE: u64 = 135_392;
@@ -26,8 +27,8 @@ const TESTNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHT22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
 const TESTNET_GENESIS_REWARD_SCRIPT: [u8; 48] =
     hex!("22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee");
-const TESTNET_GENESIS_BLOCK_VERSION: u16 = 1;
-const TESTNET_GENESIS_TX_VERSION: u16 = 1;
+const TESTNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
+const TESTNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const TESTNET_GENESIS_LOCK_TIME: u32 = 0;
 const TESTNET_GENESIS_TIMESTAMP: u64 = 1_773_360_489;
 const TESTNET_GENESIS_NONCE: u64 = 31_066;
@@ -41,8 +42,8 @@ const TESTNET_GENESIS_BLOCK_HASH: [u8; 48] =
 
 const REGNET_GENESIS_REWARD_ADDRESS: &str = TESTNET_GENESIS_REWARD_ADDRESS;
 const REGNET_GENESIS_REWARD_SCRIPT: [u8; 48] = TESTNET_GENESIS_REWARD_SCRIPT;
-const REGNET_GENESIS_BLOCK_VERSION: u16 = 1;
-const REGNET_GENESIS_TX_VERSION: u16 = 1;
+const REGNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
+const REGNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const REGNET_GENESIS_LOCK_TIME: u32 = 0;
 const REGNET_GENESIS_TIMESTAMP: u64 = TESTNET_GENESIS_TIMESTAMP;
 const REGNET_GENESIS_NONCE: u64 = 202_541;
@@ -297,7 +298,6 @@ fn genesis_state_from_parts(
         header,
         transactions: vec![coinbase],
         witnesses: Default::default(),
-        witness_root,
         fees_total_atoms: 0,
         fees_miner_atoms: 0,
         fees_burned_atoms: 0,
@@ -311,9 +311,8 @@ fn genesis_state_from_parts(
     assert_eq!(block.header.height, 0);
     assert_eq!(block.header.merkle_root, merkle_root);
     assert_eq!(block.header.witness_root, witness_root);
-    assert_eq!(block.witness_root, witness_root);
     assert_eq!(block.header.merkle_root, block.merkle_root());
-    assert_eq!(block.witness_root, block.compute_witness_root());
+    assert_eq!(block.header.witness_root, block.compute_witness_root());
     let block_hash = block.header.block_hash();
     assert_eq!(block_hash, expected_block_hash);
     assert!(pow::meets_target(
@@ -371,7 +370,7 @@ mod tests {
             MAINNET_GENESIS_REWARD_SCRIPT
         );
         assert_eq!(main.block.witnesses.len(), 0);
-        assert_eq!(main.block.witness_root, MAINNET_GENESIS_WITNESS_ROOT);
+        assert_eq!(main.block.header.witness_root, MAINNET_GENESIS_WITNESS_ROOT);
         assert_eq!(main.block.fees_total_atoms, 0);
         assert_eq!(main.block.fees_miner_atoms, 0);
         assert_eq!(main.block.fees_burned_atoms, 0);

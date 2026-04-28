@@ -14,11 +14,11 @@ pub struct DerivationPath {
     pub index: u32,
 }
 
-#[derive(Debug, PartialEq, Eq, Zeroize)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 #[zeroize(drop)]
 pub struct WalletSeed(pub [u8; 32]);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HdWallet {
     seed: WalletSeed,
     next_receive_index: u32,

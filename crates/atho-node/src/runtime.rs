@@ -43,6 +43,20 @@ impl NodeRuntime {
         }
     }
 
+    pub fn try_load_or_new(config: NodeConfig) -> Result<Self, NodeError> {
+        Ok(Self {
+            node: Node::try_load_or_new(config)?,
+            running: false,
+        })
+    }
+
+    pub fn try_load_or_recover(config: NodeConfig) -> Result<Self, NodeError> {
+        Ok(Self {
+            node: Node::try_load_or_recover(config)?,
+            running: false,
+        })
+    }
+
     pub fn start(&mut self) {
         self.running = true;
         let _ = dev::append_log(
@@ -69,15 +83,8 @@ impl NodeRuntime {
 }
 
 pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
-    let network = match std::env::var("ATHO_NETWORK")
-        .unwrap_or_else(|_| String::from("mainnet"))
-        .as_str()
-    {
-        "mainnet" => Network::Mainnet,
-        "testnet" => Network::Testnet,
-        "regnet" | "regtest" => Network::Regnet,
-        _ => return Err(RuntimeError::InvalidNetwork),
-    };
+    let raw = std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet"));
+    let network = Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?;
 
     Ok(NodeConfig::new(network))
 }
@@ -85,7 +92,7 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
 pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
-    let mut system = AthoSystem::new(config);
+    let mut system = AthoSystem::try_new(config)?;
     system.start();
     let rpc_address = rpc_bind_address(config.network);
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {

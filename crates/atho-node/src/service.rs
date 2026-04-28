@@ -1,6 +1,7 @@
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::rpc_error_from_node;
+use crate::error::NodeError;
 use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
@@ -34,6 +35,13 @@ impl NodeService {
             orchestrator: NodeOrchestrator::new(config),
             wallet_snapshot: WalletSnapshot::default(),
         }
+    }
+
+    pub fn try_new(config: NodeConfig) -> Result<Self, NodeError> {
+        Ok(Self {
+            orchestrator: NodeOrchestrator::try_new(config)?,
+            wallet_snapshot: WalletSnapshot::default(),
+        })
     }
 
     pub fn start(&mut self) {
@@ -102,18 +110,15 @@ impl NodeService {
                 fee_atoms,
             } => {
                 let tx_summary = dev::summarize_transaction(&transaction, Some(fee_atoms));
-                let response =
-                    match self
-                        .orchestrator
-                        .runtime
-                        .node
-                        .submit_transaction(MempoolEntry {
-                            transaction,
-                            fee_atoms,
-                        }) {
-                        Ok(txid) => RpcResponse::TransactionSubmitted(txid),
-                        Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
-                    };
+                let response = match self
+                    .orchestrator
+                    .runtime
+                    .node
+                    .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
+                {
+                    Ok(txid) => RpcResponse::TransactionSubmitted(txid),
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                };
                 match &response {
                     RpcResponse::TransactionSubmitted(_) => {
                         let _ = dev::append_log(

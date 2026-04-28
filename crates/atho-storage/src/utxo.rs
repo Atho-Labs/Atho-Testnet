@@ -148,7 +148,13 @@ impl UtxoSet {
         };
 
         for tx in &block.transactions {
-            let spent = spend_inputs(self, tx)?;
+            let spent = match spend_inputs(self, tx) {
+                Ok(spent) => spent,
+                Err(err) => {
+                    self.disconnect_block(undo);
+                    return Err(err);
+                }
+            };
             undo.spent.extend(spent);
 
             let created = create_outputs(tx, self.network, block.header.height);
@@ -389,5 +395,63 @@ mod tests {
         assert_eq!(set.len(), 2);
         set.disconnect_block(undo);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn utxo_set_rolls_back_prior_transactions_when_later_input_fails() {
+        let mut set = UtxoSet::new(Network::Mainnet);
+        let funding = UtxoEntry::new(Network::Mainnet, [1; 48], 0, 500, vec![1], 0, false);
+        set.insert(funding.clone()).unwrap();
+
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: funding.txid,
+                output_index: funding.output_index,
+                unlocking_script: funding.locking_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 400,
+                locking_script: vec![3],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let spend = Transaction {
+            witness: witness_bytes_for_tx(&spend),
+            ..spend
+        };
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: 500,
+                locking_script: vec![9],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let transactions = vec![coinbase, spend.clone(), spend];
+        let block = Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 75,
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
+                nonce: 0,
+            },
+            transactions,
+        );
+
+        let err = set.apply_block(&block).unwrap_err();
+        assert!(matches!(err, StorageError::MissingUtxo));
+        assert_eq!(set.len(), 1);
+        assert!(set.get(funding.txid, funding.output_index).is_some());
     }
 }

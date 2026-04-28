@@ -8,9 +8,10 @@ use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
 use atho_crypto::falcon::{self, FalconKeypair};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
-pub const DEFAULT_RESTORE_GAP_LIMIT: usize = 20;
+pub const DEFAULT_RESTORE_GAP_LIMIT: usize = 1_000;
 pub const WALLET_DATAFILE_NAME: &str = ".datafile";
 
 pub mod datafile;
@@ -27,7 +28,7 @@ pub struct WalletAddress {
     pub checksum: [u8; 4],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Wallet {
     pub network: Network,
     pub mnemonic: Option<MnemonicPhrase>,
@@ -40,6 +41,18 @@ pub struct Wallet {
 
 impl Wallet {
     pub fn from_mnemonic(mnemonic: MnemonicPhrase, passphrase: &str, network: Network) -> Self {
+        Self::from_mnemonic_with_progress(mnemonic, passphrase, network, |_, _| {})
+    }
+
+    pub fn from_mnemonic_with_progress<F>(
+        mnemonic: MnemonicPhrase,
+        passphrase: &str,
+        network: Network,
+        progress: F,
+    ) -> Self
+    where
+        F: FnMut(usize, usize),
+    {
         let root_seed = mnemonic.root_seed(passphrase);
         let wallet_seed = WalletSeed(sha3_256(&root_seed));
         let mut wallet = Self {
@@ -51,7 +64,7 @@ impl Wallet {
             snapshot: WalletSnapshot::default(),
             restore_gap_limit: DEFAULT_RESTORE_GAP_LIMIT,
         };
-        wallet.prefill();
+        wallet.prefill_with_progress(progress);
         wallet
     }
 
@@ -61,10 +74,22 @@ impl Wallet {
         network: Network,
     ) -> Result<Self, crate::mnemonic::MnemonicError> {
         let mnemonic = MnemonicPhrase::parse(phrase)?;
-        Ok(Self::from_mnemonic(mnemonic, passphrase, network))
+        Ok(Self::from_mnemonic_with_progress(
+            mnemonic,
+            passphrase,
+            network,
+            |_, _| {},
+        ))
     }
 
     pub fn from_seed(seed: WalletSeed, network: Network) -> Self {
+        Self::from_seed_with_progress(seed, network, |_, _| {})
+    }
+
+    pub fn from_seed_with_progress<F>(seed: WalletSeed, network: Network, progress: F) -> Self
+    where
+        F: FnMut(usize, usize),
+    {
         let mut wallet = Self {
             network,
             mnemonic: None,
@@ -74,7 +99,7 @@ impl Wallet {
             snapshot: WalletSnapshot::default(),
             restore_gap_limit: DEFAULT_RESTORE_GAP_LIMIT,
         };
-        wallet.prefill();
+        wallet.prefill_with_progress(progress);
         wallet
     }
 
@@ -95,6 +120,17 @@ impl Wallet {
         password: &str,
     ) -> Result<Self, datafile::WalletDatafileError> {
         datafile::WalletDataFile::load(path, password)
+    }
+
+    pub fn load_from_datafile_with_progress<F>(
+        path: &Path,
+        password: &str,
+        progress: F,
+    ) -> Result<Self, datafile::WalletDatafileError>
+    where
+        F: FnMut(usize, usize),
+    {
+        datafile::WalletDataFile::load_with_progress(path, password, progress)
     }
 
     pub fn datafile_name() -> &'static str {
@@ -156,6 +192,44 @@ impl Wallet {
             .collect()
     }
 
+    pub fn discovery_addresses(&self) -> Vec<WalletAddress> {
+        self.discovery_addresses_up_to(self.restore_gap_limit)
+    }
+
+    pub fn discovery_addresses_up_to(&self, limit: usize) -> Vec<WalletAddress> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut addresses = Vec::new();
+        let mut seen = HashSet::new();
+
+        for address in self.all_addresses() {
+            if seen.insert(address.payment_digest) {
+                addresses.push(address);
+            }
+        }
+
+        let receive_preview = self.receive_addresses(limit);
+        let change_preview = self.change_addresses(limit);
+        let preview_len = receive_preview.len().max(change_preview.len());
+
+        for index in 0..preview_len {
+            if let Some(address) = receive_preview.get(index) {
+                if seen.insert(address.payment_digest) {
+                    addresses.push(address.clone());
+                }
+            }
+            if let Some(address) = change_preview.get(index) {
+                if seen.insert(address.payment_digest) {
+                    addresses.push(address.clone());
+                }
+            }
+        }
+
+        addresses
+    }
+
     pub fn generated_receive_addresses(&self, limit: usize) -> Vec<WalletAddress> {
         self.generated_addresses(AddressKind::Receive, limit)
     }
@@ -172,8 +246,17 @@ impl Wallet {
         self.preview_addresses(AddressKind::Change, limit)
     }
 
+    #[allow(dead_code)]
     fn prefill(&mut self) {
-        self.keypool.refill_to_target(&mut self.hd_wallet);
+        self.prefill_with_progress(|_, _| {});
+    }
+
+    fn prefill_with_progress<F>(&mut self, progress: F)
+    where
+        F: FnMut(usize, usize),
+    {
+        self.keypool
+            .refill_to_target_with_progress(&mut self.hd_wallet, progress);
     }
 
     fn checkout(&mut self, kind: AddressKind, label: Option<String>) -> WalletAddress {
@@ -266,11 +349,24 @@ impl Wallet {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_state(
         network: Network,
         mnemonic: Option<MnemonicPhrase>,
         state: PersistedWalletState,
     ) -> Self {
+        Self::from_state_with_progress(network, mnemonic, state, |_, _| {})
+    }
+
+    pub(crate) fn from_state_with_progress<F>(
+        network: Network,
+        mnemonic: Option<MnemonicPhrase>,
+        state: PersistedWalletState,
+        progress: F,
+    ) -> Self
+    where
+        F: FnMut(usize, usize),
+    {
         let mut wallet = Self {
             network,
             mnemonic: mnemonic.or(state.mnemonic),
@@ -284,7 +380,9 @@ impl Wallet {
             snapshot: state.snapshot,
             restore_gap_limit: state.restore_gap_limit as usize,
         };
-        wallet.keypool.refill_to_target(&mut wallet.hd_wallet);
+        wallet
+            .keypool
+            .refill_to_target_with_progress(&mut wallet.hd_wallet, progress);
         wallet
     }
 }
@@ -383,6 +481,23 @@ mod tests {
         assert_eq!(receive_preview[0].path.index, 0);
         assert_eq!(receive_queue.len(), crate::keypool::KEYPOOL_TARGET_SIZE);
         assert_eq!(change_queue.len(), crate::keypool::KEYPOOL_TARGET_SIZE);
+    }
+
+    #[test]
+    fn wallet_discovery_addresses_include_restore_window() {
+        let wallet = Wallet::from_seed(WalletSeed([7; 32]), Network::Regnet);
+        let discovery = wallet.discovery_addresses_up_to(4);
+
+        assert!(discovery.len() >= 8);
+        assert_eq!(discovery[0].path.kind, AddressKind::Receive);
+        assert_eq!(discovery[0].path.index, 0);
+        assert_eq!(discovery[1].path.kind, AddressKind::Change);
+        assert_eq!(discovery[1].path.index, 0);
+        assert_eq!(discovery[2].path.kind, AddressKind::Receive);
+        assert_eq!(discovery[2].path.index, 1);
+        assert!(discovery
+            .iter()
+            .any(|address| address.path.kind == AddressKind::Change));
     }
 
     #[test]

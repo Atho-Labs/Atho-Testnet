@@ -54,26 +54,13 @@ fn parse_args() -> (Network, Option<String>, bool) {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "mainnet" => {
-                network = Network::Mainnet;
-                i += 1;
-            }
-            "testnet" => {
-                network = Network::Testnet;
-                i += 1;
-            }
-            "regnet" | "regtest" => {
-                network = Network::Regnet;
+            value if Network::parse(value).is_some() => {
+                network = Network::parse(value).expect("validated above");
                 i += 1;
             }
             "--network" | "-n" => {
                 if let Some(value) = args.get(i + 1) {
-                    network = match value.as_str() {
-                        "mainnet" => Network::Mainnet,
-                        "testnet" => Network::Testnet,
-                        "regnet" | "regtest" => Network::Regnet,
-                        _ => network,
-                    };
+                    network = Network::parse(value).unwrap_or(network);
                 }
                 i += 2;
             }
@@ -97,14 +84,8 @@ fn parse_args() -> (Network, Option<String>, bool) {
 }
 
 fn default_network() -> Network {
-    match std::env::var("ATHO_NETWORK")
-        .unwrap_or_else(|_| String::from("mainnet"))
-        .as_str()
-    {
-        "testnet" => Network::Testnet,
-        "regnet" | "regtest" => Network::Regnet,
-        _ => Network::Mainnet,
-    }
+    Network::parse(&std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet")))
+        .unwrap_or(Network::Mainnet)
 }
 
 fn print_usage() {

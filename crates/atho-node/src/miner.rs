@@ -4,8 +4,8 @@ use crate::node::Node;
 use crate::validation::finalize_witness_commit_refs;
 use atho_core::address::address_parts_from_public_key;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+use atho_core::consensus::rules;
 use atho_core::consensus::{pow, subsidy};
-use atho_core::constants::BLOCK_TIME_SECONDS;
 use atho_core::crypto::hash::sha3_384;
 use atho_core::transaction::{Transaction, TxOutput};
 use atho_crypto::falcon;
@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiningInterrupted;
@@ -26,6 +26,18 @@ pub struct Miner {
 impl Miner {
     pub fn new(cores: u32) -> Self {
         Self { cores }
+    }
+
+    fn current_unix_timestamp_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn candidate_block_timestamp(previous_blocks: &[Block]) -> u64 {
+        let now = Self::current_unix_timestamp_seconds();
+        pow::minimum_next_block_timestamp(previous_blocks).map_or(now, |minimum| now.max(minimum))
     }
 
     fn mine_nonce(
@@ -153,11 +165,7 @@ impl Miner {
                 block.transactions.len()
             ),
         );
-        let header = if cfg!(test) {
-            Ok(block.header.clone())
-        } else {
-            Self::mine_nonce(block.header.clone(), self.cores as usize, stop_requested)
-        };
+        let header = Self::mine_nonce(block.header.clone(), self.cores as usize, stop_requested);
         block.header = header?;
         let _ = dev::append_log(
             "miner",
@@ -179,11 +187,12 @@ impl Miner {
                 utxos.get(*txid, output_index).cloned()
             })?;
         let height = node.height().saturating_add(1);
+        let active_rules = rules::rules_at_height(height);
         let subsidy_atoms = subsidy::block_subsidy_atoms(node.height().saturating_add(1));
         let (reward_address, reward_script) =
             Self::reward_target_for_height(node.network(), height);
         let coinbase = Transaction {
-            version: 1,
+            version: active_rules.transaction_version,
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy_atoms.saturating_add(fees_atoms),
@@ -201,15 +210,17 @@ impl Miner {
             .into_iter()
             .map(|tx| finalize_witness_commit_refs(&tx, witness_root))
             .collect();
+        let difficulty_target_or_bits = node.difficulty_target_for_next_block();
+        let timestamp = Self::candidate_block_timestamp(node.blocks());
         let header = BlockHeader {
-            version: 1,
+            version: active_rules.block_version,
             network_id: node.network(),
             height,
             previous_block_hash,
             merkle_root: merkle_root(&transactions),
             witness_root,
-            timestamp: height.saturating_mul(BLOCK_TIME_SECONDS),
-            difficulty_target_or_bits: pow::target_for_height(node.network(), height),
+            timestamp,
+            difficulty_target_or_bits,
             nonce: 0,
         };
         let mut block = Block::new(header, transactions);

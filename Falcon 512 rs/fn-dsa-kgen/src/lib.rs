@@ -134,7 +134,7 @@ pub trait KeyPairGenerator: Default {
 macro_rules! kgen_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Key pair generator for degrees (`logn`) ",
-                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Zeroize, ZeroizeOnDrop)]
         pub struct $typename {
             tmp_i8: [i8; 4 * (1 << ($logn_max))],

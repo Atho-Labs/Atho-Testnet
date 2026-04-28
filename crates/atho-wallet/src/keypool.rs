@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 pub const KEYPOOL_TARGET_SIZE: usize = 5_000;
+const PREFILL_PROGRESS_BATCH: usize = 64;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keypool {
@@ -48,7 +49,41 @@ impl Keypool {
     }
 
     pub fn refill_to_target(&mut self, wallet: &mut HdWallet) {
-        self.refill(wallet, KEYPOOL_TARGET_SIZE, KEYPOOL_TARGET_SIZE);
+        self.refill_to_target_with_progress(wallet, |_, _| {});
+    }
+
+    pub fn refill_to_target_with_progress<F>(&mut self, wallet: &mut HdWallet, mut progress: F)
+    where
+        F: FnMut(usize, usize),
+    {
+        let receive_needed = KEYPOOL_TARGET_SIZE.saturating_sub(self.receive.len());
+        let change_needed = KEYPOOL_TARGET_SIZE.saturating_sub(self.change.len());
+        let total = receive_needed.saturating_add(change_needed);
+        if total == 0 {
+            progress(0, 0);
+            return;
+        }
+
+        let mut completed = 0usize;
+        progress(0, total);
+
+        while self.receive.len() < KEYPOOL_TARGET_SIZE {
+            self.receive
+                .push_back(wallet.next_path(AddressKind::Receive));
+            completed = completed.saturating_add(1);
+            if completed % PREFILL_PROGRESS_BATCH == 0 || completed == total {
+                progress(completed, total);
+            }
+        }
+        while self.change.len() < KEYPOOL_TARGET_SIZE {
+            self.change.push_back(wallet.next_path(AddressKind::Change));
+            completed = completed.saturating_add(1);
+            if completed % PREFILL_PROGRESS_BATCH == 0 || completed == total {
+                progress(completed, total);
+            }
+        }
+
+        progress(total, total);
     }
 }
 
@@ -68,5 +103,22 @@ mod tests {
         assert_eq!(pool.take_receive().map(|p| p.index), Some(1));
         assert_eq!(pool.take_change().map(|p| p.index), Some(0));
         assert!(pool.take_receive().is_none());
+    }
+
+    #[test]
+    fn keypool_refill_to_target_reports_completion() {
+        let mut wallet = HdWallet::new(WalletSeed([11; 32]));
+        let mut pool = Keypool::new();
+        let mut updates = Vec::new();
+
+        pool.refill_to_target_with_progress(&mut wallet, |completed, total| {
+            updates.push((completed, total));
+        });
+
+        assert!(!updates.is_empty());
+        assert_eq!(
+            updates.last().copied(),
+            Some((KEYPOOL_TARGET_SIZE * 2, KEYPOOL_TARGET_SIZE * 2))
+        );
     }
 }

@@ -8,12 +8,21 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct MempoolEntry {
     pub transaction: Transaction,
     pub fee_atoms: u64,
+    vsize_bytes: usize,
 }
 
 impl MempoolEntry {
+    pub fn new(transaction: Transaction, fee_atoms: u64) -> Self {
+        let vsize_bytes = transaction.vsize_bytes().max(1);
+        Self {
+            transaction,
+            fee_atoms,
+            vsize_bytes,
+        }
+    }
+
     pub fn feerate_atoms_per_vbyte(&self) -> u64 {
-        let vsize = self.transaction.vsize_bytes().max(1) as u64;
-        self.fee_atoms / vsize
+        self.fee_atoms / self.vsize_bytes as u64
     }
 }
 
@@ -167,18 +176,22 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let mut ordered: Vec<&MempoolEntry> = self.entries.values().collect();
-        ordered.sort_by(|left, right| {
+        let mut ordered: Vec<([u8; 48], &MempoolEntry)> = self
+            .entries
+            .iter()
+            .map(|(txid, entry)| (*txid, entry))
+            .collect();
+        ordered.sort_by(|(left_txid, left), (right_txid, right)| {
             right
                 .feerate_atoms_per_vbyte()
                 .cmp(&left.feerate_atoms_per_vbyte())
                 .then_with(|| right.fee_atoms.cmp(&left.fee_atoms))
-                .then_with(|| left.transaction.txid().cmp(&right.transaction.txid()))
+                .then_with(|| left_txid.cmp(right_txid))
         });
 
         let mut txs = Vec::with_capacity(ordered.len());
         let mut fees = 0u64;
-        for entry in ordered {
+        for (_, entry) in ordered {
             let fee = validate_transaction_with_context(
                 &entry.transaction,
                 entry.fee_atoms,
@@ -212,12 +225,21 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
+    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
+    use atho_crypto::falcon::{generate_from_seed, sign};
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
-        let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
+        let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(tx),
+        )
+        .expect("falcon signature")
+        .0;
+        let pubkey = keypair.public_key.0;
         let txid = tx.txid();
         let staged = TxWitness {
             signature: signature.clone(),
@@ -239,13 +261,13 @@ mod tests {
         };
         let witness_root = staged_tx.witness_commitment_hash();
         TxWitness {
-            signature,
-            pubkey,
+            signature: signature.clone(),
+            pubkey: pubkey.clone(),
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
                     sig_ref_short: crate::validation::derive_sig_ref_short(
                         &txid,
-                        &vec![9; FALCON_512_SIGNATURE_BYTES],
+                        &signature,
                         index as u32,
                     ),
                     witness_commit_ref: crate::validation::derive_witness_commit_ref(
@@ -282,14 +304,7 @@ mod tests {
         };
 
         let txid = mempool
-            .admit(
-                MempoolEntry {
-                    transaction: tx,
-                    fee_atoms: 500,
-                },
-                0,
-                |_, _| None,
-            )
+            .admit(MempoolEntry::new(tx, 500), 0, |_, _| None)
             .err()
             .expect("missing utxo should fail");
 
@@ -370,20 +385,12 @@ mod tests {
 
         let low_txid = low.txid();
         let high_txid = high.txid();
-        let _ = mempool.entries.insert(
-            low_txid,
-            MempoolEntry {
-                transaction: low.clone(),
-                fee_atoms: 2_500,
-            },
-        );
-        let _ = mempool.entries.insert(
-            high_txid,
-            MempoolEntry {
-                transaction: high.clone(),
-                fee_atoms: 3_000,
-            },
-        );
+        let _ = mempool
+            .entries
+            .insert(low_txid, MempoolEntry::new(low.clone(), 2_500));
+        let _ = mempool
+            .entries
+            .insert(high_txid, MempoolEntry::new(high.clone(), 3_000));
 
         let mut utxos = std::collections::BTreeMap::new();
         utxos.insert(
@@ -420,5 +427,32 @@ mod tests {
         assert_eq!(fees, 5_500);
         assert_eq!(txs[0].txid(), high_txid);
         assert_eq!(txs[1].txid(), low_txid);
+    }
+
+    #[test]
+    fn mempool_rejects_future_transaction_version_before_activation() {
+        let mut mempool = Mempool::new();
+        let tx = Transaction {
+            version: TRANSACTION_VERSION_V2_PLACEHOLDER,
+            inputs: vec![TxInput {
+                previous_txid: [7; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_500,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let err = mempool
+            .admit(MempoolEntry::new(tx, 2_500), 10, |_, _| None)
+            .unwrap_err();
+        assert_eq!(err, ValidationError::InvalidTransactionVersion);
     }
 }

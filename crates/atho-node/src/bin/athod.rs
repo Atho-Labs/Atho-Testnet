@@ -222,12 +222,7 @@ fn network_from_args(args: &[String]) -> Result<Option<Network>, String> {
 }
 
 fn parse_network(value: &str) -> Option<Network> {
-    match value {
-        "mainnet" => Some(Network::Mainnet),
-        "testnet" => Some(Network::Testnet),
-        "regnet" | "regtest" => Some(Network::Regnet),
-        _ => None,
-    }
+    Network::parse(value)
 }
 
 fn print_usage() {

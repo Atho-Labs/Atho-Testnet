@@ -102,7 +102,7 @@ pub trait VerifyingKey: Sized {
 macro_rules! vrfy_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature verifier for degrees (`logn`) ",
-                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Copy, Clone, Debug)]
         pub struct $typename {
             logn: u32,

@@ -129,7 +129,7 @@ pub trait SigningKey: Sized {
 macro_rules! sign_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature generator for degrees (`logn`) ",
-                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Zeroize, ZeroizeOnDrop)]
         pub struct $typename {
             f: [i8; 1 << ($logn_max)],

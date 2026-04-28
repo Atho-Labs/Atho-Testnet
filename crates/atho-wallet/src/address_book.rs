@@ -9,7 +9,7 @@ pub struct AddressRecord {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AddressBook {
     entries: Vec<AddressRecord>,
 }

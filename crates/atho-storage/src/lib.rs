@@ -6,3 +6,4 @@ pub mod db;
 pub mod error;
 pub mod path;
 pub mod utxo;
+pub mod validation;

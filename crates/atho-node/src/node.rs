@@ -3,9 +3,12 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::mempool::{Mempool, MempoolEntry};
 use crate::miner::Miner;
-use crate::validation::validate_block_with_context;
 use atho_core::block::Block;
-use atho_storage::chainstate::Chainstate as StorageChainstate;
+use atho_core::consensus::pow;
+use atho_storage::chainstate::{
+    ChainSelectionOutcome, ChainSelectionResult, Chainstate as StorageChainstate,
+};
+use atho_storage::error::StorageError;
 
 #[derive(Debug)]
 pub struct Node {
@@ -55,6 +58,14 @@ impl Node {
         self.chainstate.blocks().len()
     }
 
+    pub fn blocks(&self) -> &[Block] {
+        self.chainstate.blocks()
+    }
+
+    pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {
+        pow::target_for_next_block(self.network(), self.chainstate.blocks())
+    }
+
     pub fn mempool_len(&self) -> usize {
         self.mempool.len()
     }
@@ -86,15 +97,23 @@ impl Node {
         }
     }
 
+    pub fn try_load_or_new(config: NodeConfig) -> Result<Self, NodeError> {
+        Ok(Self {
+            config,
+            chainstate: StorageChainstate::try_load_or_new(config.network)?,
+            mempool: Mempool::new(),
+        })
+    }
+
+    pub fn try_load_or_recover(config: NodeConfig) -> Result<Self, NodeError> {
+        Ok(Self {
+            config,
+            chainstate: StorageChainstate::try_load_or_recover(config.network)?,
+            mempool: Mempool::new(),
+        })
+    }
+
     pub fn connect_block(&mut self, block: &Block) -> Result<(), NodeError> {
-        let working_utxos = self.chainstate.utxo_snapshot();
-        validate_block_with_context(
-            block,
-            self.chainstate.height.saturating_add(1),
-            self.config.network,
-            self.chainstate.tip_hash,
-            working_utxos,
-        )?;
         if let Err(err) = self.chainstate.connect_block(block) {
             let _ = dev::append_log(
                 "athod",
@@ -105,7 +124,10 @@ impl Node {
                     dev::summarize_block(block)
                 ),
             );
-            return Err(err.into());
+            return Err(match err {
+                StorageError::Validation(validation) => NodeError::Validation(validation),
+                other => NodeError::Storage(other),
+            });
         }
         self.mempool.remove_block_transactions(block);
         let updated_utxos = self.chainstate.utxo_snapshot();
@@ -153,6 +175,43 @@ impl Node {
         self.connect_block(block)
     }
 
+    pub fn consider_branch(&mut self, branch: &[Block]) -> Result<ChainSelectionResult, NodeError> {
+        let selection = self.chainstate.select_branch(branch)?;
+        match selection.outcome {
+            ChainSelectionOutcome::KeptCurrent => return Ok(selection),
+            ChainSelectionOutcome::Extended | ChainSelectionOutcome::Reorged => {}
+        }
+
+        for block in branch {
+            self.mempool.remove_block_transactions(block);
+        }
+
+        if selection.outcome == ChainSelectionOutcome::Reorged {
+            let utxos = self.chainstate.utxo_snapshot();
+            for tx in selection
+                .disconnected
+                .iter()
+                .flat_map(|block| block.transactions.iter().skip(1))
+            {
+                let Some(fee_atoms) = transaction_fee_from_utxos(tx, &utxos) else {
+                    continue;
+                };
+                let _ = self.mempool.admit(
+                    MempoolEntry::new(tx.clone(), fee_atoms),
+                    self.chainstate.height,
+                    |txid, output_index| utxos.get(*txid, output_index).cloned(),
+                );
+            }
+        }
+
+        let updated_utxos = self.chainstate.utxo_snapshot();
+        self.mempool
+            .revalidate(self.chainstate.height, |txid, output_index| {
+                updated_utxos.get(*txid, output_index).cloned()
+            });
+        Ok(selection)
+    }
+
     pub fn submit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
         let txid = self.admit_transaction(entry)?;
         let _ = dev::append_log(
@@ -171,6 +230,21 @@ impl Node {
     }
 }
 
+fn transaction_fee_from_utxos(
+    tx: &atho_core::transaction::Transaction,
+    utxos: &atho_storage::utxo::UtxoSet,
+) -> Option<u64> {
+    if tx.is_coinbase() {
+        return None;
+    }
+    let mut input_total = 0u64;
+    for input in &tx.inputs {
+        let utxo = utxos.get(input.previous_txid, input.output_index)?;
+        input_total = input_total.checked_add(utxo.value_atoms)?;
+    }
+    input_total.checked_sub(tx.output_value_atoms())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,16 +252,29 @@ mod tests {
     use crate::miner::Miner;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::{pow, subsidy};
     use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
+    use atho_crypto::falcon::{generate_from_seed, sign};
+    use atho_storage::db::Database;
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9; FALCON_512_SIGNATURE_BYTES];
-        let pubkey = vec![8; FALCON_512_PUBLIC_KEY_BYTES];
+        let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(tx),
+        )
+        .expect("falcon signature")
+        .0;
+        let pubkey = keypair.public_key.0;
         let txid = tx.txid();
         let staged = TxWitness {
             signature: signature.clone(),
@@ -207,7 +294,7 @@ mod tests {
         let sig_bytes = signature.clone();
         TxWitness {
             signature: sig_bytes.clone(),
-            pubkey,
+            pubkey: pubkey.clone(),
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
                     sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
@@ -222,14 +309,52 @@ mod tests {
         .canonical_bytes()
     }
 
+    fn temp_data_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-node-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn node_connect_block_surfaces_storage_errors() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let genesis_timestamp = atho_core::genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
         let coinbase = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(0),
+                value_atoms: subsidy::block_subsidy_atoms(1),
                 locking_script: vec![0],
             }],
             lock_time: 0,
@@ -261,11 +386,11 @@ mod tests {
             previous_block_hash: node.chainstate.tip_hash,
             merkle_root: merkle_root(&transactions),
             witness_root: witness_root(&transactions),
-            timestamp: 75,
-            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            timestamp: genesis_timestamp.saturating_add(1),
+            difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
             nonce: 0,
         };
-        let block = Block::new(header, transactions);
+        let block = Miner::new(1).solve_block(Block::new(header, transactions));
 
         let err = node.connect_block(&block).unwrap_err();
         assert!(matches!(
@@ -277,11 +402,15 @@ mod tests {
     #[test]
     fn node_rejects_wrong_parent_hash() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let genesis_timestamp = atho_core::genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
         let coinbase = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(0),
+                value_atoms: subsidy::block_subsidy_atoms(1),
                 locking_script: vec![0],
             }],
             lock_time: 0,
@@ -313,11 +442,11 @@ mod tests {
             previous_block_hash: [1; 48],
             merkle_root: merkle_root(&transactions),
             witness_root: witness_root(&transactions),
-            timestamp: 75,
-            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
+            timestamp: genesis_timestamp.saturating_add(1),
+            difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
             nonce: 0,
         };
-        let block = Block::new(header, transactions);
+        let block = Miner::new(1).solve_block(Block::new(header, transactions));
 
         let err = node.connect_block(&block).unwrap_err();
         assert!(matches!(
@@ -374,11 +503,8 @@ mod tests {
             witness: witness_bytes_for_tx(&tx),
             ..tx
         };
-        node.admit_transaction(MempoolEntry {
-            transaction: tx.clone(),
-            fee_atoms,
-        })
-        .unwrap();
+        node.admit_transaction(MempoolEntry::new(tx.clone(), fee_atoms))
+            .unwrap();
 
         let miner = Miner::new(4);
         let block = node.mine_and_connect_candidate_block(&miner).unwrap();
@@ -407,5 +533,65 @@ mod tests {
         assert_eq!(first.header.height, 1);
         assert_eq!(second.header.height, 2);
         assert_eq!(node.chainstate.height, 2);
+    }
+
+    #[test]
+    fn node_restart_reloads_persisted_chainstate() {
+        let root = temp_data_dir("restart");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut node = Node::load_or_new(NodeConfig::new(Network::Mainnet));
+        let block = node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine");
+        let tip_hash = block.header.block_hash();
+        let next_target = node.difficulty_target_for_next_block();
+        let database = Database::open(Network::Mainnet).expect("database");
+        let snapshot = database
+            .load_chainstate_snapshot()
+            .expect("snapshot")
+            .expect("present snapshot");
+        assert_eq!(snapshot.height, 1);
+        assert_eq!(snapshot.tip_hash, tip_hash);
+        let tip_header = snapshot.tip_header.expect("tip header");
+        assert_eq!(tip_header.height, 1);
+        assert_eq!(tip_header.block_hash(), tip_hash);
+        let stored_tip = database
+            .load_block(tip_hash)
+            .expect("tip block")
+            .expect("stored tip");
+        let genesis_hash = atho_core::genesis::genesis_hash(Network::Mainnet);
+        assert_eq!(stored_tip.header.height, 1);
+        assert_eq!(stored_tip.header.previous_block_hash, genesis_hash);
+        let stored_genesis = database
+            .load_block(genesis_hash)
+            .expect("genesis block")
+            .expect("stored genesis");
+        assert_eq!(stored_genesis.header.height, 0);
+        assert_eq!(stored_genesis.header.block_hash(), genesis_hash);
+        drop(node);
+
+        let reopened_database = Database::open(Network::Mainnet).expect("reopened database");
+        let reopened_snapshot = reopened_database
+            .load_chainstate_snapshot()
+            .expect("reopened snapshot")
+            .expect("reopened snapshot present");
+        assert_eq!(reopened_snapshot.height, 1);
+        assert_eq!(reopened_snapshot.tip_hash, tip_hash);
+        assert!(reopened_database
+            .load_block(tip_hash)
+            .expect("reopened tip")
+            .is_some());
+        assert!(reopened_database
+            .load_block(genesis_hash)
+            .expect("reopened genesis")
+            .is_some());
+
+        let reloaded = Node::load_or_new(NodeConfig::new(Network::Mainnet));
+        assert_eq!(reloaded.height(), 1);
+        assert_eq!(reloaded.tip_hash(), tip_hash);
+        assert_eq!(reloaded.difficulty_target_for_next_block(), next_target);
+        assert_eq!(reloaded.utxo_count(), 2);
     }
 }

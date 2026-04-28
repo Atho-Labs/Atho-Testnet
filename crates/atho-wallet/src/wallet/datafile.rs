@@ -59,6 +59,17 @@ impl WalletDataFile {
         load_impl(path, password, PASSWORD_ITERATIONS)
     }
 
+    pub fn load_with_progress<F>(
+        path: &Path,
+        password: &str,
+        progress: F,
+    ) -> Result<Wallet, WalletDatafileError>
+    where
+        F: FnMut(usize, usize),
+    {
+        load_impl_with_progress(path, password, PASSWORD_ITERATIONS, progress)
+    }
+
     fn to_bytes(&self) -> Result<Vec<u8>, WalletDatafileError> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -150,6 +161,18 @@ fn save_impl(
 }
 
 fn load_impl(path: &Path, password: &str, iterations: u32) -> Result<Wallet, WalletDatafileError> {
+    load_impl_with_progress(path, password, iterations, |_, _| {})
+}
+
+fn load_impl_with_progress<F>(
+    path: &Path,
+    password: &str,
+    iterations: u32,
+    progress: F,
+) -> Result<Wallet, WalletDatafileError>
+where
+    F: FnMut(usize, usize),
+{
     let bytes = fs::read(path)?;
     let file = WalletDataFile::from_bytes(&bytes)?;
     if file.encryption_mode != WalletEncryptionMode::PasswordAes256Gcm {
@@ -162,7 +185,12 @@ fn load_impl(path: &Path, password: &str, iterations: u32) -> Result<Wallet, Wal
         &file.ciphertext,
         iterations,
     )?;
-    Ok(Wallet::from_state(file.network, None, state))
+    Ok(Wallet::from_state_with_progress(
+        file.network,
+        None,
+        state,
+        progress,
+    ))
 }
 
 fn encrypt_state(

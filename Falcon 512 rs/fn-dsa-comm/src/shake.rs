@@ -504,7 +504,7 @@ impl KeccakState {
 macro_rules! sha3_impl {
     ($typename:ident, $size:expr) => {
         #[doc = concat!("SHA3-", stringify!($size), " implementation.\n\n",
-                "Instances are cloneable, which captures the current object state.")]
+                        "Instances are cloneable, which captures the current object state.")]
         #[derive(Copy, Clone, Debug)]
         pub struct $typename(SHA3Core<$size>);
 

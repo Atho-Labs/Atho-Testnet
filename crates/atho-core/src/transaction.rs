@@ -156,8 +156,67 @@ impl Transaction {
         self.base_bytes()
     }
 
+    pub fn base_size_bytes(&self) -> usize {
+        2 + 4
+            + self
+                .inputs
+                .iter()
+                .map(|input| 48 + 4 + 4 + input.unlocking_script.len())
+                .sum::<usize>()
+            + 4
+            + self
+                .outputs
+                .iter()
+                .map(|output| 8 + 4 + output.locking_script.len())
+                .sum::<usize>()
+            + 4
+    }
+
+    pub fn full_size_bytes(&self) -> usize {
+        2 + 2
+            + 4
+            + self
+                .inputs
+                .iter()
+                .map(|input| 48 + 4 + 4 + input.unlocking_script.len())
+                .sum::<usize>()
+            + 4
+            + self
+                .outputs
+                .iter()
+                .map(|output| 8 + 4 + output.locking_script.len())
+                .sum::<usize>()
+            + 4
+            + self.witness.len()
+            + 4
+    }
+
+    pub fn compact_size_bytes(&self) -> usize {
+        2 + compact_size_len(self.inputs.len())
+            + self
+                .inputs
+                .iter()
+                .map(|input| {
+                    48 + 4
+                        + compact_size_len(input.unlocking_script.len())
+                        + input.unlocking_script.len()
+                })
+                .sum::<usize>()
+            + compact_size_len(self.outputs.len())
+            + self
+                .outputs
+                .iter()
+                .map(|output| {
+                    8 + compact_size_len(output.locking_script.len()) + output.locking_script.len()
+                })
+                .sum::<usize>()
+            + 4
+            + compact_size_len(self.witness.len())
+            + self.witness.len()
+    }
+
     pub fn full_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.full_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
         out.push(0x00);
         out.push(0x01);
@@ -181,7 +240,7 @@ impl Transaction {
     }
 
     pub fn compact_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.compact_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
         write_compact_size(&mut out, self.inputs.len());
         for input in &self.inputs {
@@ -203,7 +262,7 @@ impl Transaction {
     }
 
     pub fn base_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.base_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
         for input in &self.inputs {
@@ -227,8 +286,8 @@ impl Transaction {
     }
 
     pub fn weight_bytes(&self) -> usize {
-        let base = self.base_bytes().len();
-        let total = self.full_bytes().len();
+        let base = self.base_size_bytes();
+        let total = self.full_size_bytes();
         base.saturating_mul(3).saturating_add(total)
     }
 
@@ -246,7 +305,8 @@ impl Transaction {
     }
 
     pub fn wtxid(&self) -> [u8; 48] {
-        let mut out = self.base_bytes();
+        let mut out = Vec::with_capacity(self.base_size_bytes() + 4 + self.witness.len());
+        out.extend_from_slice(&self.base_bytes());
         out.extend_from_slice(&(self.witness.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.witness);
         sha3_384(&out)
@@ -266,7 +326,7 @@ impl Transaction {
     /// `ATHO_TX_SIG_V1` domain: `SHA3-384(base_bytes())`, where
     /// `base_bytes()` excludes witness data.
     pub fn signing_digest(&self) -> [u8; 48] {
-        sha3_384(&self.base_bytes())
+        self.txid()
     }
 
     pub fn witness_payload(&self) -> Option<TxWitness> {

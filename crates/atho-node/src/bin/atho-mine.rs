@@ -117,12 +117,7 @@ fn network_from_args(args: &[String]) -> Result<Option<Network>, String> {
 }
 
 fn parse_network(value: &str) -> Option<Network> {
-    match value {
-        "mainnet" => Some(Network::Mainnet),
-        "testnet" => Some(Network::Testnet),
-        "regnet" | "regtest" => Some(Network::Regnet),
-        _ => None,
-    }
+    Network::parse(value)
 }
 
 fn cores_from_args(args: &[String]) -> Result<Option<usize>, String> {
@@ -164,14 +159,8 @@ fn rpc_addr_from_args(args: &[String]) -> Result<Option<String>, String> {
 }
 
 fn default_network() -> Network {
-    match std::env::var("ATHO_NETWORK")
-        .unwrap_or_else(|_| String::from("mainnet"))
-        .as_str()
-    {
-        "testnet" => Network::Testnet,
-        "regnet" | "regtest" => Network::Regnet,
-        _ => Network::Mainnet,
-    }
+    Network::parse(&std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet")))
+        .unwrap_or(Network::Mainnet)
 }
 
 fn print_usage() {

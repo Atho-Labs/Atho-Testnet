@@ -8,6 +8,15 @@ pub enum Network {
 }
 
 impl Network {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mainnet" | "atho-mainnet" => Some(Self::Mainnet),
+            "testnet" | "atho-testnet" => Some(Self::Testnet),
+            "regnet" | "regtest" | "atho-regnet" => Some(Self::Regnet),
+            _ => None,
+        }
+    }
+
     pub fn consensus_id(self) -> u8 {
         match self {
             Self::Mainnet => 1,
@@ -41,6 +50,10 @@ impl Network {
         }
     }
 
+    pub fn cli_arg(self) -> &'static str {
+        self.domain_tag()
+    }
+
     pub fn p2p_port(self) -> u16 {
         match self {
             Self::Mainnet => 56_000,
@@ -60,7 +73,8 @@ impl Network {
     pub fn visible_prefix(self) -> char {
         match self {
             Self::Mainnet => 'A',
-            Self::Testnet | Self::Regnet => 'T',
+            Self::Testnet => 'T',
+            Self::Regnet => 'R',
         }
     }
 
@@ -87,11 +101,16 @@ mod tests {
     #[test]
     fn network_identity_matches_reference() {
         assert_eq!(Network::Mainnet.id(), "atho-mainnet");
+        assert_eq!(Network::Mainnet.cli_arg(), "mainnet");
         assert_eq!(Network::Mainnet.consensus_id(), 1);
         assert_eq!(Network::from_consensus_id(2), Some(Network::Testnet));
+        assert_eq!(Network::parse("mainnet"), Some(Network::Mainnet));
+        assert_eq!(Network::parse("atho-mainnet"), Some(Network::Mainnet));
+        assert_eq!(Network::parse("atho-testnet"), Some(Network::Testnet));
+        assert_eq!(Network::parse("atho-regnet"), Some(Network::Regnet));
         assert_eq!(Network::Mainnet.p2p_port(), 56_000);
         assert_eq!(Network::Testnet.rpc_port(), 9_110);
-        assert_eq!(Network::Regnet.visible_prefix(), 'T');
+        assert_eq!(Network::Regnet.visible_prefix(), 'R');
         assert_eq!(Network::Mainnet.utxo_flag(), "");
         assert_eq!(Network::Testnet.utxo_flag(), "TEST-UTXO");
         assert_eq!(Network::Regnet.utxo_flag(), "REG-UTXO");

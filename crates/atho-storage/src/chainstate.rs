@@ -1,8 +1,10 @@
 use crate::db::{ChainstateSnapshot, Database};
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
+use crate::validation;
 use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
+use atho_core::consensus::pow;
 use atho_core::constants::{GENESIS_COINBASE_ATOMS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -10,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 struct ChainUndo {
@@ -30,6 +33,19 @@ struct PersistedChainstate {
 struct BlockRecord {
     height: u64,
     block_hash: [u8; 48],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSelectionOutcome {
+    Extended,
+    Reorged,
+    KeptCurrent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSelectionResult {
+    pub outcome: ChainSelectionOutcome,
+    pub disconnected: Vec<Block>,
 }
 
 #[derive(Debug)]
@@ -83,25 +99,42 @@ impl Chainstate {
     }
 
     pub fn load_or_new(network: Network) -> Self {
-        let storage = Database::open(network).ok();
-        if let Some(storage) = storage {
-            if let Some(persisted) = load_persisted_chainstate(network, &storage) {
-                let chainstate = persisted.into_chainstate(network, Some(storage));
-                let _ = chainstate.save_persisted_chainstate();
-                return chainstate;
-            }
+        Self::try_load_or_recover(network)
+            .unwrap_or_else(|err| panic!("failed to load chainstate for {}: {}", network.id(), err))
+    }
 
-            let chainstate = Self::fresh_with_storage(network, Some(storage));
-            if let Some(genesis_block) = chainstate.blocks.first().cloned() {
-                if let Some(storage) = chainstate.storage.as_ref() {
-                    let _ = storage.append_block(0, &genesis_block);
-                }
+    pub fn try_load_or_recover(network: Network) -> Result<Self, StorageError> {
+        match Self::try_load_or_new(network) {
+            Ok(chainstate) => Ok(chainstate),
+            Err(err) if err.is_recoverable_local_state() => {
+                quarantine_persisted_state(network, &err)?;
+                Self::try_load_or_new(network)
             }
-            let _ = chainstate.save_persisted_chainstate();
-            return chainstate;
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn try_load_or_new(network: Network) -> Result<Self, StorageError> {
+        let storage = Database::open(network)?;
+        if let Some(persisted) = load_persisted_chainstate(network, &storage)? {
+            let chainstate = persisted.try_into_chainstate(network, Some(storage))?;
+            chainstate.save_persisted_chainstate()?;
+            return Ok(chainstate);
         }
 
-        Self::fresh(network)
+        let chainstate = Self::fresh_with_storage(network, Some(storage));
+        if let Some(genesis_block) = chainstate.blocks.first().cloned() {
+            if let Some(storage) = chainstate.storage.as_ref() {
+                let snapshot = ChainstateSnapshot {
+                    height: 0,
+                    tip_hash: chainstate.tip_hash,
+                    tip_header: chainstate.tip.clone(),
+                };
+                let utxos: Vec<_> = chainstate.utxos.entries().cloned().collect();
+                storage.commit_chainstate(&snapshot, &utxos, Some((0, &genesis_block)))?;
+            }
+        }
+        Ok(chainstate)
     }
 
     pub fn connect_header(&mut self, header: BlockHeader) {
@@ -110,12 +143,43 @@ impl Chainstate {
         self.height = self.tip.as_ref().map(|header| header.height).unwrap_or(0);
     }
 
+    pub fn next_difficulty_target(&self) -> [u8; 48] {
+        pow::target_for_next_block(self.network, &self.blocks)
+    }
+
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
+        let working_utxos = self.utxos.clone();
+        validation::validate_block_with_context(
+            block,
+            self.height.saturating_add(1),
+            self.network,
+            self.tip_hash,
+            self.next_difficulty_target(),
+            &self.blocks,
+            working_utxos,
+        )?;
+
         let undo = self.utxos.apply_block(block)?;
         let previous_tip = self.tip.clone();
         let previous_tip_hash = self.tip_hash;
+        let next_tip_hash = block.header.block_hash();
+        if let Some(storage) = &self.storage {
+            let snapshot = ChainstateSnapshot {
+                height: block.header.height,
+                tip_hash: next_tip_hash,
+                tip_header: Some(block.header.clone()),
+            };
+            let utxos: Vec<_> = self.utxos.entries().cloned().collect();
+            if let Err(err) =
+                storage.commit_chainstate(&snapshot, &utxos, Some((block.header.height, block)))
+            {
+                self.utxos.disconnect_block(undo);
+                return Err(err);
+            }
+        }
+
         self.tip = Some(block.header.clone());
-        self.tip_hash = block.header.block_hash();
+        self.tip_hash = next_tip_hash;
         self.height = block.header.height;
         self.blocks.push(block.clone());
         self.undo_stack.push(ChainUndo {
@@ -124,11 +188,67 @@ impl Chainstate {
             block_undo: undo,
         });
         self.prune_history();
-        if let Some(storage) = &self.storage {
-            storage.append_block(self.height, block)?;
-        }
-        self.save_persisted_chainstate()?;
         Ok(())
+    }
+
+    pub fn select_branch(
+        &mut self,
+        branch: &[Block],
+    ) -> Result<ChainSelectionResult, StorageError> {
+        if branch.is_empty() {
+            return Err(StorageError::EmptyBranch);
+        }
+        validate_branch_sequence(branch)?;
+        let fork_hash = branch[0].header.previous_block_hash;
+        let Some(fork_index) = self
+            .blocks
+            .iter()
+            .position(|block| block.header.block_hash() == fork_hash)
+        else {
+            return Err(StorageError::ForkPointUnavailable);
+        };
+        let fork_height = self.blocks[fork_index].header.height;
+        if branch[0].header.height != fork_height.saturating_add(1) {
+            return Err(StorageError::InvalidBranchSequence);
+        }
+
+        let disconnected = self.blocks[fork_index + 1..].to_vec();
+        if !disconnected.is_empty() && !pow::branch_is_preferred(branch, &disconnected) {
+            return Ok(ChainSelectionResult {
+                outcome: ChainSelectionOutcome::KeptCurrent,
+                disconnected: Vec::new(),
+            });
+        }
+
+        for _ in 0..disconnected.len() {
+            self.disconnect_last_block()?;
+        }
+
+        let mut connected = 0usize;
+        for block in branch {
+            if let Err(err) = self.connect_block(block) {
+                while connected > 0 {
+                    self.disconnect_last_block()?;
+                    connected = connected.saturating_sub(1);
+                }
+                for canonical in &disconnected {
+                    if self.connect_block(canonical).is_err() {
+                        return Err(StorageError::RollbackFailure);
+                    }
+                }
+                return Err(err);
+            }
+            connected = connected.saturating_add(1);
+        }
+
+        Ok(ChainSelectionResult {
+            outcome: if disconnected.is_empty() {
+                ChainSelectionOutcome::Extended
+            } else {
+                ChainSelectionOutcome::Reorged
+            },
+            disconnected,
+        })
     }
 
     pub fn utxo_snapshot(&self) -> UtxoSet {
@@ -142,14 +262,39 @@ impl Chainstate {
     pub fn disconnect_last_block(&mut self) -> Result<(), StorageError> {
         let undo = self
             .undo_stack
-            .pop()
+            .last()
+            .cloned()
             .ok_or(StorageError::NoBlockToDisconnect)?;
-        self.utxos.disconnect_block(undo.block_undo);
+        let removed_block = self
+            .blocks
+            .last()
+            .cloned()
+            .ok_or(StorageError::NoBlockToDisconnect)?;
+
+        self.utxos.disconnect_block(undo.block_undo.clone());
+        let previous_height = undo
+            .previous_tip
+            .as_ref()
+            .map(|header| header.height)
+            .unwrap_or(0);
+        if let Err(err) = self.persist_snapshot_for(
+            previous_height,
+            undo.previous_tip_hash,
+            undo.previous_tip.clone(),
+        ) {
+            let reconnect = self.utxos.apply_block(&removed_block);
+            debug_assert!(
+                reconnect.is_ok(),
+                "failed to restore block after snapshot failure"
+            );
+            return Err(err);
+        }
+
+        let _ = self.undo_stack.pop();
         let _ = self.blocks.pop();
         self.tip = undo.previous_tip;
         self.tip_hash = undo.previous_tip_hash;
-        self.height = self.tip.as_ref().map(|header| header.height).unwrap_or(0);
-        self.save_persisted_chainstate()?;
+        self.height = previous_height;
         Ok(())
     }
 
@@ -182,11 +327,20 @@ impl Chainstate {
     }
 
     fn save_persisted_chainstate(&self) -> Result<(), StorageError> {
+        self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
+    }
+
+    fn persist_snapshot_for(
+        &self,
+        height: u64,
+        tip_hash: [u8; 48],
+        tip_header: Option<BlockHeader>,
+    ) -> Result<(), StorageError> {
         if let Some(storage) = &self.storage {
             let snapshot = ChainstateSnapshot {
-                height: self.height,
-                tip_hash: self.tip_hash,
-                tip_header: self.tip.clone(),
+                height,
+                tip_hash,
+                tip_header,
             };
             let utxos: Vec<_> = self.utxos.entries().cloned().collect();
             storage.save_chainstate_snapshot(&snapshot, &utxos)?;
@@ -196,51 +350,160 @@ impl Chainstate {
 }
 
 impl PersistedChainstate {
-    fn into_chainstate(self, network: Network, storage: Option<Database>) -> Chainstate {
+    fn try_into_chainstate(
+        self,
+        network: Network,
+        storage: Option<Database>,
+    ) -> Result<Chainstate, StorageError> {
         let genesis = genesis::genesis_state(network);
         let genesis_block = genesis.block;
         let mut utxos = UtxoSet::new(network);
-        utxos
-            .insert(UtxoEntry::coinbase(
-                network,
-                genesis.coinbase_txid,
-                0,
-                GENESIS_COINBASE_ATOMS,
-                internal_hpk_bytes(network, &genesis.reward_address)
-                    .unwrap_or_else(|| genesis.reward_address.as_bytes().to_vec()),
-                0,
-            ))
-            .expect("genesis utxo is network-local and unique");
         for entry in self.utxos {
-            let _ = utxos.insert(entry);
+            utxos.insert(entry)?;
+        }
+
+        if self.height == 0 {
+            if self.tip_hash != genesis_block.header.block_hash() {
+                return Err(StorageError::PersistedGenesisMismatch);
+            }
+            if utxos.get(genesis.coinbase_txid, 0).is_none() {
+                return Err(StorageError::PersistedGenesisMismatch);
+            }
         }
 
         let tip = match self.tip_header {
-            Some(header) => Some(header),
+            Some(header) => {
+                if header.height != self.height || header.block_hash() != self.tip_hash {
+                    return Err(StorageError::PersistedTipMismatch);
+                }
+                Some(header)
+            }
             None => storage
                 .as_ref()
                 .and_then(|db| db.load_block(self.tip_hash).ok().flatten())
                 .map(|block| block.header),
         };
 
-        Chainstate {
+        let blocks = if self.height == 0 {
+            vec![genesis_block]
+        } else {
+            let db = storage
+                .as_ref()
+                .ok_or(StorageError::IncompleteBlockHistory)?;
+            let blocks = load_recent_blocks_from_storage(db, self.tip_hash, 27)?;
+            let Some(last) = blocks.last() else {
+                return Err(StorageError::IncompleteBlockHistory);
+            };
+            if last.header.height != self.height || last.header.block_hash() != self.tip_hash {
+                return Err(StorageError::PersistedTipMismatch);
+            }
+            blocks
+        };
+
+        Ok(Chainstate {
             network,
             tip,
             tip_hash: self.tip_hash,
             height: self.height,
-            blocks: vec![genesis_block],
+            blocks,
             utxos,
             undo_stack: Vec::new(),
             storage,
-        }
+        })
     }
 }
 
+fn validate_branch_sequence(branch: &[Block]) -> Result<(), StorageError> {
+    for window in branch.windows(2) {
+        let [left, right] = window else {
+            continue;
+        };
+        if right.header.previous_block_hash != left.header.block_hash()
+            || right.header.height != left.header.height.saturating_add(1)
+        {
+            return Err(StorageError::InvalidBranchSequence);
+        }
+    }
+    Ok(())
+}
+
 fn chain_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("dev")
-        .join("chain")
+    crate::path::chain_dir()
+}
+
+fn quarantine_persisted_state(
+    network: Network,
+    source_error: &StorageError,
+) -> Result<(), StorageError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let label = match source_error {
+        StorageError::CorruptData => "corrupt-data",
+        StorageError::PersistedGenesisMismatch => "genesis-mismatch",
+        StorageError::PersistedTipMismatch => "tip-mismatch",
+        StorageError::IncompleteBlockHistory => "incomplete-history",
+        StorageError::LegacyStorageLayout => "legacy-layout",
+        StorageError::SchemaVersionMismatch { .. } => "schema-mismatch",
+        _ => "recovery",
+    };
+    let quarantine_root = crate::path::quarantine_dir()
+        .join(network.id())
+        .join(format!("{timestamp}-{label}"));
+    fs::create_dir_all(&quarantine_root)?;
+
+    move_if_exists(
+        crate::path::database_dir(network),
+        quarantine_root.join("db").join(network.id()),
+    )?;
+    move_if_exists(
+        chainstate_snapshot_path(network),
+        quarantine_root
+            .join("chain")
+            .join(format!("chainstate-{}.tsv", network.id())),
+    )?;
+    move_if_exists(
+        utxo_snapshot_path(network),
+        quarantine_root
+            .join("chain")
+            .join(format!("utxos-{}.tsv", network.id())),
+    )?;
+    move_if_exists(
+        blocks_ledger_path(),
+        quarantine_root.join("chain").join("blocks.tsv"),
+    )?;
+    move_if_exists(
+        transactions_ledger_path(),
+        quarantine_root.join("chain").join("transactions.tsv"),
+    )?;
+    move_if_exists(
+        transaction_inputs_ledger_path(),
+        quarantine_root.join("chain").join("transaction_inputs.tsv"),
+    )?;
+    move_if_exists(
+        transaction_outputs_ledger_path(),
+        quarantine_root
+            .join("chain")
+            .join("transaction_outputs.tsv"),
+    )?;
+
+    let mut report = File::create(quarantine_root.join("RECOVERY.txt"))?;
+    writeln!(report, "network={}", network.id())?;
+    writeln!(report, "error={source_error}")?;
+    writeln!(report, "timestamp={timestamp}")?;
+    Ok(())
+}
+
+fn move_if_exists(source: PathBuf, destination: PathBuf) -> Result<(), StorageError> {
+    if !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(source, destination)?;
+    Ok(())
 }
 
 fn ensure_chain_dir() -> std::io::Result<()> {
@@ -271,56 +534,128 @@ fn transaction_outputs_ledger_path() -> PathBuf {
     chain_dir().join("transaction_outputs.tsv")
 }
 
-fn load_persisted_chainstate(network: Network, storage: &Database) -> Option<PersistedChainstate> {
-    if let Ok(Some(snapshot)) = storage.load_chainstate_snapshot() {
-        let utxos = storage.load_utxos().ok()?;
-        return Some(PersistedChainstate {
+fn load_persisted_chainstate(
+    network: Network,
+    storage: &Database,
+) -> Result<Option<PersistedChainstate>, StorageError> {
+    if let Some(snapshot) = storage.load_chainstate_snapshot()? {
+        let utxos = storage.load_utxos()?;
+        return Ok(Some(PersistedChainstate {
             height: snapshot.height,
             tip_hash: snapshot.tip_hash,
             tip_header: snapshot.tip_header,
             utxos,
-        });
+        }));
     }
 
-    if let Some(persisted) = load_snapshot_files(network) {
-        return Some(persisted);
+    if let Some(persisted) = load_snapshot_files(network)? {
+        return Ok(Some(persisted));
     }
-    replay_legacy_chain_logs(network).ok().flatten()
+    replay_legacy_chain_logs(network)
 }
 
-fn load_snapshot_files(network: Network) -> Option<PersistedChainstate> {
+fn load_recent_blocks_from_storage(
+    storage: &Database,
+    tip_hash: [u8; 48],
+    limit: usize,
+) -> Result<Vec<Block>, StorageError> {
+    let mut blocks = Vec::new();
+    let mut next_hash = tip_hash;
+    while blocks.len() < limit {
+        let Some(block) = storage.load_block(next_hash)? else {
+            if blocks.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(StorageError::IncompleteBlockHistory);
+        };
+        next_hash = block.header.previous_block_hash;
+        blocks.push(block);
+        if blocks
+            .last()
+            .map(|block| block.header.height)
+            .unwrap_or_default()
+            == 0
+        {
+            break;
+        }
+    }
+    blocks.reverse();
+    Ok(blocks)
+}
+
+fn load_snapshot_files(network: Network) -> Result<Option<PersistedChainstate>, StorageError> {
     let state_path = chainstate_snapshot_path(network);
     let utxo_path = utxo_snapshot_path(network);
-    let state_file = File::open(state_path).ok()?;
-    let utxo_file = File::open(utxo_path).ok()?;
+    let state_exists = state_path.exists();
+    let utxo_exists = utxo_path.exists();
+    if !state_exists && !utxo_exists {
+        return Ok(None);
+    }
+    if state_exists != utxo_exists {
+        return Err(StorageError::CorruptData);
+    }
+    let state_file = File::open(state_path)?;
+    let utxo_file = File::open(utxo_path)?;
 
     let mut state_reader = BufReader::new(state_file);
+    let mut header_line = String::new();
+    if state_reader.read_line(&mut header_line)? == 0 {
+        return Err(StorageError::CorruptData);
+    }
+    if header_line.trim().is_empty() || !header_line.starts_with("height\t") {
+        return Err(StorageError::CorruptData);
+    }
     let mut state_line = String::new();
-    if state_reader.read_line(&mut state_line).ok()? == 0 {
-        return None;
+    if state_reader.read_line(&mut state_line)? == 0 {
+        return Err(StorageError::CorruptData);
     }
     let state_line = state_line.trim();
-    if state_line.is_empty() || state_line.starts_with("height\t") {
-        return None;
-    }
     let mut fields = state_line.split('\t');
-    let height = fields.next()?.parse().ok()?;
-    let tip_hash = hex::decode(fields.next()?).ok()?.try_into().ok()?;
+    let height = fields
+        .next()
+        .ok_or(StorageError::CorruptData)?
+        .parse()
+        .map_err(|_| StorageError::CorruptData)?;
+    let tip_hash = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
+        .map_err(|_| StorageError::CorruptData)?
+        .try_into()
+        .map_err(|_| StorageError::CorruptData)?;
 
     let mut utxos = Vec::new();
     let reader = BufReader::new(utxo_file);
     for line in reader.lines() {
-        let line = line.ok()?;
+        let line = line?;
         if line.starts_with("txid\t") || line.trim().is_empty() {
             continue;
         }
         let mut fields = line.split('\t');
-        let txid: [u8; 48] = hex::decode(fields.next()?).ok()?.try_into().ok()?;
-        let output_index = fields.next()?.parse().ok()?;
-        let value_atoms = fields.next()?.parse().ok()?;
-        let locking_script = hex::decode(fields.next()?).ok()?;
-        let created_height = fields.next()?.parse().ok()?;
-        let is_coinbase = fields.next()?.parse::<u8>().ok()? != 0;
+        let txid: [u8; 48] = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
+            .map_err(|_| StorageError::CorruptData)?
+            .try_into()
+            .map_err(|_| StorageError::CorruptData)?;
+        let output_index = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let value_atoms = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let locking_script = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
+            .map_err(|_| StorageError::CorruptData)?;
+        let created_height = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let is_coinbase = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse::<u8>()
+            .map_err(|_| StorageError::CorruptData)?
+            != 0;
         utxos.push(UtxoEntry::new(
             network,
             txid,
@@ -332,15 +667,15 @@ fn load_snapshot_files(network: Network) -> Option<PersistedChainstate> {
         ));
     }
 
-    Some(PersistedChainstate {
+    Ok(Some(PersistedChainstate {
         height,
         tip_hash,
         tip_header: None,
         utxos,
-    })
+    }))
 }
 
-fn replay_legacy_chain_logs(network: Network) -> std::io::Result<Option<PersistedChainstate>> {
+fn replay_legacy_chain_logs(network: Network) -> Result<Option<PersistedChainstate>, StorageError> {
     ensure_chain_dir()?;
     let block_rows = load_block_rows()?;
     if block_rows.is_empty() {
@@ -405,7 +740,7 @@ fn replay_legacy_chain_logs(network: Network) -> std::io::Result<Option<Persiste
     Ok(Some(persisted))
 }
 
-fn load_block_rows() -> std::io::Result<BTreeMap<u64, BlockRecord>> {
+fn load_block_rows() -> Result<BTreeMap<u64, BlockRecord>, StorageError> {
     let path = blocks_ledger_path();
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -419,20 +754,21 @@ fn load_block_rows() -> std::io::Result<BTreeMap<u64, BlockRecord>> {
             continue;
         }
         let mut fields = line.split('\t');
-        let height = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(height) => height,
-            None => continue,
-        };
-        let block_hash = match fields.next().and_then(parse_hex::<48>) {
-            Some(hash) => hash,
-            None => continue,
-        };
+        let height = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let block_hash = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
         rows.insert(height, BlockRecord { height, block_hash });
     }
     Ok(rows)
 }
 
-fn load_tx_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), TxRow>> {
+fn load_tx_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), TxRow>, StorageError> {
     let path = transactions_ledger_path();
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -446,29 +782,32 @@ fn load_tx_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), TxRow>> {
             continue;
         }
         let mut fields = line.split('\t');
-        let height = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(height) => height,
-            None => continue,
-        };
-        let block_hash = match fields.next().and_then(parse_hex::<48>) {
-            Some(hash) => hash,
-            None => continue,
-        };
-        let tx_index = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(tx_index) => tx_index,
-            None => continue,
-        };
-        let txid = match fields.next().and_then(parse_hex::<48>) {
-            Some(txid) => txid,
-            None => continue,
-        };
+        let height = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let block_hash = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
+        let tx_index = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let txid = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
         let _wtxid = fields.next();
         let _version = fields.next();
         let _lock_time = fields.next();
-        let input_count = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(count) => count,
-            None => continue,
-        };
+        let input_count = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
         let _output_count = fields.next();
         let _size_bytes = fields.next();
         let _weight_bytes = fields.next();
@@ -481,7 +820,7 @@ fn load_tx_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), TxRow>> {
     Ok(rows)
 }
 
-fn load_input_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), Vec<InputRow>>> {
+fn load_input_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), Vec<InputRow>>, StorageError> {
     let path = transaction_inputs_ledger_path();
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -495,27 +834,30 @@ fn load_input_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), Vec<Input
             continue;
         }
         let mut fields = line.split('\t');
-        let height = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(height) => height,
-            None => continue,
-        };
-        let block_hash = match fields.next().and_then(parse_hex::<48>) {
-            Some(hash) => hash,
-            None => continue,
-        };
-        let tx_index = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(tx_index) => tx_index,
-            None => continue,
-        };
+        let height = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let block_hash = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
+        let tx_index = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
         let _input_index = fields.next();
-        let previous_txid = match fields.next().and_then(parse_hex::<48>) {
-            Some(txid) => txid,
-            None => continue,
-        };
-        let output_index = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(output_index) => output_index,
-            None => continue,
-        };
+        let previous_txid = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
+        let output_index = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
         let _unlocking_script_hex = fields.next();
         rows.entry((height, block_hash, tx_index))
             .or_default()
@@ -527,7 +869,7 @@ fn load_input_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), Vec<Input
     Ok(rows)
 }
 
-fn load_output_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), Vec<OutputRow>>> {
+fn load_output_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), Vec<OutputRow>>, StorageError> {
     let path = transaction_outputs_ledger_path();
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -541,27 +883,28 @@ fn load_output_rows() -> std::io::Result<BTreeMap<(u64, [u8; 48], u32), Vec<Outp
             continue;
         }
         let mut fields = line.split('\t');
-        let height = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(height) => height,
-            None => continue,
-        };
-        let block_hash = match fields.next().and_then(parse_hex::<48>) {
-            Some(hash) => hash,
-            None => continue,
-        };
-        let tx_index = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(tx_index) => tx_index,
-            None => continue,
-        };
+        let height = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let block_hash = fields
+            .next()
+            .and_then(parse_hex::<48>)
+            .ok_or(StorageError::CorruptData)?;
+        let tx_index = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
         let _output_index = fields.next();
-        let value_atoms = match fields.next().and_then(|value| value.parse().ok()) {
-            Some(value_atoms) => value_atoms,
-            None => continue,
-        };
-        let locking_script = match fields.next().and_then(|value| hex::decode(value).ok()) {
-            Some(locking_script) => locking_script,
-            None => continue,
-        };
+        let value_atoms = fields
+            .next()
+            .ok_or(StorageError::CorruptData)?
+            .parse()
+            .map_err(|_| StorageError::CorruptData)?;
+        let locking_script = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
+            .map_err(|_| StorageError::CorruptData)?;
         rows.entry((height, block_hash, tx_index))
             .or_default()
             .push(OutputRow {
@@ -637,82 +980,59 @@ struct OutputRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{ChainstateSnapshot, Database};
+    use crate::error::StorageError;
+    use crate::utxo::UtxoEntry;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
-    use atho_core::crypto::hash::sha3_256;
+    use atho_core::consensus::subsidy;
+    use atho_core::crypto::hash::sha3_384;
+    use atho_core::genesis;
     use atho_core::network::Network;
-    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+    use atho_core::transaction::{Transaction, TxOutput};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
-        let mut preimage = Vec::with_capacity(
-            b"ATHO_SIG_REF_SHORT_V1".len()
-                + txid.len()
-                + signature.len()
-                + core::mem::size_of::<u32>(),
-        );
-        preimage.extend_from_slice(b"ATHO_SIG_REF_SHORT_V1");
-        preimage.extend_from_slice(txid);
-        preimage.extend_from_slice(signature);
-        preimage.extend_from_slice(&input_index.to_be_bytes());
-        let digest = sha3_256(&preimage);
-        [digest[0], digest[1]]
+    fn temp_workspace(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-chainstate-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 
-    fn derive_witness_commit_ref(
-        txid: &[u8; 48],
-        witness_root: &[u8; 48],
-        input_index: u32,
-    ) -> [u8; 16] {
-        let mut preimage = Vec::with_capacity(
-            b"ATHO_WITNESS_COMMIT_REF_V1".len()
-                + txid.len()
-                + core::mem::size_of::<u32>()
-                + witness_root.len(),
-        );
-        preimage.extend_from_slice(b"ATHO_WITNESS_COMMIT_REF_V1");
-        preimage.extend_from_slice(txid);
-        preimage.extend_from_slice(&input_index.to_be_bytes());
-        preimage.extend_from_slice(witness_root);
-        let digest = sha3_256(&preimage);
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&digest[..16]);
-        out
-    }
+    struct CurrentDirGuard(std::path::PathBuf);
 
-    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
-        let signature = vec![9, 9, 9];
-        let pubkey = vec![8, 8, 8];
-        let txid = tx.txid();
-        let staged = TxWitness {
-            signature: signature.clone(),
-            pubkey: pubkey.clone(),
-            input_refs: (0..tx.inputs.len())
-                .map(|index| WitnessInputRef {
-                    sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
-                    witness_commit_ref: [0; 16],
-                })
-                .collect(),
-        };
-        let staged_tx = Transaction {
-            witness: staged.canonical_bytes(),
-            ..tx.clone()
-        };
-        let witness_root = staged_tx.witness_commitment_hash();
-        let sig_bytes = signature.clone();
-        TxWitness {
-            signature: sig_bytes.clone(),
-            pubkey,
-            input_refs: (0..tx.inputs.len())
-                .map(|index| WitnessInputRef {
-                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
-                    witness_commit_ref: derive_witness_commit_ref(
-                        &txid,
-                        &witness_root,
-                        index as u32,
-                    ),
-                })
-                .collect(),
+    impl CurrentDirGuard {
+        fn switch_to(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(path).expect("set cwd");
+            Self(previous)
         }
-        .canonical_bytes()
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn solve_block(mut block: Block) -> Block {
+        let prefix = block.header.canonical_bytes_without_nonce();
+        let target = block.header.difficulty_target_or_bits;
+        let mut bytes = Vec::with_capacity(prefix.len() + 8);
+        bytes.extend_from_slice(&prefix);
+        bytes.resize(prefix.len() + 8, 0);
+        for nonce in 0u64.. {
+            bytes[prefix.len()..].copy_from_slice(&nonce.to_le_bytes());
+            if atho_core::consensus::pow::meets_target(&sha3_384(&bytes), &target) {
+                block.header.nonce = nonce;
+                return block;
+            }
+        }
+        unreachable!("u64 nonce space exhausted");
     }
 
     #[test]
@@ -744,74 +1064,96 @@ mod tests {
     #[test]
     fn chainstate_connects_and_disconnects_blocks() {
         let mut state = Chainstate::new(Network::Mainnet);
-        state
-            .utxos
-            .insert(crate::utxo::UtxoEntry::new(
-                Network::Mainnet,
-                [9; 48],
-                0,
-                500,
-                vec![1],
-                0,
-                false,
-            ))
-            .unwrap();
-
-        let tx = Transaction {
-            version: 1,
-            inputs: vec![TxInput {
-                previous_txid: [9; 48],
-                output_index: 0,
-                unlocking_script: vec![2],
-            }],
-            outputs: vec![TxOutput {
-                value_atoms: 400,
-                locking_script: vec![3],
-            }],
-            lock_time: 0,
-            witness: vec![],
-        };
-        let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
-            ..tx
-        };
         let coinbase = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: 500,
+                value_atoms: subsidy::block_subsidy_atoms(1),
                 locking_script: vec![9],
             }],
             lock_time: 0,
             witness: vec![],
         };
-        let transactions = vec![coinbase, tx];
-        let mut block = Block::new(
+        let transactions = vec![coinbase];
+        let block = solve_block(Block::new(
             BlockHeader {
                 version: 1,
                 network_id: Network::Mainnet,
                 height: 1,
-                previous_block_hash: [0; 48],
+                previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
-                timestamp: 75,
+                timestamp: genesis::genesis_state(Network::Mainnet)
+                    .block
+                    .header
+                    .timestamp
+                    .saturating_add(1),
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                     Network::Mainnet,
                 ),
                 nonce: 0,
             },
             transactions,
-        );
-        block.fees_miner_atoms = 500;
+        ));
 
         state.connect_block(&block).unwrap();
         assert_eq!(state.height, 1);
-        assert_eq!(state.utxo_count(), 3);
+        assert_eq!(state.utxo_count(), 2);
         assert_eq!(state.blocks().len(), 2);
 
         state.disconnect_last_block().unwrap();
         assert_eq!(state.height, 0);
-        assert_eq!(state.utxo_count(), 2);
+        assert_eq!(state.utxo_count(), 1);
+        assert_eq!(state.blocks().len(), 1);
+    }
+
+    #[test]
+    fn invalid_block_is_rejected_without_mutating_chainstate() {
+        let mut state = Chainstate::new(Network::Mainnet);
+        let before_height = state.height;
+        let before_tip_hash = state.tip_hash;
+        let before_utxo_count = state.utxo_count();
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![9],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let transactions = vec![coinbase];
+        let block = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [1; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: genesis::genesis_state(Network::Mainnet)
+                    .block
+                    .header
+                    .timestamp
+                    .saturating_add(1),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
+                nonce: 0,
+            },
+            transactions,
+        ));
+
+        let err = state.connect_block(&block).unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::Validation(validation::ValidationError::BlockParentHashMismatch)
+        ));
+        assert_eq!(state.height, before_height);
+        assert_eq!(state.tip_hash, before_tip_hash);
+        assert_eq!(state.utxo_count(), before_utxo_count);
         assert_eq!(state.blocks().len(), 1);
     }
 
@@ -838,5 +1180,502 @@ mod tests {
         state.prune_history_to_retain(2);
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn malformed_snapshot_files_fail_closed() {
+        let root = temp_workspace("files");
+        fs::create_dir_all(root.join("dev/chain")).expect("chain dir");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        fs::write(
+            root.join("dev/chain/chainstate-atho-mainnet.tsv"),
+            "height\ttip_hash\n42\tnot-hex\n",
+        )
+        .expect("state");
+        fs::write(
+            root.join("dev/chain/utxos-atho-mainnet.tsv"),
+            "txid\toutput_index\tvalue_atoms\tlocking_script_hex\tcreated_height\tis_coinbase\n0101\t0\t100\t01\t1\t0\n",
+        )
+        .expect("utxos");
+
+        let err = Chainstate::try_load_or_new(Network::Mainnet).unwrap_err();
+        assert!(matches!(err, StorageError::CorruptData));
+    }
+
+    #[test]
+    fn incomplete_history_is_quarantined_and_rebuilt() {
+        let root = temp_workspace("recover");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let db = Database::open(Network::Mainnet).expect("database");
+        db.save_chainstate_snapshot(
+            &ChainstateSnapshot {
+                height: 1,
+                tip_hash: [9; 48],
+                tip_header: None,
+            },
+            &[],
+        )
+        .expect("snapshot");
+
+        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.blocks().len(), 1);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+
+        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
+        let mut entries = fs::read_dir(quarantine_root)
+            .expect("quarantine dir")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let report = entries
+            .pop()
+            .expect("quarantine entry")
+            .path()
+            .join("RECOVERY.txt");
+        let report_text = fs::read_to_string(report).expect("report");
+        assert!(report_text.contains("error=persisted block history is incomplete"));
+
+        let reloaded = Database::open(Network::Mainnet).expect("database reloaded");
+        let snapshot = reloaded
+            .load_chainstate_snapshot()
+            .expect("load snapshot")
+            .expect("snapshot present");
+        assert_eq!(snapshot.height, 0);
+        assert_eq!(snapshot.tip_hash, genesis::genesis_hash(Network::Mainnet));
+    }
+
+    #[test]
+    fn legacy_chain_logs_are_quarantined_during_recovery() {
+        let root = temp_workspace("legacy-recover");
+        fs::create_dir_all(root.join("dev/chain")).expect("chain dir");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        fs::write(
+            root.join("dev/chain/blocks.tsv"),
+            "height\tblock_hash\n1\t090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909\n",
+        )
+        .expect("blocks");
+
+        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.blocks().len(), 1);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+        assert!(!root.join("dev/chain/blocks.tsv").exists());
+
+        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
+        let mut entries = fs::read_dir(quarantine_root)
+            .expect("quarantine dir")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let quarantined = entries.pop().expect("entry").path();
+        assert!(quarantined.join("chain/blocks.tsv").exists());
+    }
+
+    #[test]
+    fn legacy_multi_environment_storage_is_quarantined_during_recovery() {
+        let root = temp_workspace("legacy-db-recover");
+        fs::create_dir_all(root.join("dev/db/mainnet/meta")).expect("legacy meta dir");
+        fs::create_dir_all(root.join("dev/db/mainnet/blocks")).expect("legacy blocks dir");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.blocks().len(), 1);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+        assert!(root.join("dev/db/mainnet/data.mdb").exists());
+
+        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
+        let mut entries = fs::read_dir(quarantine_root)
+            .expect("quarantine dir")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        let quarantined = entries.pop().expect("entry").path();
+        assert!(quarantined.join("db/atho-mainnet/meta").exists());
+        let report_text =
+            fs::read_to_string(quarantined.join("RECOVERY.txt")).expect("recovery report");
+        assert!(report_text.contains("legacy multi-environment storage layout detected"));
+    }
+
+    #[test]
+    fn persisted_cross_network_utxos_fail_closed() {
+        let root = temp_workspace("db");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        {
+            let db = Database::open(Network::Mainnet).expect("database");
+            let snapshot = ChainstateSnapshot {
+                height: 7,
+                tip_hash: [3; 48],
+                tip_header: None,
+            };
+            let utxos = vec![
+                UtxoEntry::new(Network::Mainnet, [11; 48], 0, 100, vec![1], 1, false),
+                UtxoEntry::new(Network::Testnet, [12; 48], 1, 200, vec![2], 2, false),
+            ];
+            db.save_chainstate_snapshot(&snapshot, &utxos)
+                .expect("snapshot");
+        }
+
+        let err = Chainstate::try_load_or_new(Network::Mainnet).unwrap_err();
+        assert!(matches!(err, StorageError::CrossNetworkReplay));
+    }
+
+    #[test]
+    fn reload_preserves_next_difficulty_target_from_recent_history() {
+        let root = temp_workspace("pow");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::load_or_new(Network::Mainnet);
+        let mut last_target = state.next_difficulty_target();
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+        for height in 1u64..=4 {
+            let previous_block_hash = state.tip_hash;
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    locking_script: vec![height as u8],
+                }],
+                lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+                witness: vec![],
+            };
+            let transactions = vec![coinbase];
+            let block = solve_block(Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Mainnet,
+                    height,
+                    previous_block_hash,
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    timestamp: genesis_timestamp
+                        .saturating_add(30 * 24 * 60 * 60)
+                        .saturating_add(height),
+                    difficulty_target_or_bits: state.next_difficulty_target(),
+                    nonce: 0,
+                },
+                transactions,
+            ));
+            state.connect_block(&block).expect("connect block");
+            last_target = state.next_difficulty_target();
+        }
+
+        drop(state);
+        let reloaded = Chainstate::load_or_new(Network::Mainnet);
+        assert_eq!(reloaded.next_difficulty_target(), last_target);
+        assert_eq!(reloaded.blocks().len(), 5);
+    }
+
+    #[test]
+    fn fast_bootstrap_chain_retargets_before_full_window() {
+        let mut state = Chainstate::new(Network::Mainnet);
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+        let initial_target =
+            atho_core::consensus::pow::initial_target_for_network(Network::Mainnet);
+        let mut next_target = initial_target;
+
+        for height in 1u64..=3 {
+            let previous_block_hash = state.tip_hash;
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    locking_script: vec![height as u8],
+                }],
+                lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+                witness: vec![],
+            };
+            let transactions = vec![coinbase];
+            let block = solve_block(Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Mainnet,
+                    height,
+                    previous_block_hash,
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    timestamp: genesis_timestamp
+                        .saturating_add(30 * 24 * 60 * 60)
+                        .saturating_add(height),
+                    difficulty_target_or_bits: next_target,
+                    nonce: 0,
+                },
+                transactions,
+            ));
+            state.connect_block(&block).expect("connect block");
+            next_target = state.next_difficulty_target();
+        }
+
+        assert!(next_target < initial_target);
+    }
+
+    #[test]
+    fn single_block_reload_rehydrates_from_persisted_history() {
+        let root = temp_workspace("single-reload");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::load_or_new(Network::Mainnet);
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+        let transactions = vec![Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![1],
+            }],
+            lock_time: 1,
+            witness: vec![],
+        }];
+        let block = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: genesis_timestamp.saturating_add(1),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            transactions,
+        ));
+        let tip_hash = block.header.block_hash();
+        state.connect_block(&block).expect("connect");
+        drop(state);
+
+        let db = Database::open(Network::Mainnet).expect("database");
+        let persisted = load_persisted_chainstate(Network::Mainnet, &db)
+            .expect("persisted")
+            .expect("snapshot");
+        assert_eq!(persisted.height, 1);
+        assert_eq!(persisted.tip_hash, tip_hash);
+        assert_eq!(
+            load_recent_blocks_from_storage(&db, tip_hash, 27)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
+        assert_eq!(reloaded.height, 1);
+        assert_eq!(reloaded.tip_hash, tip_hash);
+    }
+
+    #[test]
+    fn chainstate_reorgs_to_longer_branch_and_rolls_back_current_tip() {
+        let mut state = Chainstate::new(Network::Mainnet);
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+
+        let main_1 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(1),
+                        locking_script: vec![1],
+                    }],
+                    lock_time: 1,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(1),
+                        locking_script: vec![1],
+                    }],
+                    lock_time: 1,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(1),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(1),
+                    locking_script: vec![1],
+                }],
+                lock_time: 1,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_1).unwrap();
+
+        let main_2 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 2,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![2],
+                    }],
+                    lock_time: 2,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![2],
+                    }],
+                    lock_time: 2,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(2),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(2),
+                    locking_script: vec![2],
+                }],
+                lock_time: 2,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_2).unwrap();
+        let old_tip = state.tip_hash;
+
+        let fork_2 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 2,
+                previous_block_hash: main_1.header.block_hash(),
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![22],
+                    }],
+                    lock_time: 22,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![22],
+                    }],
+                    lock_time: 22,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(10),
+                difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(2),
+                    locking_script: vec![22],
+                }],
+                lock_time: 22,
+                witness: vec![],
+            }],
+        ));
+        let fork_history = vec![
+            genesis::genesis_state(Network::Mainnet).block,
+            main_1.clone(),
+            fork_2.clone(),
+        ];
+        let fork_3 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 3,
+                previous_block_hash: fork_2.header.block_hash(),
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![33],
+                    }],
+                    lock_time: 33,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![33],
+                    }],
+                    lock_time: 33,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(11),
+                difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
+                    Network::Mainnet,
+                    &fork_history,
+                ),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(3),
+                    locking_script: vec![33],
+                }],
+                lock_time: 33,
+                witness: vec![],
+            }],
+        ));
+
+        let result = state
+            .select_branch(&[fork_2.clone(), fork_3.clone()])
+            .unwrap();
+        assert_eq!(result.outcome, ChainSelectionOutcome::Reorged);
+        assert_eq!(result.disconnected.len(), 1);
+        assert_eq!(result.disconnected[0].header.block_hash(), old_tip);
+        assert_eq!(state.height, 3);
+        assert_eq!(state.tip_hash, fork_3.header.block_hash());
     }
 }

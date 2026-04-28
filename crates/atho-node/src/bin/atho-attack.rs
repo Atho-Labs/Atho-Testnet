@@ -2,9 +2,9 @@ use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    BLOCK_TIME_SECONDS, MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES,
-    MIN_TX_FEE_PER_VBYTE_ATOMS,
+    MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
+use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -89,7 +89,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7),
             0,
             network,
-            7u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 7),
         ),
         Ok(()),
     )? {
@@ -108,7 +108,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7).saturating_add(1),
             0,
             network,
-            7u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 7),
         ),
         Err(ValidationError::CoinbaseRewardMismatch),
     )? {
@@ -138,7 +138,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7),
             0,
             network,
-            7u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 7),
         ),
         Err(ValidationError::BlockParentHashMismatch),
     )? {
@@ -157,7 +157,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7),
             0,
             other_network(network),
-            7u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 7),
         ),
         Err(ValidationError::BlockNetworkMismatch),
     )? {
@@ -176,7 +176,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(8),
             0,
             network,
-            8u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 8),
         ),
         Err(ValidationError::InvalidBlockHeight),
     )? {
@@ -195,7 +195,7 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7),
             MAX_BLOCK_SIZE_BYTES + 1,
             network,
-            7u64.saturating_mul(BLOCK_TIME_SECONDS),
+            valid_block_timestamp(network, 7),
         ),
         Err(ValidationError::BlockTooLarge),
     )? {
@@ -225,7 +225,11 @@ fn run() -> Result<(), String> {
             subsidy::block_subsidy_atoms(7),
             0,
             network,
-            7u64.saturating_mul(BLOCK_TIME_SECONDS).saturating_add(1),
+            genesis::genesis_state(network)
+                .block
+                .header
+                .timestamp
+                .saturating_sub(1),
         ),
         Err(ValidationError::InvalidBlockTimestamp),
     )? {
@@ -253,10 +257,10 @@ fn run() -> Result<(), String> {
 fn tx_case(name: &str, network: Network, tx: BuiltTransaction) -> Result<bool, String> {
     let mut node = seeded_node(network);
     let expected = tx.expected;
-    let result = node.submit_transaction(atho_node::mempool::MempoolEntry {
-        transaction: tx.transaction,
-        fee_atoms: tx.fee_atoms,
-    });
+    let result = node.submit_transaction(atho_node::mempool::MempoolEntry::new(
+        tx.transaction,
+        tx.fee_atoms,
+    ));
     let verdict = match (result, expected) {
         (Ok(_), Ok(())) => "accept".to_string(),
         (Err(atho_node::error::NodeError::Validation(err)), Err(expected_err)) => {
@@ -296,7 +300,8 @@ fn block_case(
         | Err(ValidationError::BlockParentHashMismatch)
         | Err(ValidationError::NoInputs)
         | Err(ValidationError::MempoolConflict)
-        | Err(ValidationError::MissingUtxo) => true,
+        | Err(ValidationError::MissingUtxo)
+        | Err(ValidationError::InvalidBlockTimestamp) => true,
         _ => false,
     };
     let mined = if should_mine {
@@ -339,14 +344,14 @@ fn direct_storage_injection(network: Network) -> Result<bool, String> {
         subsidy::block_subsidy_atoms(7).saturating_add(1),
         0,
         network,
-        7u64.saturating_mul(BLOCK_TIME_SECONDS),
+        valid_block_timestamp(network, 7),
     );
     match chainstate.connect_block(&inflated) {
-        Ok(()) => {
-            println!("storage_bypass=accepted_invalid_block");
+        Ok(()) => Err(String::from("storage_bypass=accepted_invalid_block")),
+        Err(err) => {
+            println!("storage_bypass=rejected_invalid_block reason={err}");
             Ok(true)
         }
-        Err(err) => Err(format!("storage_bypass=unexpected_rejection {err}")),
     }
 }
 
@@ -540,6 +545,11 @@ fn make_spend_tx(
     tx
 }
 
+fn valid_block_timestamp(network: Network, height: u64) -> u64 {
+    let genesis_timestamp = genesis::genesis_state(network).block.header.timestamp;
+    genesis_timestamp.saturating_add(height.max(1))
+}
+
 fn build_coinbase_block(
     _network: Network,
     height: u64,
@@ -607,7 +617,7 @@ fn build_double_coinbase_block(
         previous_block_hash,
         merkle_root: merkle_root(&transactions),
         witness_root: witness_root(&transactions),
-        timestamp: height.saturating_mul(BLOCK_TIME_SECONDS),
+        timestamp: valid_block_timestamp(network, height),
         difficulty_target_or_bits: pow::target_for_height(network, height),
         nonce: 0,
     };
@@ -640,7 +650,7 @@ fn build_double_spend_block(network: Network) -> Block {
         previous_block_hash: [0; 48],
         merkle_root: merkle_root(&transactions),
         witness_root: witness_root(&transactions),
-        timestamp: 7u64.saturating_mul(BLOCK_TIME_SECONDS),
+        timestamp: valid_block_timestamp(network, 7),
         difficulty_target_or_bits: pow::target_for_height(network, 7),
         nonce: 0,
     };
@@ -679,10 +689,7 @@ fn immature_coinbase_spend_case(network: Network) -> Result<bool, String> {
     .map_err(|err| err.to_string())?;
 
     let tx = make_spend_tx(10_000, 9_000, false, false, false);
-    let result = node.submit_transaction(atho_node::mempool::MempoolEntry {
-        transaction: tx,
-        fee_atoms: 1_000,
-    });
+    let result = node.submit_transaction(atho_node::mempool::MempoolEntry::new(tx, 1_000));
     match result {
         Err(atho_node::error::NodeError::Validation(
             ValidationError::InsufficientConfirmations,

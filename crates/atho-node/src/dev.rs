@@ -78,6 +78,11 @@ fn chain_outputs_file() -> PathBuf {
 }
 
 pub fn ensure_layout() -> std::io::Result<()> {
+    let _guard = dev_lock().lock().expect("dev lock poisoned");
+    ensure_layout_locked()
+}
+
+fn ensure_layout_locked() -> std::io::Result<()> {
     fs::create_dir_all(logs_dir())?;
     fs::create_dir_all(chain_dir())?;
     fs::create_dir_all(wallet_dir())?;
@@ -92,7 +97,7 @@ pub fn append_log(component: &str, line: &str) -> std::io::Result<()> {
 }
 
 fn append_log_locked(component: &str, line: &str) -> std::io::Result<()> {
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let component_path = logs_dir().join(format!("{component}.log"));
     append_line(&component_path, line)?;
     let activity_path = logs_dir().join(ACTIVITY_LOG);
@@ -106,7 +111,7 @@ fn append_log_locked(component: &str, line: &str) -> std::io::Result<()> {
 pub fn summarize_transaction(tx: &Transaction, fee_atoms: Option<u64>) -> String {
     let txid = hex::encode(tx.txid());
     let wtxid = hex::encode(tx.wtxid());
-    let size_bytes = tx.full_bytes().len();
+    let size_bytes = tx.full_size_bytes();
     let weight_bytes = tx.weight_bytes();
     let vsize_bytes = tx.vsize_bytes();
     let witness_bytes = tx.witness_bytes();
@@ -166,7 +171,7 @@ fn activity_timestamp() -> String {
 
 pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     append_log_locked(
         "chain",
         &format!("block accepted {}", summarize_block(block)),
@@ -189,7 +194,7 @@ pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     remove_tree(&db_dir())?;
     remove_tree(&audit_dir())?;
     remove_tree(&logs_dir())?;
-    ensure_layout()
+    ensure_layout_locked()
 }
 
 fn remove_tree(path: &PathBuf) -> std::io::Result<()> {
@@ -217,7 +222,7 @@ fn remove_tree(path: &PathBuf) -> std::io::Result<()> {
 
 pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let path = audit_dir().join("chain.tsv");
     copy_or_init(
         &chain_blocks_file(),
@@ -229,7 +234,7 @@ pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
 
 pub fn export_transactions(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let path = audit_dir().join("transactions.tsv");
     copy_or_init(&chain_transactions_file(), &path, "height\tblock_hash\ttx_index\ttxid\twtxid\tversion\tlock_time\tinput_count\toutput_count\tsize_bytes\tweight_bytes\tvsize_bytes\twitness_bytes\toutput_value_atoms\tcanonical_bytes_hex")?;
     Ok(path)
@@ -237,7 +242,7 @@ pub fn export_transactions(_chainstate: &Chainstate) -> std::io::Result<PathBuf>
 
 pub fn export_transaction_details(_chainstate: &Chainstate) -> std::io::Result<(PathBuf, PathBuf)> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let inputs_path = audit_dir().join("transaction_inputs.tsv");
     let outputs_path = audit_dir().join("transaction_outputs.tsv");
     copy_or_init(&chain_inputs_file(), &inputs_path, "height\tblock_hash\ttx_index\tinput_index\tprevious_txid\toutput_index\tunlocking_script_hex")?;
@@ -251,7 +256,7 @@ pub fn export_transaction_details(_chainstate: &Chainstate) -> std::io::Result<(
 
 pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let chain = audit_dir().join("chain.tsv");
     let txs = audit_dir().join("transactions.tsv");
     let inputs = audit_dir().join("transaction_inputs.tsv");
@@ -273,7 +278,7 @@ pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, Pa
 
 pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    ensure_layout()?;
+    ensure_layout_locked()?;
     let target = initial_target_for_network(network);
     let clamped_target = clamp_target(target);
     append_log_locked(
@@ -309,10 +314,7 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     let tx_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
 
     let txid = node
-        .admit_transaction(MempoolEntry {
-            transaction: tx,
-            fee_atoms: tx_fee,
-        })
+        .admit_transaction(MempoolEntry::new(tx, tx_fee))
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
     let miner = Miner::new(4);
@@ -320,11 +322,10 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
         .mine_and_connect_candidate_block(&miner)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
-    let relay = RelayLoop::new(network);
-    relay.prime();
-    relay.sync_headers(node.height());
-    relay.relay_transaction(&txid);
-    relay.relay_block(&block.header.block_hash(), block.transactions.len());
+    let mut relay = RelayLoop::new(network);
+    relay.prime(node.blocks());
+    let _ = relay.relay_transaction(&txid);
+    let _ = relay.relay_block(&block.header.block_hash(), block.transactions.len());
     append_log_locked(
         "athod",
         &format!(
@@ -517,7 +518,7 @@ fn append_tx_rows(path: &PathBuf, height: u64, block: &Block) -> std::io::Result
             tx.lock_time,
             tx.inputs.len(),
             tx.outputs.len(),
-            tx.full_bytes().len(),
+            tx.full_size_bytes(),
             tx.weight_bytes(),
             tx.vsize_bytes(),
             tx.witness_bytes(),

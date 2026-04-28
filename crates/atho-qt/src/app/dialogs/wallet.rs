@@ -90,6 +90,11 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 
     if create_clicked {
+        if app.wallet_preparation_job.is_some() {
+            app.last_error = Some(String::from("wallet preparation already in progress"));
+            return;
+        }
+
         if app.create_form.encrypt_wallet
             && app.create_form.wallet_password != app.create_form.wallet_password_confirm
         {
@@ -97,33 +102,25 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
             return;
         }
 
-        let mnemonic = match MnemonicPhrase::parse(&app.create_form.mnemonic_text) {
-            Ok(mnemonic) => mnemonic,
-            Err(err) => {
-                app.last_error = Some(err.to_string());
-                return;
-            }
-        };
-        let wallet = app.make_wallet_from_mnemonic(mnemonic, &app.create_form.mnemonic_passphrase);
-        let wallet_password = if app.create_form.encrypt_wallet {
-            app.create_form.wallet_password.as_str()
-        } else {
-            ""
-        };
-        match DesktopApp::save_wallet_to_path(
-            &wallet,
-            &app.create_form.wallet_path,
-            wallet_password,
-        ) {
-            Ok(()) => {
-                app.load_or_create_wallet(wallet, app.create_form.wallet_path.clone());
-                app.create_form.wallet_password.clear();
-                app.create_form.wallet_password_confirm.clear();
-                app.create_form.mnemonic_passphrase.clear();
-                app.create_form.reset_phrase();
-            }
-            Err(err) => app.last_error = Some(err),
+        if let Err(err) = MnemonicPhrase::parse(&app.create_form.mnemonic_text) {
+            app.last_error = Some(err.to_string());
+            return;
         }
+
+        let wallet_password = if app.create_form.encrypt_wallet {
+            app.create_form.wallet_password.clone()
+        } else {
+            String::new()
+        };
+        app.start_wallet_from_mnemonic_preparation(
+            app.create_form.mnemonic_text.clone(),
+            app.create_form.mnemonic_passphrase.clone(),
+            app.create_form.wallet_path.clone(),
+            wallet_password,
+            "Preparing wallet",
+        );
+        app.create_form.wallet_password.clear();
+        app.create_form.wallet_password_confirm.clear();
     }
 
     if cancel_clicked {
@@ -199,6 +196,11 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 
     if import_clicked {
+        if app.wallet_preparation_job.is_some() {
+            app.last_error = Some(String::from("wallet preparation already in progress"));
+            return;
+        }
+
         if app.import_form.encrypt_wallet
             && app.import_form.wallet_password != app.import_form.wallet_password_confirm
         {
@@ -212,26 +214,20 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 return;
             }
         };
-        let wallet = app.make_wallet_from_mnemonic(mnemonic, &app.import_form.mnemonic_passphrase);
         let wallet_password = if app.import_form.encrypt_wallet {
-            app.import_form.wallet_password.as_str()
+            app.import_form.wallet_password.clone()
         } else {
-            ""
+            String::new()
         };
-        match DesktopApp::save_wallet_to_path(
-            &wallet,
-            &app.import_form.wallet_path,
+        app.start_wallet_from_mnemonic_preparation(
+            mnemonic.as_sentence(),
+            app.import_form.mnemonic_passphrase.clone(),
+            app.import_form.wallet_path.clone(),
             wallet_password,
-        ) {
-            Ok(()) => {
-                app.load_or_create_wallet(wallet, app.import_form.wallet_path.clone());
-                app.import_form.wallet_password.clear();
-                app.import_form.wallet_password_confirm.clear();
-                app.import_form.mnemonic_phrase.clear();
-                app.import_form.mnemonic_passphrase.clear();
-            }
-            Err(err) => app.last_error = Some(err),
-        }
+            "Preparing wallet",
+        );
+        app.import_form.wallet_password.clear();
+        app.import_form.wallet_password_confirm.clear();
     }
 
     if cancel_clicked {
@@ -276,14 +272,15 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 
     if open_clicked {
-        match app.open_wallet_from_path(&app.open_form.wallet_path, &app.open_form.wallet_password)
-        {
-            Ok(wallet) => {
-                app.load_or_create_wallet(wallet, app.open_form.wallet_path.clone());
-                app.open_form.wallet_password.clear();
-            }
-            Err(err) => app.last_error = Some(err),
+        if app.wallet_preparation_job.is_some() {
+            app.last_error = Some(String::from("wallet preparation already in progress"));
+            return;
         }
+        app.start_open_wallet_preparation(
+            app.open_form.wallet_path.clone(),
+            app.open_form.wallet_password.clone(),
+        );
+        app.open_form.wallet_password.clear();
     }
 
     if cancel_clicked {
