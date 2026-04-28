@@ -1,8 +1,8 @@
 use crate::config::{network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::rules;
-use atho_core::crypto::hash::sha3_256;
 use atho_core::constants::MAX_BLOCK_SIZE_BYTES;
+use atho_core::crypto::hash::sha3_256;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
