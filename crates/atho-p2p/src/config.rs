@@ -23,6 +23,7 @@ pub struct P2pLimits {
     pub max_peers_per_ip: usize,
     pub max_peers_per_subnet: usize,
     pub max_known_peers: usize,
+    pub max_user_agent_bytes: usize,
     pub ban_score_threshold: u32,
     pub peer_decay_interval_secs: u64,
 }
@@ -53,6 +54,7 @@ const DEFAULT_LIMITS: P2pLimits = P2pLimits {
     max_peers_per_ip: 8,
     max_peers_per_subnet: 16,
     max_known_peers: 4_096,
+    max_user_agent_bytes: 256,
     ban_score_threshold: 100,
     peer_decay_interval_secs: 60,
 };

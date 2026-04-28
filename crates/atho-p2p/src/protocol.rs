@@ -175,6 +175,8 @@ pub enum ProtocolError {
     UnexpectedPayload,
     #[error("unsupported protocol version")]
     UnsupportedProtocolVersion,
+    #[error("user agent too long")]
+    UserAgentTooLong,
     #[error("genesis mismatch")]
     GenesisMismatch,
     #[error("ruleset mismatch")]
@@ -553,6 +555,9 @@ pub fn validate_version_message(
     if message.min_protocol_version > params.protocol_version {
         return Err(ProtocolError::UnsupportedProtocolVersion);
     }
+    if message.user_agent.len() > params.limits.max_user_agent_bytes {
+        return Err(ProtocolError::UserAgentTooLong);
+    }
     if message.genesis_hash != Hash48::from(genesis::genesis_hash(expected_network)) {
         return Err(ProtocolError::GenesisMismatch);
     }
@@ -674,6 +679,33 @@ mod tests {
         assert_eq!(
             validate_version_message(&message, Network::Mainnet),
             Err(ProtocolError::GenesisMismatch)
+        );
+    }
+
+    #[test]
+    fn version_message_validation_rejects_oversized_user_agent() {
+        let message = VersionMessage {
+            protocol_version: rules::PROTOCOL_VERSION,
+            min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+            services: LOCAL_NODE_SERVICES,
+            timestamp_unix: 1_700_000_000,
+            network: Network::Mainnet,
+            user_agent: "A".repeat(
+                network_params(Network::Mainnet)
+                    .limits
+                    .max_user_agent_bytes
+                    .saturating_add(1),
+            ),
+            best_height: 0,
+            ruleset_version: rules::RULESET_VERSION_V1,
+            relay: true,
+            genesis_hash: Hash48::from(genesis::genesis_hash(Network::Mainnet)),
+            tip_hash: Hash48::ZERO,
+            chainwork: Hash48::ZERO,
+        };
+        assert_eq!(
+            validate_version_message(&message, Network::Mainnet),
+            Err(ProtocolError::UserAgentTooLong)
         );
     }
 
