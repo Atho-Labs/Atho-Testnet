@@ -25,10 +25,12 @@ use atho_node::validation::{
 use atho_storage::chainstate::Chainstate as StorageChainstate;
 use atho_storage::db::{ChainstateSnapshot, Database};
 use atho_storage::error::StorageError;
+use atho_storage::path::ATHO_DATA_DIR_ENV;
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use std::fs;
+use std::ffi::OsString;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CASES: usize = 52_000;
@@ -235,6 +237,33 @@ fn with_cwd<T>(path: &PathBuf, f: impl FnOnce() -> T) -> Result<T, String> {
     let result = f();
     std::env::set_current_dir(previous).map_err(|err| err.to_string())?;
     Ok(result)
+}
+
+fn persistence_data_dir(root: &Path) -> PathBuf {
+    root.join("dev")
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u64) -> Transaction {
@@ -1320,6 +1349,7 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
     ));
     fs::create_dir_all(&root).map_err(|err| err.to_string())?;
     let result = with_cwd(&root, || {
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &persistence_data_dir(&root));
         for i in 0..cases {
             report.cases += 1;
             let kind = hash_seed(seed, i as u64) as usize % 4;
@@ -1599,4 +1629,19 @@ fn write_legacy_snapshot_files(
         .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{persistence_data_dir, EnvVarGuard};
+    use atho_storage::path::{chain_dir, data_root, ATHO_DATA_DIR_ENV};
+    use std::path::PathBuf;
+
+    #[test]
+    fn persistence_attack_uses_explicit_data_root() {
+        let root = PathBuf::from("/tmp/atho-adversarial-test-root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &persistence_data_dir(&root));
+        assert_eq!(data_root(), root.join("dev"));
+        assert_eq!(chain_dir(), root.join("dev").join("chain"));
+    }
 }

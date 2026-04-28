@@ -107,6 +107,7 @@ cargo build --release -p atho-node -p atho-qt
 Full Windows instructions:
 
 - [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
+- [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)
 
 ## VPS Full Node
 
@@ -156,6 +157,7 @@ Key sections:
 - [`docs/operations/commands.md`](docs/operations/commands.md)
 - [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
 - [`docs/operations/vps-full-node.md`](docs/operations/vps-full-node.md)
+- [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)
 - [`docs/node-runtime/node-runtime-and-p2p.md`](docs/node-runtime/node-runtime-and-p2p.md)
 - [`docs/node-runtime/rpc-and-client.md`](docs/node-runtime/rpc-and-client.md)
 - [`docs/gui-client/qt-client.md`](docs/gui-client/qt-client.md)

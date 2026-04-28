@@ -11,6 +11,7 @@ Run `athod` as an always-on headless full node on a VPS with a private RPC surfa
 - P2P listens on the public node port
 - the data directory is explicit
 - upgrades are performed with clean stop / replace / start cycles
+- SSH host identity is verified before first deployment
 
 ## Build
 
@@ -78,6 +79,10 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 ```
 
+Packaged example:
+
+- `dist/release/athod.service.example`
+
 ## Status Checks
 
 Use:
@@ -114,9 +119,11 @@ Under the runtime root:
 - DNS seeds are still blank, so peer bootstrap is manual
 - public-node hardening is improved, but the network layer still needs more long-run soak coverage
 - snapshot sync is not yet a peer-served protocol
+- deployment to `74.208.219.116` is blocked from this shell until the changed SSH host key is verified out of band
 
 ## Related Documentation
 
 - [Runtime Model](runtime-model.md)
 - [Commands](commands.md)
 - [Troubleshooting](troubleshooting.md)
+- [Launch Checklist](launch-checklist.md)

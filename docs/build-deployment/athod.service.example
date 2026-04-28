@@ -1,0 +1,20 @@
+[Unit]
+Description=Atho full node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atho
+WorkingDirectory=/opt/atho
+ExecStart=/opt/atho/athod --network mainnet --data-dir /var/lib/atho --peer 198.51.100.10:56000
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

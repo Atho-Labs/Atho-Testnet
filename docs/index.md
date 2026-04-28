@@ -44,6 +44,7 @@ It is designed to answer three questions clearly:
 - [Runtime Model](operations/runtime-model.md)
 - [Windows Quick Start](operations/windows-quick-start.md)
 - [VPS Full Node](operations/vps-full-node.md)
+- [Launch Checklist](operations/launch-checklist.md)
 - [Dev Workspace](operations/dev-workspace.md)
 - [Troubleshooting](operations/troubleshooting.md)
 - [Build and Packaging](build-deployment/packaging.md)

@@ -13,8 +13,10 @@ The local package script stages:
 - `atho-qt`
 - `README.md`
 - `COMMANDS.md`
+- `LAUNCH_CHECKLIST.md`
 - `RELEASE_NOTES.md`
 - `PACKAGING.md`
+- `athod.service.example`
 
 Source locations:
 
