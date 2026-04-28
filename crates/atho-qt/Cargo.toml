@@ -1,0 +1,24 @@
+[package]
+name = "atho-qt"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+arboard = "3"
+atho-core = { path = "../atho-core" }
+atho-crypto = { path = "../atho-crypto" }
+atho-node = { path = "../atho-node" }
+atho-rpc = { path = "../atho-rpc" }
+atho-storage = { path = "../atho-storage" }
+atho-wallet = { path = "../atho-wallet" }
+eframe = "0.27"
+egui_extras = { version = "0.27", features = ["image"] }
+getrandom = "0.2"
+hex = "0.4"
+rayon = "1"
+thiserror = "1"
+
+[[bin]]
+name = "atho-qt"
+path = "src/bin/atho-qt.rs"

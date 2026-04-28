@@ -1,0 +1,29 @@
+[package]
+name = "atho-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+atho-core = { path = "../atho-core" }
+atho-crypto = { path = "../atho-crypto" }
+aes-gcm = "0.10"
+bincode = "1"
+hex = "0.4"
+getrandom = "0.2"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+thiserror = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "datafile_hot_paths"
+harness = false
+
+[[bin]]
+name = "atho-address"
+path = "src/bin/atho-address.rs"

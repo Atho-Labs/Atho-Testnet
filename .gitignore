@@ -29,13 +29,11 @@ tmp/
 *.pdf
 
 # Ignore specific directories that are not part of the source
-rust-toolchain.toml
-Cargo.toml
-Cargo.lock
 dist/
 build/
 target/
 dev/logs
+fuzz/Cargo.lock
 
 
 

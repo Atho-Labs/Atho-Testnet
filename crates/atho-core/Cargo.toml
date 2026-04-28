@@ -1,0 +1,23 @@
+[package]
+name = "atho-core"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+hex = "0.4"
+hex-literal = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+sha3 = "0.10"
+thiserror = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "hot_paths"
+harness = false

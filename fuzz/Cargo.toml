@@ -1,0 +1,36 @@
+[package]
+name = "atho-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+atho-core = { path = "../crates/atho-core" }
+atho-p2p = { path = "../crates/atho-p2p" }
+
+[[bin]]
+name = "p2p_frame_decode"
+path = "fuzz_targets/p2p_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_message_roundtrip"
+path = "fuzz_targets/p2p_message_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_witness_parse"
+path = "fuzz_targets/tx_witness_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

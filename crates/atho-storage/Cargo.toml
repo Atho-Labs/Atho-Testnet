@@ -1,0 +1,15 @@
+[package]
+name = "atho-storage"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+atho-core = { path = "../atho-core" }
+atho-crypto = { path = "../atho-crypto" }
+bincode = "1"
+hex = "0.4"
+lmdb = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
+thiserror = "1"
