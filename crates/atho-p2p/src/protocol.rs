@@ -2,9 +2,11 @@ use crate::config::{network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::rules;
 use atho_core::crypto::hash::sha3_256;
+use atho_core::constants::MAX_BLOCK_SIZE_BYTES;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -12,6 +14,7 @@ use thiserror::Error;
 pub const NODE_NETWORK: u64 = 1 << 0;
 pub const NODE_WITNESS: u64 = 1 << 3;
 pub const LOCAL_NODE_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
+const MIN_SERIALIZED_TRANSACTION_BYTES: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hash48(#[serde(with = "serde_big_array::BigArray")] pub [u8; 48]);
@@ -319,9 +322,18 @@ impl NetworkMessage {
             }
             MessagePayload::Block(block) => serialize(block),
             MessagePayload::Tx(transaction) => serialize(transaction),
-            MessagePayload::CompactBlock(message) => serialize(message),
-            MessagePayload::GetBlockTxn(message) => serialize(message),
-            MessagePayload::BlockTxn(message) => serialize(message),
+            MessagePayload::CompactBlock(message) => {
+                validate_compact_block_message(message)?;
+                serialize(message)
+            }
+            MessagePayload::GetBlockTxn(message) => {
+                validate_getblocktxn_message(message)?;
+                serialize(message)
+            }
+            MessagePayload::BlockTxn(message) => {
+                validate_blocktxn_message(message)?;
+                serialize(message)
+            }
         }
     }
 
@@ -394,9 +406,21 @@ impl NetworkMessage {
                 expect_empty(payload)?;
                 MessagePayload::MemPool
             }
-            MessageCommand::CompactBlock => MessagePayload::CompactBlock(deserialize(payload)?),
-            MessageCommand::GetBlockTxn => MessagePayload::GetBlockTxn(deserialize(payload)?),
-            MessageCommand::BlockTxn => MessagePayload::BlockTxn(deserialize(payload)?),
+            MessageCommand::CompactBlock => {
+                let message: CompactBlockMessage = deserialize(payload)?;
+                validate_compact_block_message(&message)?;
+                MessagePayload::CompactBlock(message)
+            }
+            MessageCommand::GetBlockTxn => {
+                let message: GetBlockTxnMessage = deserialize(payload)?;
+                validate_getblocktxn_message(&message)?;
+                MessagePayload::GetBlockTxn(message)
+            }
+            MessageCommand::BlockTxn => {
+                let message: BlockTxnMessage = deserialize(payload)?;
+                validate_blocktxn_message(&message)?;
+                MessagePayload::BlockTxn(message)
+            }
         };
         Ok(Self::new(network, payload))
     }
@@ -457,9 +481,7 @@ pub fn reconstruct_compact_block<F>(
 where
     F: FnMut(u64) -> Option<Transaction>,
 {
-    if message.tx_count == 0 {
-        return Err(ProtocolError::InvalidCompactBlock);
-    }
+    validate_compact_block_message(message)?;
 
     let mut slots = vec![None; message.tx_count];
     for prefilled in &message.prefilled_transactions {
@@ -549,11 +571,56 @@ fn expect_empty(payload: &[u8]) -> Result<(), ProtocolError> {
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
-    bincode::serialize(value).map_err(|_| ProtocolError::MalformedPayload)
+    bincode_options()
+        .serialize(value)
+        .map_err(|_| ProtocolError::MalformedPayload)
 }
 
 fn deserialize<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> Result<T, ProtocolError> {
-    bincode::deserialize(payload).map_err(|_| ProtocolError::MalformedPayload)
+    bincode_options()
+        .with_limit(payload.len() as u64)
+        .reject_trailing_bytes()
+        .deserialize(payload)
+        .map_err(|_| ProtocolError::MalformedPayload)
+}
+
+fn bincode_options() -> impl Options {
+    bincode::DefaultOptions::new()
+}
+
+fn max_block_transaction_count() -> usize {
+    MAX_BLOCK_SIZE_BYTES / MIN_SERIALIZED_TRANSACTION_BYTES
+}
+
+fn validate_compact_block_message(message: &CompactBlockMessage) -> Result<(), ProtocolError> {
+    if message.tx_count == 0 || message.tx_count > max_block_transaction_count() {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+    if message.prefilled_transactions.len() > message.tx_count
+        || message.short_ids.len() > message.tx_count
+    {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+    if message.prefilled_transactions.len() + message.short_ids.len() != message.tx_count {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+    Ok(())
+}
+
+fn validate_getblocktxn_message(message: &GetBlockTxnMessage) -> Result<(), ProtocolError> {
+    if message.indexes.len() > max_block_transaction_count() {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+    Ok(())
+}
+
+fn validate_blocktxn_message(message: &BlockTxnMessage) -> Result<(), ProtocolError> {
+    if message.indexes.len() != message.transactions.len()
+        || message.indexes.len() > max_block_transaction_count()
+    {
+        return Err(ProtocolError::InvalidCompactBlock);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -675,5 +742,58 @@ mod tests {
         )
         .expect("reconstruct");
         assert_eq!(reconstructed, CompactBlockReconstruction::Complete(block));
+    }
+
+    #[test]
+    fn compact_block_rejects_excessive_tx_count_before_slot_allocation() {
+        let message = CompactBlockMessage {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: [1; 48],
+                witness_root: [2; 48],
+                timestamp: 1,
+                difficulty_target_or_bits: [3; 48],
+                nonce: 4,
+            },
+            tx_count: max_block_transaction_count() + 1,
+            short_ids: Vec::new(),
+            prefilled_transactions: vec![PrefilledTransaction {
+                index: 0,
+                transaction: Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    lock_time: 0,
+                    witness: vec![],
+                },
+            }],
+            fees_total_atoms: 0,
+            fees_miner_atoms: 0,
+            fees_burned_atoms: 0,
+            fees_pool_atoms: 0,
+            cumulative_burned_atoms: 0,
+        };
+        assert_eq!(
+            reconstruct_compact_block(&message, |_| None, &BTreeMap::new()),
+            Err(ProtocolError::InvalidCompactBlock)
+        );
+    }
+
+    #[test]
+    fn getblocktxn_rejects_index_count_above_reasonable_block_bound() {
+        let message = NetworkMessage::new(
+            Network::Mainnet,
+            MessagePayload::GetBlockTxn(GetBlockTxnMessage {
+                block_hash: Hash48::ZERO,
+                indexes: vec![0; max_block_transaction_count() + 1],
+            }),
+        );
+        assert_eq!(
+            message.encode_payload(),
+            Err(ProtocolError::InvalidCompactBlock)
+        );
     }
 }
