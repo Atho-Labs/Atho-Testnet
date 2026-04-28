@@ -2,15 +2,13 @@ use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;
 use crate::runtime::NodeRuntime;
-use atho_p2p::relay::RelayLoop;
-use atho_p2p::sync::SyncState;
+use crate::sync::NodeSync;
 use atho_rpc::server::RpcServer;
 
 #[derive(Debug)]
 pub struct NodeOrchestrator {
     pub runtime: NodeRuntime,
-    pub sync_state: SyncState,
-    pub relay: RelayLoop,
+    pub sync: NodeSync,
     pub rpc_server: RpcServer,
 }
 
@@ -19,8 +17,7 @@ impl NodeOrchestrator {
         let network = config.network;
         Self {
             runtime: NodeRuntime::load_or_new(config),
-            sync_state: SyncState::default(),
-            relay: RelayLoop::new(network),
+            sync: NodeSync::new(network),
             rpc_server: RpcServer::new(network),
         }
     }
@@ -29,22 +26,20 @@ impl NodeOrchestrator {
         let network = config.network;
         Ok(Self {
             runtime: NodeRuntime::try_load_or_recover(config)?,
-            sync_state: SyncState::default(),
-            relay: RelayLoop::new(network),
+            sync: NodeSync::new(network),
             rpc_server: RpcServer::new(network),
         })
     }
 
     pub fn start(&mut self) {
         self.runtime.start();
-        self.relay.prime(self.runtime.node.blocks());
-        self.sync_state = self.relay.sync_state().clone();
+        self.sync.prime(&self.runtime.node);
         self.rpc_server.block_count = self.runtime.node.height();
         self.rpc_server.mempool_count = self.runtime.node.mempool_len();
         self.rpc_server.mempool_total_fee_atoms = self.runtime.node.mempool_total_fee_atoms();
         self.rpc_server.running = self.runtime.running;
-        self.rpc_server.headers_synced = self.sync_state.headers_synced;
-        self.rpc_server.sync_best_height = self.sync_state.best_height;
+        self.rpc_server.headers_synced = self.sync.sync_state().headers_synced;
+        self.rpc_server.sync_best_height = self.sync.sync_state().best_height;
         let _ = dev::append_log(
             "p2p",
             &format!(
@@ -52,8 +47,8 @@ impl NodeOrchestrator {
                 self.runtime.node.config.network.id(),
                 self.runtime.node.height(),
                 self.runtime.node.mempool_len(),
-                self.sync_state.best_height,
-                self.sync_state.headers_synced
+                self.sync.sync_state().best_height,
+                self.sync.sync_state().headers_synced
             ),
         );
     }
@@ -111,7 +106,7 @@ mod tests {
         orchestrator.start();
         assert!(orchestrator.runtime.running);
         assert_eq!(
-            orchestrator.sync_state.best_height,
+            orchestrator.sync.sync_state().best_height,
             orchestrator.runtime.node.height()
         );
         orchestrator.stop();

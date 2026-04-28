@@ -1,2 +1,663 @@
-#[derive(Debug, Default)]
-pub struct NodeSync;
+use crate::error::NodeError;
+use crate::node::Node;
+use atho_core::block::Block;
+use atho_core::network::Network;
+use atho_p2p::config::network_params;
+use atho_p2p::connection::{ConnectionEvent, ConnectionManager};
+use atho_p2p::protocol::{
+    Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage, ProtocolError,
+};
+use atho_p2p::relay::RelayLoop;
+use atho_p2p::sync::SyncState;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum NodeSyncError {
+    #[error(transparent)]
+    Node(#[from] NodeError),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Connection(#[from] atho_p2p::connection::ConnectionError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncNotice {
+    Ready { peer: String, best_height: u64 },
+    Disconnected { peer: String, reason: String },
+}
+
+#[derive(Debug)]
+pub struct NodeSync {
+    network: Network,
+    relay: RelayLoop,
+    connections: ConnectionManager,
+}
+
+impl NodeSync {
+    pub fn new(network: Network) -> Self {
+        Self {
+            network,
+            relay: RelayLoop::new(network),
+            connections: ConnectionManager::new(network),
+        }
+    }
+
+    pub fn prime(&mut self, node: &Node) {
+        self.relay.prime(node.blocks());
+    }
+
+    pub fn sync_state(&self) -> &SyncState {
+        self.relay.sync_state()
+    }
+
+    pub fn connections(&self) -> &ConnectionManager {
+        &self.connections
+    }
+
+    pub fn add_manual_peer(&mut self, remote_addr: impl Into<String>) {
+        self.connections.add_manual_peer(remote_addr);
+    }
+
+    pub fn accept_inbound(&mut self, remote_addr: impl Into<String>) -> Result<(), NodeSyncError> {
+        self.connections.accept_inbound(remote_addr)?;
+        Ok(())
+    }
+
+    pub fn open_outbound(
+        &mut self,
+        remote_addr: impl Into<String>,
+        node: &Node,
+    ) -> Result<Vec<ConnectionEvent>, NodeSyncError> {
+        let local_version = self.relay.build_version_message(node.blocks());
+        Ok(self.connections.open_outbound(remote_addr, local_version)?)
+    }
+
+    pub fn receive(
+        &mut self,
+        remote_addr: &str,
+        message: NetworkMessage,
+        node: &mut Node,
+    ) -> Result<(Vec<ConnectionEvent>, Vec<SyncNotice>), NodeSyncError> {
+        let local_version = self.relay.build_version_message(node.blocks());
+        let events = match self
+            .connections
+            .receive(remote_addr, message, &local_version)
+        {
+            Ok(events) => events,
+            Err(atho_p2p::connection::ConnectionError::Protocol(error)) => {
+                return Ok((
+                    Vec::new(),
+                    vec![SyncNotice::Disconnected {
+                        peer: remote_addr.to_string(),
+                        reason: error.to_string(),
+                    }],
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.expand_events(events, node)
+    }
+
+    pub fn relay_block_message(&self, block: &Block) -> NetworkMessage {
+        self.relay
+            .relay_block(&block.header.block_hash(), block.transactions.len())
+    }
+
+    pub fn relay_transaction_message(&self, txid: [u8; 48]) -> NetworkMessage {
+        self.relay.relay_transaction(&txid)
+    }
+
+    fn expand_events(
+        &mut self,
+        events: Vec<ConnectionEvent>,
+        node: &mut Node,
+    ) -> Result<(Vec<ConnectionEvent>, Vec<SyncNotice>), NodeSyncError> {
+        let mut outbound = Vec::new();
+        let mut notices = Vec::new();
+
+        for event in events {
+            match event {
+                ConnectionEvent::Send { .. } => outbound.push(event),
+                ConnectionEvent::Disconnect { peer, reason } => {
+                    notices.push(SyncNotice::Disconnected { peer, reason });
+                }
+                ConnectionEvent::Ready { peer, best_height } => {
+                    if let Some(version) = self.connections.remote_version(&peer).cloned() {
+                        self.relay.accept_version(peer.clone(), &version)?;
+                    }
+                    notices.push(SyncNotice::Ready {
+                        peer: peer.clone(),
+                        best_height,
+                    });
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.clone(),
+                        message: self.relay.build_getheaders(peer.clone()),
+                    });
+                    outbound.push(ConnectionEvent::Send {
+                        peer,
+                        message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
+                    });
+                }
+                ConnectionEvent::Message { peer, message } => {
+                    self.handle_message(&peer, message, node, &mut outbound)?;
+                }
+            }
+        }
+
+        Ok((outbound, notices))
+    }
+
+    fn handle_message(
+        &mut self,
+        peer: &str,
+        message: NetworkMessage,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        match message.payload {
+            MessagePayload::Inv { inventory } => {
+                let requests = self.missing_inventory_requests(node, &inventory);
+                if !requests.is_empty() {
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: NetworkMessage::new(
+                            self.network,
+                            MessagePayload::GetData {
+                                inventory: requests,
+                            },
+                        ),
+                    });
+                }
+            }
+            MessagePayload::GetData { inventory } => {
+                self.serve_getdata(peer, &inventory, node, outbound);
+            }
+            MessagePayload::GetHeaders(request) => {
+                let headers = node.headers_after_locator(
+                    &request
+                        .locator_hashes
+                        .iter()
+                        .copied()
+                        .map(Into::into)
+                        .collect::<Vec<[u8; 48]>>(),
+                    request.stop_hash.into_inner(),
+                    network_params(self.network).limits.max_headers_per_message,
+                );
+                outbound.push(ConnectionEvent::Send {
+                    peer: peer.to_string(),
+                    message: NetworkMessage::new(self.network, MessagePayload::Headers { headers }),
+                });
+            }
+            MessagePayload::Headers { headers } => {
+                self.relay.accept_headers(&headers)?;
+                let inventory = headers
+                    .iter()
+                    .filter_map(|header| {
+                        let hash = header.block_hash();
+                        (!node.contains_block(&hash)).then_some(InventoryVector {
+                            kind: InventoryKind::Block,
+                            hash: Hash48::from(hash),
+                        })
+                    })
+                    .take(network_params(self.network).limits.max_blocks_in_flight)
+                    .collect::<Vec<_>>();
+                if !inventory.is_empty() {
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: NetworkMessage::new(
+                            self.network,
+                            MessagePayload::GetData { inventory },
+                        ),
+                    });
+                }
+                if !self.relay.sync_state().headers_synced {
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: self.relay.build_getheaders(peer.to_string()),
+                    });
+                }
+            }
+            MessagePayload::Block(block) => {
+                let block_hash = block.header.block_hash();
+                if !node.contains_block(&block_hash) {
+                    node.submit_block(&block)?;
+                    self.relay.prime(node.blocks());
+                }
+            }
+            MessagePayload::Tx(transaction) => {
+                let txid = transaction.txid();
+                if !node.mempool_contains(&txid) {
+                    node.accept_relayed_transaction(transaction)?;
+                }
+            }
+            MessagePayload::MemPool => {
+                let inventory = node
+                    .mempool_transactions()
+                    .into_iter()
+                    .take(network_params(self.network).limits.max_inv_per_message)
+                    .map(|transaction| InventoryVector {
+                        kind: InventoryKind::Transaction,
+                        hash: Hash48::from(transaction.txid()),
+                    })
+                    .collect::<Vec<_>>();
+                if !inventory.is_empty() {
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: NetworkMessage::new(
+                            self.network,
+                            MessagePayload::Inv { inventory },
+                        ),
+                    });
+                }
+            }
+            MessagePayload::NotFound { .. } | MessagePayload::Pong { .. } => {}
+            MessagePayload::Version(_)
+            | MessagePayload::Verack
+            | MessagePayload::Ping { .. }
+            | MessagePayload::GetAddr
+            | MessagePayload::Addr { .. } => {
+                return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
+            }
+        }
+        Ok(())
+    }
+
+    fn missing_inventory_requests(
+        &self,
+        node: &Node,
+        inventory: &[InventoryVector],
+    ) -> Vec<InventoryVector> {
+        inventory
+            .iter()
+            .filter(|vector| match vector.kind {
+                InventoryKind::Block => !node.contains_block(&vector.hash.into_inner()),
+                InventoryKind::Transaction => !node.mempool_contains(&vector.hash.into_inner()),
+            })
+            .take(network_params(self.network).limits.max_requests_per_peer)
+            .cloned()
+            .collect()
+    }
+
+    fn serve_getdata(
+        &self,
+        peer: &str,
+        inventory: &[InventoryVector],
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        let mut not_found = Vec::new();
+        for vector in inventory
+            .iter()
+            .take(network_params(self.network).limits.max_requests_per_peer)
+        {
+            match vector.kind {
+                InventoryKind::Block => {
+                    if let Some(block) = node.block_by_hash(vector.hash.into_inner()) {
+                        outbound.push(ConnectionEvent::Send {
+                            peer: peer.to_string(),
+                            message: NetworkMessage::new(
+                                self.network,
+                                MessagePayload::Block(block),
+                            ),
+                        });
+                    } else {
+                        not_found.push(vector.clone());
+                    }
+                }
+                InventoryKind::Transaction => {
+                    if let Some(transaction) = node.mempool_transaction(&vector.hash.into_inner()) {
+                        outbound.push(ConnectionEvent::Send {
+                            peer: peer.to_string(),
+                            message: NetworkMessage::new(
+                                self.network,
+                                MessagePayload::Tx(transaction),
+                            ),
+                        });
+                    } else {
+                        not_found.push(vector.clone());
+                    }
+                }
+            }
+        }
+        if !not_found.is_empty() {
+            outbound.push(ConnectionEvent::Send {
+                peer: peer.to_string(),
+                message: NetworkMessage::new(
+                    self.network,
+                    MessagePayload::NotFound {
+                        inventory: not_found,
+                    },
+                ),
+            });
+        }
+    }
+}
+
+impl Default for NodeSync {
+    fn default() -> Self {
+        Self::new(Network::Mainnet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NodeConfig;
+    use crate::mempool::MempoolEntry;
+    use crate::miner::Miner;
+    use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+    use atho_crypto::falcon::{generate_from_seed, sign};
+    use atho_storage::utxo::UtxoEntry;
+    use std::collections::VecDeque;
+
+    #[derive(Debug)]
+    struct SandboxPeer {
+        id: String,
+        node: Node,
+        sync: NodeSync,
+    }
+
+    #[derive(Debug)]
+    struct QueuedSend {
+        from: String,
+        to: String,
+        message: NetworkMessage,
+    }
+
+    impl SandboxPeer {
+        fn new(id: &str, network: Network) -> Self {
+            let node = Node::new(NodeConfig::new(network));
+            let mut sync = NodeSync::new(network);
+            sync.prime(&node);
+            Self {
+                id: id.to_string(),
+                node,
+                sync,
+            }
+        }
+    }
+
+    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-node-sync-test").expect("falcon keypair");
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(tx),
+        )
+        .expect("falcon signature")
+        .0;
+        let pubkey = keypair.public_key.0;
+        let txid = tx.txid();
+        let staged = TxWitness {
+            signature: signature.clone(),
+            pubkey: pubkey.clone(),
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        };
+        let staged_tx = Transaction {
+            witness: staged.canonical_bytes(),
+            ..tx.clone()
+        };
+        let witness_root = staged_tx.witness_commitment_hash();
+        TxWitness {
+            signature: signature.clone(),
+            pubkey,
+            input_refs: (0..tx.inputs.len())
+                .map(|index| WitnessInputRef {
+                    sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
+                    witness_commit_ref: derive_witness_commit_ref(
+                        &txid,
+                        &witness_root,
+                        index as u32,
+                    ),
+                })
+                .collect(),
+        }
+        .canonical_bytes()
+    }
+
+    fn collect_events(
+        queue: &mut VecDeque<QueuedSend>,
+        notices: &mut Vec<SyncNotice>,
+        from: &str,
+        events: Vec<ConnectionEvent>,
+    ) {
+        for event in events {
+            match event {
+                ConnectionEvent::Send { peer, message } => queue.push_back(QueuedSend {
+                    from: from.to_string(),
+                    to: peer,
+                    message,
+                }),
+                ConnectionEvent::Ready { peer, best_height } => {
+                    notices.push(SyncNotice::Ready { peer, best_height });
+                }
+                ConnectionEvent::Disconnect { peer, reason } => {
+                    notices.push(SyncNotice::Disconnected { peer, reason });
+                }
+                ConnectionEvent::Message { .. } => panic!("unexpected raw message event"),
+            }
+        }
+    }
+
+    fn drain(
+        left: &mut SandboxPeer,
+        right: &mut SandboxPeer,
+        queue: &mut VecDeque<QueuedSend>,
+    ) -> Vec<SyncNotice> {
+        let mut notices = Vec::new();
+        while let Some(queued) = queue.pop_front() {
+            if queued.to == left.id {
+                let (events, mut new_notices) = left
+                    .sync
+                    .receive(&queued.from, queued.message, &mut left.node)
+                    .expect("left receive");
+                collect_events(queue, &mut notices, &left.id, events);
+                notices.append(&mut new_notices);
+            } else if queued.to == right.id {
+                let (events, mut new_notices) = right
+                    .sync
+                    .receive(&queued.from, queued.message, &mut right.node)
+                    .expect("right receive");
+                collect_events(queue, &mut notices, &right.id, events);
+                notices.append(&mut new_notices);
+            } else {
+                panic!("unknown peer {}", queued.to);
+            }
+        }
+        notices
+    }
+
+    fn connect(left: &mut SandboxPeer, right: &mut SandboxPeer) -> Vec<SyncNotice> {
+        left.sync.add_manual_peer(right.id.clone());
+        right.sync.add_manual_peer(left.id.clone());
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        collect_events(&mut queue, &mut notices, &left.id, events);
+        let mut drained = drain(left, right, &mut queue);
+        notices.append(&mut drained);
+        notices
+    }
+
+    #[test]
+    fn sandbox_nodes_complete_handshake_and_share_addresses() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        right.sync.connections.add_manual_peer("8.8.8.8:9200");
+
+        let notices = connect(&mut left, &mut right);
+
+        assert!(notices
+            .iter()
+            .any(|notice| matches!(notice, SyncNotice::Ready { peer, .. } if peer == "right")));
+        assert_eq!(left.sync.connections().peer_count(), 1);
+        let addresses = left
+            .sync
+            .connections()
+            .address_manager()
+            .advertisable_addresses(8);
+        assert!(addresses.iter().any(|address| address.host == "8.8.8.8"));
+    }
+
+    #[test]
+    fn sandbox_headers_first_sync_downloads_missing_blocks() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let miner = Miner::new(1);
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine first");
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine second");
+        right.sync.prime(&right.node);
+
+        let _ = connect(&mut left, &mut right);
+
+        assert_eq!(left.node.height(), right.node.height());
+        assert_eq!(left.node.tip_hash(), right.node.tip_hash());
+        assert_eq!(left.sync.sync_state().best_height, right.node.height());
+    }
+
+    #[test]
+    fn sandbox_block_inventory_relays_new_blocks() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let miner = Miner::new(1);
+        let block = right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine");
+        right.sync.prime(&right.node);
+
+        let mut queue = VecDeque::from([QueuedSend {
+            from: right.id.clone(),
+            to: left.id.clone(),
+            message: right.sync.relay_block_message(&block),
+        }]);
+        let _ = drain(&mut left, &mut right, &mut queue);
+
+        assert_eq!(left.node.height(), right.node.height());
+        assert_eq!(left.node.tip_hash(), right.node.tip_hash());
+    }
+
+    #[test]
+    fn sandbox_transaction_inventory_relays_to_mempool() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let seed_txid = [7; 48];
+        let seed_value = 2_000u64;
+        let seed_script = vec![1];
+        for peer in [&mut left, &mut right] {
+            peer.node
+                .dev_seed_chainstate(
+                    6,
+                    peer.node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        seed_txid,
+                        0,
+                        seed_value,
+                        seed_script.clone(),
+                        0,
+                        false,
+                    )],
+                )
+                .expect("seed utxo");
+            peer.sync.prime(&peer.node);
+        }
+
+        let template = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: seed_txid,
+                output_index: 0,
+                unlocking_script: seed_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let provisional = Transaction {
+            witness: witness_bytes_for_tx(&template),
+            ..template
+        };
+        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let signed = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: seed_value.saturating_sub(fee_atoms),
+                locking_script: vec![2],
+            }],
+            ..Transaction {
+                witness: vec![],
+                ..provisional
+            }
+        };
+        let signed = Transaction {
+            witness: witness_bytes_for_tx(&signed),
+            ..signed
+        };
+        let txid = right
+            .node
+            .submit_transaction(MempoolEntry::new(signed.clone(), fee_atoms))
+            .expect("submit tx");
+
+        let mut queue = VecDeque::from([QueuedSend {
+            from: right.id.clone(),
+            to: left.id.clone(),
+            message: right.sync.relay_transaction_message(txid),
+        }]);
+        let _ = drain(&mut left, &mut right, &mut queue);
+
+        assert!(left.node.mempool_contains(&txid));
+    }
+
+    #[test]
+    fn invalid_pre_handshake_message_disconnects_peer() {
+        let left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+
+        let (events, notices) = right
+            .sync
+            .receive(
+                &left.id,
+                NetworkMessage::new(Network::Regnet, MessagePayload::Ping { nonce: 7 }),
+                &mut right.node,
+            )
+            .expect("receive");
+        assert!(events.is_empty());
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            SyncNotice::Disconnected { peer, .. } if peer == "left"
+        )));
+    }
+}

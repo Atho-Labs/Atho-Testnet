@@ -204,8 +204,8 @@ impl NodeService {
             mempool_total_fee_atoms: self.orchestrator.runtime.node.mempool_total_fee_atoms(),
             wallet_snapshot: self.wallet_snapshot.clone(),
             running: self.orchestrator.runtime.running,
-            headers_synced: self.orchestrator.sync_state.headers_synced,
-            sync_best_height: self.orchestrator.sync_state.best_height,
+            headers_synced: self.orchestrator.sync.sync_state().headers_synced,
+            sync_best_height: self.orchestrator.sync.sync_state().best_height,
         }
     }
 

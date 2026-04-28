@@ -146,6 +146,10 @@ pub enum ProtocolError {
     InvalidHeadersSequence,
     #[error("peer book full")]
     PeerBookFull,
+    #[error("handshake incomplete")]
+    HandshakeIncomplete,
+    #[error("too many locator hashes")]
+    TooManyLocatorHashes,
 }
 
 impl MessageCommand {
@@ -250,7 +254,12 @@ impl NetworkMessage {
                 }
                 serialize(inventory)
             }
-            MessagePayload::GetHeaders(message) => serialize(message),
+            MessagePayload::GetHeaders(message) => {
+                if message.locator_hashes.len() > 32 {
+                    return Err(ProtocolError::TooManyLocatorHashes);
+                }
+                serialize(message)
+            }
             MessagePayload::Headers { headers } => {
                 if headers.len() > network_params(self.network).limits.max_headers_per_message {
                     return Err(ProtocolError::TooManyHeaders);
@@ -311,7 +320,13 @@ impl NetworkMessage {
                 }
                 MessagePayload::NotFound { inventory }
             }
-            MessageCommand::GetHeaders => MessagePayload::GetHeaders(deserialize(payload)?),
+            MessageCommand::GetHeaders => {
+                let message: GetHeadersMessage = deserialize(payload)?;
+                if message.locator_hashes.len() > 32 {
+                    return Err(ProtocolError::TooManyLocatorHashes);
+                }
+                MessagePayload::GetHeaders(message)
+            }
             MessageCommand::Headers => {
                 let headers: Vec<BlockHeader> = deserialize(payload)?;
                 if headers.len() > network_params(network).limits.max_headers_per_message {
@@ -419,6 +434,21 @@ mod tests {
         assert_eq!(
             validate_version_message(&message, Network::Mainnet),
             Err(ProtocolError::GenesisMismatch)
+        );
+    }
+
+    #[test]
+    fn getheaders_rejects_locator_above_cap() {
+        let message = NetworkMessage::new(
+            Network::Mainnet,
+            MessagePayload::GetHeaders(GetHeadersMessage {
+                locator_hashes: vec![Hash48::ZERO; 33],
+                stop_hash: Hash48::ZERO,
+            }),
+        );
+        assert_eq!(
+            message.encode_payload(),
+            Err(ProtocolError::TooManyLocatorHashes)
         );
     }
 }

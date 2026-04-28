@@ -13,13 +13,18 @@ pub struct P2pLimits {
     pub max_addr_per_message: usize,
     pub max_inv_per_message: usize,
     pub max_headers_per_message: usize,
+    pub max_blocks_in_flight: usize,
+    pub max_requests_per_peer: usize,
     pub handshake_timeout_ms: u64,
     pub read_timeout_ms: u64,
     pub write_timeout_ms: u64,
     pub max_inbound_peers: usize,
     pub max_outbound_peers: usize,
     pub max_peers_per_ip: usize,
+    pub max_peers_per_subnet: usize,
     pub max_known_peers: usize,
+    pub ban_score_threshold: u32,
+    pub peer_decay_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,13 +43,18 @@ const DEFAULT_LIMITS: P2pLimits = P2pLimits {
     max_addr_per_message: 1_000,
     max_inv_per_message: 50_000,
     max_headers_per_message: 2_000,
+    max_blocks_in_flight: 128,
+    max_requests_per_peer: 256,
     handshake_timeout_ms: 5_000,
     read_timeout_ms: 10_000,
     write_timeout_ms: 10_000,
     max_inbound_peers: 32,
     max_outbound_peers: 8,
     max_peers_per_ip: 8,
+    max_peers_per_subnet: 16,
     max_known_peers: 4_096,
+    ban_score_threshold: 100,
+    peer_decay_interval_secs: 60,
 };
 
 pub fn network_params(network: Network) -> NetworkParams {

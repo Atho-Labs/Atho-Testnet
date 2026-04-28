@@ -3,8 +3,11 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::mempool::{Mempool, MempoolEntry};
 use crate::miner::Miner;
+use crate::validation::ValidationError;
 use atho_core::block::Block;
+use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
+use atho_core::transaction::Transaction;
 use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, Chainstate as StorageChainstate,
 };
@@ -62,6 +65,21 @@ impl Node {
         self.chainstate.blocks()
     }
 
+    pub fn contains_block(&self, block_hash: &[u8; 48]) -> bool {
+        self.chainstate
+            .blocks()
+            .iter()
+            .any(|block| block.header.block_hash() == *block_hash)
+    }
+
+    pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Option<Block> {
+        self.chainstate
+            .blocks()
+            .iter()
+            .find(|block| block.header.block_hash() == block_hash)
+            .cloned()
+    }
+
     pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {
         pow::target_for_next_block(self.network(), self.chainstate.blocks())
     }
@@ -72,6 +90,18 @@ impl Node {
 
     pub fn mempool_total_fee_atoms(&self) -> u64 {
         self.mempool.total_fee_atoms()
+    }
+
+    pub fn mempool_contains(&self, txid: &[u8; 48]) -> bool {
+        self.mempool.contains(txid)
+    }
+
+    pub fn mempool_transaction(&self, txid: &[u8; 48]) -> Option<Transaction> {
+        self.mempool.transaction(txid)
+    }
+
+    pub fn mempool_transactions(&self) -> Vec<Transaction> {
+        self.mempool.transactions()
     }
 
     #[doc(hidden)]
@@ -157,6 +187,19 @@ impl Node {
         Ok(txid)
     }
 
+    pub fn accept_relayed_transaction(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<[u8; 48], NodeError> {
+        if transaction.is_coinbase() {
+            return Err(NodeError::Validation(ValidationError::InvalidCoinbase));
+        }
+        let utxos = self.chainstate.utxo_snapshot();
+        let fee_atoms = transaction_fee_from_utxos(&transaction, &utxos)
+            .ok_or(NodeError::Validation(ValidationError::MissingUtxo))?;
+        self.submit_transaction(MempoolEntry::new(transaction, fee_atoms))
+    }
+
     pub fn mine_candidate_block(&self, miner: &Miner) -> Result<Block, NodeError> {
         miner.mine_candidate_block(self)
     }
@@ -227,6 +270,40 @@ impl Node {
 
     pub fn mempool_spent_inputs(&self) -> Vec<([u8; 48], u32)> {
         self.mempool.spent_inputs_snapshot()
+    }
+
+    pub fn headers_after_locator(
+        &self,
+        locator_hashes: &[[u8; 48]],
+        stop_hash: [u8; 48],
+        max_headers: usize,
+    ) -> Vec<BlockHeader> {
+        let blocks = self.chainstate.blocks();
+        if blocks.is_empty() || max_headers == 0 {
+            return Vec::new();
+        }
+
+        let start_index = locator_hashes
+            .iter()
+            .find_map(|hash| {
+                blocks
+                    .iter()
+                    .position(|block| block.header.block_hash() == *hash)
+                    .map(|index| index.saturating_add(1))
+            })
+            .unwrap_or(0);
+
+        let mut headers = Vec::new();
+        for block in blocks.iter().skip(start_index) {
+            if headers.len() >= max_headers {
+                break;
+            }
+            headers.push(block.header.clone());
+            if stop_hash != [0; 48] && block.header.block_hash() == stop_hash {
+                break;
+            }
+        }
+        headers
     }
 }
 

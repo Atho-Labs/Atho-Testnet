@@ -157,6 +157,12 @@ impl Mempool {
         self.entries.contains_key(txid)
     }
 
+    pub fn transaction(&self, txid: &[u8; 48]) -> Option<Transaction> {
+        self.entries
+            .get(txid)
+            .map(|entry| entry.transaction.clone())
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
