@@ -15,6 +15,7 @@ pub const DEFAULT_RESTORE_GAP_LIMIT: usize = 1_000;
 pub const WALLET_DATAFILE_NAME: &str = ".datafile";
 
 pub mod datafile;
+pub use datafile::WalletDatafileMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletAddress {
@@ -150,6 +151,12 @@ impl Wallet {
         F: FnMut(usize, usize),
     {
         datafile::WalletDataFile::load_with_progress(path, password, progress)
+    }
+
+    pub fn inspect_datafile(
+        path: &Path,
+    ) -> Result<WalletDatafileMetadata, datafile::WalletDatafileError> {
+        datafile::WalletDataFile::inspect(path)
     }
 
     pub fn datafile_name() -> &'static str {

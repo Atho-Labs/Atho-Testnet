@@ -20,7 +20,14 @@ const DEFAULT_PASSWORD_SCHEME: &str = "atho-wallet-password-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletEncryptionMode {
+    Plaintext = 0,
     PasswordAes256Gcm = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletDatafileMetadata {
+    pub network: Network,
+    pub encryption_mode: WalletEncryptionMode,
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +96,15 @@ impl WalletDataFile {
         load_impl_with_progress(path, password, PASSWORD_ITERATIONS, progress)
     }
 
+    pub fn inspect(path: &Path) -> Result<WalletDatafileMetadata, WalletDatafileError> {
+        let bytes = fs::read(path)?;
+        let file = WalletDataFile::from_bytes(&bytes)?;
+        Ok(WalletDatafileMetadata {
+            network: file.network,
+            encryption_mode: file.encryption_mode,
+        })
+    }
+
     fn to_bytes(&self) -> Result<Vec<u8>, WalletDatafileError> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -123,6 +139,7 @@ impl WalletDataFile {
         };
 
         let encryption_mode = match bytes[11] {
+            0 => WalletEncryptionMode::Plaintext,
             1 => WalletEncryptionMode::PasswordAes256Gcm,
             _ => return Err(WalletDatafileError::InvalidHeader),
         };
@@ -161,16 +178,24 @@ fn save_impl(
     path: &Path,
     iterations: u32,
 ) -> Result<(), WalletDatafileError> {
+    let state = wallet.capture_state();
+    // An empty passphrase is functionally "no encryption". Persist that case honestly and avoid
+    // paying a large PBKDF2 startup cost for wallets the user intentionally left unencrypted.
     let mut salt = [0u8; SALT_BYTES];
     let mut nonce = [0u8; NONCE_BYTES];
-    getrandom(&mut salt).map_err(|_| WalletDatafileError::RandomnessFailure)?;
-    getrandom(&mut nonce).map_err(|_| WalletDatafileError::RandomnessFailure)?;
-
-    let state = wallet.capture_state();
-    let ciphertext = encrypt_state(password, &salt, &nonce, &state, iterations)?;
+    let (encryption_mode, ciphertext) = if password.is_empty() {
+        (WalletEncryptionMode::Plaintext, bincode::serialize(&state)?)
+    } else {
+        getrandom(&mut salt).map_err(|_| WalletDatafileError::RandomnessFailure)?;
+        getrandom(&mut nonce).map_err(|_| WalletDatafileError::RandomnessFailure)?;
+        (
+            WalletEncryptionMode::PasswordAes256Gcm,
+            encrypt_state(password, &salt, &nonce, &state, iterations)?,
+        )
+    };
     let file = WalletDataFile {
         network: wallet.network,
-        encryption_mode: WalletEncryptionMode::PasswordAes256Gcm,
+        encryption_mode,
         salt,
         nonce,
         ciphertext,
@@ -194,16 +219,16 @@ where
 {
     let bytes = fs::read(path)?;
     let file = WalletDataFile::from_bytes(&bytes)?;
-    if file.encryption_mode != WalletEncryptionMode::PasswordAes256Gcm {
-        return Err(WalletDatafileError::UnsupportedEncryptionMode);
-    }
-    let state = decrypt_state(
-        password,
-        &file.salt,
-        &file.nonce,
-        &file.ciphertext,
-        iterations,
-    )?;
+    let state = match file.encryption_mode {
+        WalletEncryptionMode::Plaintext => bincode::deserialize(&file.ciphertext)?,
+        WalletEncryptionMode::PasswordAes256Gcm => decrypt_state(
+            password,
+            &file.salt,
+            &file.nonce,
+            &file.ciphertext,
+            iterations,
+        )?,
+    };
     Ok(Wallet::from_state_with_progress(
         file.network,
         None,
@@ -311,6 +336,23 @@ mod tests {
         save_impl(&wallet, "password", &path, TEST_ITERATIONS).unwrap();
         let err = load_impl(&path, "wrong", TEST_ITERATIONS).unwrap_err();
         assert!(matches!(err, WalletDatafileError::InvalidPassword));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_password_wallet_uses_plaintext_mode() {
+        let dir = env::temp_dir();
+        let path = dir.join("atho-wallet-plaintext.datafile");
+        let wallet = wallet();
+        save_impl(&wallet, "", &path, TEST_ITERATIONS).unwrap();
+
+        let metadata = WalletDataFile::inspect(&path).unwrap();
+        assert_eq!(metadata.network, Network::Mainnet);
+        assert_eq!(metadata.encryption_mode, WalletEncryptionMode::Plaintext);
+
+        let loaded = load_impl(&path, "", TEST_ITERATIONS).unwrap();
+        assert_eq!(loaded.mnemonic_sentence(), wallet.mnemonic_sentence());
+        assert_eq!(loaded.snapshot, wallet.snapshot);
         let _ = fs::remove_file(&path);
     }
 }

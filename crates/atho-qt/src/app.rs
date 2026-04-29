@@ -25,6 +25,7 @@ use atho_rpc::transport::RpcClient;
 use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
 use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
+use atho_wallet::wallet::datafile::WalletEncryptionMode;
 use atho_wallet::wallet::{Wallet, WalletAddress};
 use eframe::egui;
 use getrandom::getrandom;
@@ -90,12 +91,12 @@ pub struct DesktopApp {
     send_status: String,
     send_job: Option<SendJob>,
     wallet_preparation_job: Option<WalletPreparationJob>,
-    wallet_preparation_hidden: bool,
     wallet_preparation_stage: String,
     wallet_preparation_progress: f32,
     wallet_preparation_completed: usize,
     wallet_preparation_total: usize,
     wallet_scan_job: Option<WalletScanJob>,
+    wallet_readiness_gate_active: bool,
     mining_status: String,
     mining_job: Option<MiningJob>,
     pending_mining_restart: Option<u32>,
@@ -231,12 +232,12 @@ impl DesktopApp {
             send_status: String::from("Enter a destination and ATHO amount."),
             send_job: None,
             wallet_preparation_job: None,
-            wallet_preparation_hidden: false,
             wallet_preparation_stage: String::new(),
             wallet_preparation_progress: 0.0,
             wallet_preparation_completed: 0,
             wallet_preparation_total: 0,
             wallet_scan_job: None,
+            wallet_readiness_gate_active: false,
             mining_status: String::from("Idle"),
             mining_job: None,
             pending_mining_restart: None,
@@ -324,6 +325,7 @@ impl DesktopApp {
             String::from("Disconnected")
         };
         if let Some(error) = startup_error {
+            self.wallet_readiness_gate_active = false;
             self.last_error = Some(error);
         }
 
@@ -360,6 +362,16 @@ impl DesktopApp {
             .unwrap_or_else(|| String::from("wallet.dat"))
     }
 
+    fn wallet_preparation_blocks_startup(&self) -> bool {
+        self.wallet.is_none() && self.wallet_preparation_job.is_some()
+    }
+
+    fn wallet_readiness_blocks_main_ui(&self) -> bool {
+        // Managed local-node mode should not drop the user into the main shell until the wallet
+        // has completed its first post-open scan against a live backend.
+        self.wallet_preparation_blocks_startup() || self.wallet_readiness_gate_active
+    }
+
     pub(crate) fn clear_wallet_state(&mut self) {
         self.stop_mining_job();
         self.send_job = None;
@@ -382,6 +394,7 @@ impl DesktopApp {
         self.wallet_balance_cache = 0;
         self.wallet_cache_dirty = true;
         self.wallet_scan_job = None;
+        self.wallet_readiness_gate_active = false;
         self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
         self.wallet_discovery_scan_limit_cached = 0;
@@ -888,6 +901,9 @@ impl DesktopApp {
             false
         };
         self.wallet_cache_dirty = self.wallet_cache_dirty || continue_scanning;
+        if !continue_scanning {
+            self.wallet_readiness_gate_active = false;
+        }
         self.last_wallet_refresh_at = Instant::now();
         let _ = atho_node::dev::append_log(
             "atho-qt",
@@ -922,6 +938,7 @@ impl DesktopApp {
                     return;
                 }
                 self.wallet_cache_dirty = true;
+                self.wallet_readiness_gate_active = false;
                 self.last_error = Some(err.clone());
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -934,6 +951,7 @@ impl DesktopApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.wallet_cache_dirty = true;
+                self.wallet_readiness_gate_active = false;
                 self.last_error = Some(String::from("wallet scan worker disconnected"));
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -996,7 +1014,6 @@ impl DesktopApp {
             started_at: Instant::now(),
             receiver,
         });
-        self.wallet_preparation_hidden = false;
         self.wallet_preparation_stage = stage.to_owned();
         self.wallet_preparation_progress = 0.0;
         self.wallet_preparation_completed = 0;
@@ -1053,7 +1070,6 @@ impl DesktopApp {
 
         let elapsed = job.started_at.elapsed();
         self.wallet_preparation_job = None;
-        self.wallet_preparation_hidden = false;
         match completed_result {
             Ok(outcome) => {
                 self.wallet_preparation_stage = String::from("Wallet ready");
@@ -1110,7 +1126,7 @@ impl DesktopApp {
         false
     }
 
-    fn attach_wallet(&mut self, mut wallet: Wallet, wallet_path: String) {
+    fn attach_wallet(&mut self, wallet: Wallet, wallet_path: String) {
         let has_receive = wallet
             .address_book
             .snapshot()
@@ -1118,8 +1134,10 @@ impl DesktopApp {
             .any(|record| record.path.kind == AddressKind::Receive);
 
         if !has_receive {
-            let first = wallet.checkout_receive_address();
-            self.current_receive_address = Some(first);
+            // Show the first deterministic receive preview without mutating persisted wallet
+            // state during startup. Real checkout still happens only when the user explicitly
+            // requests a new receive/change address.
+            self.current_receive_address = wallet.receive_addresses(1).into_iter().next();
         }
 
         let address_records = wallet.address_book.snapshot();
@@ -1144,6 +1162,7 @@ impl DesktopApp {
         self.wallet_path = Some(wallet_path);
         self.wallet = Some(wallet);
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
+        self.wallet_readiness_gate_active = self.connection.has_local_node();
         self.refresh_wallet_address_views();
         self.wallet_cache_dirty = true;
         self.sync_wallet_state();
@@ -1430,7 +1449,7 @@ impl DesktopApp {
                 network,
                 move |completed, total| {
                     let _ = progress_sender.send(WalletPreparationEvent::Progress {
-                        stage: String::from("Generating addresses"),
+                        stage: String::from("Preparing keypool"),
                         completed,
                         total,
                     });
@@ -1458,6 +1477,11 @@ impl DesktopApp {
         let wallet_path_for_job = wallet_path.clone();
         let wallet_password_for_job = wallet_password.clone();
         self.start_wallet_preparation_job("Loading wallet", move |sender| {
+            let _ = sender.send(WalletPreparationEvent::Progress {
+                stage: String::from("Reading wallet"),
+                completed: 0,
+                total: 0,
+            });
             let progress_sender = sender.clone();
             let wallet_path_buf = PathBuf::from(&wallet_path_for_job);
             let wallet = Wallet::load_from_datafile_with_progress(
@@ -1465,7 +1489,7 @@ impl DesktopApp {
                 &wallet_password_for_job,
                 move |completed, total| {
                     let _ = progress_sender.send(WalletPreparationEvent::Progress {
-                        stage: String::from("Generating addresses"),
+                        stage: String::from("Preparing keypool"),
                         completed,
                         total,
                     });
@@ -1528,28 +1552,6 @@ impl DesktopApp {
         self.wallet_ref().and_then(Wallet::mnemonic_sentence)
     }
 
-    fn open_wallet_from_path(&self, wallet_path: &str, password: &str) -> Result<Wallet, String> {
-        let path = PathBuf::from(wallet_path);
-        let wallet = if cfg!(test) {
-            Wallet::load_from_datafile_with_iterations(
-                &path,
-                password,
-                TEST_WALLET_DATAFILE_ITERATIONS,
-            )
-        } else {
-            Wallet::load_from_datafile(&path, password)
-        }
-        .map_err(|err| err.to_string())?;
-        if wallet.network != self.connection.network() {
-            return Err(format!(
-                "wallet belongs to {} not {}",
-                wallet.network.id(),
-                self.connection.network().id()
-            ));
-        }
-        Ok(wallet)
-    }
-
     fn try_open_existing_wallet_on_startup(&mut self) {
         let path = default_wallet_path(self.connection.network());
         if !path.exists() {
@@ -1561,12 +1563,21 @@ impl DesktopApp {
         self.open_form.wallet_path = wallet_path.clone();
         self.open_form.wallet_password.clear();
 
-        match self.open_wallet_from_path(&wallet_path, "") {
-            Ok(wallet) => {
-                self.load_or_create_wallet(wallet, wallet_path);
-                self.last_error = None;
+        // Never synchronously decrypt or hydrate a wallet in the constructor. Startup must remain
+        // responsive and all real wallet preparation must flow through the same gated background
+        // worker used by explicit open/create/import actions.
+        match Wallet::inspect_datafile(path.as_path()) {
+            Ok(metadata) if metadata.network == self.connection.network() => {
+                match metadata.encryption_mode {
+                    WalletEncryptionMode::Plaintext => {
+                        self.start_open_wallet_preparation(wallet_path, String::new());
+                    }
+                    WalletEncryptionMode::PasswordAes256Gcm => {
+                        self.launch_page = LaunchPage::OpenWallet;
+                    }
+                }
             }
-            Err(_) => {
+            _ => {
                 self.launch_page = LaunchPage::OpenWallet;
                 self.last_error = None;
             }
@@ -2218,35 +2229,16 @@ impl DesktopApp {
     }
 
     fn render_wallet_preparation_overlay(&mut self, ctx: &egui::Context) {
-        if self.wallet_preparation_job.is_none() {
+        if self.wallet_preparation_job.is_none() || self.wallet.is_none() {
             return;
         }
 
         let progress = self.wallet_preparation_progress.clamp(0.0, 1.0);
-        let percentage = (progress * 100.0).round() as u32;
         let title = if self.wallet_preparation_stage.is_empty() {
-            "Generating addresses...".to_owned()
+            "Preparing wallet".to_owned()
         } else {
             self.wallet_preparation_stage.clone()
         };
-
-        if self.wallet_preparation_hidden {
-            egui::Area::new("wallet_preparation_toast".into())
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
-                .show(ctx, |ui| {
-                    if ui
-                        .add_sized(
-                            [240.0, 34.0],
-                            egui::Button::new(format!("{title} {percentage}%")),
-                        )
-                        .clicked()
-                    {
-                        self.wallet_preparation_hidden = false;
-                    }
-                });
-            return;
-        }
 
         let screen_rect = ctx.input(|input| input.screen_rect());
         let layer_id = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("wallet_prep"));
@@ -2266,16 +2258,12 @@ impl DesktopApp {
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Generating addresses...")
-                            .size(18.0)
-                            .strong(),
-                    );
+                    ui.label(egui::RichText::new("Preparing wallet").size(20.0).strong());
                     ui.add_space(4.0);
                     ui.label(title);
                     if self.wallet_preparation_total > 0 {
                         ui.label(format!(
-                            "{} / {} addresses",
+                            "{} / {} steps",
                             self.wallet_preparation_completed, self.wallet_preparation_total
                         ));
                     }
@@ -2285,14 +2273,8 @@ impl DesktopApp {
                             .desired_width(380.0)
                             .show_percentage(),
                     );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Hide").clicked() {
-                            self.wallet_preparation_hidden = true;
-                        }
-                    });
                     ui.add_space(4.0);
-                    ui.label("The wallet is not usable until this finishes.");
+                    ui.label("Wallet actions stay locked until preparation finishes.");
                 });
             });
     }
@@ -2341,19 +2323,22 @@ impl eframe::App for DesktopApp {
         self.poll_mining_job();
         self.poll_wallet_preparation_job();
         self.refresh_wallet_cache_if_needed();
-        let repaint_after = if self.wallet_preparation_job.is_some() {
-            Duration::from_millis(50)
-        } else if self.mining_job.is_some() || self.send_job.is_some() {
-            Duration::from_millis(150)
-        } else if self.wallet_cache_dirty || self.active_tab == NavTab::Overview {
-            Duration::from_millis(400)
-        } else {
-            Duration::from_millis(750)
-        };
+        let repaint_after =
+            if self.wallet_preparation_job.is_some() || self.wallet_readiness_gate_active {
+                Duration::from_millis(50)
+            } else if self.mining_job.is_some() || self.send_job.is_some() {
+                Duration::from_millis(150)
+            } else if self.wallet_cache_dirty || self.active_tab == NavTab::Overview {
+                Duration::from_millis(400)
+            } else {
+                Duration::from_millis(750)
+            };
         ctx.request_repaint_after(repaint_after);
 
-        if self.wallet.is_some() {
+        if self.wallet.is_some() && !self.wallet_readiness_gate_active {
             shell::render_main_shell(self, ctx);
+        } else if self.wallet_readiness_blocks_main_ui() {
+            startup::render_wallet_preparation_screen(self, ctx);
         } else {
             startup::render_startup_screen(self, ctx);
         }
@@ -2979,6 +2964,62 @@ mod tests {
             .iter()
             .any(|row| row.payment_digest == address.payment_digest));
         std::env::remove_var("ATHO_QT_LOCAL");
+    }
+
+    #[test]
+    fn attach_wallet_uses_receive_preview_without_mutating_wallet_state() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x44u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+
+        assert_eq!(wallet.snapshot.receive_count, 0);
+        assert!(wallet.address_book.snapshot().is_empty());
+
+        app.attach_wallet(wallet, String::from("wallet.dat"));
+
+        let attached = app.wallet_ref().expect("wallet attached");
+        assert_eq!(attached.snapshot.receive_count, 0);
+        assert!(attached.address_book.snapshot().is_empty());
+        assert!(app.current_receive_address.is_some());
+    }
+
+    #[test]
+    fn startup_auto_open_runs_through_background_wallet_preparation() {
+        let root = temp_sandbox_root("startup-auto-open");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        std::env::remove_var("ATHO_QT_FORCE_RPC");
+
+        let wallet_path = default_wallet_path(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x27u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save wallet");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        assert!(app.wallet.is_none());
+        assert!(app.wallet_preparation_job.is_some());
+        assert!(app.wallet_readiness_blocks_main_ui());
+
+        wait_until(
+            "background wallet auto-open completes",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),
+        );
+        assert!(app.current_receive_address.is_some());
     }
 
     #[test]

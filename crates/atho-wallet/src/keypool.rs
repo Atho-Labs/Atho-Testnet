@@ -2,7 +2,9 @@ use crate::hd::{AddressKind, DerivationPath, HdWallet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-pub const KEYPOOL_TARGET_SIZE: usize = 5_000;
+// Keep the default pool large enough to feel instant during normal receive/change use without
+// turning first-run wallet creation and datafile serialization into a heavy startup spike.
+pub const KEYPOOL_TARGET_SIZE: usize = 1_024;
 const PREFILL_PROGRESS_BATCH: usize = 64;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
