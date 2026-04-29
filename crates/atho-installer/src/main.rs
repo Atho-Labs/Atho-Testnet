@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eframe::egui;
+use rfd::FileDialog;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::ZipArchive;
@@ -224,7 +225,7 @@ impl InstallerApp {
 
     fn launch_installed_client(&self) -> Result<(), String> {
         let launcher = if cfg!(target_os = "windows") {
-            PathBuf::from(&self.install_dir).join("atho.cmd")
+            PathBuf::from(&self.install_dir).join("atho-qt.exe")
         } else {
             PathBuf::from(&self.bin_dir).join("atho")
         };
@@ -238,10 +239,8 @@ impl InstallerApp {
 
         #[cfg(target_os = "windows")]
         {
-            let launcher_string = launcher.to_string_lossy().into_owned();
-            let quoted = format!(r#""{}""#, launcher_string);
-            Command::new("cmd")
-                .args(["/C", quoted.as_str()])
+            Command::new(&launcher)
+                .arg("--local-node")
                 .spawn()
                 .map_err(|err| format!("failed to launch Atho: {err}"))?;
         }
@@ -257,7 +256,7 @@ impl InstallerApp {
     }
 
     fn banner(&self) -> &'static str {
-        "Atho downloads a release bundle, verifies the embedded payload checksum, installs it into a normal user location, and creates simple launchers."
+        "Atho downloads a release bundle, verifies the embedded payload checksum, installs it into a normal user location, and creates a direct client launcher."
     }
 }
 
@@ -286,12 +285,25 @@ impl eframe::App for InstallerApp {
             match self.screen {
                 Screen::Welcome => {
                     ui.label("Install location");
-                    ui.text_edit_singleline(&mut self.install_dir);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.install_dir);
+                        if ui.button("Browse...").clicked() {
+                            let starting_dir = PathBuf::from(&self.install_dir);
+                            let dialog = if starting_dir.is_dir() {
+                                FileDialog::new().set_directory(starting_dir)
+                            } else {
+                                FileDialog::new()
+                            };
+                            if let Some(folder) = dialog.pick_folder() {
+                                self.install_dir = folder.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
                     ui.add_space(6.0);
                     if self.platform != Platform::Windows {
                         ui.label(format!("Commands will be linked in {}", self.bin_dir));
                     } else {
-                        ui.label("The installer will create a Start Menu shortcut and add Atho to your user PATH.");
+                        ui.label("The installer will create a Start Menu shortcut to the GUI client and add Atho to your user PATH.");
                     }
 
                     ui.add_space(10.0);

@@ -630,6 +630,7 @@ Primary installer
 - {installer_hint}
 - verify the matching `checksums.sha256` file from the release before running the installer
 - the Windows and macOS installers verify their embedded payload checksums before install
+- on Windows, the installer asks where to install and creates a Start Menu shortcut directly to `atho-qt.exe`
 
 Default install locations
 -------------------------
@@ -801,7 +802,8 @@ New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
 if (-not $NoShortcut) {
   $wsh = New-Object -ComObject WScript.Shell
   $shortcut = $wsh.CreateShortcut((Join-Path $startMenu 'Atho.lnk'))
-  $shortcut.TargetPath = (Join-Path $destination 'atho.cmd')
+  $shortcut.TargetPath = (Join-Path $destination 'atho-qt.exe')
+  $shortcut.Arguments = '--local-node'
   $shortcut.WorkingDirectory = $destination
   $shortcut.Save()
 }
@@ -815,6 +817,7 @@ if ([string]::IsNullOrWhiteSpace($userPath)) {
 
 Write-Host "Atho installed to: $destination"
 Write-Host "Start Menu shortcut: $startMenu\Atho.lnk"
+Write-Host "Launcher target: atho-qt.exe --local-node"
 """
 
 
@@ -928,6 +931,7 @@ Layout:
   - macOS: `Atho Setup.dmg`
 - verify the matching `checksums.sha256` file from the same release before running the installer
 - each direct installer validates its embedded payload checksum before install
+- on Windows, the installer asks where to install and creates a Start Menu shortcut directly to `atho-qt.exe`
 - `desktop/install.sh` and `desktop/install.ps1` dispatch to the active bundle
 - `desktop/uninstall.sh` and `desktop/uninstall.ps1` remove the active install
 - each active bundle includes the native installer front-end:

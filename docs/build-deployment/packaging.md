@@ -29,6 +29,7 @@ The GitHub release asset set also includes the direct installer download for the
 - macOS: `Atho Setup.dmg`
 
 Those direct installers are self-contained and validate their embedded payload checksum before extracting or launching anything.
+On Windows, the installer asks for an install directory and creates a Start Menu shortcut that points directly to the GUI client executable.
 
 It also stages:
 
@@ -118,7 +119,7 @@ Windows:
 - default app location: `%LOCALAPPDATA%\Programs\Atho`
 - installer front-end: `Atho Setup.exe`
 - installer adds the bundle directory to the user PATH
-- installer creates a Start Menu shortcut
+- installer asks for the install directory and creates a Start Menu shortcut to the GUI client
 - installer verifies the embedded payload checksum before install
 - installer launches the installed client after the install step succeeds
 
