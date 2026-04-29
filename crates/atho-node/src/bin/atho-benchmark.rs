@@ -8,18 +8,18 @@ use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-use atho_crypto::falcon::{
-    generate_from_seed, sign, FalconKeypair, FALCON_512_SIGNATURE_BYTES,
-};
+use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair, FALCON_512_SIGNATURE_BYTES};
 use atho_node::config::NodeConfig;
 use atho_node::mempool::MempoolEntry;
 use atho_node::miner::Miner;
 use atho_node::node::Node;
 use atho_node::sync::NodeSync;
-use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref, validate_block_with_context};
+use atho_node::validation::{
+    derive_sig_ref_short, derive_witness_commit_ref, validate_block_with_context,
+};
 use atho_p2p::codec::WireCodec;
 use atho_p2p::protocol::{
-    compact_block_from_block, MessagePayload, NetworkMessage, VersionMessage, Hash48,
+    compact_block_from_block, Hash48, MessagePayload, NetworkMessage, VersionMessage,
     LOCAL_NODE_SERVICES,
 };
 use std::env;
@@ -253,8 +253,8 @@ impl BenchmarkFixture {
     ) -> Result<Self, String> {
         let keypair = generate_from_seed(b"atho-benchmark-keypair")
             .map_err(|err| format!("falcon keypair generation failed: {err:?}"))?;
-        let output_script = atho_core::address::public_key_digest(network, &keypair.public_key.0)
-            .to_vec();
+        let output_script =
+            atho_core::address::public_key_digest(network, &keypair.public_key.0).to_vec();
         let utxo_count = tx_count.saturating_mul(inputs_per_tx);
         let utxos = (0..utxo_count)
             .map(|index| make_funding_utxo(network, &keypair, index))
@@ -278,7 +278,8 @@ impl BenchmarkFixture {
                     chunk.len()
                 );
             }
-            let (tx, fee_atoms) = build_spend_transaction(network, chunk, &keypair, &output_script)?;
+            let (tx, fee_atoms) =
+                build_spend_transaction(network, chunk, &keypair, &output_script)?;
             entries.push(MempoolEntry::new(tx.clone(), fee_atoms));
             node.admit_transaction(MempoolEntry::new(tx.clone(), fee_atoms))
                 .map_err(|err| {
@@ -343,7 +344,8 @@ impl BenchmarkFixture {
     fn mempool_node(&self) -> Result<Node, String> {
         let mut node = self.seeded_node()?;
         for entry in self.entries.iter().cloned() {
-            node.admit_transaction(entry).map_err(|err| err.to_string())?;
+            node.admit_transaction(entry)
+                .map_err(|err| err.to_string())?;
         }
         Ok(node)
     }
@@ -416,9 +418,13 @@ fn build_spend_transaction(
     tx.witness.clear();
 
     let digest = transaction_signing_digest(&tx);
-    let signature = sign(AthoSignatureDomain::Transaction, &keypair.secret_key, &digest)
-        .map_err(|err| format!("falcon sign failed: {err:?}"))?
-        .0;
+    let signature = sign(
+        AthoSignatureDomain::Transaction,
+        &keypair.secret_key,
+        &digest,
+    )
+    .map_err(|err| format!("falcon sign failed: {err:?}"))?
+    .0;
     let txid = tx.txid();
     tx.witness = TxWitness {
         signature: signature.clone(),
@@ -471,7 +477,10 @@ fn handshake_peer(node: &mut Node, network: Network, peer: &str) -> Result<NodeS
     Ok(sync)
 }
 
-fn bench_block_validation(fixture: &BenchmarkFixture, samples: usize) -> Result<BenchResult, String> {
+fn bench_block_validation(
+    fixture: &BenchmarkFixture,
+    samples: usize,
+) -> Result<BenchResult, String> {
     verify_block_fixture(fixture)?;
     let mut durations = Vec::with_capacity(samples);
     for _ in 0..samples {
@@ -536,7 +545,8 @@ fn verify_block_fixture(fixture: &BenchmarkFixture) -> Result<(), String> {
                     continue;
                 };
                 for (input_index, input_ref) in witness.input_refs.iter().enumerate() {
-                    let expected_short = derive_sig_ref_short(&tx.txid(), &witness.signature, input_index as u32);
+                    let expected_short =
+                        derive_sig_ref_short(&tx.txid(), &witness.signature, input_index as u32);
                     let expected_commit = derive_witness_commit_ref(
                         &tx.txid(),
                         &fixture.block.header.witness_root,
@@ -559,13 +569,17 @@ fn verify_block_fixture(fixture: &BenchmarkFixture) -> Result<(), String> {
     }
 }
 
-fn bench_mempool_admission(fixture: &BenchmarkFixture, samples: usize) -> Result<BenchResult, String> {
+fn bench_mempool_admission(
+    fixture: &BenchmarkFixture,
+    samples: usize,
+) -> Result<BenchResult, String> {
     let mut durations = Vec::with_capacity(samples);
     for _ in 0..samples {
         let mut node = fixture.seeded_node()?;
         let start = Instant::now();
         for entry in fixture.entries.iter().cloned() {
-            node.admit_transaction(entry).map_err(|err| err.to_string())?;
+            node.admit_transaction(entry)
+                .map_err(|err| err.to_string())?;
         }
         durations.push(start.elapsed());
     }
@@ -584,7 +598,11 @@ fn bench_mempool_admission(fixture: &BenchmarkFixture, samples: usize) -> Result
             "mempool entries={} tx_count={} inputs_per_tx={}",
             fixture.entries.len(),
             fixture.transactions.len(),
-            fixture.transactions.first().map(|tx| tx.inputs.len()).unwrap_or(0)
+            fixture
+                .transactions
+                .first()
+                .map(|tx| tx.inputs.len())
+                .unwrap_or(0)
         ),
     })
 }
@@ -598,7 +616,8 @@ fn bench_propagation_full(
         let mut node = fixture.seeded_node()?;
         let mut sync = handshake_peer(&mut node, fixture.network, "peer-full")?;
         let start = Instant::now();
-        let message = WireCodec::decode(&fixture.full_block_frame).map_err(|err| err.to_string())?;
+        let message =
+            WireCodec::decode(&fixture.full_block_frame).map_err(|err| err.to_string())?;
         sync.receive("peer-full", message, &mut node)
             .map_err(|err| err.to_string())?;
         durations.push(start.elapsed());
@@ -644,8 +663,8 @@ fn bench_propagation_compact(
             eprintln!("compact propagation: decoding frame");
         }
         let start = Instant::now();
-        let message = WireCodec::decode(&fixture.compact_block_frame)
-            .map_err(|err| err.to_string())?;
+        let message =
+            WireCodec::decode(&fixture.compact_block_frame).map_err(|err| err.to_string())?;
         if debug {
             eprintln!("compact propagation: receive");
         }
@@ -653,7 +672,10 @@ fn bench_propagation_compact(
             .receive("peer-compact", message, &mut node)
             .map_err(|err| err.to_string())?;
         if debug {
-            eprintln!("compact propagation: receive complete notices={}", notices.len());
+            eprintln!(
+                "compact propagation: receive complete notices={}",
+                notices.len()
+            );
         }
         durations.push(start.elapsed());
         let _ = notices;
@@ -795,15 +817,12 @@ fn collect_hardware_info() -> HardwareInfo {
         .or_else(|| run_command(&["free", "-h"]))
         .unwrap_or_else(|| String::from("unknown"));
     let disk = run_command(&["df", "-h", "."]).unwrap_or_else(|| String::from("unknown"));
-    let os = run_command(&["uname", "-sr"]).unwrap_or_else(|| {
-        format!(
-            "{} {}",
-            env::consts::OS,
-            env::consts::ARCH
-        )
-    });
-    let rust_version = run_command(&["rustc", "--version"]).unwrap_or_else(|| String::from("unknown"));
-    let commit_hash = run_command(&["git", "rev-parse", "HEAD"]).unwrap_or_else(|| String::from("unknown"));
+    let os = run_command(&["uname", "-sr"])
+        .unwrap_or_else(|| format!("{} {}", env::consts::OS, env::consts::ARCH));
+    let rust_version =
+        run_command(&["rustc", "--version"]).unwrap_or_else(|| String::from("unknown"));
+    let commit_hash =
+        run_command(&["git", "rev-parse", "HEAD"]).unwrap_or_else(|| String::from("unknown"));
     let core_count = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
@@ -820,7 +839,10 @@ fn collect_hardware_info() -> HardwareInfo {
 
 fn run_command(args: &[&str]) -> Option<String> {
     let (program, rest) = args.split_first()?;
-    let output = std::process::Command::new(program).args(rest).output().ok()?;
+    let output = std::process::Command::new(program)
+        .args(rest)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

@@ -271,6 +271,11 @@ The release script stages:
 - `Atho Setup` on Linux
 - the `desktop/` share tree with matching root dispatchers
 
+It also stages the direct installer download under `dist/releases/<version>/<platform>-<arch>/installers/`:
+
+- Windows: `Atho Setup.exe`
+- macOS: `Atho Setup.dmg`
+
 For GitHub publishing, use [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml). It builds the same per-OS packages and uploads the release assets to GitHub Releases.
 
 The workflow also publishes one combined `Atho-<version>-desktop.zip` package that contains the full `desktop/` tree for all supported OS bundles.

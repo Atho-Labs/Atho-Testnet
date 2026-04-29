@@ -2,7 +2,9 @@
 
 ## Purpose
 
-This repo uses a Rust build plus a small Python packager that stages a clean, downloadable bundle for the current host OS. The bundle now includes a native installer front-end called `Atho Setup` so the user flow is closer to Bitcoin Core: download, run installer, then open Atho.
+This repo uses a Rust build plus a small Python packager that stages a clean, downloadable bundle for the current host OS. The bundle includes a native installer front-end called `Atho Setup` so the user flow is closer to Bitcoin Core: download, run installer, then open Atho.
+
+The packager also stages a self-contained installer asset for the current host OS so the GitHub release page can expose a real launcher file instead of only a wrapper archive.
 
 The goal is simple:
 
@@ -20,6 +22,11 @@ The current release bundle packages the binaries that exist in this repo today:
   - Windows: `Atho Setup.exe`
   - macOS: `Atho Setup.app`
   - Linux: `Atho Setup`
+
+The GitHub release asset set also includes the direct installer download for the current host:
+
+- Windows: `Atho Setup.exe`
+- macOS: `Atho Setup.dmg`
 
 It also stages:
 
@@ -60,6 +67,7 @@ The packager writes three paths:
 - current compatibility mirror: `dist/release/`
 - shareable desktop tree: `desktop/releases/<version>/<platform>-<arch>/`
 - active desktop mirror: `desktop/latest/<platform>-<arch>/`
+- download-first installers: `dist/releases/<version>/<platform>-<arch>/installers/`
 - shareable desktop root installers: `desktop/install.sh`, `desktop/install.ps1`, `desktop/uninstall.sh`, `desktop/uninstall.ps1`
 - each active bundle also includes the native installer front-end (`Atho Setup` for the current platform)
 
@@ -101,6 +109,7 @@ macOS:
 - default command location: `~/bin`
 - installer front-end: `Atho Setup.app`
 - installer creates a `Atho.command` launcher for double-click launch
+- the app bundle is self-contained, but unsigned releases can still trigger Gatekeeper until signing/notarization is added
 
 Windows:
 
@@ -137,6 +146,12 @@ The `desktop/` folder also contains root installer dispatchers so the shared tre
 
 The active bundle itself contains the native installer front-end, so testers can also open `Atho Setup` directly from the release tree.
 
+The packaged installer itself is self-contained:
+
+- the Windows `Atho Setup.exe` asset carries the payload inside the executable
+- the macOS `Atho Setup.app` bundle carries its payload inside `Contents/Resources/payload.zip`
+- the release tree still keeps the extracted bundle for operator workflows and debugging
+
 ## GitHub Release Publishing
 
 This repository includes a GitHub Actions workflow at [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml) that builds the per-OS packages and publishes them as GitHub Release assets.
@@ -156,13 +171,14 @@ That combined package contains the full `desktop/` tree with all platform bundle
 Each release asset contains:
 
 - the platform archive from `dist/releases/<version>/<platform>-<arch>/archives/`
+- the direct installer asset from `dist/releases/<version>/<platform>-<arch>/installers/`
 - a platform-specific checksum file
 - a platform-specific manifest file
 
-Download the asset that matches your OS, extract it, and run the native setup front-end inside the bundle:
+Download the asset that matches your OS, extract it if needed, and run the native setup front-end inside the bundle:
 
 - Windows: `Atho Setup.exe`
-- macOS: `Atho Setup.app`
+- macOS: `Atho Setup.dmg`
 - Linux: `Atho Setup`
 
 If you want one download that carries every platform package, pick `Atho-<version>-desktop.zip`.

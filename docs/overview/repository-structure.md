@@ -10,7 +10,7 @@ That means:
 - storage, wallet, networking, RPC, node runtime, and GUI are separated
 - operational docs are centralized under `docs/`
 - repo-local sandbox artifacts can stay under `dev/` when explicitly requested
-- staged release artifacts stay under `dist/releases/<version>/<platform>-<arch>/` with `dist/release/` as the current compatibility mirror, `desktop/releases/<version>/<platform>-<arch>/` as the shareable release tree, and `desktop/latest/<platform>-<arch>/` as the active mirror
+- staged release artifacts stay under `dist/releases/<version>/<platform>-<arch>/` with `dist/release/` as the current compatibility mirror, `dist/releases/<version>/<platform>-<arch>/installers/` as the direct-download installer staging area, `desktop/releases/<version>/<platform>-<arch>/` as the shareable release tree, and `desktop/latest/<platform>-<arch>/` as the active mirror
 
 This keeps the trusted core auditable and avoids mixing design notes, runtime state, and build outputs at repo root.
 
@@ -23,6 +23,7 @@ The repo root had a strong crate layout already, but it was cluttered by:
 - a Qt reference map inside the GUI crate
 - a vendor README inside the vendored Falcon tree
 - release docs are staged into the release mirror under `dist/release/` and mirrored into `desktop/releases/...` and `desktop/latest/...`
+- direct installer downloads are staged under `dist/releases/.../installers/` before GitHub publishing
 - a dev workspace README inside `dev/`
 
 That made documentation discovery harder and weakened the repo’s front-door quality.

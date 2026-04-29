@@ -75,6 +75,9 @@ jobs:
           artifact_dir="release-assets/${BUNDLE_TAG}"
           mkdir -p "$artifact_dir/release" "$artifact_dir/desktop"
           cp "$bundle_dir"/archives/* "$artifact_dir/release"/
+          if [ -d "$bundle_dir/installers" ]; then
+            cp "$bundle_dir"/installers/* "$artifact_dir/release"/
+          fi
           cp "$bundle_dir/checksums.sha256" "$artifact_dir/release/Atho-${VERSION}-${BUNDLE_TAG}.checksums.sha256"
           cp "$bundle_dir/manifest.json" "$artifact_dir/release/Atho-${VERSION}-${BUNDLE_TAG}.manifest.json"
           cp -R desktop/. "$artifact_dir/desktop"/
@@ -123,6 +126,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Atho ${{ steps.resolve.outputs.release_version }}
           generate_release_notes: true
+          overwrite_files: true
           files: |
             release-assets/release/**/*
 

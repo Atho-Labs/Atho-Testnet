@@ -1,13 +1,20 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eframe::egui;
+use tempfile::TempDir;
+use zip::ZipArchive;
+
+const PAYLOAD_FOOTER_MAGIC: &[u8; 8] = b"ATHOPLD1";
+const PAYLOAD_FOOTER_SIZE: u64 = 16;
 
 fn main() -> eframe::Result<()> {
-    let bundle_root = match locate_release_root() {
-        Ok(path) => path,
+    let bundle = match locate_release_root() {
+        Ok(bundle) => bundle,
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(1);
@@ -18,7 +25,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Atho Setup",
         options,
-        Box::new(move |_cc| Box::new(InstallerApp::new(bundle_root.clone()))),
+        Box::new(move |_cc| Box::new(InstallerApp::new(bundle))),
     )
 }
 
@@ -99,9 +106,34 @@ enum Screen {
     Finished,
 }
 
+struct BundleLocation {
+    root: PathBuf,
+    _tempdir: Option<TempDir>,
+}
+
+impl BundleLocation {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            _tempdir: None,
+        }
+    }
+
+    fn extracted(root: PathBuf, tempdir: TempDir) -> Self {
+        Self {
+            root,
+            _tempdir: Some(tempdir),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
 struct InstallerApp {
     platform: Platform,
-    bundle_root: PathBuf,
+    bundle: BundleLocation,
     install_dir: String,
     bin_dir: String,
     launch_after_install: bool,
@@ -111,11 +143,11 @@ struct InstallerApp {
 }
 
 impl InstallerApp {
-    fn new(bundle_root: PathBuf) -> Self {
+    fn new(bundle: BundleLocation) -> Self {
         let platform = Platform::current();
         Self {
             platform,
-            bundle_root,
+            bundle,
             install_dir: platform.default_install_dir(),
             bin_dir: platform.default_bin_dir(),
             launch_after_install: true,
@@ -130,7 +162,7 @@ impl InstallerApp {
         self.error = None;
 
         let output = if cfg!(target_os = "windows") {
-            let script = self.bundle_root.join("install.ps1");
+            let script = self.bundle.root().join("install.ps1");
             if !script.exists() {
                 return Err(format!("missing installer script: {}", script.display()));
             }
@@ -148,11 +180,11 @@ impl InstallerApp {
                 .arg("-File")
                 .arg(&script)
                 .env("ATHO_INSTALL_DIR", &self.install_dir)
-                .current_dir(&self.bundle_root)
+                .current_dir(self.bundle.root())
                 .output()
                 .map_err(|err| format!("failed to run installer: {err}"))?
         } else {
-            let script = self.bundle_root.join("install.sh");
+            let script = self.bundle.root().join("install.sh");
             if !script.exists() {
                 return Err(format!("missing installer script: {}", script.display()));
             }
@@ -160,7 +192,7 @@ impl InstallerApp {
                 .arg(&script)
                 .env("ATHO_INSTALL_DIR", &self.install_dir)
                 .env("ATHO_BIN_DIR", &self.bin_dir)
-                .current_dir(&self.bundle_root)
+                .current_dir(self.bundle.root())
                 .output()
                 .map_err(|err| format!("failed to run installer: {err}"))?
         };
@@ -243,7 +275,7 @@ impl eframe::App for InstallerApp {
                 ui.monospace(self.platform.label());
                 ui.separator();
                 ui.label("Release bundle:");
-                ui.monospace(self.bundle_root.display().to_string());
+                ui.monospace(self.bundle.root().display().to_string());
             });
 
             ui.add_space(8.0);
@@ -318,9 +350,13 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn locate_release_root() -> Result<PathBuf, String> {
+fn locate_release_root() -> Result<BundleLocation, String> {
     let exe =
         env::current_exe().map_err(|err| format!("failed to locate installer binary: {err}"))?;
+    if let Some(bundle) = locate_embedded_bundle(&exe)? {
+        return Ok(bundle);
+    }
+
     if cfg!(target_os = "macos") {
         if let Some(app_root) = exe
             .parent()
@@ -328,11 +364,174 @@ fn locate_release_root() -> Result<PathBuf, String> {
             .and_then(Path::parent)
             .and_then(Path::parent)
         {
-            return Ok(app_root.to_path_buf());
+            return Ok(BundleLocation::new(app_root.to_path_buf()));
         }
     }
 
     exe.parent()
         .map(Path::to_path_buf)
+        .map(BundleLocation::new)
         .ok_or_else(|| "failed to determine release root".to_string())
+}
+
+fn locate_embedded_bundle(exe: &Path) -> Result<Option<BundleLocation>, String> {
+    if cfg!(target_os = "macos") {
+        if let Some(bundle) = locate_macos_resource_bundle(exe)? {
+            return Ok(Some(bundle));
+        }
+    }
+
+    if cfg!(target_os = "windows") {
+        if let Some(bundle) = locate_windows_embedded_bundle(exe)? {
+            return Ok(Some(bundle));
+        }
+    }
+
+    Ok(None)
+}
+
+fn locate_macos_resource_bundle(exe: &Path) -> Result<Option<BundleLocation>, String> {
+    let Some(contents_root) = exe.parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let payload = contents_root.join("Resources").join("payload.zip");
+    if !payload.exists() {
+        return Ok(None);
+    }
+    extract_payload_zip(&payload).map(Some)
+}
+
+fn locate_windows_embedded_bundle(exe: &Path) -> Result<Option<BundleLocation>, String> {
+    let metadata = match fs::metadata(exe) {
+        Ok(metadata) => metadata,
+        Err(err) => return Err(format!("failed to inspect installer binary: {err}")),
+    };
+    if metadata.len() < PAYLOAD_FOOTER_SIZE {
+        return Ok(None);
+    }
+
+    let mut file =
+        File::open(exe).map_err(|err| format!("failed to open installer binary: {err}"))?;
+    file.seek(SeekFrom::End(-(PAYLOAD_FOOTER_SIZE as i64)))
+        .map_err(|err| format!("failed to read installer footer: {err}"))?;
+
+    let mut footer = [0u8; PAYLOAD_FOOTER_SIZE as usize];
+    file.read_exact(&mut footer)
+        .map_err(|err| format!("failed to read installer footer: {err}"))?;
+
+    if &footer[..PAYLOAD_FOOTER_MAGIC.len()] != PAYLOAD_FOOTER_MAGIC {
+        return Ok(None);
+    }
+
+    let payload_len = u64::from_le_bytes(
+        footer[PAYLOAD_FOOTER_MAGIC.len()..]
+            .try_into()
+            .expect("payload footer length"),
+    );
+    if payload_len > metadata.len().saturating_sub(PAYLOAD_FOOTER_SIZE) {
+        return Err("embedded installer payload is truncated".to_string());
+    }
+
+    let payload_total = payload_len
+        .checked_add(PAYLOAD_FOOTER_SIZE)
+        .ok_or_else(|| "embedded installer payload length overflow".to_string())?;
+    let payload_start = metadata
+        .len()
+        .checked_sub(payload_total)
+        .ok_or_else(|| "embedded installer payload length underflow".to_string())?;
+    file.seek(SeekFrom::Start(payload_start))
+        .map_err(|err| format!("failed to seek installer payload: {err}"))?;
+
+    let mut payload = vec![0u8; payload_len as usize];
+    file.read_exact(&mut payload)
+        .map_err(|err| format!("failed to read embedded installer payload: {err}"))?;
+
+    extract_payload_bytes(&payload)
+        .map(Some)
+        .map_err(|err| format!("failed to extract embedded installer payload: {err}"))
+}
+
+fn extract_payload_zip(path: &Path) -> Result<BundleLocation, String> {
+    let bytes = fs::read(path)
+        .map_err(|err| format!("failed to read embedded installer payload: {err}"))?;
+    extract_payload_bytes(&bytes)
+}
+
+fn extract_payload_bytes(bytes: &[u8]) -> Result<BundleLocation, String> {
+    let tempdir =
+        TempDir::new().map_err(|err| format!("failed to create temporary bundle: {err}"))?;
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor)
+        .map_err(|err| format!("invalid installer payload archive: {err}"))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("failed to read installer payload entry: {err}"))?;
+        let Some(relative) = entry.enclosed_name().map(PathBuf::from) else {
+            return Err("installer payload contains an unsafe path".to_string());
+        };
+        let outpath = tempdir.path().join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&outpath)
+                .map_err(|err| format!("failed to create payload directory: {err}"))?;
+            continue;
+        }
+
+        if let Some(parent) = outpath.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create payload parent directory: {err}"))?;
+        }
+
+        let mut outfile =
+            File::create(&outpath).map_err(|err| format!("failed to write payload file: {err}"))?;
+        std::io::copy(&mut entry, &mut outfile)
+            .map_err(|err| format!("failed to extract payload file: {err}"))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&outpath, fs::Permissions::from_mode(mode & 0o777))
+                .map_err(|err| format!("failed to set payload permissions: {err}"))?;
+        }
+    }
+
+    let root = tempdir.path().to_path_buf();
+    Ok(BundleLocation::extracted(root, tempdir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::CompressionMethod;
+    use zip::ZipWriter;
+
+    #[test]
+    fn payload_zip_extracts_into_temporary_bundle() {
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buffer);
+            let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer
+                .start_file("install.sh", options)
+                .expect("start install script");
+            writer
+                .write_all(b"#!/usr/bin/env bash\nexit 0\n")
+                .expect("write install script");
+            writer
+                .add_directory("nested/", options)
+                .expect("start nested directory");
+            writer
+                .start_file("nested/data.txt", options)
+                .expect("start nested file");
+            writer.write_all(b"payload").expect("write nested file");
+            writer.finish().expect("finish payload");
+        }
+
+        let bundle = extract_payload_bytes(buffer.get_ref()).expect("extract payload");
+        assert!(bundle.root().join("install.sh").exists());
+        assert!(bundle.root().join("nested/data.txt").exists());
+    }
 }

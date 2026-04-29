@@ -114,6 +114,12 @@ GitHub release publishing is automated by [`.github/workflows/publish-packages.y
 
 GitHub Releases also gets one combined download named `Atho-<version>-desktop.zip`. That archive contains the full `desktop/` tree with every platform bundle, so you can download one file, extract it, and run the installer for your OS from inside the folder.
 
+The release assets also include a direct installer download for the current host platform:
+
+- Windows: `Atho Setup.exe`
+- macOS: `Atho Setup.dmg`
+- Linux: use the platform archive and run `Atho Setup` from inside the extracted folder
+
 ## Runtime Roots
 
 Default runtime root:

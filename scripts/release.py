@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import struct
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,8 @@ DESKTOP_ROOT = ROOT / "desktop"
 DESKTOP_VERSIONED_RELEASES_ROOT = DESKTOP_ROOT / "releases"
 DESKTOP_LATEST_ROOT = DESKTOP_ROOT / "latest"
 BOOTSTRAP_PEER = os.environ.get("ATHO_MAINNET_PEER", "74.208.219.116:56000")
+INSTALLERS_DIR_NAME = "installers"
+PAYLOAD_FOOTER_MAGIC = b"ATHOPLD1"
 
 DOC_FILES = [
     ("README.md", ROOT / "README.md"),
@@ -73,6 +77,7 @@ def main() -> int:
         host_arch,
         args.include_dev_tools,
     )
+    stage_download_artifacts(release_root, host_platform)
     remove_path(release_root / "archives")
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     build_archive(release_root, archive_path, archive_prefix(version, release_tag))
@@ -337,6 +342,79 @@ def stage_release_root(
     else:
         make_executable(release_root / install_script_name(platform_name))
         make_executable(release_root / uninstall_script_name(platform_name))
+
+
+def stage_download_artifacts(release_root: Path, platform_name: str) -> None:
+    payload_path = create_installer_payload(release_root, platform_name)
+    try:
+        if platform_name == "windows":
+            append_payload_to_windows_installer(release_root / "Atho Setup.exe", payload_path)
+            installers_dir = release_root / INSTALLERS_DIR_NAME
+            installers_dir.mkdir(parents=True, exist_ok=True)
+            copy_file(release_root / "Atho Setup.exe", installers_dir / "Atho Setup.exe")
+        elif platform_name == "macos":
+            app_root = release_root / "Atho Setup.app"
+            installers_dir = release_root / INSTALLERS_DIR_NAME
+            installers_dir.mkdir(parents=True, exist_ok=True)
+            copy_file(payload_path, app_root / "Contents" / "Resources" / "payload.zip")
+            build_macos_dmg(app_root, installers_dir / "Atho Setup.dmg")
+    finally:
+        remove_path(payload_path)
+
+
+def create_installer_payload(release_root: Path, platform_name: str) -> Path:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip", prefix="atho-payload-") as tmp:
+        payload_path = Path(tmp.name)
+    with zipfile.ZipFile(payload_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in iter_payload_files(release_root, platform_name):
+            archive.write(path, arcname=path.relative_to(release_root).as_posix())
+    return payload_path
+
+
+def iter_payload_files(root: Path, platform_name: str):
+    installer_name = installer_artifact_name(platform_name)
+    installer_root = Path(installer_name)
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] == INSTALLERS_DIR_NAME:
+            continue
+        if relative.parts and relative.parts[0] == "archives":
+            continue
+        if relative == installer_root or relative.is_relative_to(installer_root):
+            continue
+        yield path
+
+
+def append_payload_to_windows_installer(installer_path: Path, payload_path: Path) -> None:
+    payload = payload_path.read_bytes()
+    footer = struct.pack("<8sQ", PAYLOAD_FOOTER_MAGIC, len(payload))
+    with installer_path.open("ab") as handle:
+        handle.write(payload)
+        handle.write(footer)
+
+
+def build_macos_dmg(app_root: Path, dmg_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="atho-dmg-") as temp_dir:
+        staging_dir = Path(temp_dir) / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(app_root, staging_dir / app_root.name)
+        applications_link = staging_dir / "Applications"
+        if not applications_link.exists():
+            os.symlink("/Applications", applications_link)
+        run([
+            "hdiutil",
+            "create",
+            "-volname",
+            "Atho Setup",
+            "-srcfolder",
+            str(staging_dir),
+            "-ov",
+            "-format",
+            "UDZO",
+            str(dmg_path),
+        ])
 
 
 def stage_installer_frontend(release_root: Path, version: str, platform_name: str, arch: str) -> None:
@@ -769,8 +847,11 @@ def iter_release_files(root: Path):
     for path in sorted(root.rglob("*")):
         if path.is_dir():
             continue
+        if path.relative_to(root).parts and path.relative_to(root).parts[0] == INSTALLERS_DIR_NAME:
+            continue
         if path.parent.name == "archives" and path.name.endswith((".tar.gz", ".zip")):
-            yield path
+            if path.name.startswith("Atho-"):
+                yield path
             continue
         if path.name == "checksums.sha256":
             continue
@@ -830,6 +911,10 @@ Current release version:
 Layout:
 - `desktop/releases/<version>/<platform>-<arch>/`
 - `desktop/latest/<platform>-<arch>/` as the active bundle mirror
+- `dist/releases/<version>/<platform>-<arch>/installers/` for direct installer downloads
+- direct installer downloads:
+  - Windows: `Atho Setup.exe`
+  - macOS: `Atho Setup.dmg`
 - `desktop/install.sh` and `desktop/install.ps1` dispatch to the active bundle
 - `desktop/uninstall.sh` and `desktop/uninstall.ps1` remove the active install
 - each active bundle includes the native installer front-end:
@@ -840,6 +925,7 @@ Layout:
 How to use:
 - open the root `desktop/` folder
 - download the combined `Atho-<version>-desktop.zip` release if you want every platform bundle in one file
+- on GitHub Releases, prefer the direct installer asset from `dist/releases/<version>/<platform>-<arch>/installers/` when it is available
 - run `install.sh` on Linux or macOS, or launch the native installer directly from the bundle
 - run `install.ps1` on Windows, or launch `Atho Setup.exe` directly from the bundle
 - keep all platform bundles in this folder if you are assembling a multi-OS release set

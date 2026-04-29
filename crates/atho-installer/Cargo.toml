@@ -6,6 +6,8 @@ license = "Proprietary"
 
 [dependencies]
 eframe = "0.27"
+tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "atho-setup"
