@@ -3,16 +3,20 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::mempool::{Mempool, MempoolEntry};
 use crate::miner::Miner;
+#[cfg(test)]
+use crate::test_support::acquire_global_test_lock;
 use crate::validation::ValidationError;
 use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
 use atho_core::transaction::Transaction;
+use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
+use atho_p2p::protocol::PeerAddress;
 use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
-use atho_storage::db::PeerHealthRecord;
+use atho_storage::db::{PeerHealthRecord, PeerRecord};
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -20,14 +24,20 @@ pub struct Node {
     pub config: NodeConfig,
     chainstate: StorageChainstate,
     pub mempool: Mempool,
+    #[cfg(test)]
+    _test_lock: crate::test_support::TestLockGuard,
 }
 
 impl Node {
     pub fn new(config: NodeConfig) -> Self {
+        #[cfg(test)]
+        let test_lock = acquire_global_test_lock();
         Self {
             config,
             chainstate: StorageChainstate::new(config.network),
             mempool: Mempool::new(),
+            #[cfg(test)]
+            _test_lock: test_lock,
         }
     }
 
@@ -106,10 +116,91 @@ impl Node {
             .map_err(NodeError::from)
     }
 
+    pub fn load_peer_record(&self, remote_addr: &str) -> Result<Option<PeerRecord>, NodeError> {
+        self.chainstate
+            .load_peer(remote_addr)
+            .map_err(NodeError::from)
+    }
+
+    pub fn list_peer_records(&self) -> Result<Vec<PeerRecord>, NodeError> {
+        self.chainstate.list_peers().map_err(NodeError::from)
+    }
+
     pub fn save_peer_health(&self, record: &PeerHealthRecord) -> Result<(), NodeError> {
         self.chainstate
             .save_peer_health(record)
             .map_err(NodeError::from)
+    }
+
+    pub fn save_peer_record(&self, record: &PeerRecord) -> Result<(), NodeError> {
+        self.chainstate.save_peer(record).map_err(NodeError::from)
+    }
+
+    pub fn observe_peer(
+        &self,
+        remote_addr: impl Into<String>,
+        observed_height: u64,
+        observed_unix: u64,
+    ) -> Result<(), NodeError> {
+        let remote_addr = remote_addr.into();
+        let record = PeerRecord {
+            network: self.network(),
+            remote_addr: remote_addr.clone(),
+            first_seen_height: observed_height,
+            last_seen_height: observed_height,
+            last_seen_unix: observed_unix,
+        };
+        let merged = match self.load_peer_record(&remote_addr)? {
+            Some(existing) => PeerRecord {
+                network: self.network(),
+                remote_addr,
+                first_seen_height: existing.first_seen_height,
+                last_seen_height: record.last_seen_height,
+                last_seen_unix: existing.last_seen_unix.max(record.last_seen_unix),
+            },
+            None => record,
+        };
+        self.save_peer_record(&merged)
+    }
+
+    pub fn observe_peer_address(
+        &self,
+        address: &PeerAddress,
+        observed_height: u64,
+        observed_unix: u64,
+    ) -> Result<(), NodeError> {
+        let mut record = PeerRecord {
+            network: self.network(),
+            remote_addr: format_remote_addr(address),
+            first_seen_height: observed_height,
+            last_seen_height: observed_height,
+            last_seen_unix: observed_unix.max(address.last_seen_unix),
+        };
+        if let Some(existing) = self.load_peer_record(&record.remote_addr)? {
+            record.first_seen_height = existing.first_seen_height;
+            record.last_seen_unix = existing.last_seen_unix.max(record.last_seen_unix);
+        }
+        self.save_peer_record(&record)
+    }
+
+    pub fn peer_addresses(&self) -> Result<Vec<PeerAddress>, NodeError> {
+        let mut records = self.list_peer_records()?;
+        records.sort_by(|left, right| {
+            right
+                .last_seen_unix
+                .cmp(&left.last_seen_unix)
+                .then(right.last_seen_height.cmp(&left.last_seen_height))
+                .then(left.remote_addr.cmp(&right.remote_addr))
+        });
+        Ok(records
+            .into_iter()
+            .filter_map(|record| {
+                let mut address =
+                    parse_remote_addr(&record.remote_addr, self.network().p2p_port())?;
+                address.last_seen_unix = record.last_seen_unix;
+                Some(address)
+            })
+            .collect())
     }
 
     pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {
@@ -156,26 +247,38 @@ impl Node {
     }
 
     pub fn load_or_new(config: NodeConfig) -> Self {
+        #[cfg(test)]
+        let test_lock = acquire_global_test_lock();
         Self {
             config,
             chainstate: StorageChainstate::load_or_new(config.network),
             mempool: Mempool::new(),
+            #[cfg(test)]
+            _test_lock: test_lock,
         }
     }
 
     pub fn try_load_or_new(config: NodeConfig) -> Result<Self, NodeError> {
+        #[cfg(test)]
+        let test_lock = acquire_global_test_lock();
         Ok(Self {
             config,
             chainstate: StorageChainstate::try_load_or_new(config.network)?,
             mempool: Mempool::new(),
+            #[cfg(test)]
+            _test_lock: test_lock,
         })
     }
 
     pub fn try_load_or_recover(config: NodeConfig) -> Result<Self, NodeError> {
+        #[cfg(test)]
+        let test_lock = acquire_global_test_lock();
         Ok(Self {
             config,
             chainstate: StorageChainstate::try_load_or_recover(config.network)?,
             mempool: Mempool::new(),
+            #[cfg(test)]
+            _test_lock: test_lock,
         })
     }
 
@@ -363,6 +466,7 @@ mod tests {
     use super::*;
     use crate::mempool::MempoolEntry;
     use crate::miner::Miner;
+    use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
@@ -436,13 +540,19 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -646,6 +756,27 @@ mod tests {
         assert_eq!(first.header.height, 1);
         assert_eq!(second.header.height, 2);
         assert_eq!(node.chainstate.height, 2);
+    }
+
+    #[test]
+    fn node_merges_peer_observations_without_losing_first_seen_height() {
+        let root = temp_data_dir("peer-observation");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let node = Node::load_or_new(NodeConfig::new(Network::Mainnet));
+        node.observe_peer("127.0.0.1:56000", 12, 1_700_000_100)
+            .expect("first peer observation");
+        node.observe_peer("127.0.0.1:56000", 34, 1_700_000_200)
+            .expect("second peer observation");
+
+        let record = node
+            .load_peer_record("127.0.0.1:56000")
+            .expect("load peer record")
+            .expect("peer record present");
+        assert_eq!(record.first_seen_height, 12);
+        assert_eq!(record.last_seen_height, 34);
+        assert_eq!(record.remote_addr, "127.0.0.1:56000");
     }
 
     #[test]

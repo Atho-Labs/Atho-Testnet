@@ -210,7 +210,7 @@ cargo run -p atho-wallet --bin atho-address -- inspect A...
 Wipe disposable state:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev wipe --data-dir /tmp/atho-dev
+cargo run -p atho-node --bin athod -- wipe --network regnet --data-dir /tmp/atho-dev --all
 ```
 
 Reset from genesis:
@@ -231,6 +231,11 @@ Export TSV audit views:
 cargo run -p atho-node --bin athod -- dev export chain --data-dir /tmp/atho-dev
 cargo run -p atho-node --bin athod -- dev export tx --data-dir /tmp/atho-dev
 ```
+
+Notes:
+
+- `wipe` refuses mainnet unless `--dangerously-allow-mainnet` is passed explicitly
+- keep benchmark and disposable node state under a sandbox directory such as `/tmp/atho-dev`
 
 ## Packaging
 

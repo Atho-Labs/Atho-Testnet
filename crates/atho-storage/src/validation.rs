@@ -4,7 +4,8 @@ use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    MAX_BLOCK_SIZE_BYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_RAW_BYTES,
+    MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -12,6 +13,7 @@ use atho_core::transaction::Transaction;
 use atho_crypto::falcon::{
     self, FalconPublicKey, FalconSignature, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
 };
+use rayon::prelude::*;
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -51,6 +53,8 @@ pub enum ValidationError {
     ProofOfWorkInvalid,
     #[error("block parent hash mismatch")]
     BlockParentHashMismatch,
+    #[error("duplicate transaction id")]
+    DuplicateTransactionId,
     #[error("missing utxo")]
     MissingUtxo,
     #[error("input ownership mismatch")]
@@ -185,7 +189,7 @@ pub fn validate_transaction_for_height(
     )
 }
 
-pub fn validate_transaction_for_height_with_schedule(
+pub fn validate_transaction_structure_for_height_with_schedule(
     tx: &Transaction,
     fee_atoms: u64,
     height: u64,
@@ -200,7 +204,9 @@ pub fn validate_transaction_for_height_with_schedule(
     if tx.outputs.is_empty() {
         return Err(ValidationError::NoOutputs);
     }
-    if tx.vsize_bytes() > MAX_TRANSACTION_SIZE_BYTES {
+    let raw_size_bytes = tx.full_size_bytes();
+    let vsize_bytes = tx.vsize_bytes();
+    if raw_size_bytes > MAX_TRANSACTION_RAW_BYTES || vsize_bytes > MAX_TRANSACTION_VBYTES {
         return Err(ValidationError::TransactionTooLarge);
     }
     if tx.outputs.iter().any(|output| output.value_atoms == 0) {
@@ -212,7 +218,7 @@ pub fn validate_transaction_for_height_with_schedule(
             return Err(ValidationError::DuplicateInput);
         }
     }
-    let minimum_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+    let minimum_fee = vsize_bytes as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
     if fee_atoms < minimum_fee {
         return Err(ValidationError::FeeBelowMinimum);
     }
@@ -232,29 +238,21 @@ pub fn validate_transaction_for_height_with_schedule(
             return Err(ValidationError::WitnessInputReferenceMismatch);
         }
     }
+    Ok(())
+}
+
+pub fn validate_transaction_for_height_with_schedule(
+    tx: &Transaction,
+    fee_atoms: u64,
+    height: u64,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    validate_transaction_structure_for_height_with_schedule(tx, fee_atoms, height, schedule)?;
     verify_transaction_signature(tx)?;
     Ok(())
 }
 
-pub fn validate_transaction_with_context<F>(
-    tx: &Transaction,
-    fee_atoms: u64,
-    spend_height: u64,
-    lookup: F,
-) -> Result<u64, ValidationError>
-where
-    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
-{
-    validate_transaction_with_context_and_schedule(
-        tx,
-        fee_atoms,
-        spend_height,
-        lookup,
-        &rules::SCHEDULED_ACTIVATIONS,
-    )
-}
-
-pub fn validate_transaction_with_context_and_schedule<F>(
+pub fn validate_transaction_with_context_structure_and_schedule<F>(
     tx: &Transaction,
     fee_atoms: u64,
     spend_height: u64,
@@ -264,7 +262,7 @@ pub fn validate_transaction_with_context_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    validate_transaction_for_height_with_schedule(tx, fee_atoms, spend_height, schedule)?;
+    validate_transaction_structure_for_height_with_schedule(tx, fee_atoms, spend_height, schedule)?;
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
@@ -300,6 +298,45 @@ where
     if actual_fee != fee_atoms {
         return Err(ValidationError::FeeMismatch);
     }
+    Ok(actual_fee)
+}
+
+pub fn validate_transaction_with_context<F>(
+    tx: &Transaction,
+    fee_atoms: u64,
+    spend_height: u64,
+    lookup: F,
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    validate_transaction_with_context_and_schedule(
+        tx,
+        fee_atoms,
+        spend_height,
+        lookup,
+        &rules::SCHEDULED_ACTIVATIONS,
+    )
+}
+
+pub fn validate_transaction_with_context_and_schedule<F>(
+    tx: &Transaction,
+    fee_atoms: u64,
+    spend_height: u64,
+    lookup: F,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    let actual_fee = validate_transaction_with_context_structure_and_schedule(
+        tx,
+        fee_atoms,
+        spend_height,
+        lookup,
+        schedule,
+    )?;
+    verify_transaction_signature(tx)?;
     Ok(actual_fee)
 }
 
@@ -374,7 +411,13 @@ fn validate_block_impl_with_schedule(
     if block.header.timestamp == 0 {
         return Err(ValidationError::InvalidBlockTimestamp);
     }
-    if block.vsize_bytes() > MAX_BLOCK_SIZE_BYTES || block.weight_bytes() > MAX_BLOCK_WEIGHT {
+    let raw_size_bytes = block.full_size_bytes();
+    let vsize_bytes = block.vsize_bytes();
+    let weight_bytes = block.weight_bytes();
+    if raw_size_bytes > MAX_BLOCK_RAW_BYTES
+        || vsize_bytes > MAX_BLOCK_VBYTES
+        || weight_bytes > MAX_BLOCK_WEIGHT
+    {
         return Err(ValidationError::BlockTooLarge);
     }
     if block.merkle_root() != block.header.merkle_root {
@@ -402,9 +445,15 @@ fn validate_block_impl_with_schedule(
         height,
         schedule,
     )?;
+    if !txids_are_unique(&block.transactions) {
+        return Err(ValidationError::DuplicateTransactionId);
+    }
+    if !block_inputs_are_unique(&block.transactions) {
+        return Err(ValidationError::MempoolConflict);
+    }
     if block.transactions.len() > 1 {
         for tx in &block.transactions[1..] {
-            validate_transaction_for_height_with_schedule(
+            validate_transaction_structure_for_height_with_schedule(
                 tx,
                 tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS,
                 height,
@@ -412,7 +461,43 @@ fn validate_block_impl_with_schedule(
             )?;
         }
     }
+    if block.transactions.len() > 1 {
+        verify_transaction_signatures_parallel(&block.transactions[1..])?;
+    }
     Ok(())
+}
+
+fn verify_transaction_signatures_parallel(
+    transactions: &[Transaction],
+) -> Result<(), ValidationError> {
+    let results: Vec<Result<(), ValidationError>> = transactions
+        .par_iter()
+        .map(verify_transaction_signature)
+        .collect();
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+fn txids_are_unique(transactions: &[Transaction]) -> bool {
+    let mut seen = BTreeSet::new();
+    transactions
+        .iter()
+        .map(Transaction::txid)
+        .all(|txid| seen.insert(txid))
+}
+
+fn block_inputs_are_unique(transactions: &[Transaction]) -> bool {
+    let mut seen = BTreeSet::new();
+    for tx in transactions {
+        for input in &tx.inputs {
+            if !seen.insert((input.previous_txid, input.output_index)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub fn validate_block(block: &Block, height: u64, network: Network) -> Result<(), ValidationError> {
@@ -476,13 +561,6 @@ pub fn validate_block_with_context_and_schedule(
         return Err(ValidationError::ProofOfWorkInvalid);
     }
 
-    validate_coinbase_transaction_with_schedule(
-        &block.transactions[0],
-        subsidy::block_subsidy_atoms(height).saturating_add(block.fees_miner_atoms),
-        height,
-        schedule,
-    )?;
-
     let block_witness_root = block.header.witness_root;
     let mut seen_inputs = BTreeSet::new();
     let mut sum_fees = 0u64;
@@ -494,7 +572,7 @@ pub fn validate_block_with_context_and_schedule(
 
         let txid = tx.txid();
         let fee_rate = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let fee = validate_transaction_with_context_and_schedule(
+        let fee = validate_transaction_with_context_structure_and_schedule(
             tx,
             fee_rate,
             height,
@@ -557,8 +635,10 @@ mod tests {
         ScheduledActivation, BLOCK_VERSION_V1, BLOCK_VERSION_V2_PLACEHOLDER, RULESET_VERSION_V1,
         RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1, TRANSACTION_VERSION_V2_PLACEHOLDER,
     };
+    use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_TRANSACTION_RAW_BYTES};
     use atho_core::crypto::hash::sha3_384;
-    use atho_core::transaction::{Transaction, TxOutput};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
 
     fn solve_block(mut block: Block) -> Block {
         let prefix = block.header.canonical_bytes_without_nonce();
@@ -792,6 +872,79 @@ mod tests {
                 &schedule
             ),
             Err(ValidationError::InvalidBlockVersion)
+        );
+    }
+
+    #[test]
+    fn oversized_transaction_raw_bytes_are_rejected() {
+        let mut tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: [7; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1,
+                locking_script: vec![0; MAX_TRANSACTION_RAW_BYTES + 1],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let txid = tx.txid();
+        let signature = vec![1u8; FALCON_512_SIGNATURE_BYTES];
+        let witness = TxWitness {
+            signature: signature.clone(),
+            pubkey: vec![2u8; FALCON_512_PUBLIC_KEY_BYTES],
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &signature, 0),
+                witness_commit_ref: [0; 16],
+            }],
+        };
+        tx.witness = witness.canonical_bytes();
+
+        assert_eq!(
+            validate_transaction_structure_for_height_with_schedule(
+                &tx,
+                1,
+                1,
+                &rules::SCHEDULED_ACTIVATIONS,
+            ),
+            Err(ValidationError::TransactionTooLarge)
+        );
+    }
+
+    #[test]
+    fn oversized_block_raw_bytes_are_rejected() {
+        let coinbase = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![0; MAX_BLOCK_RAW_BYTES + 1],
+            }],
+            lock_time: 1,
+            witness: vec![],
+        };
+        let transactions = vec![coinbase];
+        let block = Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 1,
+                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+                nonce: 0,
+            },
+            transactions,
+        );
+
+        assert_eq!(
+            validate_block_without_pow(&block, 1, Network::Mainnet),
+            Err(ValidationError::BlockTooLarge)
         );
     }
 }

@@ -25,8 +25,11 @@ mod tests {
         assert_eq!(STANDARD_TX_CONFIRMATIONS, 7);
         assert_eq!(MIN_TX_FEE_ATOMS, 1);
         assert_eq!(BLOCK_TIME_SECONDS, 75);
-        assert_eq!(MAX_BLOCK_SIZE_BYTES, 2_000_000);
-        assert_eq!(MAX_BLOCK_WEIGHT, 8_000_000);
+        assert_eq!(MAX_BLOCK_VBYTES, 3_000_000);
+        assert_eq!(MAX_BLOCK_RAW_BYTES, 12_000_000);
+        assert_eq!(MAX_BLOCK_SIZE_BYTES, 3_000_000);
+        assert_eq!(MAX_BLOCK_WEIGHT, 12_000_000);
+        assert_eq!(MAX_BLOCK_SERIALIZED_BYTES, 12_000_000);
         assert_eq!(ADDRESS_CHECKSUM_BYTES, 4);
         assert_eq!(GENESIS_COINBASE_ATOMS, 5_000_000_000);
     }

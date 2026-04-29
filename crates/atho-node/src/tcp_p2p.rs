@@ -9,6 +9,7 @@ use atho_p2p::config::network_params;
 use atho_p2p::connection::ConnectionEvent;
 use atho_p2p::protocol::{Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage};
 use atho_storage::db::PeerHealthRecord;
+use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::str::FromStr;
@@ -21,6 +22,9 @@ use thiserror::Error;
 const FRAME_HEADER_BYTES: usize = 24;
 const OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const OUTBOUND_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(32);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
+const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
 const PEER_QUALITY_SUCCESS_RECOVERY: u32 = 10;
@@ -58,6 +62,7 @@ pub struct TcpP2pRuntime {
     stop_requested: Arc<AtomicBool>,
     #[cfg_attr(not(test), allow(dead_code))]
     active_inbound_threads: Arc<AtomicUsize>,
+    outbound_targets: Arc<Mutex<BTreeSet<String>>>,
     listener_thread: Option<JoinHandle<()>>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     maintenance_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -83,6 +88,7 @@ impl TcpP2pRuntime {
         let local_addr = listener.local_addr().map_err(TcpP2pError::Io)?;
         let stop_requested = Arc::new(AtomicBool::new(false));
         let active_inbound_threads = Arc::new(AtomicUsize::new(0));
+        let outbound_targets = Arc::new(Mutex::new(BTreeSet::new()));
         let peer_threads = Arc::new(Mutex::new(Vec::new()));
         let maintenance_threads = Arc::new(Mutex::new(Vec::new()));
         let listener_state = Arc::clone(&state);
@@ -127,16 +133,30 @@ impl TcpP2pRuntime {
             }
         });
 
-        Ok(Self {
+        let runtime = Self {
             network,
             bind_addr: local_addr,
             state,
             stop_requested,
             active_inbound_threads,
+            outbound_targets,
             listener_thread: Some(listener_thread),
             peer_threads,
             maintenance_threads,
-        })
+        };
+        let discovery_thread = spawn_peer_discovery(
+            runtime.network,
+            Arc::clone(&runtime.state),
+            Arc::clone(&runtime.stop_requested),
+            Arc::clone(&runtime.peer_threads),
+            Arc::clone(&runtime.outbound_targets),
+        );
+        runtime
+            .maintenance_threads
+            .lock()
+            .expect("maintenance thread list poisoned")
+            .push(discovery_thread);
+        Ok(runtime)
     }
 
     pub fn bind_service(
@@ -174,11 +194,16 @@ impl TcpP2pRuntime {
     }
 
     pub fn maintain_outbound(&self, remote_addr: impl Into<String>) {
+        let remote_addr = remote_addr.into();
+        if !track_outbound_target(&self.outbound_targets, &remote_addr) {
+            return;
+        }
         let thread = spawn_outbound_maintainer(
-            remote_addr.into(),
+            remote_addr,
             Arc::clone(&self.state),
             Arc::clone(&self.stop_requested),
             Arc::clone(&self.peer_threads),
+            Arc::clone(&self.outbound_targets),
         );
         self.maintenance_threads
             .lock()
@@ -260,8 +285,11 @@ fn spawn_outbound_maintainer(
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    outbound_targets: Arc<Mutex<BTreeSet<String>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let _target_guard =
+            OutboundTargetGuard::new(Arc::clone(&outbound_targets), remote_addr.clone());
         let network = {
             let state = state.lock().expect("p2p runtime state poisoned");
             state.network()
@@ -272,7 +300,7 @@ fn spawn_outbound_maintainer(
             let now_unix = unix_timestamp();
             if health.backoff_until_unix > now_unix {
                 let remaining = health.backoff_until_unix.saturating_sub(now_unix).max(1);
-                sleep_with_stop(&stop_requested, Duration::from_secs(remaining.min(1)));
+                sleep_with_stop(&stop_requested, Duration::from_secs(remaining));
                 continue;
             }
 
@@ -363,6 +391,79 @@ fn spawn_outbound_maintainer(
     })
 }
 
+fn spawn_peer_discovery(
+    network: Network,
+    state: Arc<Mutex<NodeService>>,
+    stop_requested: Arc<AtomicBool>,
+    peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    outbound_targets: Arc<Mutex<BTreeSet<String>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let candidate_limit = network_params(network)
+            .limits
+            .max_outbound_peers
+            .saturating_mul(4)
+            .max(8);
+        while !stop_requested.load(Ordering::Acquire) {
+            let candidates = {
+                let mut state = state.lock().expect("p2p runtime state poisoned");
+                state.p2p_bootstrap_peers(candidate_limit)
+            };
+            for remote_addr in candidates {
+                if !track_outbound_target(&outbound_targets, &remote_addr) {
+                    continue;
+                }
+                let thread = spawn_outbound_maintainer(
+                    remote_addr,
+                    Arc::clone(&state),
+                    Arc::clone(&stop_requested),
+                    Arc::clone(&peer_threads),
+                    Arc::clone(&outbound_targets),
+                );
+                peer_threads
+                    .lock()
+                    .expect("peer thread list poisoned")
+                    .push(thread);
+            }
+            sleep_with_stop(&stop_requested, PEER_DISCOVERY_INTERVAL);
+        }
+    })
+}
+
+fn track_outbound_target(
+    outbound_targets: &Arc<Mutex<BTreeSet<String>>>,
+    remote_addr: &str,
+) -> bool {
+    outbound_targets
+        .lock()
+        .expect("outbound target registry poisoned")
+        .insert(remote_addr.to_string())
+}
+
+struct OutboundTargetGuard {
+    outbound_targets: Arc<Mutex<BTreeSet<String>>>,
+    remote_addr: String,
+}
+
+impl OutboundTargetGuard {
+    fn new(outbound_targets: Arc<Mutex<BTreeSet<String>>>, remote_addr: String) -> Self {
+        Self {
+            outbound_targets,
+            remote_addr,
+        }
+    }
+}
+
+impl Drop for OutboundTargetGuard {
+    fn drop(&mut self) {
+        let mut targets = self
+            .outbound_targets
+            .lock()
+            .expect("outbound target registry poisoned");
+        let _ = targets.remove(&self.remote_addr);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ConnectionRole {
     Inbound,
@@ -422,6 +523,7 @@ fn spawn_peer_thread(
                 state.tip_hash()
             };
             let mut last_announced_mempool = Vec::<[u8; 48]>::new();
+            let mut last_activity = SystemTime::now();
             let peer_network = {
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.network()
@@ -440,6 +542,7 @@ fn spawn_peer_thread(
                         if bytes_received > 0 {
                             let mut state = state.lock().expect("p2p runtime state poisoned");
                             state.p2p_note_bytes_received(&peer_id, bytes_received);
+                            last_activity = SystemTime::now();
                         }
                         message
                     }
@@ -451,20 +554,24 @@ fn spawn_peer_thread(
                             }
                             continue;
                         }
-                        if let Some(message) =
-                            poll_tip_announcement(&state, &mut last_announced_tip)
+                        if let Some(messages) =
+                            poll_tip_announcements(&state, &mut last_announced_tip)
                         {
-                            let bytes_sent = match write_message(&mut stream, &message) {
-                                Ok(bytes_sent) => bytes_sent,
-                                Err(err) => {
-                                    return format!(
-                                        "tip announcement failed peer={peer_id} error={err}"
-                                    );
+                            for message in messages {
+                                let bytes_sent = match write_message(&mut stream, &message) {
+                                    Ok(bytes_sent) => bytes_sent,
+                                    Err(err) => {
+                                        return format!(
+                                            "tip announcement failed peer={peer_id} error={err}"
+                                        );
+                                    }
+                                };
+                                if bytes_sent > 0 {
+                                    let mut state =
+                                        state.lock().expect("p2p runtime state poisoned");
+                                    state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                                    last_activity = SystemTime::now();
                                 }
-                            };
-                            if bytes_sent > 0 {
-                                let mut state = state.lock().expect("p2p runtime state poisoned");
-                                state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                             }
                         }
                         if let Some(messages) =
@@ -483,7 +590,35 @@ fn spawn_peer_thread(
                                     let mut state =
                                         state.lock().expect("p2p runtime state poisoned");
                                     state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                                    last_activity = SystemTime::now();
                                 }
+                            }
+                        }
+                        if handshake_ready
+                            && last_activity.elapsed().unwrap_or_default() >= KEEPALIVE_INTERVAL
+                        {
+                            let keepalive = NetworkMessage::new(
+                                peer_network,
+                                MessagePayload::Ping {
+                                    nonce: unix_timestamp(),
+                                },
+                            );
+                            let bytes_sent = match write_message(&mut stream, &keepalive) {
+                                Ok(bytes_sent) => bytes_sent,
+                                Err(err) => {
+                                    return format!(
+                                        "keepalive ping failed peer={peer_id} error={err}"
+                                    );
+                                }
+                            };
+                            if bytes_sent > 0 {
+                                let mut state = state.lock().expect("p2p runtime state poisoned");
+                                state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                                last_activity = SystemTime::now();
+                                let _ = dev::append_log(
+                                    "p2p",
+                                    &format!("keepalive ping sent peer={peer_id}"),
+                                );
                             }
                         }
                         continue;
@@ -524,6 +659,7 @@ fn spawn_peer_thread(
                 if bytes_sent > 0 {
                     let mut state = state.lock().expect("p2p runtime state poisoned");
                     state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                    last_activity = SystemTime::now();
                 }
             }
         })();
@@ -548,18 +684,18 @@ fn spawn_peer_thread(
     })
 }
 
-fn poll_tip_announcement(
+fn poll_tip_announcements(
     state: &Arc<Mutex<NodeService>>,
     last_announced_tip: &mut [u8; 48],
-) -> Option<NetworkMessage> {
+) -> Option<Vec<NetworkMessage>> {
     let state = state.lock().expect("p2p runtime state poisoned");
     let tip_hash = state.tip_hash();
     if tip_hash == *last_announced_tip {
         return None;
     }
-    let message = state.p2p_relay_compact_tip_message()?;
+    let messages = state.p2p_relay_compact_tip_messages_since(*last_announced_tip);
     *last_announced_tip = tip_hash;
-    Some(message)
+    Some(messages)
 }
 
 fn poll_mempool_announcements(
@@ -602,7 +738,7 @@ fn poll_mempool_announcements(
 
 fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    stream.set_read_timeout(Some(PEER_IO_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     Ok(())
 }
@@ -784,7 +920,7 @@ impl Drop for InboundThreadGuard {
     }
 }
 
-fn next_outbound_retry_delay(consecutive_failures: u32) -> Duration {
+pub(crate) fn next_outbound_retry_delay(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(5);
     let factor = 1u64 << shift;
     OUTBOUND_RETRY_INTERVAL
@@ -815,6 +951,7 @@ fn sleep_with_stop(stop_requested: &Arc<AtomicBool>, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::acquire_global_test_lock;
     use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::RpcResponse;
@@ -828,13 +965,19 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -1004,6 +1147,41 @@ mod tests {
         eprintln!(
             "tcp_outbound_reconnect_ms={}",
             recovery_started.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn tcp_runtime_penalizes_peer_health_after_disconnect() {
+        let left = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("left");
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+
+        right
+            .connect_outbound(left.bind_addr().to_string())
+            .expect("connect outbound");
+
+        wait_until("peer handshake", Duration::from_secs(10), || {
+            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+        });
+
+        let peer_addr = left.bind_addr().to_string();
+        {
+            let mut state = right.state.lock().expect("right state");
+            let notice =
+                state.p2p_disconnect_peer(&peer_addr, String::from("peer closed connection"));
+            assert!(notice.is_some(), "disconnect should return a notice");
+        }
+
+        wait_until(
+            "peer health updated after disconnect",
+            Duration::from_secs(5),
+            || {
+                let mut state = right.state.lock().expect("right state");
+                state.p2p_peer_health(&peer_addr).is_some_and(|record| {
+                    record.consecutive_failures >= 1
+                        && record.quality_score < PEER_QUALITY_MAX_SCORE
+                        && record.backoff_until_unix >= unix_timestamp()
+                })
+            },
         );
     }
 

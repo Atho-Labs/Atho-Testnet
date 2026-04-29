@@ -1,4 +1,4 @@
-use crate::db::{ChainstateSnapshot, Database, PeerHealthRecord};
+use crate::db::{ChainstateSnapshot, Database, PeerHealthRecord, PeerRecord};
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use crate::validation;
@@ -347,11 +347,32 @@ impl Chainstate {
         storage.load_peer_health(remote_addr)
     }
 
+    pub fn load_peer(&self, remote_addr: &str) -> Result<Option<PeerRecord>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_peer(remote_addr)
+    }
+
+    pub fn list_peers(&self) -> Result<Vec<PeerRecord>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(Vec::new());
+        };
+        storage.list_peers()
+    }
+
     pub fn save_peer_health(&self, record: &PeerHealthRecord) -> Result<(), StorageError> {
         let Some(storage) = &self.storage else {
             return Ok(());
         };
         storage.upsert_peer_health(record)
+    }
+
+    pub fn save_peer(&self, record: &PeerRecord) -> Result<(), StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        storage.upsert_peer(record)
     }
 
     pub fn canonical_blocks(&self) -> Result<Vec<Block>, StorageError> {
@@ -1106,6 +1127,7 @@ mod tests {
     use super::*;
     use crate::db::{ChainstateSnapshot, CommitFaultPoint, Database};
     use crate::error::StorageError;
+    use crate::test_support::acquire_global_test_lock;
     use crate::utxo::UtxoEntry;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::subsidy;
@@ -1114,6 +1136,7 @@ mod tests {
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxOutput};
     use std::fs;
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_workspace(label: &str) -> std::path::PathBuf {
@@ -1127,19 +1150,26 @@ mod tests {
         ))
     }
 
-    struct CurrentDirGuard(std::path::PathBuf);
+    struct CurrentDirGuard {
+        previous: std::path::PathBuf,
+        _lock: MutexGuard<'static, ()>,
+    }
 
     impl CurrentDirGuard {
         fn switch_to(path: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(path).expect("set cwd");
-            Self(previous)
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
+            let _ = std::env::set_current_dir(&self.previous);
         }
     }
 

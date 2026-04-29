@@ -8,17 +8,53 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct MempoolEntry {
     pub transaction: Transaction,
     pub fee_atoms: u64,
+    txid: [u8; 48],
+    wtxid: [u8; 48],
+    base_size_bytes: usize,
+    raw_size_bytes: usize,
     vsize_bytes: usize,
 }
 
 impl MempoolEntry {
     pub fn new(transaction: Transaction, fee_atoms: u64) -> Self {
+        let txid = transaction.txid();
+        let wtxid = transaction.wtxid();
+        let base_size_bytes = transaction.base_size_bytes();
+        let raw_size_bytes = transaction.full_size_bytes();
         let vsize_bytes = transaction.vsize_bytes().max(1);
         Self {
             transaction,
             fee_atoms,
+            txid,
+            wtxid,
+            base_size_bytes,
+            raw_size_bytes,
             vsize_bytes,
         }
+    }
+
+    pub fn txid(&self) -> [u8; 48] {
+        self.txid
+    }
+
+    pub fn wtxid(&self) -> [u8; 48] {
+        self.wtxid
+    }
+
+    pub fn raw_size_bytes(&self) -> usize {
+        self.raw_size_bytes
+    }
+
+    pub fn base_size_bytes(&self) -> usize {
+        self.base_size_bytes
+    }
+
+    pub fn full_size_bytes(&self) -> usize {
+        self.raw_size_bytes
+    }
+
+    pub fn vsize_bytes(&self) -> usize {
+        self.vsize_bytes
     }
 
     pub fn feerate_atoms_per_vbyte(&self) -> u64 {
@@ -93,7 +129,7 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let txid = entry.transaction.txid();
+        let txid = entry.txid();
         if self.entries.contains_key(&txid) {
             return Err(ValidationError::MempoolConflict);
         }
@@ -186,6 +222,23 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
+        let (entries, fees) = self.validated_entries(spend_height, |txid, output_index| {
+            lookup(txid, output_index)
+        })?;
+        Ok((
+            entries.into_iter().map(|entry| entry.transaction).collect(),
+            fees,
+        ))
+    }
+
+    pub fn validated_entries<F>(
+        &self,
+        spend_height: u64,
+        mut lookup: F,
+    ) -> Result<(Vec<MempoolEntry>, u64), ValidationError>
+    where
+        F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+    {
         let mut ordered: Vec<([u8; 48], &MempoolEntry)> = self
             .entries
             .iter()
@@ -199,7 +252,7 @@ impl Mempool {
                 .then_with(|| left_txid.cmp(right_txid))
         });
 
-        let mut txs = Vec::with_capacity(ordered.len());
+        let mut entries = Vec::with_capacity(ordered.len());
         let mut fees = 0u64;
         for (_, entry) in ordered {
             let fee = validate_transaction_with_context(
@@ -209,9 +262,9 @@ impl Mempool {
                 |txid, output_index| lookup(txid, output_index),
             )?;
             fees = fees.saturating_add(fee);
-            txs.push(entry.transaction.clone());
+            entries.push(entry.clone());
         }
-        Ok((txs, fees))
+        Ok((entries, fees))
     }
 
     pub fn total_fee_atoms(&self) -> u64 {

@@ -2,10 +2,11 @@ use crate::state::UiState;
 use atho_rpc::error::RpcError;
 use atho_rpc::response::{NetworkPeerDiagnostics, RpcResponse};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewModel {
     pub network_label: String,
     pub block_count: u64,
+    pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub peer_count: usize,
@@ -19,6 +20,29 @@ pub struct ViewModel {
     pub headers_synced: bool,
     pub ui_state: UiState,
     pub sync_stage: String,
+}
+
+impl Default for ViewModel {
+    fn default() -> Self {
+        Self {
+            network_label: String::new(),
+            block_count: 0,
+            tip_hash: [0; 48],
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            peer_count: 0,
+            inbound_peer_count: 0,
+            outbound_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            sync_best_height: 0,
+            running: false,
+            headers_synced: false,
+            ui_state: UiState::default(),
+            sync_stage: String::new(),
+        }
+    }
 }
 
 impl ViewModel {

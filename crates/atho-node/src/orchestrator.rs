@@ -70,23 +70,31 @@ impl NodeOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::acquire_global_test_lock;
     use atho_core::network::Network;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct CurrentDirGuard(std::path::PathBuf);
+    struct CurrentDirGuard {
+        previous: std::path::PathBuf,
+        _lock: crate::test_support::TestLockGuard,
+    }
 
     impl CurrentDirGuard {
         fn switch_to(path: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(path).expect("set cwd");
-            Self(previous)
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
+            let _ = std::env::set_current_dir(&self.previous);
         }
     }
 

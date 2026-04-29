@@ -1,6 +1,8 @@
 use crate::error::NodeError;
 use crate::node::Node;
+use crate::validation::ValidationError;
 use atho_core::block::Block;
+use atho_core::consensus::pow;
 use atho_core::network::Network;
 use atho_p2p::config::network_params;
 use atho_p2p::connection::{ConnectionEvent, ConnectionManager};
@@ -8,12 +10,14 @@ use atho_p2p::downloader::BlockDownloadScheduler;
 use atho_p2p::protocol::{
     compact_block_from_block, compact_short_id, reconstruct_compact_block, BlockTxnMessage,
     CompactBlockMessage, CompactBlockReconstruction, GetBlockTxnMessage, Hash48, InventoryKind,
-    InventoryVector, MessagePayload, NetworkMessage, ProtocolError,
+    InventoryVector, MessagePayload, NetworkMessage, PeerAddress, ProtocolError,
 };
 use atho_p2p::relay::RelayLoop;
 use atho_p2p::sync::SyncState;
 use atho_storage::chainstate::ChainSelectionOutcome;
+use atho_storage::error::StorageError;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -38,7 +42,7 @@ pub struct NodeSync {
     relay: RelayLoop,
     connections: ConnectionManager,
     downloader: BlockDownloadScheduler,
-    branch_buffers: BTreeMap<String, Vec<Block>>,
+    branch_buffers: BTreeMap<String, BufferedBranch>,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
 }
 
@@ -46,6 +50,11 @@ pub struct NodeSync {
 struct PendingCompactBlock {
     message: CompactBlockMessage,
     overrides: BTreeMap<u32, atho_core::transaction::Transaction>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BufferedBranch {
+    blocks: BTreeMap<[u8; 48], Block>,
 }
 
 impl NodeSync {
@@ -78,6 +87,16 @@ impl NodeSync {
 
     pub fn add_manual_peer(&mut self, remote_addr: impl Into<String>) {
         self.connections.add_manual_peer(remote_addr);
+    }
+
+    pub fn seed_peer_addresses(
+        &mut self,
+        addresses: &[PeerAddress],
+    ) -> Result<Vec<PeerAddress>, NodeSyncError> {
+        let public_source = !matches!(self.network, Network::Regnet);
+        Ok(self
+            .connections
+            .note_gossip_addresses(addresses, public_source)?)
     }
 
     pub fn accept_inbound(&mut self, remote_addr: impl Into<String>) -> Result<(), NodeSyncError> {
@@ -169,6 +188,7 @@ impl NodeSync {
                         self.relay.accept_version(peer.clone(), &version)?;
                     }
                     self.downloader.note_peer_ready(peer.clone());
+                    self.record_peer_observation(node, &peer, best_height)?;
                     notices.push(SyncNotice::Ready {
                         peer: peer.clone(),
                         best_height,
@@ -306,11 +326,35 @@ impl NodeSync {
             MessagePayload::Version(_)
             | MessagePayload::Verack
             | MessagePayload::Ping { .. }
-            | MessagePayload::GetAddr
-            | MessagePayload::Addr { .. } => {
+            | MessagePayload::GetAddr => {
                 return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
             }
+            MessagePayload::Addr { addresses } => {
+                let accepted = self
+                    .connections
+                    .note_gossip_addresses(&addresses, !matches!(self.network, Network::Regnet))
+                    .map_err(NodeSyncError::from)?;
+                let observed_height = self
+                    .connections
+                    .remote_best_height(peer)
+                    .unwrap_or_else(|| node.height());
+                let observed_unix = now_unix();
+                node.observe_peer(peer.to_string(), observed_height, observed_unix)?;
+                for address in accepted {
+                    node.observe_peer_address(&address, observed_height, observed_unix)?;
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn record_peer_observation(
+        &self,
+        node: &mut Node,
+        peer: &str,
+        observed_height: u64,
+    ) -> Result<(), NodeSyncError> {
+        node.observe_peer(peer.to_string(), observed_height, now_unix())?;
         Ok(())
     }
 
@@ -343,53 +387,168 @@ impl NodeSync {
         if node.contains_block(&block_hash) {
             self.downloader.note_block_received(block_hash);
             self.pending_compact_blocks.remove(&block_hash);
-            self.branch_buffers.remove(peer);
+            self.remove_buffered_block(peer, &block_hash);
             self.push_scheduled_block_requests(outbound);
+            self.process_buffered_branches(peer, node, outbound)?;
             return Ok(());
         }
 
         if block.header.previous_block_hash == node.tip_hash() {
-            node.submit_block(&block)?;
-            self.relay.prime(node.blocks());
-            self.downloader.note_block_received(block_hash);
-            self.pending_compact_blocks.remove(&block_hash);
+            match node.submit_block(&block) {
+                Ok(()) => {
+                    self.relay.prime(node.blocks());
+                    self.downloader.note_block_received(block_hash);
+                    self.pending_compact_blocks.remove(&block_hash);
+                    self.remove_buffered_block(peer, &block_hash);
+                    self.push_scheduled_block_requests(outbound);
+                    self.process_buffered_branches(peer, node, outbound)?;
+                    return Ok(());
+                }
+                Err(NodeError::Validation(validation))
+                    if Self::recoverable_tip_validation(&validation) =>
+                {
+                    // Keep the block buffered so fork-choice can re-evaluate it once the
+                    // branch is complete enough to compare by cumulative work.
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        self.buffer_peer_block(peer, block);
+        self.process_buffered_branches(peer, node, outbound)?;
+
+        Ok(())
+    }
+
+    fn branch_is_preferred_over_current(branch: &[Block], current_blocks: &[Block]) -> bool {
+        let Some(first) = branch.first() else {
+            return false;
+        };
+        let Some(fork_index) = current_blocks
+            .iter()
+            .position(|block| block.header.block_hash() == first.header.previous_block_hash)
+        else {
+            return false;
+        };
+        pow::branch_is_preferred(branch, &current_blocks[fork_index + 1..])
+    }
+
+    fn buffer_peer_block(&mut self, peer: &str, block: Block) {
+        self.branch_buffers
+            .entry(peer.to_string())
+            .or_default()
+            .blocks
+            .insert(block.header.block_hash(), block);
+    }
+
+    fn remove_buffered_block(&mut self, peer: &str, block_hash: &[u8; 48]) {
+        let mut remove_peer = false;
+        if let Some(buffer) = self.branch_buffers.get_mut(peer) {
+            buffer.blocks.remove(block_hash);
+            remove_peer = buffer.blocks.is_empty();
+        }
+        if remove_peer {
             self.branch_buffers.remove(peer);
-            self.push_scheduled_block_requests(outbound);
-            return Ok(());
+        }
+    }
+
+    fn buffered_branch_from_tip(
+        &self,
+        peer: &str,
+        node: &Node,
+        tip_hash: [u8; 48],
+    ) -> Option<Vec<Block>> {
+        let buffer = self.branch_buffers.get(peer)?;
+        let mut branch_reversed = Vec::new();
+        let mut current_hash = tip_hash;
+
+        loop {
+            let block = buffer.blocks.get(&current_hash)?.clone();
+            let previous_hash = block.header.previous_block_hash;
+            branch_reversed.push(block);
+            if node.contains_block(&previous_hash) {
+                break;
+            }
+            if buffer.blocks.contains_key(&previous_hash) {
+                current_hash = previous_hash;
+                continue;
+            }
+            return None;
         }
 
-        let branch = self.branch_buffers.entry(peer.to_string()).or_default();
-        if branch.last().is_some_and(|previous| {
-            previous.header.block_hash() == block.header.previous_block_hash
-        }) {
-            branch.push(block);
-        } else {
-            branch.clear();
-            branch.push(block);
-        }
+        branch_reversed.reverse();
+        Some(branch_reversed)
+    }
 
-        if branch
-            .last()
-            .is_some_and(|candidate| candidate.header.height > node.height())
-        {
-            let candidate_branch = branch.clone();
+    fn best_buffered_branch(&self, peer: &str, node: &Node) -> Option<Vec<Block>> {
+        let buffer = self.branch_buffers.get(peer)?;
+        let mut best: Option<Vec<Block>> = None;
+        let tip_hashes = buffer.blocks.keys().copied().collect::<Vec<_>>();
+        for tip_hash in tip_hashes {
+            let Some(candidate) = self.buffered_branch_from_tip(peer, node, tip_hash) else {
+                continue;
+            };
+            match &best {
+                None => best = Some(candidate),
+                Some(current) if pow::branch_is_preferred(&candidate, current) => {
+                    best = Some(candidate)
+                }
+                _ => {}
+            }
+        }
+        best
+    }
+
+    fn process_buffered_branches(
+        &mut self,
+        peer: &str,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        loop {
+            let Some(candidate_branch) = self.best_buffered_branch(peer, node) else {
+                return Ok(());
+            };
+            if !Self::branch_is_preferred_over_current(&candidate_branch, node.blocks()) {
+                return Ok(());
+            }
+
             let candidate_hashes = candidate_branch
                 .iter()
                 .map(|candidate| candidate.header.block_hash())
                 .collect::<Vec<_>>();
-            let selection = node.consider_branch(&candidate_branch)?;
-            if selection.outcome != ChainSelectionOutcome::KeptCurrent {
-                self.relay.prime(node.blocks());
-                for hash in candidate_hashes {
-                    self.downloader.note_block_received(hash);
-                    self.pending_compact_blocks.remove(&hash);
+            match node.consider_branch(&candidate_branch) {
+                Ok(selection) if selection.outcome != ChainSelectionOutcome::KeptCurrent => {
+                    self.relay.prime(node.blocks());
+                    for hash in candidate_hashes {
+                        self.downloader.note_block_received(hash);
+                        self.pending_compact_blocks.remove(&hash);
+                        self.remove_buffered_block(peer, &hash);
+                    }
+                    self.push_scheduled_block_requests(outbound);
                 }
-                self.branch_buffers.clear();
-                self.push_scheduled_block_requests(outbound);
+                Ok(_) => return Ok(()),
+                Err(err) if Self::recoverable_branch_error(&err) => return Ok(()),
+                Err(err) => return Err(err.into()),
             }
         }
+    }
 
-        Ok(())
+    fn recoverable_tip_validation(validation: &ValidationError) -> bool {
+        matches!(
+            validation,
+            ValidationError::InvalidBlockHeight | ValidationError::BlockParentHashMismatch
+        )
+    }
+
+    fn recoverable_branch_error(error: &NodeError) -> bool {
+        match error {
+            NodeError::Validation(validation) => Self::recoverable_tip_validation(validation),
+            NodeError::Storage(
+                StorageError::ForkPointUnavailable | StorageError::InvalidBranchSequence,
+            ) => true,
+            _ => false,
+        }
     }
 
     fn handle_compact_block(
@@ -606,19 +765,36 @@ impl Default for NodeSync {
     }
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use crate::mempool::MempoolEntry;
     use crate::miner::Miner;
+    use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_core::block::{merkle_root, witness_root, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::consensus::{pow, subsidy};
     use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::genesis;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
+    use atho_p2p::protocol::PeerAddress;
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
     use std::collections::VecDeque;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug)]
     struct SandboxPeer {
@@ -634,6 +810,12 @@ mod tests {
         message: NetworkMessage,
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+        _lock: crate::test_support::TestLockGuard,
+    }
+
     impl SandboxPeer {
         fn new(id: &str, network: Network) -> Self {
             let node = Node::new(NodeConfig::new(network));
@@ -645,6 +827,51 @@ mod tests {
                 sync,
             }
         }
+
+        fn new_persistent(id: &str, network: Network) -> Self {
+            let node = Node::load_or_new(NodeConfig::new(network));
+            let mut sync = NodeSync::new(network);
+            sync.prime(&node);
+            Self {
+                id: id.to_string(),
+                node,
+                sync,
+            }
+        }
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn temp_data_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-sync-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 
     fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
@@ -688,6 +915,40 @@ mod tests {
                 .collect(),
         }
         .canonical_bytes()
+    }
+
+    fn coinbase_block(
+        network: Network,
+        height: u64,
+        previous_block_hash: [u8; 48],
+        target: [u8; 48],
+        timestamp: u64,
+    ) -> Block {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(height),
+                locking_script: vec![1],
+            }],
+            lock_time: height as u32,
+            witness: vec![],
+        };
+        let transactions = vec![coinbase];
+        Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: network,
+                height,
+                previous_block_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp,
+                difficulty_target_or_bits: target,
+                nonce: 0,
+            },
+            transactions,
+        )
     }
 
     fn collect_events(
@@ -779,6 +1040,55 @@ mod tests {
             .address_manager()
             .advertisable_addresses(8);
         assert!(addresses.iter().any(|address| address.host == "8.8.8.8"));
+    }
+
+    #[test]
+    fn sandbox_addr_gossip_persists_peer_records_and_seed_graph() {
+        let root = temp_data_dir("peer-gossip");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut left = SandboxPeer::new_persistent("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let gossip = PeerAddress {
+            host: String::from("9.9.9.9"),
+            port: 9200,
+            services: 0,
+            last_seen_unix: 1_700_000_123,
+        };
+        let (events, notices) = left
+            .sync
+            .receive(
+                &right.id,
+                NetworkMessage::new(
+                    Network::Regnet,
+                    MessagePayload::Addr {
+                        addresses: vec![gossip],
+                    },
+                ),
+                &mut left.node,
+            )
+            .expect("addr gossip");
+
+        assert!(events.is_empty());
+        assert!(notices.is_empty());
+        let stored = left
+            .node
+            .load_peer_record("9.9.9.9:9200")
+            .expect("load peer record")
+            .expect("peer record present");
+        assert_eq!(stored.remote_addr, "9.9.9.9:9200");
+        assert!(stored.last_seen_unix > 0);
+        let addresses = left
+            .sync
+            .connections()
+            .address_manager()
+            .advertisable_addresses(8);
+        assert!(addresses
+            .iter()
+            .any(|address| address.host == "9.9.9.9" && address.port == 9200));
     }
 
     #[test]
@@ -1048,5 +1358,111 @@ mod tests {
         assert_eq!(canonical.node.height(), fork.node.height());
         assert_eq!(canonical.node.tip_hash(), fork.node.tip_hash());
         assert_eq!(canonical.sync.sync_state().best_height, fork.node.height());
+    }
+
+    #[test]
+    fn branch_fork_choice_uses_work_not_raw_height() {
+        let genesis = genesis::genesis_state(Network::Regnet).block;
+        let genesis_hash = genesis.header.block_hash();
+        let easy_target = pow::DIFFICULTY_PROFILE.min_difficulty_target;
+        let hard_target = pow::DIFFICULTY_PROFILE.max_difficulty_target;
+
+        let current_1 = coinbase_block(Network::Regnet, 1, genesis_hash, easy_target, 1_000);
+        let current_2 = coinbase_block(
+            Network::Regnet,
+            2,
+            current_1.header.block_hash(),
+            easy_target,
+            1_075,
+        );
+        let current_chain = vec![genesis, current_1, current_2];
+        let candidate_branch = vec![coinbase_block(
+            Network::Regnet,
+            1,
+            current_chain[0].header.block_hash(),
+            hard_target,
+            1_000,
+        )];
+
+        assert!(NodeSync::branch_is_preferred_over_current(
+            &candidate_branch,
+            &current_chain
+        ));
+    }
+
+    #[test]
+    fn recoverable_tip_height_mismatch_stays_buffered() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let arbitrary_tip = [9; 48];
+        peer.node
+            .dev_seed_chainstate(5, arbitrary_tip, Vec::<UtxoEntry>::new())
+            .expect("seed chainstate");
+
+        let block = coinbase_block(
+            Network::Regnet,
+            3,
+            arbitrary_tip,
+            pow::initial_target_for_network(Network::Regnet),
+            1_000,
+        );
+
+        let mut outbound = Vec::new();
+        peer.sync
+            .handle_received_block("peer", block, &mut peer.node, &mut outbound)
+            .expect("recoverable branch mismatch");
+
+        assert!(outbound.is_empty());
+        assert_eq!(
+            peer.sync
+                .branch_buffers
+                .get("peer")
+                .map(|buffer| buffer.blocks.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn out_of_order_branch_blocks_reconstruct_and_reorg() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let miner = Miner::new(1);
+        let mut reference_node = Node::new(NodeConfig::new(Network::Regnet));
+
+        let block_1 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 1"),
+        );
+        reference_node
+            .connect_block(&block_1)
+            .expect("connect reference block 1");
+        let block_2 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 2"),
+        );
+        reference_node
+            .connect_block(&block_2)
+            .expect("connect reference block 2");
+        let block_3 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 3"),
+        );
+
+        let mut outbound = Vec::new();
+        peer.sync
+            .handle_received_block("peer", block_3.clone(), &mut peer.node, &mut outbound)
+            .expect("buffer tip block");
+        peer.sync
+            .handle_received_block("peer", block_2.clone(), &mut peer.node, &mut outbound)
+            .expect("buffer middle block");
+        peer.sync
+            .handle_received_block("peer", block_1.clone(), &mut peer.node, &mut outbound)
+            .expect("reconstruct buffered branch");
+
+        assert!(outbound.is_empty());
+        assert_eq!(peer.node.height(), 3);
+        assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
+        assert!(peer.sync.branch_buffers.get("peer").is_none());
     }
 }

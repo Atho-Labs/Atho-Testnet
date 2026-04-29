@@ -6,10 +6,12 @@ use atho_core::address::address_parts_from_public_key;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::rules;
 use atho_core::consensus::{pow, subsidy};
+use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::transaction::{Transaction, TxOutput};
 use atho_crypto::falcon;
 use rayon::prelude::*;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -181,37 +183,111 @@ impl Miner {
 
     pub fn build_candidate_block(&self, node: &Node) -> Result<Block, NodeError> {
         let utxos = node.utxo_snapshot();
-        let (pending_transactions, fees_atoms) = node
+        let height = node.height().saturating_add(1);
+        let (validated_entries, _) = node
             .mempool
-            .valid_transactions(node.height().saturating_add(1), |txid, output_index| {
+            .validated_entries(height, |txid, output_index| {
                 utxos.get(*txid, output_index).cloned()
             })?;
-        let height = node.height().saturating_add(1);
         let active_rules = rules::rules_at_height(height);
         let subsidy_atoms = subsidy::block_subsidy_atoms(node.height().saturating_add(1));
         let (reward_address, reward_script) =
             Self::reward_target_for_height(node.network(), height);
+        let previous_block_hash = node.tip_hash();
+        let timestamp = Self::candidate_block_timestamp(node.blocks());
+        let difficulty_target_or_bits = node.difficulty_target_for_next_block();
+        let header_template = BlockHeader {
+            version: active_rules.block_version,
+            network_id: node.network(),
+            height,
+            previous_block_hash,
+            merkle_root: [0; 48],
+            witness_root: [0; 48],
+            timestamp,
+            difficulty_target_or_bits,
+            nonce: 0,
+        };
+        let coinbase_template = Transaction {
+            version: active_rules.transaction_version,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy_atoms,
+                locking_script: reward_script.clone(),
+            }],
+            lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+            witness: vec![],
+        };
+        let header_size_bytes = header_template.canonical_size_bytes();
+        let coinbase_base_bytes = coinbase_template.base_size_bytes();
+        let coinbase_full_bytes = coinbase_template.full_size_bytes();
+        let mut block_base_bytes = header_size_bytes + 4 + 4 + coinbase_base_bytes;
+        let mut block_full_bytes = header_size_bytes + 4 + 4 + coinbase_full_bytes;
+        let mut selected_transactions = Vec::new();
+        let mut selected_fee_atoms = 0u64;
+        let mut block_spent_set = BTreeSet::new();
+
+        for entry in validated_entries {
+            let fee_atoms = entry.fee_atoms;
+            let base_size_bytes = entry.base_size_bytes();
+            let raw_size_bytes = entry.raw_size_bytes();
+            let tx = entry.transaction;
+            let mut inserted_inputs = Vec::with_capacity(tx.inputs.len());
+            let mut conflicted = false;
+            for input in &tx.inputs {
+                let key = (input.previous_txid, input.output_index);
+                if !block_spent_set.insert(key) {
+                    conflicted = true;
+                    break;
+                }
+                inserted_inputs.push(key);
+            }
+            if conflicted {
+                for key in inserted_inputs {
+                    let _ = block_spent_set.remove(&key);
+                }
+                continue;
+            }
+
+            let next_base_bytes = block_base_bytes + 4 + base_size_bytes;
+            let next_full_bytes = block_full_bytes + 4 + raw_size_bytes;
+            let next_weight = next_base_bytes
+                .saturating_mul(3)
+                .saturating_add(next_full_bytes);
+            let next_vbytes = (next_weight.saturating_add(3)) / 4;
+            if next_full_bytes > MAX_BLOCK_RAW_BYTES
+                || next_vbytes > MAX_BLOCK_VBYTES
+                || next_weight > MAX_BLOCK_WEIGHT
+            {
+                for key in inserted_inputs {
+                    let _ = block_spent_set.remove(&key);
+                }
+                continue;
+            }
+
+            block_base_bytes = next_base_bytes;
+            block_full_bytes = next_full_bytes;
+            selected_fee_atoms = selected_fee_atoms.saturating_add(fee_atoms);
+            selected_transactions.push(tx);
+        }
+
         let coinbase = Transaction {
             version: active_rules.transaction_version,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy_atoms.saturating_add(fees_atoms),
+                value_atoms: subsidy_atoms.saturating_add(selected_fee_atoms),
                 locking_script: reward_script,
             }],
             lock_time: u32::try_from(height).unwrap_or(u32::MAX),
             witness: vec![],
         };
-        let mut transactions = Vec::with_capacity(pending_transactions.len().saturating_add(1));
+        let mut transactions = Vec::with_capacity(selected_transactions.len().saturating_add(1));
         transactions.push(coinbase);
-        transactions.extend(pending_transactions);
-        let previous_block_hash = node.tip_hash();
+        transactions.extend(selected_transactions);
         let witness_root = witness_root(&transactions);
         transactions = transactions
             .into_iter()
             .map(|tx| finalize_witness_commit_refs(&tx, witness_root))
             .collect();
-        let difficulty_target_or_bits = node.difficulty_target_for_next_block();
-        let timestamp = Self::candidate_block_timestamp(node.blocks());
         let header = BlockHeader {
             version: active_rules.block_version,
             network_id: node.network(),
@@ -224,8 +300,8 @@ impl Miner {
             nonce: 0,
         };
         let mut block = Block::new(header, transactions);
-        block.fees_total_atoms = fees_atoms;
-        block.fees_miner_atoms = fees_atoms;
+        block.fees_total_atoms = selected_fee_atoms;
+        block.fees_miner_atoms = selected_fee_atoms;
         block.fees_burned_atoms = 0;
         block.fees_pool_atoms = 0;
         block.cumulative_burned_atoms = 0;

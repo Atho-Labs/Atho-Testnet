@@ -350,7 +350,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
                         for peer in &app.view_model.peers {
                             ui.label(peer_direction_label(peer.direction));
-                            ui.label(&peer.remote_addr);
+                            widgets::elided_label(ui, &peer.remote_addr, 24);
                             ui.label(if peer.handshake_ready {
                                 "Ready"
                             } else {
@@ -366,10 +366,12 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                     .map(|version| version.to_string())
                                     .unwrap_or_else(|| String::from("-")),
                             );
-                            ui.label(
+                            widgets::elided_label(
+                                ui,
                                 peer.user_agent
-                                    .clone()
-                                    .unwrap_or_else(|| String::from("-")),
+                                    .as_deref()
+                                    .unwrap_or("-"),
+                                20,
                             );
                             ui.label(format_bytes(peer.bytes_sent));
                             ui.label(format_bytes(peer.bytes_received));

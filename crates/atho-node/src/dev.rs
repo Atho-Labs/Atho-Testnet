@@ -15,7 +15,7 @@ use atho_storage::chainstate::Chainstate;
 use atho_storage::utxo::UtxoEntry;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -80,11 +80,16 @@ pub fn ensure_layout() -> std::io::Result<()> {
 }
 
 fn ensure_layout_locked() -> std::io::Result<()> {
-    fs::create_dir_all(logs_dir())?;
-    fs::create_dir_all(chain_dir())?;
-    fs::create_dir_all(wallet_dir())?;
-    fs::create_dir_all(db_dir())?;
-    fs::create_dir_all(audit_dir())?;
+    ensure_layout_for(&dev_root())
+}
+
+fn ensure_layout_for(root: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(root.join("logs"))?;
+    fs::create_dir_all(root.join("chain"))?;
+    fs::create_dir_all(root.join("wallet"))?;
+    fs::create_dir_all(root.join("db"))?;
+    fs::create_dir_all(root.join("audit"))?;
+    fs::create_dir_all(root.join("quarantine"))?;
     Ok(())
 }
 
@@ -186,15 +191,25 @@ pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
 
 pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    remove_tree(&chain_dir())?;
-    remove_tree(&wallet_dir())?;
-    remove_tree(&db_dir())?;
-    remove_tree(&audit_dir())?;
-    remove_tree(&logs_dir())?;
-    ensure_layout_locked()
+    wipe_root_locked(&dev_root())
 }
 
-fn remove_tree(path: &PathBuf) -> std::io::Result<()> {
+pub fn wipe_root(root: &Path) -> std::io::Result<()> {
+    let _guard = dev_lock().lock().expect("dev lock poisoned");
+    wipe_root_locked(root)
+}
+
+fn wipe_root_locked(root: &Path) -> std::io::Result<()> {
+    remove_tree(&root.join("chain"))?;
+    remove_tree(&root.join("wallet"))?;
+    remove_tree(&root.join("db"))?;
+    remove_tree(&root.join("audit"))?;
+    remove_tree(&root.join("logs"))?;
+    remove_tree(&root.join("quarantine"))?;
+    ensure_layout_for(root)
+}
+
+fn remove_tree(path: &Path) -> std::io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -666,14 +681,44 @@ fn parse_activity_line(line: &str) -> Option<ActivityLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::acquire_global_test_lock;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn dev_layout_can_be_created_and_wiped() {
+        let _lock = acquire_global_test_lock();
         ensure_layout().unwrap();
         append_log("athod", "test line").unwrap();
         wipe_chain_and_keys().unwrap();
         assert!(logs_dir().exists());
         assert!(!chain_dir().exists() || chain_dir().is_dir());
         assert!(!wallet_dir().exists() || wallet_dir().is_dir());
+    }
+
+    #[test]
+    fn wipe_root_recreates_an_explicit_sandbox_tree() {
+        let _lock = acquire_global_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "atho-dev-wipe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("logs")).expect("logs");
+        fs::write(root.join("logs").join("athod.log"), "temp").expect("log");
+        fs::create_dir_all(root.join("db").join("nested")).expect("db");
+
+        wipe_root(&root).expect("wipe");
+
+        assert!(root.join("logs").exists());
+        assert!(root.join("chain").exists());
+        assert!(root.join("wallet").exists());
+        assert!(root.join("db").exists());
+        assert!(root.join("audit").exists());
+        assert!(root.join("quarantine").exists());
+        assert!(!root.join("logs").join("athod.log").exists());
     }
 }

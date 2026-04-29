@@ -1,8 +1,8 @@
-use crate::address_manager::AddressManager;
+use crate::address_manager::{format_remote_addr, AddressManager};
 use crate::banlist::BanList;
 use crate::config::network_params;
 use crate::handshake::{HandshakeAction, HandshakeState};
-use crate::protocol::{MessagePayload, NetworkMessage, ProtocolError, VersionMessage};
+use crate::protocol::{MessagePayload, NetworkMessage, PeerAddress, ProtocolError, VersionMessage};
 use atho_core::network::Network;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -87,6 +87,16 @@ impl ConnectionManager {
 
     pub fn add_manual_peer(&mut self, remote_addr: impl Into<String>) {
         self.address_manager.add_manual_peer(remote_addr);
+    }
+
+    pub fn note_gossip_addresses(
+        &mut self,
+        addresses: &[PeerAddress],
+        public_source: bool,
+    ) -> Result<Vec<PeerAddress>, ConnectionError> {
+        self.address_manager
+            .note_gossip_addresses(addresses, public_source)
+            .map_err(ConnectionError::Protocol)
     }
 
     pub fn accept_inbound(
@@ -212,18 +222,22 @@ impl ConnectionManager {
                 message: NetworkMessage::new(
                     self.network,
                     MessagePayload::Addr {
-                        addresses: self.address_manager.advertisable_addresses(
-                            network_params(self.network).limits.max_addr_per_message,
-                        ),
+                        addresses: {
+                            let limits = network_params(self.network).limits;
+                            let share_limit = limits
+                                .max_outbound_peers
+                                .saturating_mul(8)
+                                .max(8)
+                                .min(limits.max_addr_per_message);
+                            self.address_manager
+                                .advertisable_addresses(share_limit)
+                                .into_iter()
+                                .filter(|address| format_remote_addr(address) != remote_addr)
+                                .collect()
+                        },
                     },
                 ),
             }]),
-            MessagePayload::Addr { addresses } => {
-                self.address_manager
-                    .note_gossip_addresses(addresses, true)
-                    .map_err(ConnectionError::Protocol)?;
-                Ok(Vec::new())
-            }
             _ => Ok(vec![ConnectionEvent::Message {
                 peer: remote_addr.to_string(),
                 message,

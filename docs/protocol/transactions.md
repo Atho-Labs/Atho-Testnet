@@ -124,6 +124,7 @@ Current transaction validation checks include:
 
 - supported transaction version
 - non-empty outputs
+- maximum raw size
 - maximum vsize
 - non-zero output values
 - duplicate input rejection

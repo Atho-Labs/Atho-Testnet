@@ -39,7 +39,7 @@ When `ATHO_DATA_DIR` points at `./dev`, Atho uses:
 Wipe disposable state:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev wipe --data-dir "$PWD/dev"
+cargo run -p atho-node --bin athod -- wipe --network regnet --data-dir "$PWD/dev" --all
 ```
 
 Reset and restart from genesis:
@@ -82,6 +82,8 @@ Important:
 ## Shipping Rule
 
 Do not treat `dev/` as release content. It exists only for disposable local execution.
+
+If you ever need to wipe mainnet data, the CLI now requires an explicit `--dangerously-allow-mainnet` flag. The normal sandbox workflow should stay on `regnet` or another disposable root.
 
 ## Related Documentation
 

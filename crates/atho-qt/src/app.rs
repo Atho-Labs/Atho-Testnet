@@ -126,6 +126,12 @@ pub struct DesktopApp {
 }
 
 #[derive(Debug, Clone)]
+struct SpendableWalletUtxo {
+    address: WalletAddress,
+    utxo: UtxoEntry,
+}
+
+#[derive(Debug, Clone)]
 struct SelectedSpendPlan {
     address: WalletAddress,
     utxos: Vec<UtxoEntry>,
@@ -303,9 +309,11 @@ impl DesktopApp {
     fn apply_connection_status(&mut self, status: ConnectionStatus) {
         let previous_block_count = self.view_model.block_count;
         let previous_mempool_count = self.view_model.mempool_count;
+        let previous_tip_hash = self.view_model.tip_hash;
         let startup_error = status.startup_error.clone();
         self.view_model.network_label = status.network.id().to_string();
         self.view_model.block_count = status.block_count;
+        self.view_model.tip_hash = status.tip_hash;
         self.view_model.mempool_count = status.mempool_count;
         self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
         self.view_model.peer_count = status.peer_count;
@@ -339,7 +347,8 @@ impl DesktopApp {
 
         if self.wallet.is_some()
             && (status.block_count != previous_block_count
-                || status.mempool_count != previous_mempool_count)
+                || status.mempool_count != previous_mempool_count
+                || status.tip_hash != previous_tip_hash)
         {
             self.wallet_cache_dirty = true;
         }
@@ -1863,10 +1872,10 @@ impl DesktopApp {
             ));
         }
 
-        let selected_plan = {
+        let spendable_inputs = {
             let wallet_addresses = &self.wallet_addresses_cache;
             let wallet_address_index_cache = &self.wallet_address_index_cache;
-            let mut grouped: HashMap<[u8; 32], (WalletAddress, Vec<UtxoEntry>)> = HashMap::new();
+            let mut entries = Vec::new();
             for utxo in self.wallet_utxos_cache.clone() {
                 if reserved_inputs.contains(&(utxo.txid, utxo.output_index)) {
                     continue;
@@ -1875,28 +1884,33 @@ impl DesktopApp {
                     Ok(digest) => digest,
                     Err(_) => continue,
                 };
-                if let Some(&index) = wallet_address_index_cache.get(&digest) {
-                    let address = &wallet_addresses[index];
-                    grouped
-                        .entry(address.payment_digest)
-                        .or_insert((address.clone(), Vec::new()))
-                        .1
-                        .push(utxo);
-                }
+                let Some(&index) = wallet_address_index_cache.get(&digest) else {
+                    continue;
+                };
+                entries.push(SpendableWalletUtxo {
+                    address: wallet_addresses[index].clone(),
+                    utxo,
+                });
             }
-
-            let Some(selected_plan) = Self::select_wallet_utxos(
-                grouped.into_values().collect(),
-                amount,
-                self.send_include_fee_in_total,
-            )?
-            else {
-                return Err(String::from(
-                    "No spendable wallet UTXOs available; refresh to clear mempool-locked outputs",
-                ));
-            };
-            selected_plan
+            entries
         };
+
+        if spendable_inputs.is_empty() {
+            return Err(String::from(
+                "No spendable wallet UTXOs available; refresh to clear mempool-locked outputs",
+            ));
+        }
+
+        let selected_plan = Self::select_wallet_utxos(
+            spendable_inputs,
+            amount,
+            self.send_include_fee_in_total,
+        )?
+        .ok_or_else(|| {
+            String::from(
+                "No input combination covers the requested amount; try a smaller amount or consolidate UTXOs first",
+            )
+        })?;
 
         let keypair = {
             let wallet = self
@@ -2026,70 +2040,69 @@ impl DesktopApp {
     }
 
     fn select_wallet_utxos(
-        grouped: Vec<(WalletAddress, Vec<UtxoEntry>)>,
+        mut candidates: Vec<SpendableWalletUtxo>,
         amount_atoms: u64,
         include_fee_in_total: bool,
     ) -> Result<Option<SelectedSpendPlan>, String> {
-        let best = grouped
-            .into_par_iter()
-            .map(|(address, mut utxos)| {
-                utxos.sort_by(|a, b| b.value_atoms.cmp(&a.value_atoms).then(a.txid.cmp(&b.txid)));
-                let mut best: Option<SelectedSpendPlan> = None;
-                let mut selected = Vec::new();
-                let mut total = 0u64;
-                for utxo in utxos {
-                    total = total.saturating_add(utxo.value_atoms);
-                    selected.push(utxo);
-                    let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
-                    let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+        candidates.sort_by(|left, right| {
+            right
+                .utxo
+                .value_atoms
+                .cmp(&left.utxo.value_atoms)
+                .then(left.utxo.txid.cmp(&right.utxo.txid))
+                .then(left.utxo.output_index.cmp(&right.utxo.output_index))
+        });
 
-                    let candidate_output_count = if include_fee_in_total {
-                        if total == amount_atoms && amount_atoms > estimate_exact_fee {
-                            Some(1)
-                        } else if total > amount_atoms && amount_atoms > estimate_change_fee {
-                            Some(2)
-                        } else {
-                            None
-                        }
-                    } else {
-                        let exact_target = amount_atoms.checked_add(estimate_exact_fee);
-                        let change_target = amount_atoms.checked_add(estimate_change_fee);
-                        if exact_target == Some(total) {
-                            Some(1)
-                        } else if change_target.is_some_and(|target| total > target) {
-                            Some(2)
-                        } else {
-                            None
-                        }
-                    };
+        let mut best: Option<SelectedSpendPlan> = None;
+        let mut selected = Vec::new();
+        let mut total = 0u64;
 
-                    if let Some(output_count) = candidate_output_count {
-                        let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
-                        let candidate = SelectedSpendPlan {
-                            address: address.clone(),
-                            utxos: selected.clone(),
-                            total_input_atoms: total,
-                            output_count,
-                            estimated_fee_atoms,
-                        };
-                        best = Self::prefer_candidate(best, candidate);
-                        if output_count == 1 {
-                            break;
-                        }
-                    }
+        for candidate in candidates {
+            total = total.saturating_add(candidate.utxo.value_atoms);
+            selected.push(candidate);
+            let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
+            let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+
+            let candidate_output_count = if include_fee_in_total {
+                if total == amount_atoms && amount_atoms > estimate_exact_fee {
+                    Some(1)
+                } else if total > amount_atoms && amount_atoms > estimate_change_fee {
+                    Some(2)
+                } else {
+                    None
                 }
-                best
-            })
-            .reduce(
-                || None,
-                |current, candidate| match (current, candidate) {
-                    (None, next) => next,
-                    (next, None) => next,
-                    (Some(existing), Some(candidate)) => {
-                        Self::prefer_candidate(Some(existing), candidate)
-                    }
-                },
-            );
+            } else {
+                let exact_target = amount_atoms.checked_add(estimate_exact_fee);
+                let change_target = amount_atoms.checked_add(estimate_change_fee);
+                if exact_target == Some(total) {
+                    Some(1)
+                } else if change_target.is_some_and(|target| total > target) {
+                    Some(2)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(output_count) = candidate_output_count {
+                let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
+                let signing_address = selected
+                    .first()
+                    .expect("selected spend plan must have at least one input")
+                    .address
+                    .clone();
+                let candidate = SelectedSpendPlan {
+                    address: signing_address,
+                    utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
+                    total_input_atoms: total,
+                    output_count,
+                    estimated_fee_atoms,
+                };
+                best = Self::prefer_candidate(best, candidate);
+                if output_count == 1 {
+                    break;
+                }
+            }
+        }
 
         Ok(best)
     }
@@ -2614,6 +2627,7 @@ fn rewrite_reward_script(block: &Block, reward_script: &[u8]) -> Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::acquire_global_test_lock;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::pow;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
@@ -2636,19 +2650,30 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
 
         fn set_value(key: &'static str, value: &str) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -2896,7 +2921,7 @@ mod tests {
 
     #[test]
     fn desktop_app_refreshes_view_state() {
-        std::env::set_var("ATHO_QT_LOCAL", "1");
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
         app.refresh().unwrap();
         assert!(app.ui_state.connected);
@@ -2905,7 +2930,6 @@ mod tests {
             app.launch_page,
             LaunchPage::Welcome | LaunchPage::OpenWallet
         ));
-        std::env::remove_var("ATHO_QT_LOCAL");
     }
 
     #[test]
@@ -2916,6 +2940,7 @@ mod tests {
             network: Network::Regnet,
             rpc_address: String::from("127.0.0.1:18445"),
             block_count: 12,
+            tip_hash: [0x11; 48],
             mempool_count: 1,
             mempool_total_fee_atoms: 44,
             peer_count: 2,
@@ -2972,6 +2997,55 @@ mod tests {
             "10000.44544444"
         );
         assert_eq!(DesktopApp::format_send_amount_input(ATOMS_PER_ATHO), "1");
+    }
+
+    #[test]
+    fn select_wallet_utxos_can_span_multiple_addresses() {
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x6au8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let first = wallet.checkout_receive_address();
+        let second = wallet.checkout_receive_address();
+
+        let candidates = vec![
+            SpendableWalletUtxo {
+                address: first.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x11; 48],
+                    0,
+                    60 * ATOMS_PER_ATHO,
+                    first.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+            SpendableWalletUtxo {
+                address: second.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x22; 48],
+                    0,
+                    60 * ATOMS_PER_ATHO,
+                    second.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+        ];
+
+        let plan = DesktopApp::select_wallet_utxos(candidates, 100 * ATOMS_PER_ATHO, false)
+            .expect("selection")
+            .expect("multi-address plan");
+
+        assert_eq!(plan.utxos.len(), 2);
+        assert_eq!(plan.total_input_atoms, 120 * ATOMS_PER_ATHO);
+        assert!(
+            plan.address.payment_digest == first.payment_digest
+                || plan.address.payment_digest == second.payment_digest
+        );
     }
 
     #[test]
@@ -3044,7 +3118,7 @@ mod tests {
 
     #[test]
     fn generated_addresses_do_not_invalidate_wallet_scan_progress() {
-        std::env::set_var("ATHO_QT_LOCAL", "1");
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
         let mut wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[1u8; 32], MnemonicLength::Words24).unwrap(),
@@ -3064,7 +3138,6 @@ mod tests {
             .wallet_addresses_cache
             .iter()
             .any(|row| row.payment_digest == address.payment_digest));
-        std::env::remove_var("ATHO_QT_LOCAL");
     }
 
     #[test]
@@ -3098,7 +3171,7 @@ mod tests {
         let _home = EnvVarGuard::set_path("HOME", &home);
         let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
-        std::env::remove_var("ATHO_QT_FORCE_RPC");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
 
         let wallet_path = default_wallet_path(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -3133,7 +3206,7 @@ mod tests {
         let _home = EnvVarGuard::set_path("HOME", &home);
         let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
-        std::env::remove_var("ATHO_QT_FORCE_RPC");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
 
         let wallet_path = default_wallet_path(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -3241,7 +3314,7 @@ mod tests {
 
     #[test]
     fn mining_reward_script_falls_back_to_last_receive_address() {
-        std::env::set_var("ATHO_QT_LOCAL", "1");
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
         let mut wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[2u8; 32], MnemonicLength::Words24).unwrap(),
@@ -3263,13 +3336,12 @@ mod tests {
                 .payment_digest,
             last.payment_digest
         );
-        std::env::remove_var("ATHO_QT_LOCAL");
     }
 
     #[test]
     fn wallet_scan_waits_for_rpc_readiness() {
-        std::env::set_var("ATHO_QT_FORCE_RPC", "1");
-        std::env::remove_var("ATHO_QT_LOCAL");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "1");
+        let _clear_local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "0");
 
         let mut app = DesktopApp::new(Network::Mainnet);
         app.connection =
@@ -3293,8 +3365,6 @@ mod tests {
         assert!(!app.wallet_scan_rpc_ready());
         assert!(app.wallet_scan_job.is_none());
         assert!(app.wallet_cache_dirty);
-
-        std::env::remove_var("ATHO_QT_FORCE_RPC");
     }
 
     #[test]
@@ -3308,7 +3378,7 @@ mod tests {
         let _home = EnvVarGuard::set_path("HOME", &home);
         let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
-        std::env::remove_var("ATHO_QT_FORCE_RPC");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
 
         let wallet_path = default_wallet_path(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -3515,7 +3585,7 @@ mod tests {
         let _home = EnvVarGuard::set_path("HOME", &home);
         let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
-        std::env::remove_var("ATHO_QT_FORCE_RPC");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
 
         let wallet_path = default_wallet_path(Network::Regnet);
         let wallet = Wallet::from_mnemonic(

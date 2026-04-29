@@ -43,6 +43,7 @@ It is designed to answer three questions clearly:
 - [Quick Start](../quickstart.md)
 - [Commands](operations/commands.md)
 - [Runtime Model](operations/runtime-model.md)
+- [Optimizations and Max Parallelization Speed](operations/optimizations-and-max-parallelization-speed.md)
 - [Linux Quick Start](operations/linux-quick-start.md)
 - [macOS Quick Start](operations/macos-quick-start.md)
 - [Windows Quick Start](operations/windows-quick-start.md)

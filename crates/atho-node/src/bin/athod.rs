@@ -13,6 +13,8 @@ struct RuntimeCli {
     data_dir: Option<String>,
     peers: Vec<String>,
     public_rpc: bool,
+    all: bool,
+    dangerously_allow_mainnet: bool,
 }
 
 impl RuntimeCli {
@@ -75,6 +77,7 @@ fn run() -> Result<(), String> {
         }
         Some("status") => show_status(&args[1..]),
         Some("verify") => verify_node(&args[1..]),
+        Some("wipe") => run_wipe(&args[1..]),
         Some("dev") => run_dev(&args[1..]),
         Some("run") => run_node(&args[1..]),
         _ => run_node(&args),
@@ -243,15 +246,7 @@ fn run_dev(args: &[String]) -> Result<(), String> {
             println!("block_hash={}", hex::encode(profile.block_hash));
             Ok(())
         }
-        Some("wipe") => {
-            let runtime = parse_runtime_cli(&args[1..])?;
-            runtime.apply_env();
-            let _ = atho_node::dev::append_log("athod", "dev wipe requested");
-            atho_node::dev::wipe_chain_and_keys().map_err(|err| err.to_string())?;
-            let _ = atho_node::dev::append_log("athod", "dev wipe completed");
-            println!("dev state wiped");
-            Ok(())
-        }
+        Some("wipe") => run_wipe(&args[1..]),
         Some("reset") => {
             let runtime = parse_runtime_cli(&args[1..])?;
             runtime.apply_env();
@@ -310,6 +305,45 @@ fn run_dev(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn run_wipe(args: &[String]) -> Result<(), String> {
+    let runtime = parse_runtime_cli(args)?;
+    runtime.apply_env();
+    let network = runtime
+        .network
+        .ok_or_else(|| "wipe requires --network <mainnet|testnet|regnet>".to_string())?;
+    if network == Network::Mainnet && !runtime.dangerously_allow_mainnet {
+        return Err("refusing to wipe mainnet without --dangerously-allow-mainnet".to_string());
+    }
+    if !runtime.all {
+        return Err("wipe requires --all".to_string());
+    }
+    let data_dir = runtime
+        .data_dir
+        .ok_or_else(|| "wipe requires --data-dir PATH".to_string())?;
+    let root = std::path::PathBuf::from(data_dir);
+    let _ = atho_node::dev::append_log(
+        "athod",
+        &format!(
+            "wipe requested network={} root={} all={} mainnet_override={}",
+            network.id(),
+            root.display(),
+            runtime.all,
+            runtime.dangerously_allow_mainnet
+        ),
+    );
+    atho_node::dev::wipe_root(&root).map_err(|err| err.to_string())?;
+    let _ = atho_node::dev::append_log(
+        "athod",
+        &format!(
+            "wipe completed network={} root={}",
+            network.id(),
+            root.display()
+        ),
+    );
+    println!("wiped {}", root.display());
+    Ok(())
+}
+
 fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
     let mut runtime = RuntimeCli::default();
     let mut i = 0usize;
@@ -363,6 +397,14 @@ fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
             }
             "--public-rpc" => {
                 runtime.public_rpc = true;
+                i += 1;
+            }
+            "--all" => {
+                runtime.all = true;
+                i += 1;
+            }
+            "--dangerously-allow-mainnet" => {
+                runtime.dangerously_allow_mainnet = true;
                 i += 1;
             }
             "--help" | "-h" => {
@@ -423,6 +465,7 @@ fn parse_network(value: &str) -> Option<Network> {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  athod [--network <mainnet|testnet|regnet>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc]");
+    eprintln!("  athod wipe --network <mainnet|testnet|regnet> --data-dir PATH --all [--dangerously-allow-mainnet]");
     eprintln!("  athod status [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
     eprintln!("  athod verify [--network <mainnet|testnet|regnet>] [--data-dir PATH]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine> [options]");
@@ -459,6 +502,24 @@ mod tests {
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
         assert_eq!(parsed.peers.len(), 2);
         assert!(parsed.public_rpc);
+    }
+
+    #[test]
+    fn wipe_flags_parse_explicit_sandbox_guard() {
+        let args = vec![
+            String::from("wipe"),
+            String::from("--network"),
+            String::from("regnet"),
+            String::from("--data-dir"),
+            String::from("/tmp/atho-dev"),
+            String::from("--all"),
+            String::from("--dangerously-allow-mainnet"),
+        ];
+        let parsed = parse_runtime_cli(&args[1..]).expect("parse");
+        assert_eq!(parsed.network, Some(Network::Regnet));
+        assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho-dev"));
+        assert!(parsed.all);
+        assert!(parsed.dangerously_allow_mainnet);
     }
 
     #[test]

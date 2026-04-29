@@ -31,6 +31,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CASES: usize = 52_000;
@@ -243,16 +244,29 @@ fn persistence_data_dir(root: &Path) -> PathBuf {
     root.join("dev")
 }
 
+fn env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl EnvVarGuard {
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+        let lock = env_lock();
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
-        Self { key, previous }
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
     }
 }
 

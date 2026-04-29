@@ -47,7 +47,8 @@ impl RelayLoop {
     }
 
     pub fn note_address(&mut self, address: PeerAddress) -> Result<(), ProtocolError> {
-        self.peers.note_address(address)
+        let _ = self.peers.note_address(address)?;
+        Ok(())
     }
 
     pub fn build_version_message(&self, blocks: &[Block]) -> NetworkMessage {

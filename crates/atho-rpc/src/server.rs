@@ -7,6 +7,7 @@ use atho_core::network::Network;
 pub struct RpcServer {
     pub network: Network,
     pub block_count: u64,
+    pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub running: bool,
@@ -19,6 +20,7 @@ impl RpcServer {
         Self {
             network,
             block_count: 0,
+            tip_hash: [0; 48],
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             running: false,
@@ -31,6 +33,7 @@ impl RpcServer {
         NodeStatus {
             network: self.network,
             block_count: self.block_count,
+            tip_hash: self.tip_hash,
             mempool_count: self.mempool_count,
             mempool_total_fee_atoms: self.mempool_total_fee_atoms,
             running: self.running,

@@ -85,6 +85,8 @@ pub struct NetworkDiagnostics {
 pub struct NodeStatus {
     pub network: Network,
     pub block_count: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub running: bool,

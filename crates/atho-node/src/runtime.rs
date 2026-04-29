@@ -5,9 +5,11 @@ use crate::node::Node;
 use crate::system::AthoSystem;
 use crate::tcp_p2p::TcpP2pRuntime;
 use atho_core::network::Network;
+use atho_p2p::config::network_params;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
+use std::collections::BTreeSet;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -107,8 +109,20 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let p2p_address = p2p_bind_address(network);
     let p2p_runtime = TcpP2pRuntime::bind_shared(network, Arc::clone(&system), &p2p_address)
         .map_err(|err| NodeError::Runtime(RuntimeError::P2pBindFailed(err.to_string())))?;
-    for peer in p2p_peer_addresses() {
-        p2p_runtime.maintain_outbound(peer);
+    let bootstrap_limit = network_params(network)
+        .limits
+        .max_outbound_peers
+        .saturating_mul(4)
+        .max(8);
+    let bootstrap_peers = {
+        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        guard.p2p_bootstrap_peers(bootstrap_limit)
+    };
+    let mut seen = BTreeSet::new();
+    for peer in p2p_peer_addresses().into_iter().chain(bootstrap_peers) {
+        if seen.insert(peer.clone()) {
+            p2p_runtime.maintain_outbound(peer);
+        }
     }
     let rpc_address = rpc_bind_address(config.network);
     validate_rpc_bind_address(&rpc_address)?;

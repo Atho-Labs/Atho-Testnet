@@ -19,6 +19,7 @@ pub struct ConnectionStatus {
     pub network: Network,
     pub rpc_address: String,
     pub block_count: u64,
+    pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub peer_count: usize,
@@ -283,6 +284,7 @@ impl ReadOnlyNodeConnection {
                 network: self.network,
                 rpc_address: self.rpc_address.clone(),
                 block_count: 0,
+                tip_hash: [0; 48],
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
                 peer_count: 0,
@@ -349,6 +351,7 @@ impl ReadOnlyNodeConnection {
                         network,
                         rpc_address: rpc_address.clone(),
                         block_count: 0,
+                        tip_hash: [0; 48],
                         mempool_count: 0,
                         mempool_total_fee_atoms: 0,
                         peer_count: 0,
@@ -402,6 +405,7 @@ fn collect_rpc_status(
                 network,
                 rpc_address: rpc_address.to_string(),
                 block_count: 0,
+                tip_hash: [0; 48],
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
                 peer_count: 0,
@@ -428,6 +432,7 @@ fn collect_rpc_status(
             network,
             rpc_address: rpc_address.to_string(),
             block_count: 0,
+            tip_hash: [0; 48],
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             peer_count: 0,
@@ -462,6 +467,7 @@ fn collect_rpc_status(
         network,
         rpc_address: rpc_address.to_string(),
         block_count,
+        tip_hash: [0; 48],
         mempool_count,
         mempool_total_fee_atoms: 0,
         peer_count: 0,
@@ -488,6 +494,7 @@ fn connection_status_from_node_status(
         network: status.network,
         rpc_address,
         block_count: status.block_count,
+        tip_hash: status.tip_hash,
         mempool_count: status.mempool_count,
         mempool_total_fee_atoms: status.mempool_total_fee_atoms,
         peer_count: status.network_diagnostics.peer_count,
@@ -716,6 +723,7 @@ fn workspace_manifest_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::acquire_global_test_lock;
     use atho_node::miner::Miner;
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::{
@@ -735,19 +743,30 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
 
         fn set_value(key: &'static str, value: &str) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -790,6 +809,7 @@ mod tests {
                     RpcRequest::GetNodeStatus => RpcResponse::NodeStatus(NodeStatus {
                         network,
                         block_count,
+                        tip_hash: [0; 48],
                         mempool_count,
                         mempool_total_fee_atoms: total_fee_atoms,
                         running: true,
@@ -926,7 +946,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
-        std::env::remove_var(ATHO_QT_FORCE_RPC_ENV);
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "0");
 
         let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Regnet, free_rpc_address());
         let status = wait_for_status(&conn, |status| status.connected && status.running);
@@ -971,7 +991,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
-        std::env::remove_var(ATHO_QT_FORCE_RPC_ENV);
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "0");
 
         let conn = ReadOnlyNodeConnection::new(Network::Regnet);
         let status = wait_for_status(&conn, |status| status.connected && status.running);

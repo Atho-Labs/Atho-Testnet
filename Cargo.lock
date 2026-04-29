@@ -546,6 +546,7 @@ dependencies = [
  "bincode",
  "hex",
  "lmdb",
+ "rayon",
  "serde",
  "serde-big-array",
  "thiserror 1.0.69",

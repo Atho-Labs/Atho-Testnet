@@ -7,9 +7,6 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
         "atho_terminal".to_string(),
         egui::FontData::from_static(include_bytes!("../../assets/fonts/RobotoMono-Bold.ttf")),
     );
-    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.insert(0, "atho_terminal".to_string());
-    }
     if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
         family.insert(0, "atho_terminal".to_string());
     }

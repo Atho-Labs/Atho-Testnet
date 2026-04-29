@@ -108,7 +108,7 @@ fn render_recent_transactions(
                     widgets::row_value_signed(ui, row.amount_atoms);
                 });
             });
-            widgets::muted_label(ui, &row.label);
+            widgets::elided_label(ui, &row.label, 72);
             ui.add_space(6.0);
         }
     });

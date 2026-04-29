@@ -1,7 +1,9 @@
+use crate::address_manager::{format_remote_addr, parse_remote_addr};
 use crate::config::network_params;
 use crate::protocol::{validate_version_message, PeerAddress, ProtocolError, VersionMessage};
 use atho_core::network::Network;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
@@ -43,11 +45,17 @@ impl PeerBook {
         self.manual_peers.iter().cloned().collect()
     }
 
-    pub fn note_address(&mut self, address: PeerAddress) -> Result<(), ProtocolError> {
-        let key = format!("{}:{}", address.host, address.port);
-        if !self.known_peers.contains_key(&key)
-            && self.known_peers.len() >= network_params(self.network).limits.max_known_peers
-        {
+    pub fn note_address(&mut self, address: PeerAddress) -> Result<bool, ProtocolError> {
+        let key = format_remote_addr(&address);
+        if let Some(existing) = self.known_peers.get_mut(&key) {
+            existing.address.host = address.host;
+            existing.address.port = address.port;
+            existing.address.services |= address.services;
+            existing.address.last_seen_unix =
+                existing.address.last_seen_unix.max(address.last_seen_unix);
+            return Ok(false);
+        }
+        if self.known_peers.len() >= network_params(self.network).limits.max_known_peers {
             return Err(ProtocolError::PeerBookFull);
         }
         self.known_peers.insert(
@@ -59,7 +67,7 @@ impl PeerBook {
                 ban_score: 0,
             },
         );
-        Ok(())
+        Ok(true)
     }
 
     pub fn accept_version(
@@ -70,7 +78,13 @@ impl PeerBook {
         validate_version_message(version, self.network)?;
         let remote_addr = remote_addr.into();
         let default_port = network_params(self.network).default_port;
-        let address = split_remote_addr(&remote_addr, default_port);
+        let mut address = parse_remote_addr(&remote_addr, default_port).unwrap_or(PeerAddress {
+            host: remote_addr.clone(),
+            port: default_port,
+            services: 0,
+            last_seen_unix: 0,
+        });
+        address.last_seen_unix = now_unix();
         if !self.known_peers.contains_key(&remote_addr)
             && self.known_peers.len() >= network_params(self.network).limits.max_known_peers
         {
@@ -105,23 +119,11 @@ impl PeerBook {
     }
 }
 
-fn split_remote_addr(remote_addr: &str, default_port: u16) -> PeerAddress {
-    if let Some((host, port)) = remote_addr.rsplit_once(':') {
-        if let Ok(port) = port.parse::<u16>() {
-            return PeerAddress {
-                host: host.to_string(),
-                port,
-                services: 0,
-                last_seen_unix: 0,
-            };
-        }
-    }
-    PeerAddress {
-        host: remote_addr.to_string(),
-        port: default_port,
-        services: 0,
-        last_seen_unix: 0,
-    }
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

@@ -103,7 +103,7 @@ Current checks include:
 - timestamp bounds
 - target bounds
 - proof of work
-- block size and weight
+- block raw size, vbyte size, and weight
 - non-empty transaction list
 - exactly one coinbase at position zero
 - merkle root match
@@ -115,6 +115,11 @@ Current checks include:
 Why:
 
 - chainstate mutation must only happen after one canonical full-block validation path succeeds
+
+Current block caps:
+
+- maximum vbytes: `3,000,000`
+- maximum raw bytes: about `12,000,000`
 
 ## Chain Acceptance
 

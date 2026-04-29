@@ -6,9 +6,11 @@ use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
 use crate::sync::{NodeSyncError, SyncNotice};
+use crate::tcp_p2p::next_outbound_retry_delay;
 use crate::wallet_history;
 use atho_core::block::Block;
 use atho_core::network::Network;
+use atho_p2p::address_manager::format_remote_addr;
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
 use atho_p2p::protocol::NetworkMessage;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
@@ -18,12 +20,13 @@ use atho_rpc::response::{
 };
 use atho_storage::db::PeerHealthRecord;
 use atho_wallet::snapshot::WalletSnapshot;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemStatus {
     pub network: Network,
     pub block_count: u64,
+    pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub wallet_snapshot: WalletSnapshot,
@@ -90,6 +93,8 @@ impl NodeService {
 
     pub fn start(&mut self) {
         self.orchestrator.start();
+        self.seed_peer_graph();
+        self.refresh_runtime_views();
     }
 
     pub fn stop(&mut self) {
@@ -265,6 +270,7 @@ impl NodeService {
         SystemStatus {
             network: self.network(),
             block_count: self.orchestrator.runtime.node.height(),
+            tip_hash: self.orchestrator.runtime.node.tip_hash(),
             mempool_count: self.orchestrator.runtime.node.mempool_len(),
             mempool_total_fee_atoms: self.orchestrator.runtime.node.mempool_total_fee_atoms(),
             wallet_snapshot: self.wallet_snapshot.clone(),
@@ -279,6 +285,7 @@ impl NodeService {
         NodeStatus {
             network: status.network,
             block_count: status.block_count,
+            tip_hash: status.tip_hash,
             mempool_count: status.mempool_count,
             mempool_total_fee_atoms: status.mempool_total_fee_atoms,
             running: status.running,
@@ -434,13 +441,26 @@ impl NodeService {
         peer.last_receive_unix = Some(now);
     }
 
-    pub fn p2p_relay_compact_tip_message(&self) -> Option<NetworkMessage> {
-        let block = self
-            .orchestrator
-            .runtime
-            .node
-            .block_by_hash(self.orchestrator.runtime.node.tip_hash())?;
-        Some(self.orchestrator.sync.relay_compact_block_message(&block))
+    pub fn p2p_relay_compact_tip_messages_since(
+        &self,
+        last_announced_tip: [u8; 48],
+    ) -> Vec<NetworkMessage> {
+        let blocks = self.orchestrator.runtime.node.blocks();
+        if blocks.len() <= 1 {
+            return Vec::new();
+        }
+
+        let start_index = blocks
+            .iter()
+            .position(|block| block.header.block_hash() == last_announced_tip)
+            .map(|index| index.saturating_add(1))
+            .unwrap_or(1);
+
+        blocks
+            .iter()
+            .skip(start_index)
+            .map(|block| self.orchestrator.sync.relay_compact_block_message(block))
+            .collect()
     }
 
     pub fn p2p_accept_inbound(&mut self, remote_addr: impl Into<String>) -> Result<(), NodeError> {
@@ -480,8 +500,42 @@ impl NodeService {
     }
 
     pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
-        let notice = self.orchestrator.sync.disconnect_peer(remote_addr, reason);
+        let notice = self
+            .orchestrator
+            .sync
+            .disconnect_peer(remote_addr, reason.clone());
         self.network_runtime.peers.remove(remote_addr);
+        if notice.is_some() && reason != "runtime stopping" {
+            let now = unix_timestamp();
+            let mut health = self
+                .p2p_peer_health(remote_addr)
+                .unwrap_or(PeerHealthRecord {
+                    network: self.network(),
+                    remote_addr: remote_addr.to_string(),
+                    quality_score: 100,
+                    consecutive_failures: 0,
+                    backoff_until_unix: 0,
+                    last_failure_unix: None,
+                    last_success_unix: None,
+                });
+            health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+            health.quality_score = health.quality_score.saturating_sub(15);
+            health.last_failure_unix = Some(now);
+            let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
+            health.backoff_until_unix = now.saturating_add(retry_delay.as_secs().max(1));
+            self.p2p_save_peer_health(&health);
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "peer health penalized peer={} reason={} retry_in_secs={} failures={} quality={}",
+                    remote_addr,
+                    reason,
+                    retry_delay.as_secs().max(1),
+                    health.consecutive_failures,
+                    health.quality_score
+                ),
+            );
+        }
         self.refresh_runtime_views();
         notice
     }
@@ -490,6 +544,7 @@ impl NodeService {
         self.orchestrator
             .sync
             .prime(&self.orchestrator.runtime.node);
+        self.seed_peer_graph();
         self.refresh_runtime_views();
     }
 
@@ -509,6 +564,7 @@ impl NodeService {
 
     fn refresh_runtime_views(&mut self) {
         self.orchestrator.rpc_server.block_count = self.orchestrator.runtime.node.height();
+        self.orchestrator.rpc_server.tip_hash = self.orchestrator.runtime.node.tip_hash();
         self.orchestrator.rpc_server.mempool_count = self.orchestrator.runtime.node.mempool_len();
         self.orchestrator.rpc_server.mempool_total_fee_atoms =
             self.orchestrator.runtime.node.mempool_total_fee_atoms();
@@ -517,6 +573,75 @@ impl NodeService {
             self.orchestrator.sync.sync_state().headers_synced;
         self.orchestrator.rpc_server.sync_best_height =
             self.orchestrator.sync.sync_state().best_height;
+    }
+
+    pub fn p2p_bootstrap_peers(&mut self, max: usize) -> Vec<String> {
+        let now = unix_timestamp();
+        let connected_peers = self
+            .orchestrator
+            .sync
+            .connections()
+            .peer_snapshots()
+            .into_iter()
+            .map(|peer| peer.remote_addr)
+            .collect::<BTreeSet<_>>();
+        let mut candidates = self
+            .orchestrator
+            .sync
+            .connections()
+            .address_manager()
+            .advertisable_addresses(max.saturating_mul(4));
+        let mut scored = Vec::new();
+
+        for address in candidates.drain(..) {
+            let remote_addr = format_remote_addr(&address);
+            if connected_peers.contains(&remote_addr) {
+                continue;
+            }
+            let health = self.p2p_peer_health(&remote_addr);
+            if health
+                .as_ref()
+                .is_some_and(|record| record.backoff_until_unix > now)
+            {
+                continue;
+            }
+            scored.push((address, remote_addr, health));
+        }
+
+        scored.sort_by(|left, right| {
+            let left_health = left.2.as_ref();
+            let right_health = right.2.as_ref();
+            right_health
+                .map(|record| record.quality_score)
+                .cmp(&left_health.map(|record| record.quality_score))
+                .then(
+                    left_health
+                        .map(|record| record.consecutive_failures)
+                        .cmp(&right_health.map(|record| record.consecutive_failures)),
+                )
+                .then(
+                    right_health
+                        .and_then(|record| record.last_success_unix)
+                        .cmp(&left_health.and_then(|record| record.last_success_unix)),
+                )
+                .then(right.0.last_seen_unix.cmp(&left.0.last_seen_unix))
+                .then(left.0.host.cmp(&right.0.host))
+                .then(left.0.port.cmp(&right.0.port))
+        });
+
+        let mut seen = BTreeSet::new();
+        let mut peers = Vec::new();
+
+        for (_, remote_addr, _) in scored {
+            if seen.insert(remote_addr.clone()) {
+                peers.push(remote_addr);
+            }
+            if peers.len() >= max {
+                return peers;
+            }
+        }
+
+        peers
     }
 
     #[doc(hidden)]
@@ -530,9 +655,165 @@ impl NodeService {
     }
 }
 
+impl NodeService {
+    fn seed_peer_graph(&mut self) {
+        let network = self.network();
+        let public_source = !matches!(network, Network::Regnet);
+        let peer_addresses = match self.orchestrator.runtime.node.peer_addresses() {
+            Ok(peer_addresses) => peer_addresses,
+            Err(err) => {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!("peer seed load failed network={} error={err}", network.id()),
+                );
+                return;
+            }
+        };
+        let accepted = match self.orchestrator.sync.seed_peer_addresses(&peer_addresses) {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!("peer seed failed network={} error={err}", network.id()),
+                );
+                return;
+            }
+        };
+        if !accepted.is_empty() && public_source {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "seeded {} persisted peer address(es) into discovery graph",
+                    accepted.len()
+                ),
+            );
+        }
+    }
+}
+
 impl Drop for NodeService {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::acquire_global_test_lock;
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn temp_data_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "atho-service-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn bootstrap_peers_include_persisted_peer_records() {
+        let root = temp_data_dir("bootstrap-peers");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.sandbox_with_node_mut(|node| {
+            node.observe_peer("8.8.8.8:9200", 12, 1_700_000_000)
+                .expect("peer observation");
+        });
+        service.p2p_prime();
+
+        let peers = service.p2p_bootstrap_peers(8);
+        assert!(peers.iter().any(|peer| peer == "8.8.8.8:9200"));
+    }
+
+    #[test]
+    fn bootstrap_peers_prefer_healthy_records_and_skip_backed_off_peers() {
+        let root = temp_data_dir("bootstrap-health");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.sandbox_with_node_mut(|node| {
+            node.observe_peer("9.9.9.9:9200", 12, 1_700_000_000)
+                .expect("peer observation");
+            node.observe_peer("8.8.8.8:9200", 12, 1_700_000_000)
+                .expect("peer observation");
+            node.observe_peer("7.7.7.7:9200", 12, 1_700_000_000)
+                .expect("peer observation");
+        });
+
+        let now = unix_timestamp();
+        service.p2p_save_peer_health(&PeerHealthRecord {
+            network: Network::Regnet,
+            remote_addr: String::from("9.9.9.9:9200"),
+            quality_score: 40,
+            consecutive_failures: 2,
+            backoff_until_unix: 0,
+            last_failure_unix: Some(now.saturating_sub(60)),
+            last_success_unix: Some(now.saturating_sub(120)),
+        });
+        service.p2p_save_peer_health(&PeerHealthRecord {
+            network: Network::Regnet,
+            remote_addr: String::from("8.8.8.8:9200"),
+            quality_score: 95,
+            consecutive_failures: 0,
+            backoff_until_unix: 0,
+            last_failure_unix: None,
+            last_success_unix: Some(now.saturating_sub(5)),
+        });
+        service.p2p_save_peer_health(&PeerHealthRecord {
+            network: Network::Regnet,
+            remote_addr: String::from("7.7.7.7:9200"),
+            quality_score: 100,
+            consecutive_failures: 8,
+            backoff_until_unix: now.saturating_add(3_600),
+            last_failure_unix: Some(now),
+            last_success_unix: None,
+        });
+
+        service.p2p_prime();
+
+        let peers = service.p2p_bootstrap_peers(8);
+        assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:9200"));
+        assert!(peers.iter().any(|peer| peer == "9.9.9.9:9200"));
+        assert!(!peers.iter().any(|peer| peer == "7.7.7.7:9200"));
     }
 }
 

@@ -3,7 +3,8 @@ use crate::peer::{PeerBook, PeerState};
 use crate::protocol::{PeerAddress, ProtocolError, VersionMessage};
 use atho_core::network::Network;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct AddressManager {
@@ -47,11 +48,17 @@ impl AddressManager {
         &mut self,
         addresses: &[PeerAddress],
         public_source: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Vec<PeerAddress>, ProtocolError> {
+        let mut accepted = Vec::new();
+        let mut seen = BTreeSet::new();
         for address in addresses
             .iter()
             .take(network_params(self.network).limits.max_addr_per_message)
         {
+            let key = format_remote_addr(address);
+            if !seen.insert(key) {
+                continue;
+            }
             if public_source && !is_publicly_routable_host(&address.host) {
                 continue;
             }
@@ -66,25 +73,50 @@ impl AddressManager {
                     continue;
                 }
             }
-            let key = format!("{}:{}", address.host, address.port);
-            self.peers.note_address(address.clone())?;
-            if let Some(ip) = parse_ip(&address.host) {
-                *self.peers_per_ip.entry(ip).or_default() += 1;
-                *self.peers_per_subnet.entry(subnet_key(ip)).or_default() += 1;
+            match self.peers.note_address(address.clone()) {
+                Ok(is_new) => {
+                    if is_new {
+                        if let Some(ip) = parse_ip(&address.host) {
+                            *self.peers_per_ip.entry(ip).or_default() += 1;
+                            *self.peers_per_subnet.entry(subnet_key(ip)).or_default() += 1;
+                        }
+                    }
+                    accepted.push(address.clone());
+                }
+                Err(ProtocolError::PeerBookFull) => break,
+                Err(err) => return Err(err),
             }
-            if self.peers.peer_count() >= network_params(self.network).limits.max_known_peers {
-                break;
-            }
-            let _ = key;
         }
-        Ok(())
+        Ok(accepted)
     }
 
     pub fn advertisable_addresses(&self, max: usize) -> Vec<PeerAddress> {
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::new();
 
-        for peer in self.peers.peers() {
+        let mut peers = self.peers.peers();
+        peers.sort_by(|left, right| {
+            right
+                .connected
+                .cmp(&left.connected)
+                .then(
+                    right
+                        .address
+                        .last_seen_unix
+                        .cmp(&left.address.last_seen_unix),
+                )
+                .then(
+                    right
+                        .version
+                        .as_ref()
+                        .map(|version| version.best_height)
+                        .cmp(&left.version.as_ref().map(|version| version.best_height)),
+                )
+                .then(left.address.host.cmp(&right.address.host))
+                .then(left.address.port.cmp(&right.address.port))
+        });
+
+        for peer in peers {
             if seen.insert((peer.address.host.clone(), peer.address.port)) {
                 addresses.push(peer.address);
             }
@@ -127,8 +159,20 @@ impl AddressManager {
     }
 }
 
-fn parse_remote_addr(remote_addr: &str, default_port: u16) -> Option<PeerAddress> {
+pub fn parse_remote_addr(remote_addr: &str, default_port: u16) -> Option<PeerAddress> {
+    if let Ok(socket_addr) = SocketAddr::from_str(remote_addr) {
+        return Some(PeerAddress {
+            host: socket_addr.ip().to_string(),
+            port: socket_addr.port(),
+            services: 0,
+            last_seen_unix: 0,
+        });
+    }
     if let Some((host, port)) = remote_addr.rsplit_once(':') {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
         if let Ok(port) = port.parse::<u16>() {
             return Some(PeerAddress {
                 host: host.to_string(),
@@ -144,6 +188,18 @@ fn parse_remote_addr(remote_addr: &str, default_port: u16) -> Option<PeerAddress
         services: 0,
         last_seen_unix: 0,
     })
+}
+
+pub fn format_remote_addr(address: &PeerAddress) -> String {
+    if address
+        .host
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| matches!(ip, IpAddr::V6(_)))
+    {
+        format!("[{}]:{}", address.host, address.port)
+    } else {
+        format!("{}:{}", address.host, address.port)
+    }
 }
 
 fn parse_ip(host: &str) -> Option<IpAddr> {
@@ -245,5 +301,13 @@ mod tests {
             .accept_version("8.8.8.8:56000", &version)
             .expect("accept");
         assert_eq!(manager.best_height(), 77);
+    }
+
+    #[test]
+    fn remote_addr_helpers_round_trip_ipv6_literals() {
+        let parsed = parse_remote_addr("[2001:db8::1]:56000", 56000).expect("parse");
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 56000);
+        assert_eq!(format_remote_addr(&parsed), "[2001:db8::1]:56000");
     }
 }

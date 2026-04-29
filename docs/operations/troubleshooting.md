@@ -28,7 +28,7 @@ What to inspect:
 Useful reset:
 
 ```bash
-cargo run -p atho-node --bin athod -- dev wipe --data-dir /tmp/atho-dev
+cargo run -p atho-node --bin athod -- wipe --network regnet --data-dir /tmp/atho-dev --all
 ```
 
 ## Qt Shows `Connection refused`

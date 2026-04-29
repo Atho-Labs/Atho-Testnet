@@ -317,6 +317,17 @@ impl Database {
         self.put(Dataset::Peers, &key, &value)
     }
 
+    pub fn load_peer(&self, remote_addr: &str) -> Result<Option<PeerRecord>, StorageError> {
+        match self.get(Dataset::Peers, remote_addr.as_bytes())? {
+            Some(bytes) => {
+                let record: PeerRecord =
+                    bincode::deserialize(&bytes).map_err(|_| StorageError::CorruptData)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn list_peers(&self) -> Result<Vec<PeerRecord>, StorageError> {
         let mut peers = Vec::new();
         for (_, value) in self.entries(Dataset::Peers)? {
@@ -639,19 +650,27 @@ fn maybe_inject_commit_fault(point: CommitFaultPoint) -> Result<(), StorageError
 mod tests {
     use super::*;
     use crate::path::ATHO_DATA_DIR_ENV;
+    use crate::test_support::acquire_global_test_lock;
     use std::ffi::OsString;
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &Path) -> Self {
+            let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, previous }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 

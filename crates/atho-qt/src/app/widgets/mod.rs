@@ -121,6 +121,16 @@ pub(crate) fn muted_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(11.0).color(MUTED));
 }
 
+pub(crate) fn elided_label(ui: &mut egui::Ui, text: &str, max_chars: usize) -> egui::Response {
+    let display = elide_text(text, max_chars);
+    let response = ui.label(egui::RichText::new(display.clone()).size(11.0).color(TEXT));
+    if display != text {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
+}
+
 pub(crate) fn text_input(ui: &mut egui::Ui, text: &mut String, hint: &str) {
     ui.add(
         egui::TextEdit::singleline(text)
@@ -163,4 +173,29 @@ pub(crate) fn short_hash(bytes: &[u8]) -> String {
     } else {
         format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
     }
+}
+
+pub(crate) fn elide_text(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars <= 1 {
+        return String::from("…");
+    }
+    if max_chars == 2 {
+        return String::from("…");
+    }
+
+    let front = (max_chars - 1) / 2;
+    let back = max_chars.saturating_sub(front + 1);
+    let mut out = String::with_capacity(max_chars);
+    for ch in chars.iter().take(front) {
+        out.push(*ch);
+    }
+    out.push('…');
+    for ch in chars.iter().skip(chars.len().saturating_sub(back)) {
+        out.push(*ch);
+    }
+    out
 }

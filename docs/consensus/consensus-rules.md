@@ -25,6 +25,7 @@ A non-coinbase transaction must satisfy:
 
 - supported version at the target height
 - at least one output
+- maximum raw size limit
 - maximum vsize limit
 - non-zero outputs
 - unique inputs
@@ -45,7 +46,7 @@ A block must satisfy:
 - bounded target
 - proof of work
 - valid timestamp
-- size and weight limits
+- raw, vbyte, and weight limits
 - non-empty transaction list
 - first transaction is coinbase
 - no second coinbase
