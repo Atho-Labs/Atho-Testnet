@@ -78,7 +78,7 @@ def main() -> int:
         host_arch,
         args.include_dev_tools,
     )
-    stage_download_artifacts(release_root, host_platform)
+    stage_download_artifacts(release_root, host_platform, host_arch)
     remove_path(release_root / "archives")
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     build_archive(release_root, archive_path, archive_prefix(version, release_tag))
@@ -184,13 +184,21 @@ def uninstall_script_name(platform_name: str) -> str:
 def launcher_names(platform_name: str) -> list[str]:
     if platform_name == "windows":
         return [
+            "Atho.exe",
             "atho.cmd",
             "atho-mainnet.cmd",
             "atho-testnet.cmd",
             "atho-regnet.cmd",
         ]
     if platform_name == "macos":
-        return ["atho", "atho-mainnet", "atho-testnet", "atho-regnet", "Atho.command"]
+        return [
+            "Atho.app",
+            "atho",
+            "atho-mainnet",
+            "atho-testnet",
+            "atho-regnet",
+            "Atho.command",
+        ]
     return ["atho", "atho-mainnet", "atho-testnet", "atho-regnet"]
 
 
@@ -204,6 +212,14 @@ def installer_artifact_name(platform_name: str) -> str:
     if platform_name == "macos":
         return "Atho Setup.app"
     return "Atho Setup"
+
+
+def download_installer_artifact_name(platform_name: str, arch: str) -> str:
+    if platform_name == "windows":
+        return "Atho Setup.exe"
+    if platform_name == "macos":
+        return f"Atho Setup-{arch}.dmg"
+    raise ValueError(f"unsupported direct installer platform: {platform_name}")
 
 
 def installer_desktop_entry_name() -> str:
@@ -296,6 +312,10 @@ def stage_release_root(
     for target_name in ("athod", "atho-mine", "atho-qt", "atho-address"):
         copy_binary(target_name, release_root / f"{target_name}{binary_suffix}")
 
+    if platform_name == "windows":
+        stage_windows_client_executable(release_root)
+    if platform_name == "macos":
+        stage_macos_client_app(release_root, version, arch)
     stage_installer_frontend(release_root, version, platform_name, arch)
 
     if platform_name == "windows":
@@ -345,7 +365,7 @@ def stage_release_root(
         make_executable(release_root / uninstall_script_name(platform_name))
 
 
-def stage_download_artifacts(release_root: Path, platform_name: str) -> None:
+def stage_download_artifacts(release_root: Path, platform_name: str, arch: str) -> None:
     payload_path = create_installer_payload(release_root, platform_name)
     try:
         if platform_name == "windows":
@@ -354,14 +374,16 @@ def stage_download_artifacts(release_root: Path, platform_name: str) -> None:
             installers_dir.mkdir(parents=True, exist_ok=True)
             copy_file(release_root / "Atho Setup.exe", installers_dir / "Atho Setup.exe")
         elif platform_name == "macos":
-            app_root = release_root / "Atho Setup.app"
             installers_dir = release_root / INSTALLERS_DIR_NAME
             installers_dir.mkdir(parents=True, exist_ok=True)
+            app_root = release_root / "Atho Setup.app"
             copy_file(payload_path, app_root / "Contents" / "Resources" / "payload.zip")
             (app_root / "Contents" / "Resources" / "payload.sha256").write_bytes(
                 hashlib.sha256(payload_path.read_bytes()).digest()
             )
-            build_macos_dmg(app_root, installers_dir / "Atho Setup.dmg")
+            sign_macos_bundle(release_root / "Atho.app")
+            sign_macos_bundle(app_root)
+            build_macos_dmg(release_root, installers_dir / download_installer_artifact_name(platform_name, arch))
     finally:
         remove_path(payload_path)
 
@@ -404,11 +426,14 @@ def append_payload_to_windows_installer(installer_path: Path, payload_path: Path
         handle.write(footer)
 
 
-def build_macos_dmg(app_root: Path, dmg_path: Path) -> None:
+def build_macos_dmg(release_root: Path, dmg_path: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="atho-dmg-") as temp_dir:
         staging_dir = Path(temp_dir) / "staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(app_root, staging_dir / app_root.name)
+        for app_name in ("Atho Setup.app", "Atho.app"):
+            app_root = release_root / app_name
+            if app_root.exists():
+                shutil.copytree(app_root, staging_dir / app_root.name)
         applications_link = staging_dir / "Applications"
         if not applications_link.exists():
             os.symlink("/Applications", applications_link)
@@ -424,6 +449,39 @@ def build_macos_dmg(app_root: Path, dmg_path: Path) -> None:
             "UDZO",
             str(dmg_path),
         ])
+
+
+def stage_macos_client_app(release_root: Path, version: str, arch: str) -> None:
+    app_root = release_root / "Atho.app"
+    contents_root = app_root / "Contents"
+    macos_root = contents_root / "MacOS"
+    macos_root.mkdir(parents=True, exist_ok=True)
+    copy_binary("atho-qt", macos_root / "Atho")
+    write_text_file(contents_root / "Info.plist", macos_client_info_plist(version, arch))
+    make_executable(macos_root / "Atho")
+
+
+def stage_windows_client_executable(release_root: Path) -> None:
+    copy_file(release_root / "atho-qt.exe", release_root / "Atho.exe")
+
+
+def sign_macos_bundle(bundle_path: Path) -> None:
+    if not bundle_path.exists():
+        return
+    identity = os.environ.get("ATHO_MACOS_CODESIGN_IDENTITY", "-").strip() or "-"
+    command = [
+        "codesign",
+        "--force",
+        "--deep",
+        "--sign",
+        identity,
+    ]
+    if identity != "-":
+        command.extend(["--options", "runtime", "--timestamp"])
+    else:
+        command.append("--timestamp=none")
+    command.append(str(bundle_path))
+    run(command)
 
 
 def stage_installer_frontend(release_root: Path, version: str, platform_name: str, arch: str) -> None:
@@ -524,6 +582,10 @@ def macos_command_launcher() -> str:
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$script_dir/Atho.app" ]; then
+  open -a "$script_dir/Atho.app" --args "$@"
+  exit 0
+fi
 exec "$script_dir/atho" "$@"
 """
 
@@ -579,6 +641,32 @@ def macos_info_plist(version: str, arch: str) -> str:
 """
 
 
+def macos_client_info_plist(version: str, arch: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>Atho</string>
+  <key>CFBundleExecutable</key>
+  <string>Atho</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.atho.client</string>
+  <key>CFBundleName</key>
+  <string>Atho</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>{version}</string>
+  <key>CFBundleVersion</key>
+  <string>{version}</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+</dict>
+</plist>
+"""
+
+
 def install_md(version: str, platform_name: str, arch: str) -> str:
     release_tag = f"{platform_name}-{arch}"
     install_name = install_script_name(platform_name)
@@ -589,13 +677,13 @@ def install_md(version: str, platform_name: str, arch: str) -> str:
         install_command = ".\\Atho Setup.exe"
         install_prefix = r"%LOCALAPPDATA%\Programs\Atho"
         bin_dir = r"%LOCALAPPDATA%\Programs\Atho"
-        launcher_hint = "double-click `Atho` from the Start Menu shortcut or run `atho.cmd`"
+        launcher_hint = "double-click `Atho.exe` from the Start Menu or desktop shortcut, or run `atho.cmd`"
         installer_hint = "double-click `Atho Setup.exe`"
     elif platform_name == "macos":
         install_command = 'open "Atho Setup.app"'
         install_prefix = "~/Applications/Atho"
         bin_dir = "~/bin"
-        launcher_hint = "double-click `Atho.command` or run `atho`"
+        launcher_hint = "double-click `Atho.app`, `Atho.command`, or run `atho`"
         installer_hint = "double-click `Atho Setup.app`"
     else:
         install_command = "./Atho Setup"
@@ -619,7 +707,9 @@ What is packaged
 - `atho-mine`
 - `atho-qt`
 - `atho-address`
+- Windows client launcher: `Atho.exe`
 - `atho` launcher
+- macOS client app bundle: `Atho.app`
 - installer front-end: `{installer_name}`
 - quickstart and operator docs
 - install and uninstall helpers
@@ -630,7 +720,8 @@ Primary installer
 - {installer_hint}
 - verify the matching `checksums.sha256` file from the release before running the installer
 - the Windows and macOS installers verify their embedded payload checksums before install
-- on Windows, the installer asks where to install and creates a Start Menu shortcut directly to `atho-qt.exe`
+- on Windows, the installer asks where to install and creates Start Menu and Desktop shortcuts directly to `Atho.exe`
+- on macOS, the installer installs the `Atho.app` client bundle and opens it after install when requested
 
 Default install locations
 -------------------------
@@ -675,7 +766,8 @@ The release script writes a versioned bundle under `dist/releases/{version}/{rel
 
 Expected first run
 ------------------
-- the GUI opens with the `atho` launcher
+- the GUI opens with the `Atho.app` bundle on macOS or the `Atho.exe` client launcher on Windows
+- the GUI opens with the `atho` launcher on Linux and other non-packaged environments
 - the client starts a managed local node on the selected network
 - mainnet uses the bootstrap peer until DNS seeds are added
 - `athod` and `atho-mine` remain available as direct commands
@@ -719,7 +811,11 @@ StartupNotify=true
 EOF
 """
 
-    macos_command_chmod = 'chmod +x "$app_dir"/Atho.command\n' if platform_name == "macos" else ""
+    macos_command_chmod = (
+        'chmod +x "$app_dir"/Atho.command "$app_dir"/Atho.app/Contents/MacOS/Atho\n'
+        if platform_name == "macos"
+        else ""
+    )
 
     return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -730,6 +826,7 @@ bin_dir="${{ATHO_BIN_DIR:-{default_bin_dir}}}"
 desktop_dir="${{XDG_DATA_HOME:-$HOME/.local/share}}/applications"
 
 mkdir -p "$app_dir" "$bin_dir"
+rm -rf "$app_dir/Atho.app"
 cp -R "$source_dir"/. "$app_dir"/
 rm -rf "$app_dir/archives"
 rm -rf "$app_dir/Atho Setup.app" "$app_dir/Atho Setup"
@@ -797,15 +894,22 @@ Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $destination 'Atho S
 Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $destination 'Atho Setup.command')
 
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Atho'
+$desktop = [Environment]::GetFolderPath('Desktop')
 New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
 
 if (-not $NoShortcut) {
   $wsh = New-Object -ComObject WScript.Shell
   $shortcut = $wsh.CreateShortcut((Join-Path $startMenu 'Atho.lnk'))
-  $shortcut.TargetPath = (Join-Path $destination 'atho-qt.exe')
-  $shortcut.Arguments = '--local-node'
+  $shortcut.TargetPath = (Join-Path $destination 'Atho.exe')
   $shortcut.WorkingDirectory = $destination
   $shortcut.Save()
+
+  if ($desktop) {
+    $desktopShortcut = $wsh.CreateShortcut((Join-Path $desktop 'Atho.lnk'))
+    $desktopShortcut.TargetPath = (Join-Path $destination 'Atho.exe')
+    $desktopShortcut.WorkingDirectory = $destination
+    $desktopShortcut.Save()
+  }
 }
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -817,7 +921,8 @@ if ([string]::IsNullOrWhiteSpace($userPath)) {
 
 Write-Host "Atho installed to: $destination"
 Write-Host "Start Menu shortcut: $startMenu\Atho.lnk"
-Write-Host "Launcher target: atho-qt.exe --local-node"
+Write-Host "Desktop shortcut: $desktop\Atho.lnk"
+Write-Host "Launcher target: Atho.exe"
 """
 
 
@@ -829,9 +934,13 @@ def windows_uninstall_script() -> str:
 $ErrorActionPreference = 'Stop'
 $destination = [Environment]::ExpandEnvironmentVariables($Destination)
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Atho'
+$desktop = [Environment]::GetFolderPath('Desktop')
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $destination
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $startMenu
+if ($desktop) {
+  Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $desktop 'Atho.lnk')
+}
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($userPath -and $userPath -like "*$destination*") {
@@ -928,23 +1037,28 @@ Layout:
 - `dist/releases/<version>/<platform>-<arch>/installers/` for direct installer downloads
 - direct installer downloads:
   - Windows: `Atho Setup.exe`
-  - macOS: `Atho Setup.dmg`
+  - macOS: `Atho Setup-arm64.dmg` or `Atho Setup-x86_64.dmg`
 - verify the matching `checksums.sha256` file from the same release before running the installer
 - each direct installer validates its embedded payload checksum before install
-- on Windows, the installer asks where to install and creates a Start Menu shortcut directly to `atho-qt.exe`
+- on Windows, the installer asks where to install and creates Start Menu and Desktop shortcuts directly to `Atho.exe`
+- on macOS, the installer installs the `Atho.app` client bundle and launches it after a successful install
 - `desktop/install.sh` and `desktop/install.ps1` dispatch to the active bundle
 - `desktop/uninstall.sh` and `desktop/uninstall.ps1` remove the active install
 - each active bundle includes the native installer front-end:
   - Windows: `Atho Setup.exe`
   - macOS: `Atho Setup.app`
   - Linux: `Atho Setup`
+  - macOS client app: `Atho.app`
+  - Windows client launcher: `Atho.exe`
 
 How to use:
 - open the root `desktop/` folder
 - download the combined `Atho-<version>-desktop.zip` release if you want every platform bundle in one file
 - on GitHub Releases, prefer the direct installer asset from `dist/releases/<version>/<platform>-<arch>/installers/` when it is available
-- run `install.sh` on Linux or macOS, or launch the native installer directly from the bundle
+- run `install.sh` on Linux, or launch the native installer directly from the bundle on macOS
 - run `install.ps1` on Windows, or launch `Atho Setup.exe` directly from the bundle
+- on macOS, double-click `Atho.app` for the normal desktop client experience
+- on Windows, double-click `Atho.exe` for the normal desktop client experience after install
 - keep all platform bundles in this folder if you are assembling a multi-OS release set
 
 The packager writes the current host bundle into `dist/releases/...`, `desktop/releases/...`, and `desktop/latest/...`.

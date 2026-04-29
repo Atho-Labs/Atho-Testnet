@@ -269,15 +269,17 @@ The release script stages:
 - `Atho Setup.exe` on Windows
 - `Atho Setup.app` on macOS
 - `Atho Setup` on Linux
+- `Atho.app` on macOS as the installed client bundle
 - the `desktop/` share tree with matching root dispatchers
 
 It also stages the direct installer download under `dist/releases/<version>/<platform>-<arch>/installers/`:
 
 - Windows: `Atho Setup.exe`
-- macOS: `Atho Setup.dmg`
+- macOS: `Atho Setup-arm64.dmg` or `Atho Setup-x86_64.dmg`
 
 Before opening a direct installer, verify the matching `checksums.sha256` file from the same GitHub release. The Windows and macOS installers also validate their embedded payload checksums before they install or launch anything.
-On Windows, the installer prompts for an install directory and creates a Start Menu shortcut to the GUI client executable.
+On Windows, the installer prompts for an install directory and creates Start Menu and Desktop shortcuts to `Atho.exe`.
+On macOS, the installer installs `Atho.app` and opens it after install when requested.
 
 For GitHub publishing, use [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml). It builds the same per-OS packages and uploads the release assets to GitHub Releases.
 

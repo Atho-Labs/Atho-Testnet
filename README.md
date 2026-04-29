@@ -108,7 +108,7 @@ py -3 scripts\release.py
 The packaging guide is in [`docs/build-deployment/packaging.md`](docs/build-deployment/packaging.md).
 
 The shareable release tree is `desktop/`, which mirrors each built bundle under `desktop/releases/<version>/<platform>-<arch>/`.
-The root `desktop/install.sh` and `desktop/install.ps1` scripts dispatch to `desktop/latest/<platform>-<arch>/` for the current OS, and the active bundle contains the native `Atho Setup` installer front-end for that platform.
+The root `desktop/install.sh` and `desktop/install.ps1` scripts dispatch to `desktop/latest/<platform>-<arch>/` for the current OS, and the active bundle contains the native `Atho Setup` installer front-end plus the platform client launcher (`Atho.exe` on Windows or `Atho.app` on macOS).
 
 GitHub release publishing is automated by [`.github/workflows/publish-packages.yml`](.github/workflows/publish-packages.yml). It builds Windows, macOS, and Linux packages and publishes the matching archive for each OS to GitHub Releases.
 
@@ -117,11 +117,13 @@ GitHub Releases also gets one combined download named `Atho-<version>-desktop.zi
 The release assets also include a direct installer download for the current host platform:
 
 - Windows: `Atho Setup.exe`
-- macOS: `Atho Setup.dmg`
+- macOS: `Atho Setup-arm64.dmg` or `Atho Setup-x86_64.dmg`
 - Linux: use the platform archive and run `Atho Setup` from inside the extracted folder
+On Windows, the installed client launcher is `Atho.exe`.
 
 Before running a direct installer, verify the matching `checksums.sha256` file from the same release. The Windows `.exe` and macOS `.dmg` also verify their embedded payload checksums before installing.
-On Windows, the installer also asks for an install location, creates a Start Menu shortcut to the GUI client, and launches the client after install.
+On Windows, the installer also asks for an install location, creates Start Menu and Desktop shortcuts to `Atho.exe`, and launches the client after install.
+On macOS, the installer installs the bundled `Atho.app` client and opens it after install when requested.
 
 ## Runtime Roots
 

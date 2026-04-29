@@ -24,6 +24,8 @@ jobs:
         include:
           - os: ubuntu-latest
             bundle_tag: linux-x86_64
+          - os: macos-13
+            bundle_tag: macos-x86_64
           - os: macos-14
             bundle_tag: macos-arm64
           - os: windows-latest

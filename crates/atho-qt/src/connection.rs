@@ -428,7 +428,13 @@ fn collect_rpc_status(
     }
 
     if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
-        return connection_status_from_node_status(network, rpc_address.to_string(), status);
+        let mut connection_status =
+            connection_status_from_node_status(network, rpc_address.to_string(), status);
+        if managed_node.is_some() {
+            connection_status.running = true;
+            connection_status.connected = connection_status.network == network;
+        }
+        return connection_status;
     }
 
     if let Some(node) = managed_node {
@@ -706,7 +712,15 @@ fn local_node_stdio(network: Network) -> Result<(Stdio, Stdio), String> {
 
 fn node_binary_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("ATHO_NODE_BIN") {
-        return Some(PathBuf::from(path));
+        let candidate = PathBuf::from(path);
+        return Some(if candidate.is_absolute() {
+            candidate
+        } else {
+            workspace_manifest_path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(candidate)
+        });
     }
 
     let exe = std::env::current_exe().ok()?;
@@ -899,7 +913,8 @@ mod tests {
         conn: &ReadOnlyNodeConnection,
         predicate: impl Fn(&ConnectionStatus) -> bool,
     ) -> ConnectionStatus {
-        for _ in 0..200 {
+        // Local-node startup can be slow in release builds and on busy CI runners.
+        for _attempt in 0..600 {
             let status = conn.status();
             if predicate(&status) {
                 return status;

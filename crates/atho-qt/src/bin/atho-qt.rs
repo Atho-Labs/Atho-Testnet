@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use atho_core::network::Network;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,12 +32,15 @@ fn main() {
         print_usage();
         return;
     }
-    let cli = parse_args().unwrap_or_else(|err| {
+    let mut cli = parse_args().unwrap_or_else(|err| {
         eprintln!("{err}");
         std::process::exit(1);
     });
-    cli.apply_env();
     let network = cli.network.unwrap_or_else(default_network);
+    if should_auto_launch_local_node(&cli) {
+        cli.local_node = true;
+    }
+    cli.apply_env();
     if cli.local_node {
         std::env::set_var("ATHO_QT_LOCAL", "1");
         std::env::set_var("ATHO_QT_FORCE_RPC", "1");
@@ -73,6 +78,48 @@ fn main() {
     }
 
     let _ = atho_node::dev::append_log("atho-qt", "stopped atho-qt");
+}
+
+fn should_auto_launch_local_node(cli: &QtCli) -> bool {
+    if cli.local_node || cli.rpc_address.is_some() {
+        return false;
+    }
+    launched_from_macos_app_bundle() || launched_from_windows_client_entrypoint()
+}
+
+fn launched_from_macos_app_bundle() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    is_macos_app_bundle_executable(&exe)
+}
+
+fn is_macos_app_bundle_executable(exe: &Path) -> bool {
+    let Some(app_root) = exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    app_root.extension().and_then(|ext| ext.to_str()) == Some("app")
+}
+
+fn launched_from_windows_client_entrypoint() -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    is_windows_client_entrypoint_executable(&exe)
+}
+
+fn is_windows_client_entrypoint_executable(exe: &Path) -> bool {
+    exe.file_name().and_then(|name| name.to_str()) == Some("Atho.exe")
 }
 
 fn parse_args() -> Result<QtCli, String> {
@@ -185,5 +232,23 @@ mod tests {
         assert_eq!(parsed.p2p_addr.as_deref(), Some("0.0.0.0:9200"));
         assert_eq!(parsed.peers, vec![String::from("127.0.0.1:9300")]);
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
+    }
+
+    #[test]
+    fn macos_app_bundle_path_is_recognized() {
+        let app_executable = Path::new("/Applications/Atho.app/Contents/MacOS/Atho");
+        assert!(is_macos_app_bundle_executable(app_executable));
+
+        let plain_executable = Path::new("/usr/local/bin/atho-qt");
+        assert!(!is_macos_app_bundle_executable(plain_executable));
+    }
+
+    #[test]
+    fn windows_client_entrypoint_path_is_recognized() {
+        let client_executable = Path::new("C:/Program Files/Atho/Atho.exe");
+        assert!(is_windows_client_entrypoint_executable(client_executable));
+
+        let plain_executable = Path::new("C:/Program Files/Atho/atho-qt.exe");
+        assert!(!is_windows_client_entrypoint_executable(plain_executable));
     }
 }

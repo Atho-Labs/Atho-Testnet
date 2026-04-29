@@ -78,6 +78,8 @@ Use the simplest desktop path first:
 .\target\release\atho-qt.exe --network regnet --local-node
 ```
 
+If you installed the packaged Windows release, launch `Atho.exe` from the Start Menu or Desktop shortcut instead of the raw `atho-qt.exe` binary.
+
 If you want the client to connect to an already-running node instead:
 
 ```powershell

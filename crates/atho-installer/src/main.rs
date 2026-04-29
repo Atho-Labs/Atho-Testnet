@@ -225,7 +225,22 @@ impl InstallerApp {
 
     fn launch_installed_client(&self) -> Result<(), String> {
         let launcher = if cfg!(target_os = "windows") {
-            PathBuf::from(&self.install_dir).join("atho-qt.exe")
+            let preferred = PathBuf::from(&self.install_dir).join("Atho.exe");
+            if preferred.exists() {
+                preferred
+            } else {
+                PathBuf::from(&self.install_dir).join("atho-qt.exe")
+            }
+        } else if cfg!(target_os = "macos") {
+            let app_bundle = PathBuf::from(&self.install_dir).join("Atho.app");
+            if app_bundle.exists() {
+                return Command::new("/usr/bin/open")
+                    .arg(&app_bundle)
+                    .spawn()
+                    .map_err(|err| format!("failed to launch Atho.app: {err}"))
+                    .map(|_| ());
+            }
+            PathBuf::from(&self.bin_dir).join("atho")
         } else {
             PathBuf::from(&self.bin_dir).join("atho")
         };
@@ -239,8 +254,11 @@ impl InstallerApp {
 
         #[cfg(target_os = "windows")]
         {
-            Command::new(&launcher)
-                .arg("--local-node")
+            let mut command = Command::new(&launcher);
+            if launcher.file_name().and_then(|name| name.to_str()) != Some("Atho.exe") {
+                command.arg("--local-node");
+            }
+            command
                 .spawn()
                 .map_err(|err| format!("failed to launch Atho: {err}"))?;
         }
@@ -256,7 +274,7 @@ impl InstallerApp {
     }
 
     fn banner(&self) -> &'static str {
-        "Atho downloads a release bundle, verifies the embedded payload checksum, installs it into a normal user location, and creates a direct client launcher."
+        "Atho downloads a release bundle, verifies the embedded payload checksum, installs it into a normal user location, and creates a direct client app and launcher."
     }
 }
 
@@ -301,9 +319,16 @@ impl eframe::App for InstallerApp {
                     });
                     ui.add_space(6.0);
                     if self.platform != Platform::Windows {
-                        ui.label(format!("Commands will be linked in {}", self.bin_dir));
+                        if self.platform == Platform::Macos {
+                            ui.label(format!(
+                                "The installer will place Atho.app in the install folder and link commands in {}",
+                                self.bin_dir
+                            ));
+                        } else {
+                            ui.label(format!("Commands will be linked in {}", self.bin_dir));
+                        }
                     } else {
-                        ui.label("The installer will create a Start Menu shortcut to the GUI client and add Atho to your user PATH.");
+                        ui.label("The installer will create Start Menu and Desktop shortcuts to `Atho.exe` and add Atho to your user PATH.");
                     }
 
                     ui.add_space(10.0);
@@ -339,7 +364,13 @@ impl eframe::App for InstallerApp {
                 Screen::Finished => {
                     ui.label("Installation complete.");
                     ui.add_space(8.0);
-                    ui.label("You can now launch Atho from the shortcut or command line.");
+                    if self.platform == Platform::Macos {
+                        ui.label("You can now launch Atho.app from the install folder or open Atho from the client shortcut.");
+                    } else if self.platform == Platform::Windows {
+                        ui.label("You can now launch Atho.exe from the install folder or open Atho from the Start Menu or Desktop shortcut.");
+                    } else {
+                        ui.label("You can now launch Atho from the shortcut or command line.");
+                    }
                     if let Some(error) = &self.error {
                         ui.add_space(8.0);
                         ui.colored_label(egui::Color32::YELLOW, error);
