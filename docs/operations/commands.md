@@ -92,6 +92,19 @@ Run the targeted attack sweep:
 cargo run -p atho-node --bin atho-attack -- --network regnet
 ```
 
+Run the end-to-end benchmark harness:
+
+```bash
+cargo run --release -p atho-node --bin atho-benchmark -- --network regnet --tx-count 256 --inputs-per-tx 1 --samples 3 --output benchmark.md
+```
+
+Heavier block and relay coverage:
+
+```bash
+cargo run --release -p atho-node --bin atho-benchmark -- --network regnet --tx-count 6000 --inputs-per-tx 1 --samples 3 --output benchmark.md
+cargo run --release -p atho-node --bin atho-benchmark -- --network regnet --tx-count 5084 --inputs-per-tx 2 --samples 3 --output benchmark.md
+```
+
 ## Full Node
 
 Preferred command:

@@ -106,6 +106,23 @@ Why:
 
 - a peer should be rejected before sync work begins if it cannot validate the same chain
 
+## Readiness and Buffer Semantics
+
+These lifecycle states are intentionally separate:
+
+- `handshake_ready` means the transport session is ready for normal peer messages.
+- `headers_synced` means the peer header view has been integrated enough for header-first sync progress.
+- neither of those means wallet spendability or mining readiness
+- wallet spendability is owned by the local canonical chain height and wallet scan snapshot
+- orphan/branch buffers are peer-local, transient, and non-persistent
+- buffered branches are rechecked globally after each accepted block so a parent arriving on one peer can still unlock a child chain buffered from another peer
+- pending compact-block reconstruction state is cleared on disconnect and on final accept/reject
+
+Why:
+
+- readiness bugs become operator bugs when a client or wallet assumes a peer is “fully ready” too early
+- orphan buffers become correctness bugs if they outlive the chain context that made them meaningful
+
 ## Headers-First Sync
 
 The current sync layer:

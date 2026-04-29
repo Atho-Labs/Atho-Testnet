@@ -1,7 +1,7 @@
 # Atho Consensus Security Report
 
 ## Build Info
-- Commit hash: `377afd2815b5d50238750c33412a3c0cc846e104`
+- Commit hash: `92c3c2b6ae3b153b8bb302ddc5555196f94bf080`
 - Rust version: `rustc 1.94.1 (e408947bf 2026-03-25)`
 - Build profile: `release`
 - OS: `Darwin 24.6.0 arm64`
@@ -29,6 +29,15 @@
 - `cargo run --release -p atho-node --bin atho-attack -- --network regnet`
 - `cargo run --release -p atho-node --bin atho-adversarial -- --cases 52000 --seed 12345`
 - Direct libFuzzer binaries from `fuzz/Cargo.toml`
+- Consensus fuzz smoke runs:
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin tx_decode -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin tx_roundtrip -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin sighash -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin block_decode -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin block_validate -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin mempool_admission -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin compact_block_reconstruct -- -runs=1000`
+  - `cargo run --release --manifest-path fuzz/Cargo.toml --bin network_message_decode -- -runs=1000`
 - Earlier sandbox wipe verification:
   - `cargo run --release -p atho-node --bin athod -- wipe --network regnet --data-dir <tmp> --all`
   - `cargo run --release -p atho-node --bin athod -- wipe --network mainnet --data-dir /tmp/... --all`
@@ -46,7 +55,7 @@
 | Mempool behavior | Pass | Conflict handling, revalidation, and policy checks passed |
 | P2P / sync / propagation | Pass | Handshake, relay, sync, and reorg tests passed |
 | Storage / restart / recovery | Pass | Snapshot, quarantine, and rollback tests passed |
-| Fuzz / stress | Partial | Direct fuzz runs were clean, but dedicated consensus fuzz targets are still missing |
+| Fuzz / stress | Pass | Direct fuzz runs and the new consensus fuzz smoke targets were clean |
 
 ## Critical Findings
 | Severity | Area | Bug | Reproduction | Status |
@@ -64,10 +73,9 @@
 - Added regression coverage for wrong-key standard outputs and higher-fee block acceptance in `crates/atho-storage/src/validation.rs`.
 
 ## Exact Issues Still Open
-- Dedicated consensus fuzz targets for `tx_decode`, `tx_roundtrip`, `sighash`, `block_decode`, `block_validate`, `mempool_admission`, `compact_block_reconstruct`, and `network_message_decode` are still missing.
 - `cargo fuzz` is not installed in this environment, so fuzzing was run through direct libFuzzer binaries.
 - Sanitizer-backed fuzzing, Miri, and TSAN/ASAN were not available in this run.
-- There is still no dedicated end-to-end benchmark harness for full block validation, mempool throughput, or propagation latency.
+- The dedicated end-to-end benchmark harness for full block validation, mempool throughput, and propagation latency now exists and was smoke-run successfully, but it is not yet wired into CI.
 
 ## Exact Modules / Functions Implicated
 - `crates/atho-storage/src/validation.rs`
@@ -107,66 +115,75 @@
   - `p2p_message_roundtrip`
   - `rpc_request_decode`
 - Each target was run for `20,000` iterations.
-- The fuzz targets currently present in the repo are useful, but they do not yet cover the full consensus attack surface.
+- Direct consensus fuzz smoke runs completed with no crashes and no unique failures:
+  - `tx_decode`
+  - `tx_roundtrip`
+  - `sighash`
+  - `block_decode`
+  - `block_validate`
+  - `mempool_admission`
+  - `compact_block_reconstruct`
+  - `network_message_decode`
+- Each of the consensus smoke targets was run for `1,000` iterations.
 
 ## Top 25 Highest-Risk Blockers
-1. No dedicated `tx_decode` fuzz target.
-2. No dedicated `tx_roundtrip` fuzz target.
-3. No dedicated `sighash` fuzz target.
-4. No dedicated `block_decode` fuzz target.
-5. No dedicated `block_validate` fuzz target.
-6. No dedicated `mempool_admission` fuzz target.
-7. No dedicated `compact_block_reconstruct` fuzz target.
-8. No dedicated `network_message_decode` fuzz target.
-9. `cargo fuzz` is missing in the local environment.
-10. No sanitizer-backed fuzz run was available.
-11. No Miri run was available.
-12. No TSAN run was available.
-13. No ASAN run was available.
-14. No differential validator baseline exists in the repo.
-15. No dedicated full block validation benchmark harness exists.
-16. No dedicated mempool throughput benchmark harness exists.
-17. No dedicated propagation benchmark harness exists.
-18. No dedicated header-first sync benchmark harness exists.
-19. No cold-cache / warm-cache benchmark harness exists for the full node.
-20. No long-duration consensus soak test is wired into CI.
-21. No replay corpus for malformed storage records is persisted in CI.
-22. No cache-poisoning stress harness for reorgs is wired into CI.
-23. No partial-write fault-injection harness covers every storage path.
-24. No adversarial P2P corpus regression gate exists.
-25. No automated release-mode attack harness gate is enforced in CI.
+1. `cargo fuzz` is missing in the local environment.
+2. No sanitizer-backed fuzz run was available.
+3. No Miri run was available.
+4. No TSAN run was available.
+5. No ASAN run was available.
+6. No differential validator baseline exists in the repo.
+7. No cold-cache / warm-cache benchmark harness exists for the full node.
+8. No long-duration consensus soak test is wired into CI.
+9. No replay corpus for malformed storage records is persisted in CI.
+10. No cache-poisoning stress harness for reorgs is wired into CI.
+11. No partial-write fault-injection harness covers every storage path.
+12. No adversarial P2P corpus regression gate exists.
+13. No automated release-mode attack harness gate is enforced in CI.
+14. The consensus fuzz smoke runs are direct binary executions rather than a managed `cargo fuzz` workflow.
+15. The consensus fuzz corpus is not yet persisted.
+16. The consensus smoke runs were not instrumented with sanitizers in this environment.
+17. The benchmark harness has only been smoke-run at modest sample counts.
+18. There is no CI gate for the end-to-end benchmark harness yet.
+19. There is no release gating for the benchmark markdown output yet.
+20. There is no long-duration propagation soak in CI yet.
+21. There is no restart-plus-reorg soak harness in CI yet.
+22. There is no orphan-pressure stress harness in CI yet.
+23. There is no corpus triage workflow for newly found fuzz crashes yet.
+24. There is no CI gate for the direct libFuzzer binary smoke runs yet.
+25. There is no release-mode attack harness gate for the new fuzz targets yet.
 
 ## Top 25 Missing Hardening Steps
-1. Add `tx_decode` fuzzing.
-2. Add `tx_roundtrip` fuzzing.
-3. Add `sighash` fuzzing.
-4. Add `block_decode` fuzzing.
-5. Add `block_validate` fuzzing.
-6. Add `mempool_admission` fuzzing.
-7. Add `compact_block_reconstruct` fuzzing.
-8. Add `network_message_decode` fuzzing.
-9. Install or vendor `cargo fuzz` for this repo.
-10. Add sanitizer-backed fuzz CI.
-11. Add Miri coverage for parser and validator hot paths.
-12. Add TSAN coverage for cache and reorg logic.
-13. Add ASAN coverage for parsers and network decoders.
-14. Add a reference-validator differential test harness if one exists.
-15. Add a dedicated block-validation benchmark runner.
-16. Add a dedicated mempool benchmark runner.
-17. Add a dedicated propagation benchmark runner.
-18. Add a dedicated header-first sync benchmark runner.
-19. Add cold-cache and warm-cache benchmark modes for consensus paths.
-20. Add long-run reorg soak tests.
-21. Add persistent malformed-state replay corpora.
-22. Add cache-poisoning and restart-replay stress tests.
-23. Add partial-write fault injection across all storage entry points.
-24. Add adversarial P2P corpus persistence and replay.
-25. Gate release-mode attack and regression harnesses in CI.
+1. Install or vendor `cargo fuzz` for this repo.
+2. Add sanitizer-backed fuzz CI.
+3. Add Miri coverage for parser and validator hot paths.
+4. Add TSAN coverage for cache and reorg logic.
+5. Add ASAN coverage for parsers and network decoders.
+6. Add a reference-validator differential test harness if one exists.
+7. Add cold-cache and warm-cache benchmark modes for consensus paths.
+8. Add long-run reorg soak tests.
+9. Add persistent malformed-state replay corpora.
+10. Add cache-poisoning and restart-replay stress tests.
+11. Add partial-write fault injection across all storage entry points.
+12. Add adversarial P2P corpus persistence and replay.
+13. Gate release-mode attack and regression harnesses in CI.
+14. Add a CI gate for the direct libFuzzer binary smoke runs.
+15. Add a corpus persistence workflow for the consensus fuzz targets.
+16. Add sanitizer-aware crash reproduction for fuzz findings.
+17. Add a benchmark CI gate for the end-to-end harness.
+18. Add a longer block-validation soak run at realistic block counts.
+19. Add a longer mempool admission soak run under contention.
+20. Add a longer propagation soak run under peer churn.
+21. Add a restart-plus-reorg soak harness.
+22. Add an orphan-pressure stress harness.
+23. Add a benchmark output diff gate.
+24. Add an artifact retention policy for fuzz crashes.
+25. Add a release-mode attack harness gate for the new fuzz targets.
 
 ## Final Roadmap
-1. Add the missing consensus fuzz targets.
+1. Install or vendor `cargo fuzz` for this repo.
 2. Wire fuzzing into CI with sanitizers.
-3. Add benchmark harnesses for block validation, mempool, and propagation.
+3. Add benchmark CI gates for the end-to-end harness.
 4. Add more reorg and cache-poisoning stress tests.
 5. Add a release-mode regression gate for the attack and adversarial harnesses.
 

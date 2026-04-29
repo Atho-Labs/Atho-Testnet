@@ -1,6 +1,6 @@
 use crate::error::NodeError;
 use crate::node::Node;
-use crate::validation::ValidationError;
+use crate::validation::{finalize_witness_commit_refs, ValidationError};
 use atho_core::block::Block;
 use atho_core::consensus::pow;
 use atho_core::network::Network;
@@ -594,6 +594,7 @@ impl NodeSync {
             &BTreeMap::new(),
         )? {
             CompactBlockReconstruction::Complete(block) => {
+                let block = finalize_compact_block_witness_refs(block);
                 self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
@@ -694,6 +695,7 @@ impl NodeSync {
         )? {
             CompactBlockReconstruction::Complete(block) => {
                 self.pending_compact_blocks.remove(&block_hash);
+                let block = finalize_compact_block_witness_refs(block);
                 self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
@@ -780,6 +782,24 @@ impl NodeSync {
                 ),
             });
         }
+    }
+}
+
+fn finalize_compact_block_witness_refs(block: Block) -> Block {
+    let witness_root = block.header.witness_root;
+    let transactions = block
+        .transactions
+        .iter()
+        .map(|tx| finalize_witness_commit_refs(tx, witness_root))
+        .collect::<Vec<_>>();
+    let witnesses = transactions
+        .iter()
+        .filter_map(|tx| tx.witness_payload().map(|witness| (tx.txid(), witness)))
+        .collect();
+    Block {
+        transactions,
+        witnesses,
+        ..block
     }
 }
 

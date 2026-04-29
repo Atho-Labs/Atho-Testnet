@@ -135,3 +135,28 @@ The current codebase already has the major safe speed levers in place:
 - sandbox-safe wipe and test flow
 
 The remaining work is mostly measurement, tuning, and proving the best batch sizes and worker counts for the real hardware and sandbox network shape.
+
+## Lifecycle Semantics We State Explicitly
+
+These rules are now documented so readiness does not stay implied:
+
+- `headers_synced` means the local header chain has caught up to the peer-reported header view. It does not mean the wallet is spendable or that the node is fully ready for mining actions.
+- `handshake_ready` means the P2P transport handshake finished. It does not mean the peer is safe to trust for consensus state.
+- `wallet_ready` means the Qt wallet has a stable local scan snapshot and the RPC backend has passed the readiness gate.
+- Wallet spendability uses the local canonical block count, not a peer-advertised height.
+- Orphan and branch buffers are peer-local, in-memory only, and non-consensus state.
+- Orphan and branch buffers are dropped on peer disconnect.
+- Buffered branches are re-evaluated globally after each accepted block so a parent arriving on one peer can still unblock children buffered from another peer.
+- Pending compact-block reconstruction state is transient and is cleared when the block is accepted, rejected, or the peer disconnects.
+
+## Benchmark Harness
+
+The dedicated benchmark harness is now implemented as `atho-benchmark`.
+It measures:
+
+- block validation
+- mempool admission throughput
+- full-block propagation latency
+- compact-block propagation latency
+
+It runs against sandbox data only, starts from a wiped temp root by default, and can write `benchmark.md` directly.
