@@ -28,6 +28,8 @@ The GitHub release asset set also includes the direct installer download for the
 - Windows: `Atho Setup.exe`
 - macOS: `Atho Setup.dmg`
 
+Those direct installers are self-contained and validate their embedded payload checksum before extracting or launching anything.
+
 It also stages:
 
 - `atho` launcher for the desktop client
@@ -117,6 +119,8 @@ Windows:
 - installer front-end: `Atho Setup.exe`
 - installer adds the bundle directory to the user PATH
 - installer creates a Start Menu shortcut
+- installer verifies the embedded payload checksum before install
+- installer launches the installed client after the install step succeeds
 
 ## Launcher Model
 

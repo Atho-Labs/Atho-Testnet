@@ -120,6 +120,8 @@ The release assets also include a direct installer download for the current host
 - macOS: `Atho Setup.dmg`
 - Linux: use the platform archive and run `Atho Setup` from inside the extracted folder
 
+Before running a direct installer, verify the matching `checksums.sha256` file from the same release. The Windows `.exe` and macOS `.dmg` also verify their embedded payload checksums before installing.
+
 ## Runtime Roots
 
 Default runtime root:

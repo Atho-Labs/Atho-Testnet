@@ -28,6 +28,7 @@ DESKTOP_LATEST_ROOT = DESKTOP_ROOT / "latest"
 BOOTSTRAP_PEER = os.environ.get("ATHO_MAINNET_PEER", "74.208.219.116:56000")
 INSTALLERS_DIR_NAME = "installers"
 PAYLOAD_FOOTER_MAGIC = b"ATHOPLD1"
+PAYLOAD_DIGEST_BYTES = 32
 
 DOC_FILES = [
     ("README.md", ROOT / "README.md"),
@@ -357,6 +358,9 @@ def stage_download_artifacts(release_root: Path, platform_name: str) -> None:
             installers_dir = release_root / INSTALLERS_DIR_NAME
             installers_dir.mkdir(parents=True, exist_ok=True)
             copy_file(payload_path, app_root / "Contents" / "Resources" / "payload.zip")
+            (app_root / "Contents" / "Resources" / "payload.sha256").write_bytes(
+                hashlib.sha256(payload_path.read_bytes()).digest()
+            )
             build_macos_dmg(app_root, installers_dir / "Atho Setup.dmg")
     finally:
         remove_path(payload_path)
@@ -389,7 +393,12 @@ def iter_payload_files(root: Path, platform_name: str):
 
 def append_payload_to_windows_installer(installer_path: Path, payload_path: Path) -> None:
     payload = payload_path.read_bytes()
-    footer = struct.pack("<8sQ", PAYLOAD_FOOTER_MAGIC, len(payload))
+    footer = struct.pack(
+        f"<8sQ{PAYLOAD_DIGEST_BYTES}s",
+        PAYLOAD_FOOTER_MAGIC,
+        len(payload),
+        hashlib.sha256(payload).digest(),
+    )
     with installer_path.open("ab") as handle:
         handle.write(payload)
         handle.write(footer)
@@ -619,6 +628,8 @@ What is packaged
 Primary installer
 -----------------
 - {installer_hint}
+- verify the matching `checksums.sha256` file from the release before running the installer
+- the Windows and macOS installers verify their embedded payload checksums before install
 
 Default install locations
 -------------------------
@@ -915,6 +926,8 @@ Layout:
 - direct installer downloads:
   - Windows: `Atho Setup.exe`
   - macOS: `Atho Setup.dmg`
+- verify the matching `checksums.sha256` file from the same release before running the installer
+- each direct installer validates its embedded payload checksum before install
 - `desktop/install.sh` and `desktop/install.ps1` dispatch to the active bundle
 - `desktop/uninstall.sh` and `desktop/uninstall.ps1` remove the active install
 - each active bundle includes the native installer front-end:

@@ -472,6 +472,7 @@ name = "atho-installer"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "sha2",
  "tempfile",
  "zip",
 ]

@@ -276,6 +276,8 @@ It also stages the direct installer download under `dist/releases/<version>/<pla
 - Windows: `Atho Setup.exe`
 - macOS: `Atho Setup.dmg`
 
+Before opening a direct installer, verify the matching `checksums.sha256` file from the same GitHub release. The Windows and macOS installers also validate their embedded payload checksums before they install or launch anything.
+
 For GitHub publishing, use [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml). It builds the same per-OS packages and uploads the release assets to GitHub Releases.
 
 The workflow also publishes one combined `Atho-<version>-desktop.zip` package that contains the full `desktop/` tree for all supported OS bundles.

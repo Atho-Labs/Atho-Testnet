@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eframe::egui;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::ZipArchive;
 
 const PAYLOAD_FOOTER_MAGIC: &[u8; 8] = b"ATHOPLD1";
-const PAYLOAD_FOOTER_SIZE: u64 = 16;
+const PAYLOAD_DIGEST_BYTES: usize = 32;
+const PAYLOAD_FOOTER_SIZE: u64 = 8 + 8 + PAYLOAD_DIGEST_BYTES as u64;
+const LEGACY_PAYLOAD_FOOTER_SIZE: u64 = 8 + 8;
 
 fn main() -> eframe::Result<()> {
     let bundle = match locate_release_root() {
@@ -254,7 +257,7 @@ impl InstallerApp {
     }
 
     fn banner(&self) -> &'static str {
-        "Atho downloads a release bundle, installs it into a normal user location, and creates simple launchers."
+        "Atho downloads a release bundle, verifies the embedded payload checksum, installs it into a normal user location, and creates simple launchers."
     }
 }
 
@@ -398,7 +401,17 @@ fn locate_macos_resource_bundle(exe: &Path) -> Result<Option<BundleLocation>, St
     if !payload.exists() {
         return Ok(None);
     }
-    extract_payload_zip(&payload).map(Some)
+    let digest_path = contents_root.join("Resources").join("payload.sha256");
+    if digest_path.exists() {
+        let payload_bytes = fs::read(&payload)
+            .map_err(|err| format!("failed to read embedded installer payload: {err}"))?;
+        let expected_digest = fs::read(&digest_path)
+            .map_err(|err| format!("failed to read embedded installer checksum: {err}"))?;
+        verify_payload_digest(&payload_bytes, &expected_digest)?;
+        extract_payload_bytes(&payload_bytes).map(Some)
+    } else {
+        extract_payload_zip(&payload).map(Some)
+    }
 }
 
 fn locate_windows_embedded_bundle(exe: &Path) -> Result<Option<BundleLocation>, String> {
@@ -406,18 +419,52 @@ fn locate_windows_embedded_bundle(exe: &Path) -> Result<Option<BundleLocation>, 
         Ok(metadata) => metadata,
         Err(err) => return Err(format!("failed to inspect installer binary: {err}")),
     };
-    if metadata.len() < PAYLOAD_FOOTER_SIZE {
+    if metadata.len() < LEGACY_PAYLOAD_FOOTER_SIZE {
         return Ok(None);
     }
 
     let mut file =
         File::open(exe).map_err(|err| format!("failed to open installer binary: {err}"))?;
-    file.seek(SeekFrom::End(-(PAYLOAD_FOOTER_SIZE as i64)))
-        .map_err(|err| format!("failed to read installer footer: {err}"))?;
+    if metadata.len() >= PAYLOAD_FOOTER_SIZE {
+        file.seek(SeekFrom::End(-(PAYLOAD_FOOTER_SIZE as i64)))
+            .map_err(|err| format!("failed to read installer footer: {err}"))?;
 
-    let mut footer = [0u8; PAYLOAD_FOOTER_SIZE as usize];
+        let mut footer = [0u8; PAYLOAD_FOOTER_SIZE as usize];
+        file.read_exact(&mut footer)
+            .map_err(|err| format!("failed to read installer footer: {err}"))?;
+
+        if &footer[..PAYLOAD_FOOTER_MAGIC.len()] == PAYLOAD_FOOTER_MAGIC {
+            let (payload_len, expected_digest) = parse_windows_payload_footer(&footer)?;
+            if payload_len > metadata.len().saturating_sub(PAYLOAD_FOOTER_SIZE) {
+                return Err("embedded installer payload is truncated".to_string());
+            }
+
+            let payload_total = payload_len
+                .checked_add(PAYLOAD_FOOTER_SIZE)
+                .ok_or_else(|| "embedded installer payload length overflow".to_string())?;
+            let payload_start = metadata
+                .len()
+                .checked_sub(payload_total)
+                .ok_or_else(|| "embedded installer payload length underflow".to_string())?;
+            file.seek(SeekFrom::Start(payload_start))
+                .map_err(|err| format!("failed to seek installer payload: {err}"))?;
+
+            let mut payload = vec![0u8; payload_len as usize];
+            file.read_exact(&mut payload)
+                .map_err(|err| format!("failed to read embedded installer payload: {err}"))?;
+            verify_payload_digest(&payload, &expected_digest)?;
+            return extract_payload_bytes(&payload)
+                .map(Some)
+                .map_err(|err| format!("failed to extract embedded installer payload: {err}"));
+        }
+    }
+
+    file.seek(SeekFrom::End(-(LEGACY_PAYLOAD_FOOTER_SIZE as i64)))
+        .map_err(|err| format!("failed to read legacy installer footer: {err}"))?;
+
+    let mut footer = [0u8; LEGACY_PAYLOAD_FOOTER_SIZE as usize];
     file.read_exact(&mut footer)
-        .map_err(|err| format!("failed to read installer footer: {err}"))?;
+        .map_err(|err| format!("failed to read legacy installer footer: {err}"))?;
 
     if &footer[..PAYLOAD_FOOTER_MAGIC.len()] != PAYLOAD_FOOTER_MAGIC {
         return Ok(None);
@@ -428,12 +475,12 @@ fn locate_windows_embedded_bundle(exe: &Path) -> Result<Option<BundleLocation>, 
             .try_into()
             .expect("payload footer length"),
     );
-    if payload_len > metadata.len().saturating_sub(PAYLOAD_FOOTER_SIZE) {
+    if payload_len > metadata.len().saturating_sub(LEGACY_PAYLOAD_FOOTER_SIZE) {
         return Err("embedded installer payload is truncated".to_string());
     }
 
     let payload_total = payload_len
-        .checked_add(PAYLOAD_FOOTER_SIZE)
+        .checked_add(LEGACY_PAYLOAD_FOOTER_SIZE)
         .ok_or_else(|| "embedded installer payload length overflow".to_string())?;
     let payload_start = metadata
         .len()
@@ -500,6 +547,36 @@ fn extract_payload_bytes(bytes: &[u8]) -> Result<BundleLocation, String> {
     Ok(BundleLocation::extracted(root, tempdir))
 }
 
+fn parse_windows_payload_footer(footer: &[u8]) -> Result<(u64, [u8; PAYLOAD_DIGEST_BYTES]), String> {
+    if footer.len() != PAYLOAD_FOOTER_SIZE as usize {
+        return Err("embedded installer footer has an unexpected length".to_string());
+    }
+    if &footer[..PAYLOAD_FOOTER_MAGIC.len()] != PAYLOAD_FOOTER_MAGIC {
+        return Err("embedded installer footer magic mismatch".to_string());
+    }
+    let payload_len = u64::from_le_bytes(
+        footer[PAYLOAD_FOOTER_MAGIC.len()..PAYLOAD_FOOTER_MAGIC.len() + 8]
+            .try_into()
+            .expect("payload footer length"),
+    );
+    let expected_digest: [u8; PAYLOAD_DIGEST_BYTES] =
+        footer[PAYLOAD_FOOTER_MAGIC.len() + 8..]
+            .try_into()
+            .expect("payload footer digest");
+    Ok((payload_len, expected_digest))
+}
+
+fn verify_payload_digest(payload: &[u8], expected_digest: &[u8]) -> Result<(), String> {
+    if expected_digest.len() != PAYLOAD_DIGEST_BYTES {
+        return Err("embedded installer checksum has an unexpected length".to_string());
+    }
+    let actual_digest: [u8; PAYLOAD_DIGEST_BYTES] = Sha256::digest(payload).into();
+    if actual_digest.as_slice() != expected_digest {
+        return Err("embedded installer payload checksum mismatch".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +610,27 @@ mod tests {
         let bundle = extract_payload_bytes(buffer.get_ref()).expect("extract payload");
         assert!(bundle.root().join("install.sh").exists());
         assert!(bundle.root().join("nested/data.txt").exists());
+    }
+
+    #[test]
+    fn payload_digest_verification_rejects_bad_checksum() {
+        let payload = b"payload bytes";
+        let mut digest = Sha256::digest(payload).to_vec();
+        digest[0] ^= 0xff;
+        let err = verify_payload_digest(payload, &digest).expect_err("checksum mismatch");
+        assert!(err.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn windows_payload_footer_parses_digest_and_length() {
+        let payload = b"payload bytes";
+        let digest: [u8; PAYLOAD_DIGEST_BYTES] = Sha256::digest(payload).into();
+        let mut footer = Vec::new();
+        footer.extend_from_slice(PAYLOAD_FOOTER_MAGIC);
+        footer.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        footer.extend_from_slice(&digest);
+        let (len, parsed_digest) = parse_windows_payload_footer(&footer).expect("parse footer");
+        assert_eq!(len, payload.len() as u64);
+        assert_eq!(parsed_digest, digest);
     }
 }

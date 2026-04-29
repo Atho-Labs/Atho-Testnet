@@ -11,6 +11,7 @@ That means:
 - operational docs are centralized under `docs/`
 - repo-local sandbox artifacts can stay under `dev/` when explicitly requested
 - staged release artifacts stay under `dist/releases/<version>/<platform>-<arch>/` with `dist/release/` as the current compatibility mirror, `dist/releases/<version>/<platform>-<arch>/installers/` as the direct-download installer staging area, `desktop/releases/<version>/<platform>-<arch>/` as the shareable release tree, and `desktop/latest/<platform>-<arch>/` as the active mirror
+- direct installers are self-contained and validate their embedded payload checksums before install
 
 This keeps the trusted core auditable and avoids mixing design notes, runtime state, and build outputs at repo root.
 
