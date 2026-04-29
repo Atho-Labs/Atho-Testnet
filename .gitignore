@@ -30,6 +30,7 @@ tmp/
 
 # Ignore specific directories that are not part of the source
 dist/
+desktop/
 build/
 target/
 dev/logs

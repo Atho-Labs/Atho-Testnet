@@ -28,6 +28,8 @@ Recent sandbox execution has covered:
 - reorg and branch-selection tests
 - RPC-driven Qt tip synchronization
 - Qt wallet create/open/send/receive/mining lifecycle
+- live TCP two-node sync/reorg and transaction relay
+- 25-node live cluster convergence and restart recovery
 - P2P handshake, message framing, inventory handling, and headers-first logic
 
 ## Recent Executed Commands
@@ -49,12 +51,12 @@ cargo run --release -p atho-node --bin atho-adversarial -- --cases 52000 --seed 
 
 Passing counts from the most recent documented full-stack pass:
 
-- `atho-core`: `34 passed`
-- `atho-wallet`: `22 passed`
-- `atho-p2p`: `18 passed`
-- `atho-storage`: `19 passed`
-- `atho-node`: `19 passed`
-- `atho-qt`: `16 passed`
+- `atho-core`: `35 passed`
+- `atho-wallet`: `25 passed`
+- `atho-p2p`: `25 passed`
+- `atho-storage`: `25 passed`
+- `atho-node`: `42 passed`
+- `atho-qt`: `25 passed`
 - targeted attack sweep: `19/19 passed`
 
 Adversarial campaign result:
@@ -79,7 +81,6 @@ They materially raise confidence in:
 
 ## What They Do Not Yet Prove
 
-- live TCP network behavior across real peers
 - full pruning lifecycle safety
 - snapshot sync correctness
 - schema migration safety
@@ -88,16 +89,14 @@ They materially raise confidence in:
 
 ## Current Highest-Value Missing Tests
 
-1. two real `athod` processes over TCP
-2. live header sync from one node to another
-3. live block relay over sockets
-4. live transaction relay over sockets
-5. pruning + restart execution
-6. snapshot sync lifecycle
-7. schema migration tests
-8. GUI automation at the window/control level
-9. long-run restart soak
-10. activation-boundary execution with a real V2 ruleset
+1. 50-node real-socket soak
+2. longer restart / reconnect soak across live peers
+3. pruning + restart execution
+4. snapshot sync lifecycle
+5. schema migration tests
+6. GUI automation at the window/control level
+7. long-run public-network soak
+8. activation-boundary execution with a real V2 ruleset
 
 ## Related Documentation
 

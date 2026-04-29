@@ -12,6 +12,7 @@ use atho_p2p::protocol::{
 };
 use atho_p2p::relay::RelayLoop;
 use atho_p2p::sync::SyncState;
+use atho_storage::chainstate::ChainSelectionOutcome;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -37,6 +38,7 @@ pub struct NodeSync {
     relay: RelayLoop,
     connections: ConnectionManager,
     downloader: BlockDownloadScheduler,
+    branch_buffers: BTreeMap<String, Vec<Block>>,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
 }
 
@@ -53,6 +55,7 @@ impl NodeSync {
             relay: RelayLoop::new(network),
             connections: ConnectionManager::new(network),
             downloader: BlockDownloadScheduler::default(),
+            branch_buffers: BTreeMap::new(),
             pending_compact_blocks: BTreeMap::new(),
         }
     }
@@ -138,6 +141,7 @@ impl NodeSync {
             return None;
         }
         self.downloader.note_peer_disconnected(remote_addr);
+        self.branch_buffers.remove(remote_addr);
         Some(SyncNotice::Disconnected {
             peer: remote_addr.to_string(),
             reason,
@@ -157,6 +161,7 @@ impl NodeSync {
                 ConnectionEvent::Send { .. } => outbound.push(event),
                 ConnectionEvent::Disconnect { peer, reason } => {
                     self.downloader.note_peer_disconnected(&peer);
+                    self.branch_buffers.remove(&peer);
                     notices.push(SyncNotice::Disconnected { peer, reason });
                 }
                 ConnectionEvent::Ready { peer, best_height } => {
@@ -251,14 +256,7 @@ impl NodeSync {
                 }
             }
             MessagePayload::Block(block) => {
-                let block_hash = block.header.block_hash();
-                if !node.contains_block(&block_hash) {
-                    node.submit_block(&block)?;
-                    self.relay.prime(node.blocks());
-                }
-                self.downloader.note_block_received(block_hash);
-                self.pending_compact_blocks.remove(&block_hash);
-                self.push_scheduled_block_requests(outbound);
+                self.handle_received_block(peer, block, node, outbound)?;
             }
             MessagePayload::CompactBlock(message) => {
                 self.handle_compact_block(peer, message, node, outbound)?;
@@ -334,6 +332,66 @@ impl NodeSync {
         }
     }
 
+    fn handle_received_block(
+        &mut self,
+        peer: &str,
+        block: Block,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        let block_hash = block.header.block_hash();
+        if node.contains_block(&block_hash) {
+            self.downloader.note_block_received(block_hash);
+            self.pending_compact_blocks.remove(&block_hash);
+            self.branch_buffers.remove(peer);
+            self.push_scheduled_block_requests(outbound);
+            return Ok(());
+        }
+
+        if block.header.previous_block_hash == node.tip_hash() {
+            node.submit_block(&block)?;
+            self.relay.prime(node.blocks());
+            self.downloader.note_block_received(block_hash);
+            self.pending_compact_blocks.remove(&block_hash);
+            self.branch_buffers.remove(peer);
+            self.push_scheduled_block_requests(outbound);
+            return Ok(());
+        }
+
+        let branch = self.branch_buffers.entry(peer.to_string()).or_default();
+        if branch.last().is_some_and(|previous| {
+            previous.header.block_hash() == block.header.previous_block_hash
+        }) {
+            branch.push(block);
+        } else {
+            branch.clear();
+            branch.push(block);
+        }
+
+        if branch
+            .last()
+            .is_some_and(|candidate| candidate.header.height > node.height())
+        {
+            let candidate_branch = branch.clone();
+            let candidate_hashes = candidate_branch
+                .iter()
+                .map(|candidate| candidate.header.block_hash())
+                .collect::<Vec<_>>();
+            let selection = node.consider_branch(&candidate_branch)?;
+            if selection.outcome != ChainSelectionOutcome::KeptCurrent {
+                self.relay.prime(node.blocks());
+                for hash in candidate_hashes {
+                    self.downloader.note_block_received(hash);
+                    self.pending_compact_blocks.remove(&hash);
+                }
+                self.branch_buffers.clear();
+                self.push_scheduled_block_requests(outbound);
+            }
+        }
+
+        Ok(())
+    }
+
     fn handle_compact_block(
         &mut self,
         peer: &str,
@@ -353,13 +411,7 @@ impl NodeSync {
             &BTreeMap::new(),
         )? {
             CompactBlockReconstruction::Complete(block) => {
-                if !node.contains_block(&block_hash) {
-                    node.submit_block(&block)?;
-                    self.relay.prime(node.blocks());
-                }
-                self.downloader.note_block_received(block_hash);
-                self.pending_compact_blocks.remove(&block_hash);
-                self.push_scheduled_block_requests(outbound);
+                self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
                 self.pending_compact_blocks.insert(
@@ -459,12 +511,7 @@ impl NodeSync {
         )? {
             CompactBlockReconstruction::Complete(block) => {
                 self.pending_compact_blocks.remove(&block_hash);
-                if !node.contains_block(&block_hash) {
-                    node.submit_block(&block)?;
-                    self.relay.prime(node.blocks());
-                }
-                self.downloader.note_block_received(block_hash);
-                self.push_scheduled_block_requests(outbound);
+                self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
                 outbound.push(ConnectionEvent::Send {
@@ -963,5 +1010,43 @@ mod tests {
         assert_eq!(left.node.height(), right.node.height());
         assert_eq!(left.node.tip_hash(), right.node.tip_hash());
         assert!(left.node.block_by_hash(block.header.block_hash()).is_some());
+    }
+
+    #[test]
+    fn sandbox_longer_branch_reorgs_to_the_preferred_tip() {
+        let mut canonical = SandboxPeer::new("canonical", Network::Regnet);
+        let mut fork = SandboxPeer::new("fork", Network::Regnet);
+        let miner = Miner::new(1);
+
+        canonical
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine canonical block 1");
+        canonical
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine canonical block 2");
+        canonical.sync.prime(&canonical.node);
+
+        fork.node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine fork block 1");
+        fork.node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine fork block 2");
+        fork.node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine fork block 3");
+        fork.sync.prime(&fork.node);
+
+        let notices = connect(&mut canonical, &mut fork);
+
+        assert!(notices.iter().any(|notice| matches!(
+            notice,
+            SyncNotice::Ready { peer, .. } if peer == "fork"
+        )));
+        assert_eq!(canonical.node.height(), fork.node.height());
+        assert_eq!(canonical.node.tip_hash(), fork.node.tip_hash());
+        assert_eq!(canonical.sync.sync_state().best_height, fork.node.height());
     }
 }

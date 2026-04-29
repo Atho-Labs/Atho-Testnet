@@ -51,7 +51,7 @@ Current operator defaults:
 
 - RPC binds to loopback
 - public RPC binds are refused unless the operator explicitly opts in
-- desktop local-node startup stays on the same RPC path as external clients
+- desktop local-node startup uses the same managed RPC path as external clients
 
 Why:
 

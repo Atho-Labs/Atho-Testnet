@@ -1,0 +1,126 @@
+name: Publish Atho Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without a leading v, for example 0.1.0
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.bundle_tag }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bundle_tag: linux-x86_64
+          - os: macos-14
+            bundle_tag: macos-arm64
+          - os: windows-latest
+            bundle_tag: windows-x86_64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release bundle
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          BUNDLE_TAG: ${{ matrix.bundle_tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION_INPUT:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "release version is required" >&2
+            exit 1
+          fi
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            py -3 scripts/release.py --version "$VERSION"
+          else
+            python3 scripts/release.py --version "$VERSION"
+          fi
+
+          bundle_dir="dist/releases/${VERSION}/${BUNDLE_TAG}"
+          if [ ! -d "$bundle_dir" ]; then
+            echo "missing bundle directory: $bundle_dir" >&2
+            exit 1
+          fi
+
+          artifact_dir="release-assets/${BUNDLE_TAG}"
+          mkdir -p "$artifact_dir"
+          cp "$bundle_dir"/archives/* "$artifact_dir"/
+          cp "$bundle_dir/checksums.sha256" "$artifact_dir/Atho-${VERSION}-${BUNDLE_TAG}.checksums.sha256"
+          cp "$bundle_dir/manifest.json" "$artifact_dir/Atho-${VERSION}-${BUNDLE_TAG}.manifest.json"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atho-${{ matrix.bundle_tag }}
+          path: release-assets/${{ matrix.bundle_tag }}/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve release tag
+        id: resolve
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION_INPUT:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "release version is required" >&2
+            exit 1
+          fi
+          printf 'release_version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'release_tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Atho ${{ steps.resolve.outputs.release_version }}
+          generate_release_notes: true
+          files: |
+            release-assets/**/*

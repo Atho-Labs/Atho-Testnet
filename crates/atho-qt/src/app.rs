@@ -26,10 +26,11 @@ use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
 use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::datafile::WalletEncryptionMode;
-use atho_wallet::wallet::{Wallet, WalletAddress};
+use atho_wallet::wallet::{Wallet, WalletAddress, DEFAULT_RESTORE_GAP_LIMIT};
 use eframe::egui;
 use getrandom::getrandom;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod dialogs;
+mod mnemonic_ui;
 mod models;
 mod pages;
 mod shell;
@@ -47,14 +49,16 @@ mod theme;
 mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
-    ActivityRow, AddressPoolFilter, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob,
-    MiningJobResult, MiningOutcome, NavTab, OpenWalletForm, ReceiveAddressRow, ReceivePageTab,
-    ReceiveRequestRecord, SendJob, SendOutcome, WalletActivityKind, WalletActivityRow,
-    WalletBalanceSummary, WalletManagementForm,
+    AddressPoolFilter, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningJobResult,
+    MiningOutcome, NavTab, OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord,
+    SendJob, SendOutcome, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
+    WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
 const WALLET_DISCOVERY_SCAN_STEPS: &[usize] = &[32, 128, 256, 512, 1_000];
+const MIN_WALLET_DISCOVERY_SCAN_LIMIT: usize = 32;
+const MAX_WALLET_DISCOVERY_SCAN_LIMIT: usize = 20_000;
 const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
 
 pub struct DesktopApp {
@@ -111,23 +115,14 @@ pub struct DesktopApp {
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
     wallet_balance_summary_cache: WalletBalanceSummary,
-    pub(crate) activity_feed: Vec<ActivityRow>,
-    activity_feed_fingerprint: Option<ActivityFeedFingerprint>,
     wallet_cache_dirty: bool,
     wallet_scan_nonce: u64,
     wallet_discovery_scan_limit: usize,
     wallet_discovery_scan_limit_cached: usize,
-    last_activity_refresh_at: Instant,
     last_wallet_refresh_at: Instant,
     wallet_balance_cache: u64,
     theme_initialized: bool,
     compact_viewport: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActivityFeedFingerprint {
-    len: u64,
-    modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +175,22 @@ struct WalletScanJob {
     receiver: mpsc::Receiver<Result<WalletScanOutcome, String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletBackupMetadata {
+    network: String,
+    exported_at_unix: u64,
+    configured_recovery_window: usize,
+    active_scan_window: usize,
+    receive_keypool_queued: usize,
+    change_keypool_queued: usize,
+    highest_generated_receive_index: Option<u32>,
+    highest_generated_change_index: Option<u32>,
+    highest_reserved_receive_index: Option<u32>,
+    highest_reserved_change_index: Option<u32>,
+    next_receive_index: u32,
+    next_change_index: u32,
+}
+
 impl DesktopApp {
     pub fn new(network: Network) -> Self {
         Self::new_with_rpc(network, None)
@@ -190,7 +201,11 @@ impl DesktopApp {
             Some(address) => ReadOnlyNodeConnection::with_rpc_address(network, address),
             None => ReadOnlyNodeConnection::new(network),
         };
-        let status_monitor = connection.spawn_status_monitor(Duration::from_secs(1));
+        let status_monitor = connection.spawn_status_monitor(if connection.has_local_node() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        });
         let launch_page = LaunchPage::Welcome;
         let available_cores = available_mining_cores();
 
@@ -252,15 +267,10 @@ impl DesktopApp {
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
             wallet_balance_summary_cache: WalletBalanceSummary::default(),
-            activity_feed: Vec::new(),
-            activity_feed_fingerprint: None,
             wallet_cache_dirty: true,
             wallet_scan_nonce: 0,
             wallet_discovery_scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
             wallet_discovery_scan_limit_cached: 0,
-            last_activity_refresh_at: Instant::now()
-                .checked_sub(Duration::from_secs(2))
-                .unwrap_or_else(Instant::now),
             last_wallet_refresh_at: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .unwrap_or_else(Instant::now),
@@ -276,14 +286,12 @@ impl DesktopApp {
             String::from("Disconnected")
         };
         app.try_open_existing_wallet_on_startup();
-        app.refresh_activity_feed(true);
         app
     }
 
     pub fn refresh(&mut self) -> Result<(), QtError> {
         let status = self.connection.status();
         self.apply_connection_status(status);
-        self.refresh_activity_feed(true);
         self.poll_wallet_preparation_job();
         if self.wallet.is_some() {
             self.wallet_cache_dirty = true;
@@ -362,6 +370,59 @@ impl DesktopApp {
             .unwrap_or_else(|| String::from("wallet.dat"))
     }
 
+    fn wallet_keypool_depths(&self) -> (usize, usize) {
+        self.wallet_ref()
+            .map(Wallet::keypool_depths)
+            .unwrap_or_default()
+    }
+
+    fn wallet_next_indices(&self) -> (u32, u32) {
+        self.wallet_ref()
+            .map(Wallet::next_indices)
+            .unwrap_or((0, 0))
+    }
+
+    fn wallet_highest_reserved_indices(&self) -> (Option<u32>, Option<u32>) {
+        self.wallet_ref()
+            .map(Wallet::highest_reserved_indices)
+            .unwrap_or((None, None))
+    }
+
+    fn wallet_highest_generated_indices(&self) -> (Option<u32>, Option<u32>) {
+        self.wallet_ref()
+            .map(Wallet::highest_generated_indices)
+            .unwrap_or((None, None))
+    }
+
+    fn wallet_configured_recovery_window(&self) -> usize {
+        self.wallet_ref()
+            .map(Wallet::restore_gap_limit)
+            .unwrap_or(DEFAULT_RESTORE_GAP_LIMIT)
+    }
+
+    fn wallet_current_receive_index(&self) -> Option<u32> {
+        self.current_receive_address
+            .as_ref()
+            .map(|address| address.path.index)
+    }
+
+    fn sync_wallet_recovery_window_form(&mut self) {
+        self.wallet_management_form.restore_gap_limit_input =
+            self.wallet_configured_recovery_window().to_string();
+    }
+
+    fn queue_wallet_scan_to_limit(&mut self, limit: usize) -> bool {
+        if limit <= self.wallet_discovery_scan_limit {
+            return false;
+        }
+        self.wallet_discovery_scan_limit = limit;
+        self.wallet_cache_dirty = true;
+        self.last_wallet_refresh_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        true
+    }
+
     fn wallet_preparation_blocks_startup(&self) -> bool {
         self.wallet.is_none() && self.wallet_preparation_job.is_some()
     }
@@ -412,6 +473,7 @@ impl DesktopApp {
         self.last_error = None;
         self.wallet_management_form.backup_password.clear();
         self.wallet_management_form.backup_password_confirm.clear();
+        self.wallet_management_form.restore_gap_limit_input = DEFAULT_RESTORE_GAP_LIMIT.to_string();
         self.receive_page_tab = ReceivePageTab::RequestPayment;
         self.address_pool_filter = AddressPoolFilter::Unused;
         self.ui_state.wallet_snapshot = Default::default();
@@ -567,7 +629,6 @@ impl DesktopApp {
     fn refresh_status_only_for_test(&mut self) -> Result<(), QtError> {
         let status = self.connection.status();
         self.apply_connection_status(status);
-        self.refresh_activity_feed(true);
         Ok(())
     }
 
@@ -833,27 +894,34 @@ impl DesktopApp {
         }
 
         let scan_limit = self.wallet_discovery_scan_limit;
-        let wallet_addresses_cache = if self.wallet_discovery_scan_limit_cached == scan_limit
-            && !self.wallet_addresses_cache.is_empty()
-        {
+        let reuse_cached_addresses = self.wallet_discovery_scan_limit_cached == scan_limit
+            && !self.wallet_addresses_cache.is_empty();
+        let wallet_addresses_cache = if reuse_cached_addresses {
             self.wallet_addresses_cache.clone()
         } else {
-            let Some(wallet) = self.wallet_ref() else {
-                return;
-            };
-            wallet.discovery_addresses_up_to(scan_limit)
+            Vec::new()
         };
-        let receive_addresses = wallet_addresses_cache
-            .iter()
-            .filter(|address| address.path.kind == AddressKind::Receive)
-            .take(RECEIVE_ADDRESS_LIST_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
+        let wallet_for_scan = if reuse_cached_addresses {
+            None
+        } else {
+            self.wallet_ref().cloned()
+        };
         let connection = self.connection.clone();
         let wallet_scan_nonce = self.wallet_scan_nonce;
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
+            let wallet_addresses_cache = if let Some(wallet) = wallet_for_scan {
+                wallet.discovery_addresses_up_to(scan_limit)
+            } else {
+                wallet_addresses_cache
+            };
+            let receive_addresses = wallet_addresses_cache
+                .iter()
+                .filter(|address| address.path.kind == AddressKind::Receive)
+                .take(RECEIVE_ADDRESS_LIST_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>();
             let result = Self::build_wallet_scan_snapshot(
                 connection,
                 wallet_addresses_cache,
@@ -1041,7 +1109,7 @@ impl DesktopApp {
                     self.wallet_preparation_completed = completed;
                     self.wallet_preparation_total = total;
                     self.wallet_preparation_progress = if total == 0 {
-                        1.0
+                        0.0
                     } else {
                         (completed as f32 / total as f32).clamp(0.0, 1.0)
                     };
@@ -1119,11 +1187,47 @@ impl DesktopApp {
     fn advance_wallet_discovery_scan_limit(&mut self) -> bool {
         for &step in WALLET_DISCOVERY_SCAN_STEPS {
             if step > self.wallet_discovery_scan_limit {
-                self.wallet_discovery_scan_limit = step;
-                return true;
+                return self.queue_wallet_scan_to_limit(step);
             }
         }
         false
+    }
+
+    fn apply_wallet_recovery_window_setting(&mut self) -> Result<String, String> {
+        let limit = self
+            .wallet_management_form
+            .restore_gap_limit_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| String::from("Recovery window must be a whole number"))?;
+        if limit < MIN_WALLET_DISCOVERY_SCAN_LIMIT {
+            return Err(format!(
+                "Recovery window must be at least {MIN_WALLET_DISCOVERY_SCAN_LIMIT}"
+            ));
+        }
+        if limit > MAX_WALLET_DISCOVERY_SCAN_LIMIT {
+            return Err(format!(
+                "Recovery window must be at most {MAX_WALLET_DISCOVERY_SCAN_LIMIT}"
+            ));
+        }
+
+        let current_scan_limit = self.wallet_discovery_scan_limit;
+        let wallet = self
+            .wallet_mut()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        wallet.set_restore_gap_limit(limit);
+        self.sync_wallet_recovery_window_form();
+
+        if self.queue_wallet_scan_to_limit(limit) {
+            Ok(format!(
+                "Recovery window set to {limit}. Background scan queued from {current_scan_limit} to {limit}."
+            ))
+        } else {
+            self.wallet_cache_dirty = true;
+            Ok(format!(
+                "Recovery window set to {limit}. Current session already scanned to {current_scan_limit}."
+            ))
+        }
     }
 
     fn attach_wallet(&mut self, wallet: Wallet, wallet_path: String) {
@@ -1162,11 +1266,17 @@ impl DesktopApp {
         self.wallet_path = Some(wallet_path);
         self.wallet = Some(wallet);
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
+        self.sync_wallet_recovery_window_form();
         self.wallet_readiness_gate_active = self.connection.has_local_node();
         self.refresh_wallet_address_views();
         self.wallet_cache_dirty = true;
+        self.last_wallet_refresh_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         self.sync_wallet_state();
-        self.start_wallet_scan_job();
+        if self.wallet_scan_rpc_ready() {
+            self.start_wallet_scan_job();
+        }
         self.active_tab = NavTab::Overview;
         self.launch_page = LaunchPage::Welcome;
     }
@@ -1419,7 +1529,7 @@ impl DesktopApp {
         getrandom(&mut entropy).map_err(|_| String::from("failed to gather wallet entropy"))?;
         let mnemonic = MnemonicPhrase::from_entropy(&entropy, MnemonicLength::Words24)
             .map_err(|err| err.to_string())?;
-        self.create_form.mnemonic_text = mnemonic.as_sentence();
+        self.create_form.mnemonic_words = mnemonic_ui::words_from_sentence(&mnemonic.as_sentence());
         self.create_form.acknowledged_backup = false;
         Ok(())
     }
@@ -1457,7 +1567,7 @@ impl DesktopApp {
             );
             let _ = sender.send(WalletPreparationEvent::Progress {
                 stage: String::from("Saving wallet"),
-                completed: 1,
+                completed: 0,
                 total: 1,
             });
             DesktopApp::save_wallet_to_path(
@@ -1465,6 +1575,11 @@ impl DesktopApp {
                 &wallet_path_for_job,
                 &wallet_password_for_job,
             )?;
+            let _ = sender.send(WalletPreparationEvent::Progress {
+                stage: String::from("Saving wallet"),
+                completed: 1,
+                total: 1,
+            });
             Ok(WalletPreparationOutcome {
                 wallet,
                 wallet_path: wallet_path_for_job,
@@ -1534,7 +1649,40 @@ impl DesktopApp {
         let wallet = self
             .wallet_ref()
             .ok_or_else(|| String::from("Load or create a wallet first"))?;
-        Self::save_wallet_to_path(wallet, backup_path, password)
+        Self::save_wallet_to_path(wallet, backup_path, password)?;
+        self.write_wallet_backup_metadata(backup_path)
+    }
+
+    fn write_wallet_backup_metadata(&self, backup_path: &str) -> Result<(), String> {
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let (receive_keypool_queued, change_keypool_queued) = wallet.keypool_depths();
+        let (highest_generated_receive_index, highest_generated_change_index) =
+            wallet.highest_generated_indices();
+        let (highest_reserved_receive_index, highest_reserved_change_index) =
+            wallet.highest_reserved_indices();
+        let (next_receive_index, next_change_index) = wallet.next_indices();
+        let metadata = WalletBackupMetadata {
+            network: wallet.network.id().to_string(),
+            exported_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            configured_recovery_window: wallet.restore_gap_limit(),
+            active_scan_window: self.wallet_discovery_scan_limit,
+            receive_keypool_queued,
+            change_keypool_queued,
+            highest_generated_receive_index,
+            highest_generated_change_index,
+            highest_reserved_receive_index,
+            highest_reserved_change_index,
+            next_receive_index,
+            next_change_index,
+        };
+        let metadata_path = PathBuf::from(format!("{backup_path}.meta.json"));
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|err| err.to_string())?;
+        fs::write(metadata_path, metadata_bytes).map_err(|err| err.to_string())
     }
 
     fn change_wallet_passphrase(&self, password: &str) -> Result<(), String> {
@@ -2234,6 +2382,7 @@ impl DesktopApp {
         }
 
         let progress = self.wallet_preparation_progress.clamp(0.0, 1.0);
+        let show_progress = self.wallet_preparation_total > 0;
         let title = if self.wallet_preparation_stage.is_empty() {
             "Preparing wallet".to_owned()
         } else {
@@ -2268,12 +2417,17 @@ impl DesktopApp {
                         ));
                     }
                     ui.add_space(10.0);
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .desired_width(380.0)
-                            .show_percentage(),
-                    );
-                    ui.add_space(4.0);
+                    if show_progress {
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(380.0)
+                                .animate(true),
+                        );
+                        ui.add_space(4.0);
+                    } else {
+                        ui.add(egui::Spinner::new().size(18.0));
+                        ui.add_space(6.0);
+                    }
                     ui.label("Wallet actions stay locked until preparation finishes.");
                 });
             });
@@ -2281,14 +2435,6 @@ impl DesktopApp {
 
     fn clamp_mining_cores(&self, cores: u32) -> u32 {
         cores.clamp(1, self.max_mining_cores())
-    }
-
-    pub(crate) fn activity_feed_export(&self) -> String {
-        self.activity_feed
-            .iter()
-            .map(|row| format!("{} {} {}", row.timestamp, row.component, row.message))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn read_clipboard_text() -> Option<String> {
@@ -2313,12 +2459,11 @@ impl eframe::App for DesktopApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(700.0, 440.0)));
             self.compact_viewport = true;
         } else if self.wallet.is_some() && self.compact_viewport {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 660.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(860.0, 560.0)));
             self.compact_viewport = false;
         }
         theme::apply_theme(ctx);
         self.drain_status_updates();
-        self.refresh_activity_feed(false);
         self.poll_send_job();
         self.poll_mining_job();
         self.poll_wallet_preparation_job();
@@ -2350,50 +2495,6 @@ impl DesktopApp {
     fn drain_status_updates(&mut self) {
         while let Some(status) = self.status_monitor.try_recv_latest() {
             self.apply_connection_status(status);
-        }
-    }
-
-    fn refresh_activity_feed(&mut self, force: bool) {
-        if !force && self.active_tab != NavTab::Overview {
-            return;
-        }
-        if !force && self.last_activity_refresh_at.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.last_activity_refresh_at = Instant::now();
-        let path = atho_node::dev::logs_dir().join("activity.log");
-        let fingerprint = match fs::metadata(&path) {
-            Ok(metadata) => ActivityFeedFingerprint {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-            },
-            Err(_) => ActivityFeedFingerprint {
-                len: 0,
-                modified: None,
-            },
-        };
-        if self.activity_feed_fingerprint == Some(fingerprint) {
-            return;
-        }
-
-        match atho_node::dev::recent_activity_lines(12) {
-            Ok(lines) => {
-                self.activity_feed = lines
-                    .into_iter()
-                    .map(|line| ActivityRow {
-                        timestamp: line.timestamp,
-                        component: line.component,
-                        message: line.line,
-                    })
-                    .collect();
-                self.activity_feed_fingerprint = Some(fingerprint);
-            }
-            Err(err) => {
-                let _ = atho_node::dev::append_log(
-                    "atho-qt",
-                    &format!("failed to refresh activity feed: {err}"),
-                );
-            }
         }
     }
 }
@@ -3020,6 +3121,122 @@ mod tests {
             |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),
         );
         assert!(app.current_receive_address.is_some());
+    }
+
+    #[test]
+    fn startup_auto_open_reports_compact_local_node_timings() {
+        let root = temp_sandbox_root("startup-timings");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        std::env::remove_var("ATHO_QT_FORCE_RPC");
+
+        let wallet_path = default_wallet_path(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x71u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save wallet");
+
+        let started = Instant::now();
+        let mut app = DesktopApp::new(Network::Regnet);
+        let constructor_elapsed = started.elapsed();
+
+        wait_until(
+            "wallet auto-open completes",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),
+        );
+        let wallet_prepared_elapsed = started.elapsed();
+
+        wait_until(
+            "wallet readiness gate clears",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && !app.wallet_readiness_blocks_main_ui(),
+        );
+        let shell_ready_elapsed = started.elapsed();
+
+        eprintln!(
+            "qt_startup_timings constructor_ms={} wallet_prepared_ms={} shell_ready_ms={}",
+            constructor_elapsed.as_millis(),
+            wallet_prepared_elapsed.as_millis(),
+            shell_ready_elapsed.as_millis()
+        );
+
+        assert!(app
+            .connection
+            .with_local_system_for_test(|_| true)
+            .is_some());
+        assert!(
+            app.last_error.is_none(),
+            "unexpected startup error: {:?}",
+            app.last_error
+        );
+    }
+
+    #[test]
+    fn apply_wallet_recovery_window_updates_scan_target_and_wallet_setting() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x51u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(wallet, String::from("wallet.dat"));
+
+        app.wallet_management_form.restore_gap_limit_input = String::from("2048");
+        let message = app
+            .apply_wallet_recovery_window_setting()
+            .expect("apply recovery window");
+
+        assert!(message.contains("2048"));
+        assert_eq!(app.wallet_discovery_scan_limit, 2048);
+        assert_eq!(app.wallet_ref().expect("wallet").restore_gap_limit(), 2048);
+        assert!(app.wallet_cache_dirty);
+    }
+
+    #[test]
+    fn export_wallet_backup_writes_index_metadata() {
+        let root = temp_sandbox_root("backup-metadata");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x61u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let _ = wallet.checkout_receive_address();
+        let _ = wallet.checkout_change_address();
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+        app.wallet_management_form.restore_gap_limit_input = String::from("2048");
+        app.apply_wallet_recovery_window_setting()
+            .expect("apply recovery window");
+
+        let backup_path = root.join("wallet.dat.backup");
+        app.export_wallet_backup(backup_path.to_string_lossy().as_ref(), "")
+            .expect("export backup");
+
+        let metadata_path = PathBuf::from(format!("{}.meta.json", backup_path.to_string_lossy()));
+        let metadata_bytes = fs::read(metadata_path).expect("read metadata");
+        let metadata: WalletBackupMetadata =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+        assert_eq!(metadata.network, Network::Regnet.id());
+        assert_eq!(metadata.configured_recovery_window, 2048);
+        assert_eq!(metadata.highest_generated_receive_index, Some(0));
+        assert!(metadata.receive_keypool_queued > 0);
     }
 
     #[test]

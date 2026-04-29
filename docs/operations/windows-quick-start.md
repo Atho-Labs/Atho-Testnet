@@ -61,7 +61,7 @@ Start a node:
 Because DNS seeds are still blank, add peers explicitly for live network sync:
 
 ```powershell
-.\target\release\athod.exe --network mainnet --peer 203.0.113.10:56000 --peer 203.0.113.11:56000
+.\target\release\athod.exe --network mainnet --peer 74.208.219.116:56000
 ```
 
 Check status:
@@ -87,7 +87,7 @@ If you want the client to connect to an already-running node instead:
 If the managed local node must bootstrap manually:
 
 ```powershell
-.\target\release\atho-qt.exe --network mainnet --local-node --peer 203.0.113.10:56000
+.\target\release\atho-qt.exe --network mainnet --local-node --peer 74.208.219.116:56000
 ```
 
 ## Run The Miner
@@ -96,7 +96,7 @@ Start the node first, then the miner:
 
 ```powershell
 .\target\release\athod.exe --network regnet
-.\target\release\atho-mine.exe --network regnet --rpc-addr 127.0.0.1:9210
+.\target\release\atho-mine.exe --network regnet
 ```
 
 ## Logs And Recovery

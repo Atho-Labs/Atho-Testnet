@@ -365,6 +365,10 @@ impl NodeService {
         self.orchestrator.sync.sync_state().headers_synced
     }
 
+    pub fn p2p_mempool_txids(&self) -> Vec<[u8; 48]> {
+        self.orchestrator.runtime.node.mempool_txids()
+    }
+
     pub fn p2p_peer_health(&mut self, remote_addr: &str) -> Option<PeerHealthRecord> {
         if let Some(record) = self.peer_health_cache.get(remote_addr) {
             return Some(record.clone());

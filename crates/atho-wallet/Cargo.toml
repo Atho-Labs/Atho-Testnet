@@ -12,6 +12,7 @@ bincode = "1"
 hex = "0.4"
 getrandom = "0.2"
 pbkdf2 = "0.12"
+rayon = "1"
 sha2 = "0.10"
 thiserror = "1"
 zeroize = { version = "1", features = ["zeroize_derive"] }

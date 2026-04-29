@@ -10,7 +10,7 @@ That means:
 - storage, wallet, networking, RPC, node runtime, and GUI are separated
 - operational docs are centralized under `docs/`
 - repo-local sandbox artifacts can stay under `dev/` when explicitly requested
-- staged release artifacts stay under `dist/`
+- staged release artifacts stay under `dist/releases/<version>/<platform>-<arch>/` with `dist/release/` as the current compatibility mirror, `desktop/releases/<version>/<platform>-<arch>/` as the shareable release tree, and `desktop/latest/<platform>-<arch>/` as the active mirror
 
 This keeps the trusted core auditable and avoids mixing design notes, runtime state, and build outputs at repo root.
 
@@ -22,7 +22,7 @@ The repo root had a strong crate layout already, but it was cluttered by:
 - PDFs at root and under `crates/`
 - a Qt reference map inside the GUI crate
 - a vendor README inside the vendored Falcon tree
-- duplicate release docs under `dist/release/`
+- release docs are staged into the release mirror under `dist/release/` and mirrored into `desktop/releases/...` and `desktop/latest/...`
 - a dev workspace README inside `dev/`
 
 That made documentation discovery harder and weakened the repo’s front-door quality.
@@ -87,6 +87,7 @@ Owns the software implementation.
 - `atho-rpc`: local RPC request/response and transport
 - `atho-node`: node runtime, miner, mempool, service surface, orchestration
 - `atho-qt`: desktop client and view orchestration
+- `atho-installer`: native installer front-end and release setup wizard
 
 ### `docs/`
 
@@ -113,6 +114,14 @@ It is not the default operator root and it is not a documentation source.
 Owns release staging output only.
 
 It is not the canonical source of package documentation.
+
+The canonical release builder writes versioned bundles into `dist/releases/<version>/<platform>-<arch>/` and refreshes `dist/release/` for local compatibility.
+
+### `desktop/`
+
+Owns the shareable desktop release tree.
+
+It mirrors the built release bundle under `desktop/releases/<version>/<platform>-<arch>/`, maintains an active bundle mirror under `desktop/latest/<platform>-<arch>/`, carries a top-level `README.md` for the release share folder, and ships the platform-native `Atho Setup` installer front-end inside each active bundle.
 
 ## Moved Documentation Sources
 

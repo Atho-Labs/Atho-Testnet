@@ -136,6 +136,10 @@ impl Node {
         self.mempool.transactions()
     }
 
+    pub fn mempool_txids(&self) -> Vec<[u8; 48]> {
+        self.mempool.txids()
+    }
+
     #[doc(hidden)]
     pub fn dev_seed_chainstate(
         &mut self,

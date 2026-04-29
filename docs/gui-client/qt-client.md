@@ -45,7 +45,7 @@ Implemented in:
 Current behavior:
 
 - runtime uses RPC for real node interaction
-- `--local-node` can manage a local node child process
+- `--local-node` manages a local node child process
 - `--peer` and `--p2p-addr` can be passed through when DNS seeds are unavailable
 - tests can still use an in-process backend hook for deterministic lifecycle coverage
 

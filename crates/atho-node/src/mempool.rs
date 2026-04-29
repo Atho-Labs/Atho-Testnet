@@ -174,6 +174,10 @@ impl Mempool {
             .collect()
     }
 
+    pub fn txids(&self) -> Vec<[u8; 48]> {
+        self.entries.keys().copied().collect()
+    }
+
     pub fn valid_transactions<F>(
         &self,
         spend_height: u64,

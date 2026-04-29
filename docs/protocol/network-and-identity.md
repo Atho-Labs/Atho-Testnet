@@ -132,7 +132,7 @@ Why:
 ## Current Limitations
 
 - no DNS seed population yet
-- no completed live TCP peer runtime
+- live TCP peer runtime exists, but peer bootstrap is still manual
 - no peer discovery persistence beyond local storage plumbing
 
 ## Related Documentation

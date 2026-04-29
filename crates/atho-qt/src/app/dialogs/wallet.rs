@@ -1,4 +1,4 @@
-use crate::app::{widgets, DesktopApp, LaunchPage};
+use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage};
 use atho_wallet::mnemonic::MnemonicPhrase;
 use eframe::egui;
 
@@ -49,21 +49,24 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.create_form.show_passwords, "Show passphrases");
         ui.add_space(14.0);
 
-        if !app.create_form.mnemonic_text.is_empty() {
+        let create_mnemonic_sentence =
+            mnemonic_ui::mnemonic_sentence_from_words(&app.create_form.mnemonic_words).ok();
+        if create_mnemonic_sentence.is_some() {
             ui.colored_label(
                 widgets::ACCENT,
                 "Write this recovery phrase down now. It is shown once.",
             );
-            let mut phrase = app.create_form.mnemonic_text.clone();
-            ui.add(
-                egui::TextEdit::multiline(&mut phrase)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(3)
-                    .interactive(false),
+            ui.add_space(8.0);
+            mnemonic_ui::render_word_grid(
+                ui,
+                &mut app.create_form.mnemonic_words,
+                false,
+                "create_mnemonic_grid",
+                false,
             );
             ui.horizontal(|ui| {
                 if ui.button("Copy phrase").clicked() {
-                    DesktopApp::copy_text(ui, app.create_form.mnemonic_text.clone());
+                    DesktopApp::copy_text(ui, create_mnemonic_sentence.clone().unwrap_or_default());
                 }
                 ui.checkbox(
                     &mut app.create_form.acknowledged_backup,
@@ -74,7 +77,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
         ui.add_space(18.0);
         ui.horizontal(|ui| {
-            let ready = !app.create_form.mnemonic_text.is_empty()
+            let ready = create_mnemonic_sentence.is_some()
                 && app.create_form.acknowledged_backup
                 && (!app.create_form.encrypt_wallet
                     || (!app.create_form.wallet_password.is_empty()
@@ -102,7 +105,16 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
             return;
         }
 
-        if let Err(err) = MnemonicPhrase::parse(&app.create_form.mnemonic_text) {
+        let mnemonic_sentence =
+            match mnemonic_ui::mnemonic_sentence_from_words(&app.create_form.mnemonic_words) {
+                Ok(sentence) => sentence,
+                Err(err) => {
+                    app.last_error = Some(err);
+                    return;
+                }
+            };
+
+        if let Err(err) = MnemonicPhrase::parse(&mnemonic_sentence) {
             app.last_error = Some(err.to_string());
             return;
         }
@@ -113,7 +125,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
             String::new()
         };
         app.start_wallet_from_mnemonic_preparation(
-            app.create_form.mnemonic_text.clone(),
+            mnemonic_sentence,
             app.create_form.mnemonic_passphrase.clone(),
             app.create_form.wallet_path.clone(),
             wallet_password,
@@ -147,10 +159,19 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::text_input(ui, &mut app.import_form.wallet_path, "");
         ui.add_space(8.0);
         form_label(ui, "Mnemonic phrase");
-        ui.add(
-            egui::TextEdit::multiline(&mut app.import_form.mnemonic_phrase)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
+        let mut selected_word_count = app.import_form.mnemonic_word_count;
+        if let Some(changed_to) =
+            mnemonic_ui::render_word_count_picker(ui, &mut selected_word_count)
+        {
+            app.import_form.set_mnemonic_word_count(changed_to);
+        }
+        ui.add_space(8.0);
+        mnemonic_ui::render_word_grid(
+            ui,
+            &mut app.import_form.mnemonic_words,
+            true,
+            "import_mnemonic_grid",
+            true,
         );
         ui.add_space(8.0);
         form_label(ui, "Seed passphrase (optional)");
@@ -182,10 +203,12 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.import_form.show_passwords, "Show passphrases");
         ui.add_space(18.0);
         ui.horizontal(|ui| {
+            let import_mnemonic_ready =
+                mnemonic_ui::mnemonic_sentence_from_words(&app.import_form.mnemonic_words).is_ok();
             let ready = (!app.import_form.encrypt_wallet
                 || (!app.import_form.wallet_password.is_empty()
                     && app.import_form.wallet_password == app.import_form.wallet_password_confirm))
-                && !app.import_form.mnemonic_phrase.trim().is_empty();
+                && import_mnemonic_ready;
             if ui.add_enabled(ready, egui::Button::new("Import")).clicked() {
                 import_clicked = true;
             }
@@ -207,7 +230,15 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
             app.last_error = Some(String::from("wallet passwords do not match"));
             return;
         }
-        let mnemonic = match MnemonicPhrase::parse(&app.import_form.mnemonic_phrase) {
+        let mnemonic_sentence =
+            match mnemonic_ui::mnemonic_sentence_from_words(&app.import_form.mnemonic_words) {
+                Ok(sentence) => sentence,
+                Err(err) => {
+                    app.last_error = Some(err);
+                    return;
+                }
+            };
+        let mnemonic = match MnemonicPhrase::parse(&mnemonic_sentence) {
             Ok(mnemonic) => mnemonic,
             Err(err) => {
                 app.last_error = Some(err.to_string());

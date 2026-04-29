@@ -336,7 +336,7 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     Ok(audit_dir().join("chain.tsv"))
 }
 
-fn signed_spend_transaction(
+pub(crate) fn signed_spend_transaction(
     network: Network,
     seed_txid: [u8; 48],
     seed_value: u64,
@@ -436,7 +436,7 @@ fn signing_keypair(
     })
 }
 
-fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
+pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
     match network {
         Network::Mainnet => ([0x11; 48], 2_000, 0x11),
         Network::Testnet => ([0x22; 48], 1_500, 0x22),

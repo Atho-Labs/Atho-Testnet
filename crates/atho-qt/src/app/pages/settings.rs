@@ -1,5 +1,6 @@
 use crate::app::{
-    widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage, OpenWalletForm,
+    mnemonic_ui, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage,
+    OpenWalletForm,
 };
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
@@ -18,6 +19,14 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.label(format!(
             "Change addresses: {}",
             app.ui_state.wallet_snapshot.change_count
+        ));
+        ui.label(format!(
+            "Configured recovery window: {}",
+            app.wallet_configured_recovery_window()
+        ));
+        ui.label(format!(
+            "Active scan window: {}",
+            app.wallet_discovery_scan_limit
         ));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -46,6 +55,70 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.checkbox(
             &mut app.ui_state.rotate_coinbase_address,
             "Rotate coinbase to a fresh receive address",
+        );
+    });
+
+    ui.add_space(14.0);
+    widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Wallet Index Recovery");
+        ui.add_space(12.0);
+        widgets::muted_label(
+            ui,
+            "The address-pool page starts with the first discovery window for responsiveness. Raise the recovery window here when a restored wallet may have activity farther out on the derivation index.",
+        );
+        ui.add_space(12.0);
+        let (receive_keypool_queued, change_keypool_queued) = app.wallet_keypool_depths();
+        let (highest_generated_receive_index, highest_generated_change_index) =
+            app.wallet_highest_generated_indices();
+        let (highest_reserved_receive_index, highest_reserved_change_index) =
+            app.wallet_highest_reserved_indices();
+        ui.label(format!(
+            "Queued keypool: {} receive / {} change",
+            receive_keypool_queued, change_keypool_queued
+        ));
+        ui.label(format!(
+            "Highest generated indexes: {} / {}",
+            highest_generated_receive_index
+                .map(|index| format!("R{index:04}"))
+                .unwrap_or_else(|| String::from("none")),
+            highest_generated_change_index
+                .map(|index| format!("C{index:04}"))
+                .unwrap_or_else(|| String::from("none")),
+        ));
+        ui.label(format!(
+            "Highest reserved indexes: {} / {}",
+            highest_reserved_receive_index
+                .map(|index| format!("R{index:04}"))
+                .unwrap_or_else(|| String::from("none")),
+            highest_reserved_change_index
+                .map(|index| format!("C{index:04}"))
+                .unwrap_or_else(|| String::from("none")),
+        ));
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Recovery window");
+            ui.add_sized(
+                [120.0, 28.0],
+                egui::TextEdit::singleline(
+                    &mut app.wallet_management_form.restore_gap_limit_input,
+                ),
+            );
+            if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Apply & Rescan"))
+                .clicked()
+            {
+                match app.apply_wallet_recovery_window_setting() {
+                    Ok(message) => {
+                        app.last_error = None;
+                        app.send_status = message;
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+        });
+        widgets::muted_label(
+            ui,
+            "This updates the active scan immediately in memory. Export a backup or rewrite the wallet file if you want the new recovery window preserved outside this session.",
         );
     });
 
@@ -111,6 +184,10 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 }
             }
         });
+        widgets::muted_label(
+            ui,
+            "Backup export also writes a .meta.json companion file with the wallet's generated and reserved derivation index tips.",
+        );
     });
 
     ui.add_space(14.0);
@@ -123,17 +200,18 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 "This wallet is unlocked. The recovery phrase is available for review.",
             );
             ui.add_space(10.0);
-            let mut phrase_text = phrase;
-            ui.add(
-                egui::TextEdit::multiline(&mut phrase_text)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false),
+            let mut phrase_words = mnemonic_ui::words_from_sentence(&phrase);
+            mnemonic_ui::render_word_grid(
+                ui,
+                &mut phrase_words,
+                false,
+                "settings_recovery_phrase_grid",
+                false,
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Copy recovery phrase").clicked() {
-                    DesktopApp::copy_text(ui, phrase_text.clone());
+                    DesktopApp::copy_text(ui, phrase.clone());
                 }
             });
         } else {

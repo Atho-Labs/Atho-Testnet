@@ -28,6 +28,18 @@ Detailed status lives in:
 - [`docs/production-readiness/current-status.md`](docs/production-readiness/current-status.md)
 - [`docs/production-readiness/roadmap.md`](docs/production-readiness/roadmap.md)
 
+## Quick Start
+
+Use the short operator guide first:
+
+- [`quickstart.md`](quickstart.md)
+
+If you are using a packaged release, run the native installer first:
+
+- Windows: `Atho Setup.exe`
+- macOS: `Atho Setup.app`
+- Linux: `Atho Setup`
+
 ## Design Principles
 
 - keep the trusted core small
@@ -64,6 +76,13 @@ cargo run -p atho-node --bin athod -- --network mainnet
 cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
 ```
 
+For repeated local launches after the first build, run the binary directly:
+
+```bash
+cargo build -p atho-qt
+./target/debug/atho-qt --network mainnet --local-node
+```
+
 ### Miner
 
 ```bash
@@ -71,6 +90,27 @@ cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:
 ```
 
 More commands and operator notes live in [`docs/operations/commands.md`](docs/operations/commands.md).
+
+## Release Packaging
+
+Build and stage a local release bundle for the current host with:
+
+```bash
+python3 scripts/release.py
+```
+
+Windows:
+
+```powershell
+py -3 scripts\release.py
+```
+
+The packaging guide is in [`docs/build-deployment/packaging.md`](docs/build-deployment/packaging.md).
+
+The shareable release tree is `desktop/`, which mirrors each built bundle under `desktop/releases/<version>/<platform>-<arch>/`.
+The root `desktop/install.sh` and `desktop/install.ps1` scripts dispatch to `desktop/latest/<platform>-<arch>/` for the current OS, and the active bundle contains the native `Atho Setup` installer front-end for that platform.
+
+GitHub release publishing is automated by [`.github/workflows/publish-packages.yml`](.github/workflows/publish-packages.yml). It builds Windows, macOS, and Linux packages and publishes the matching archive for each OS to GitHub Releases.
 
 ## Runtime Roots
 
@@ -144,10 +184,12 @@ crates/
   atho-rpc/       local RPC request/response and transport
   atho-node/      runtime, service, miner, mempool, orchestration
   atho-qt/        thin desktop client
+  atho-installer/ native installer front-end
 docs/             documentation, operator guides, readiness notes, whitepaper
 scripts/          build and packaging helpers
 dev/              optional repo-local sandbox workspace when explicitly selected
 dist/             staged release artifacts
+desktop/          shareable desktop release tree
 ```
 
 ## Documentation Map

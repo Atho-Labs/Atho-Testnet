@@ -43,6 +43,22 @@ impl Keypool {
         )
     }
 
+    pub fn receive_len(&self) -> usize {
+        self.receive.len()
+    }
+
+    pub fn change_len(&self) -> usize {
+        self.change.len()
+    }
+
+    pub fn highest_receive_index(&self) -> Option<u32> {
+        self.receive.back().map(|path| path.index)
+    }
+
+    pub fn highest_change_index(&self) -> Option<u32> {
+        self.change.back().map(|path| path.index)
+    }
+
     pub fn from_snapshot(receive: Vec<DerivationPath>, change: Vec<DerivationPath>) -> Self {
         Self {
             receive: receive.into_iter().collect(),

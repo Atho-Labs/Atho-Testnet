@@ -184,11 +184,7 @@ pub fn rpc_bind_address(network: Network) -> String {
 }
 
 pub fn default_rpc_bind_address(network: Network) -> String {
-    match network {
-        Network::Mainnet => String::from("127.0.0.1:18443"),
-        Network::Testnet => String::from("127.0.0.1:18444"),
-        Network::Regnet => String::from("127.0.0.1:18445"),
-    }
+    format!("127.0.0.1:{}", network.rpc_port())
 }
 
 fn validate_rpc_bind_address(address: &str) -> Result<(), NodeError> {
@@ -265,7 +261,7 @@ mod tests {
 
     #[test]
     fn rpc_bind_validation_rejects_public_addresses_by_default() {
-        let err = validate_rpc_bind_address("0.0.0.0:18443").unwrap_err();
+        let err = validate_rpc_bind_address("0.0.0.0:9010").unwrap_err();
         assert!(matches!(
             err,
             NodeError::Runtime(RuntimeError::PublicRpcDenied(_))
@@ -275,14 +271,14 @@ mod tests {
     #[test]
     fn rpc_bind_validation_accepts_public_addresses_when_explicitly_allowed() {
         std::env::set_var("ATHO_RPC_ALLOW_PUBLIC", "1");
-        let result = validate_rpc_bind_address("0.0.0.0:18443");
+        let result = validate_rpc_bind_address("0.0.0.0:9010");
         std::env::remove_var("ATHO_RPC_ALLOW_PUBLIC");
         assert!(result.is_ok());
     }
 
     #[test]
     fn rpc_bind_validation_accepts_loopback_addresses() {
-        assert!(validate_rpc_bind_address("127.0.0.1:18443").is_ok());
+        assert!(validate_rpc_bind_address("127.0.0.1:9010").is_ok());
     }
 
     #[test]

@@ -40,6 +40,7 @@ It is designed to answer three questions clearly:
 
 ## Operations And Delivery
 
+- [Quick Start](../quickstart.md)
 - [Commands](operations/commands.md)
 - [Runtime Model](operations/runtime-model.md)
 - [Linux Quick Start](operations/linux-quick-start.md)

@@ -73,6 +73,7 @@ Why:
 
 - normal users should have a one-command desktop path
 - operators should still be able to point the client at a separately managed node
+- the managed local-node path should exercise the real RPC node path
 - the settings page should expose local diagnostics similar in spirit to Bitcoin Core without turning public RPC into a topology leak
 
 ## Runtime Root
@@ -108,16 +109,17 @@ That root contains:
 
 DNS seeds are intentionally blank right now.
 
-That means manual peers are still required for live sync:
+That means manual peers are still required for live sync.
+The current canonical bootstrap peer is:
 
 ```bash
-athod --network mainnet --peer host1:56000 --peer host2:56000
+athod --network mainnet --peer 74.208.219.116:56000
 ```
 
 The same applies to the desktop client when it manages a local node:
 
 ```bash
-atho-qt --network mainnet --local-node --peer host1:56000
+atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
 ```
 
 Why:

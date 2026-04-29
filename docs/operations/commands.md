@@ -18,23 +18,16 @@ Recommended roles:
 
 ## Quick Start
 
-Full node:
+The shortest useful commands are:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet
+cargo build --release -p atho-node -p atho-qt
+./target/release/atho-qt --network regnet --local-node
+./target/release/athod --network regnet
+./target/release/atho-mine --network regnet
 ```
 
-Desktop client with a managed local node:
-
-```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
-```
-
-Standalone miner:
-
-```bash
-cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:9210
-```
+`--local-node` starts a managed `athod` child process over RPC so the desktop client uses the real node path.
 
 ## Data Root
 
@@ -104,7 +97,7 @@ cargo run -p atho-node --bin atho-attack -- --network regnet
 Preferred command:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet
+./target/release/athod --network mainnet
 ```
 
 Useful flags:
@@ -119,55 +112,55 @@ Useful flags:
 Examples:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network regnet --data-dir /tmp/atho-regnet
-cargo run -p atho-node --bin athod -- --network mainnet --peer 198.51.100.10:56000 --peer 198.51.100.11:56000
-cargo run -p atho-node --bin athod -- --network mainnet --rpc-addr 127.0.0.1:9010
+./target/release/athod --network regnet --data-dir /tmp/atho-regnet
+./target/release/athod --network mainnet --peer 74.208.219.116:56000
+./target/release/athod --network mainnet --rpc-addr 127.0.0.1:9010
 ```
 
 Status:
 
 ```bash
-cargo run -p atho-node --bin athod -- status --network mainnet
-cargo run -p atho-node --bin athod -- status --rpc-addr 127.0.0.1:9010
+./target/release/athod status --network mainnet
+./target/release/athod status --rpc-addr 127.0.0.1:9010
 ```
 
-The status command now reports:
+The status command reports:
 
 - connected peer count
 - inbound/outbound split
 - total bytes sent and received
-- a peer diagnostics section with endpoint, direction, height, protocol version, and traffic totals
+- peer diagnostics with endpoint, direction, height, protocol version, and traffic totals
 
 Verification:
 
 ```bash
-cargo run -p atho-node --bin athod -- verify --network mainnet
+./target/release/athod verify --network mainnet
 ```
 
 Important:
 
 - RPC is local-only by default
 - P2P listens publicly by default
-- DNS seeds are still blank, so use `--peer` for live bootstrap
+- DNS seeds are still blank, so use `--peer 74.208.219.116:56000` for live mainnet bootstrap
 
 ## Desktop Client
 
 Attach to an existing node:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --rpc-addr 127.0.0.1:9010
+./target/release/atho-qt --network mainnet --rpc-addr 127.0.0.1:9010
 ```
 
 Start a managed local node:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+./target/release/atho-qt --network mainnet --local-node
 ```
 
 Managed local node with explicit bootstrap peers:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 198.51.100.10:56000
+./target/release/atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
 ```
 
 Useful flags:
@@ -191,8 +184,8 @@ The settings page includes a controlled network diagnostics view with:
 Run the node first, then the miner:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network regnet
-cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:9210
+./target/release/athod --network regnet
+./target/release/atho-mine --network regnet
 ```
 
 Useful flags:
@@ -241,43 +234,29 @@ cargo run -p atho-node --bin athod -- dev export tx --data-dir /tmp/atho-dev
 
 ## Packaging
 
-Stage local release artifacts:
+Stage a local release bundle with the native installer front-end:
+
+```bash
+python3 scripts/release.py
+```
+
+Windows:
+
+```powershell
+py -3 scripts\release.py
+```
+
+The release script stages:
+
+- `Atho Setup.exe` on Windows
+- `Atho Setup.app` on macOS
+- `Atho Setup` on Linux
+- the `desktop/` share tree with matching root dispatchers
+
+For GitHub publishing, use [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml). It builds the same per-OS packages and uploads the release assets to GitHub Releases.
+
+The legacy wrappers still work:
 
 ```bash
 ./scripts/package.sh
 ```
-
-Current staged files:
-
-- `athod`
-- `atho-mine`
-- `atho-qt`
-- `README.md`
-- `COMMANDS.md`
-- `RELEASE_NOTES.md`
-- `PACKAGING.md`
-
-## Deprecated Launch Forms
-
-Still supported for compatibility, but no longer recommended:
-
-- `athod run mainnet`
-- `athod run testnet`
-- `athod run regnet`
-
-Preferred form:
-
-```bash
-athod --network mainnet
-```
-
-## Related Documentation
-
-- [Runtime Model](runtime-model.md)
-- [Windows Quick Start](windows-quick-start.md)
-- [Linux Quick Start](linux-quick-start.md)
-- [macOS Quick Start](macos-quick-start.md)
-- [VPS Full Node](vps-full-node.md)
-- [Dev Workspace](dev-workspace.md)
-- [Build and Packaging](../build-deployment/packaging.md)
-- [Troubleshooting](troubleshooting.md)

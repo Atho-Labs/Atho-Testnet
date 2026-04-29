@@ -61,13 +61,13 @@ Current likely cause:
 Fix:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet --peer 198.51.100.10:56000
+cargo run -p atho-node --bin athod -- --network mainnet --peer 74.208.219.116:56000
 ```
 
 For the desktop client:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 198.51.100.10:56000
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 74.208.219.116:56000
 ```
 
 What to check after that:
@@ -119,7 +119,13 @@ Only do that if you have a real access-control plan.
 Rebuild the staged artifacts:
 
 ```bash
-./scripts/package.sh
+python3 scripts/release.py
+```
+
+Or on Windows:
+
+```powershell
+py -3 scripts\release.py
 ```
 
 ## Related Documentation

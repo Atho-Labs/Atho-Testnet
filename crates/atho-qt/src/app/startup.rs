@@ -36,7 +36,7 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
             } else {
                 app.wallet_preparation_stage.clone()
             },
-            true,
+            app.wallet_preparation_total > 0,
         )
     } else if !app.ui_state.connected || !app.view_model.running {
         (
@@ -114,8 +114,10 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
                                         ui.add(
                                             egui::ProgressBar::new(progress)
                                                 .desired_width((card_width - 56.0).max(240.0))
-                                                .show_percentage(),
+                                                .animate(true),
                                         );
+                                    } else {
+                                        ui.add(egui::Spinner::new().size(20.0));
                                     }
                                 });
                             });
@@ -132,7 +134,7 @@ fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
             .strong(),
     );
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_centered(|ui| {
         if ui
             .add_sized([142.0, 28.0], egui::Button::new("Create Wallet"))
             .clicked()

@@ -8,5 +8,6 @@ members = [
   "crates/atho-rpc",
   "crates/atho-node",
   "crates/atho-qt",
+  "crates/atho-installer",
 ]
 resolver = "2"

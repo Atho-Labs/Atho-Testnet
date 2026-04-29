@@ -297,6 +297,7 @@ mod tests {
     use crate::mnemonic::{MnemonicLength, MnemonicPhrase};
     use crate::wallet::WALLET_DATAFILE_NAME;
     use std::env;
+    use std::time::Instant;
 
     const TEST_ITERATIONS: u32 = 10_000;
 
@@ -352,6 +353,30 @@ mod tests {
 
         let loaded = load_impl(&path, "", TEST_ITERATIONS).unwrap();
         assert_eq!(loaded.mnemonic_sentence(), wallet.mnemonic_sentence());
+        assert_eq!(loaded.snapshot, wallet.snapshot);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plaintext_wallet_load_reports_timing() {
+        let dir = env::temp_dir();
+        let path = dir.join("atho-wallet-plaintext-timing.datafile");
+        let wallet = wallet();
+
+        let save_started = Instant::now();
+        save_impl(&wallet, "", &path, TEST_ITERATIONS).unwrap();
+        let save_elapsed = save_started.elapsed();
+
+        let load_started = Instant::now();
+        let loaded = load_impl(&path, "", TEST_ITERATIONS).unwrap();
+        let load_elapsed = load_started.elapsed();
+
+        eprintln!(
+            "wallet_datafile_timings plaintext_save_ms={} plaintext_load_ms={}",
+            save_elapsed.as_millis(),
+            load_elapsed.as_millis()
+        );
+
         assert_eq!(loaded.snapshot, wallet.snapshot);
         let _ = fs::remove_file(&path);
     }

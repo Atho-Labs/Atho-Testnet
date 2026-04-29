@@ -61,7 +61,7 @@ Start a node:
 Because DNS seeds are still blank, add peers explicitly for live network sync:
 
 ```bash
-./target/release/athod --network mainnet --peer 203.0.113.10:56000
+./target/release/athod --network mainnet --peer 74.208.219.116:56000
 ```
 
 Check status:
@@ -89,13 +89,13 @@ Use the simplest desktop path first:
 If you want the client to connect to an already-running node instead:
 
 ```bash
-./target/release/atho-qt --network regnet --rpc-addr 127.0.0.1:18445
+./target/release/atho-qt --network regnet --rpc-addr 127.0.0.1:9210
 ```
 
 If the managed local node must bootstrap manually:
 
 ```bash
-./target/release/atho-qt --network mainnet --local-node --peer 203.0.113.10:56000
+./target/release/atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
 ```
 
 The settings page includes a local-only diagnostics section with peer counts, byte counters, and per-peer transport details.
@@ -106,7 +106,7 @@ Start the node first, then the miner:
 
 ```bash
 ./target/release/athod --network regnet
-./target/release/atho-mine --network regnet --rpc-addr 127.0.0.1:18445
+./target/release/atho-mine --network regnet
 ```
 
 ## Related Documentation

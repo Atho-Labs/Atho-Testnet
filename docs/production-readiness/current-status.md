@@ -43,7 +43,8 @@ Interpretation:
 - RPC-driven Qt client
 - managed local-node Qt startup through the real RPC path
 - real mined-block, send, confirm, restart, and rehydrate lifecycle coverage
-- live TCP peer runtime with real-socket sandbox tests
+- live TCP peer runtime with real-socket sync, reorg, restart, and transaction relay coverage
+- 25-node live cluster convergence and recovery coverage
 
 ## What Is Still Incomplete
 

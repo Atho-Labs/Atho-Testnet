@@ -1,6 +1,8 @@
 use super::default_wallet_path;
 use atho_core::network::Network;
+use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
 use atho_wallet::wallet::WalletAddress;
+use atho_wallet::wallet::DEFAULT_RESTORE_GAP_LIMIT;
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
@@ -98,7 +100,7 @@ pub(crate) struct CreateWalletForm {
     pub(crate) wallet_password: String,
     pub(crate) wallet_password_confirm: String,
     pub(crate) mnemonic_passphrase: String,
-    pub(crate) mnemonic_text: String,
+    pub(crate) mnemonic_words: Vec<String>,
     pub(crate) acknowledged_backup: bool,
     pub(crate) show_passwords: bool,
 }
@@ -111,14 +113,14 @@ impl CreateWalletForm {
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
             mnemonic_passphrase: String::new(),
-            mnemonic_text: String::new(),
+            mnemonic_words: vec![String::new(); DEFAULT_MNEMONIC_WORD_COUNT],
             acknowledged_backup: false,
             show_passwords: false,
         }
     }
 
     pub(crate) fn reset_phrase(&mut self) {
-        self.mnemonic_text.clear();
+        self.mnemonic_words = vec![String::new(); DEFAULT_MNEMONIC_WORD_COUNT];
         self.acknowledged_backup = false;
     }
 }
@@ -128,6 +130,7 @@ pub(crate) struct WalletManagementForm {
     pub(crate) backup_path: String,
     pub(crate) backup_password: String,
     pub(crate) backup_password_confirm: String,
+    pub(crate) restore_gap_limit_input: String,
     pub(crate) show_passwords: bool,
 }
 
@@ -137,6 +140,7 @@ impl WalletManagementForm {
             backup_path: default_backup_wallet_path(network),
             backup_password: String::new(),
             backup_password_confirm: String::new(),
+            restore_gap_limit_input: DEFAULT_RESTORE_GAP_LIMIT.to_string(),
             show_passwords: false,
         }
     }
@@ -148,7 +152,8 @@ pub(crate) struct ImportWalletForm {
     pub(crate) encrypt_wallet: bool,
     pub(crate) wallet_password: String,
     pub(crate) wallet_password_confirm: String,
-    pub(crate) mnemonic_phrase: String,
+    pub(crate) mnemonic_words: Vec<String>,
+    pub(crate) mnemonic_word_count: usize,
     pub(crate) mnemonic_passphrase: String,
     pub(crate) show_passwords: bool,
 }
@@ -160,10 +165,17 @@ impl ImportWalletForm {
             encrypt_wallet: false,
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
-            mnemonic_phrase: String::new(),
+            mnemonic_words: vec![String::new(); DEFAULT_MNEMONIC_WORD_COUNT],
+            mnemonic_word_count: DEFAULT_MNEMONIC_WORD_COUNT,
             mnemonic_passphrase: String::new(),
             show_passwords: false,
         }
+    }
+
+    pub(crate) fn set_mnemonic_word_count(&mut self, count: usize) {
+        self.mnemonic_word_count = count;
+        self.mnemonic_words.resize_with(count, String::new);
+        self.mnemonic_words.truncate(count);
     }
 }
 
@@ -219,13 +231,6 @@ pub(crate) struct WalletBalanceSummary {
     pub(crate) available_atoms: u64,
     pub(crate) pending_atoms: u64,
     pub(crate) total_atoms: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ActivityRow {
-    pub(crate) timestamp: String,
-    pub(crate) component: String,
-    pub(crate) message: String,
 }
 
 #[derive(Debug, Clone)]

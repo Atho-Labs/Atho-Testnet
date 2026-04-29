@@ -7,7 +7,7 @@ use atho_core::network::Network;
 use atho_p2p::codec::{CodecError, WireCodec};
 use atho_p2p::config::network_params;
 use atho_p2p::connection::ConnectionEvent;
-use atho_p2p::protocol::NetworkMessage;
+use atho_p2p::protocol::{Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage};
 use atho_storage::db::PeerHealthRecord;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -421,6 +421,7 @@ fn spawn_peer_thread(
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.tip_hash()
             };
+            let mut last_announced_mempool = Vec::<[u8; 48]>::new();
             let peer_network = {
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.network()
@@ -464,6 +465,25 @@ fn spawn_peer_thread(
                             if bytes_sent > 0 {
                                 let mut state = state.lock().expect("p2p runtime state poisoned");
                                 state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                            }
+                        }
+                        if let Some(messages) =
+                            poll_mempool_announcements(&state, &mut last_announced_mempool)
+                        {
+                            for message in messages {
+                                let bytes_sent = match write_message(&mut stream, &message) {
+                                    Ok(bytes_sent) => bytes_sent,
+                                    Err(err) => {
+                                        return format!(
+                                            "mempool announcement failed peer={peer_id} error={err}"
+                                        );
+                                    }
+                                };
+                                if bytes_sent > 0 {
+                                    let mut state =
+                                        state.lock().expect("p2p runtime state poisoned");
+                                    state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                                }
                             }
                         }
                         continue;
@@ -540,6 +560,44 @@ fn poll_tip_announcement(
     let message = state.p2p_relay_compact_tip_message()?;
     *last_announced_tip = tip_hash;
     Some(message)
+}
+
+fn poll_mempool_announcements(
+    state: &Arc<Mutex<NodeService>>,
+    last_announced_txids: &mut Vec<[u8; 48]>,
+) -> Option<Vec<NetworkMessage>> {
+    let (network, txids) = {
+        let state = state.lock().expect("p2p runtime state poisoned");
+        (state.network(), state.p2p_mempool_txids())
+    };
+    if txids == *last_announced_txids {
+        return None;
+    }
+    *last_announced_txids = txids.clone();
+    if txids.is_empty() {
+        return None;
+    }
+
+    let max_inventory = network_params(network).limits.max_inv_per_message.max(1);
+    let messages = txids
+        .chunks(max_inventory)
+        .map(|chunk| {
+            NetworkMessage::new(
+                network,
+                MessagePayload::Inv {
+                    inventory: chunk
+                        .iter()
+                        .copied()
+                        .map(|txid| InventoryVector {
+                            kind: InventoryKind::Transaction,
+                            hash: Hash48::from(txid),
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    Some(messages)
 }
 
 fn configure_stream(stream: &TcpStream) -> io::Result<()> {
@@ -757,7 +815,11 @@ fn sleep_with_stop(stop_requested: &Arc<AtomicBool>, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_rpc::request::RpcRequest;
+    use atho_rpc::response::RpcResponse;
     use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use atho_storage::utxo::UtxoEntry;
     use std::ffi::OsString;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -851,6 +913,7 @@ mod tests {
             left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
         });
 
+        let announced_at = Instant::now();
         let mined_hash = left.mine_local_block().expect("mine after connect");
 
         wait_until("tip announcement", Duration::from_secs(30), || {
@@ -859,6 +922,10 @@ mod tests {
                 && right_snapshot.height == 1
                 && right_snapshot.headers_synced
         });
+        eprintln!(
+            "tcp_tip_announcement_ms={}",
+            announced_at.elapsed().as_millis()
+        );
     }
 
     #[test]
@@ -919,6 +986,7 @@ mod tests {
         let left =
             TcpP2pRuntime::new_in_memory(Network::Regnet, delayed_addr.to_string()).expect("left");
         left.mine_local_block().expect("mine delayed peer block");
+        let recovery_started = Instant::now();
 
         wait_until(
             "delayed outbound reconnect",
@@ -932,6 +1000,10 @@ mod tests {
                     && right_snapshot.tip_hash == left_snapshot.tip_hash
                     && right_snapshot.headers_synced
             },
+        );
+        eprintln!(
+            "tcp_outbound_reconnect_ms={}",
+            recovery_started.elapsed().as_millis()
         );
     }
 
@@ -1095,5 +1167,175 @@ mod tests {
         wait_until("raw inbound peers drained", Duration::from_secs(8), || {
             runtime.active_inbound_threads() == 0 && runtime.snapshot().peer_count == 0
         });
+    }
+
+    #[test]
+    fn tcp_runtime_reorgs_to_longer_branch_after_reconnect() {
+        let canonical =
+            TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("canonical");
+        let fork = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("fork");
+
+        canonical.mine_local_block().expect("canonical block 1");
+        canonical.mine_local_block().expect("canonical block 2");
+        fork.mine_local_block().expect("fork block 1");
+        fork.mine_local_block().expect("fork block 2");
+        fork.mine_local_block().expect("fork block 3");
+
+        fork.connect_outbound(canonical.bind_addr().to_string())
+            .expect("connect outbound");
+
+        wait_until("fork reorg", Duration::from_secs(30), || {
+            let canonical_snapshot = canonical.snapshot();
+            let fork_snapshot = fork.snapshot();
+            canonical_snapshot.height == fork_snapshot.height
+                && canonical_snapshot.tip_hash == fork_snapshot.tip_hash
+                && canonical_snapshot.headers_synced
+                && fork_snapshot.headers_synced
+        });
+    }
+
+    #[test]
+    fn tcp_runtime_relays_transactions_over_real_sockets() {
+        let left = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("left");
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+
+        for runtime in [&left, &right] {
+            let mut state = runtime.state.lock().expect("runtime state");
+            state.sandbox_with_node_mut(|node| {
+                node.dev_seed_chainstate(
+                    6,
+                    node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        seed_txid,
+                        0,
+                        seed_value,
+                        vec![seed_script],
+                        0,
+                        false,
+                    )],
+                )
+                .expect("seed chainstate");
+            });
+        }
+
+        right
+            .connect_outbound(left.bind_addr().to_string())
+            .expect("connect outbound");
+
+        wait_until("peer handshake", Duration::from_secs(10), || {
+            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+        });
+
+        let relayed_at = Instant::now();
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed transaction");
+        let txid = transaction.txid();
+        let fee_atoms = transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let response = {
+            let mut state = left.state.lock().expect("left state");
+            state.handle_mut(RpcRequest::SubmitTransaction {
+                transaction: transaction.clone(),
+                fee_atoms,
+            })
+        };
+        assert!(
+            matches!(response, RpcResponse::TransactionSubmitted(submitted) if submitted == txid)
+        );
+
+        wait_until("relayed transaction", Duration::from_secs(30), || {
+            let left_has_tx = {
+                let state = left.state.lock().expect("left state");
+                state.p2p_mempool_txids().contains(&txid)
+            };
+            let right_has_tx = {
+                let state = right.state.lock().expect("right state");
+                state.p2p_mempool_txids().contains(&txid)
+            };
+            left_has_tx && right_has_tx
+        });
+        eprintln!(
+            "tcp_transaction_relay_ms={}",
+            relayed_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn tcp_runtime_25_node_cluster_converges_restarts_and_recovers() {
+        let started = Instant::now();
+        let leader = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("leader");
+        let leader_addr = leader.bind_addr().to_string();
+        let mut followers = Vec::new();
+
+        for _ in 0..24 {
+            let follower =
+                TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("follower");
+            follower.maintain_outbound(leader_addr.clone());
+            followers.push(follower);
+        }
+
+        wait_until("cluster connected", Duration::from_secs(20), || {
+            let leader_snapshot = leader.snapshot();
+            leader_snapshot.peer_count == followers.len()
+                && followers
+                    .iter()
+                    .all(|follower| follower.snapshot().peer_count == 1)
+        });
+
+        for _ in 0..3 {
+            leader.mine_local_block().expect("mine cluster block");
+        }
+
+        wait_until("cluster synchronized", Duration::from_secs(30), || {
+            let leader_snapshot = leader.snapshot();
+            followers.iter().all(|follower| {
+                let snapshot = follower.snapshot();
+                snapshot.height == leader_snapshot.height
+                    && snapshot.tip_hash == leader_snapshot.tip_hash
+                    && snapshot.headers_synced
+            })
+        });
+
+        let restart_targets: Vec<_> = followers.drain(0..5).collect();
+        drop(restart_targets);
+
+        wait_until("cluster shrink", Duration::from_secs(10), || {
+            leader.snapshot().peer_count == followers.len()
+        });
+
+        let mut restarted_followers = Vec::new();
+        for _ in 0..5 {
+            let follower =
+                TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("restart");
+            follower.maintain_outbound(leader_addr.clone());
+            restarted_followers.push(follower);
+        }
+
+        wait_until("cluster restored", Duration::from_secs(30), || {
+            let leader_snapshot = leader.snapshot();
+            leader_snapshot.peer_count == followers.len() + restarted_followers.len()
+                && followers
+                    .iter()
+                    .chain(restarted_followers.iter())
+                    .all(|follower| {
+                        let snapshot = follower.snapshot();
+                        snapshot.height == leader_snapshot.height
+                            && snapshot.tip_hash == leader_snapshot.tip_hash
+                            && snapshot.headers_synced
+                    })
+        });
+
+        eprintln!(
+            "tcp_cluster_25_nodes startup_ms={} height={} peer_count={}",
+            started.elapsed().as_millis(),
+            leader.snapshot().height,
+            leader.snapshot().peer_count
+        );
     }
 }

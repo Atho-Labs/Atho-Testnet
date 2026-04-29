@@ -7,6 +7,7 @@ use atho_core::address::address_parts_from_public_key;
 use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
 use atho_crypto::falcon::{self, FalconKeypair};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -106,6 +107,10 @@ impl Wallet {
 
     pub fn restore_gap_limit(&self) -> usize {
         self.restore_gap_limit
+    }
+
+    pub fn set_restore_gap_limit(&mut self, limit: usize) {
+        self.restore_gap_limit = limit.max(1);
     }
 
     pub fn save_to_datafile(
@@ -213,13 +218,52 @@ impl Wallet {
     pub fn all_addresses(&self) -> Vec<WalletAddress> {
         self.address_book
             .snapshot()
-            .into_iter()
+            .into_par_iter()
             .map(|record| self.derive_address(record.path))
             .collect()
     }
 
     pub fn discovery_addresses(&self) -> Vec<WalletAddress> {
         self.discovery_addresses_up_to(self.restore_gap_limit)
+    }
+
+    pub fn next_indices(&self) -> (u32, u32) {
+        self.hd_wallet.counters()
+    }
+
+    pub fn keypool_depths(&self) -> (usize, usize) {
+        (self.keypool.receive_len(), self.keypool.change_len())
+    }
+
+    pub fn highest_reserved_indices(&self) -> (Option<u32>, Option<u32>) {
+        (
+            self.keypool.highest_receive_index(),
+            self.keypool.highest_change_index(),
+        )
+    }
+
+    pub fn highest_generated_indices(&self) -> (Option<u32>, Option<u32>) {
+        let mut highest_receive = None;
+        let mut highest_change = None;
+        for record in self.address_book.snapshot() {
+            match record.path.kind {
+                AddressKind::Receive => {
+                    highest_receive = Some(
+                        highest_receive
+                            .map(|current: u32| current.max(record.path.index))
+                            .unwrap_or(record.path.index),
+                    );
+                }
+                AddressKind::Change => {
+                    highest_change = Some(
+                        highest_change
+                            .map(|current: u32| current.max(record.path.index))
+                            .unwrap_or(record.path.index),
+                    );
+                }
+            }
+        }
+        (highest_receive, highest_change)
     }
 
     pub fn discovery_addresses_up_to(&self, limit: usize) -> Vec<WalletAddress> {
@@ -310,37 +354,33 @@ impl Wallet {
         if limit == 0 {
             return Vec::new();
         }
-        let mut addresses = Vec::with_capacity(limit);
         let (receive_queue, change_queue) = self.keypool.snapshot();
         let queue = match kind {
             AddressKind::Receive => receive_queue,
             AddressKind::Change => change_queue,
         };
-        for path in queue {
-            addresses.push(self.derive_address(path));
-            if addresses.len() == limit {
-                break;
-            }
-        }
-
-        addresses
+        queue
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|path| self.derive_address(path))
+            .collect()
     }
 
     fn generated_addresses(&self, kind: AddressKind, limit: usize) -> Vec<WalletAddress> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut addresses = Vec::with_capacity(limit);
-        for record in self.address_book.snapshot() {
-            if record.path.kind != kind {
-                continue;
-            }
-            addresses.push(self.derive_address(record.path));
-            if addresses.len() == limit {
-                break;
-            }
-        }
-        addresses
+        self.address_book
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.path.kind == kind)
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|record| self.derive_address(record.path))
+            .collect()
     }
 
     fn derive_address(&self, path: DerivationPath) -> WalletAddress {
@@ -547,6 +587,38 @@ mod tests {
         assert_eq!(preview.len(), 2);
         assert_eq!(preview[0].address, first.address);
         assert_eq!(preview[1].address, second.address);
+    }
+
+    #[test]
+    fn wallet_reports_generated_and_reserved_index_tips() {
+        let mut wallet = Wallet::from_seed(WalletSeed([3; 32]), Network::Mainnet);
+
+        let (receive_depth, change_depth) = wallet.keypool_depths();
+        assert_eq!(receive_depth, crate::keypool::KEYPOOL_TARGET_SIZE);
+        assert_eq!(change_depth, crate::keypool::KEYPOOL_TARGET_SIZE);
+        assert_eq!(
+            wallet.highest_reserved_indices(),
+            (
+                Some((crate::keypool::KEYPOOL_TARGET_SIZE - 1) as u32),
+                Some((crate::keypool::KEYPOOL_TARGET_SIZE - 1) as u32)
+            )
+        );
+        assert_eq!(wallet.highest_generated_indices(), (None, None));
+
+        let receive = wallet.checkout_receive_address();
+        let change = wallet.checkout_change_address();
+
+        assert_eq!(
+            wallet.highest_generated_indices(),
+            (Some(receive.path.index), Some(change.path.index))
+        );
+        assert_eq!(
+            wallet.next_indices(),
+            (
+                crate::keypool::KEYPOOL_TARGET_SIZE as u32 + 1,
+                crate::keypool::KEYPOOL_TARGET_SIZE as u32 + 1
+            )
+        );
     }
 
     #[test]

@@ -509,7 +509,14 @@ fn default_rpc_address(network: Network) -> String {
 }
 
 fn use_inprocess_backend() -> bool {
-    cfg!(test) && std::env::var(ATHO_QT_FORCE_RPC_ENV).ok().as_deref() != Some("1")
+    if std::env::var(ATHO_QT_FORCE_RPC_ENV).ok().as_deref() == Some("1") {
+        return false;
+    }
+
+    // The embedded backend is reserved for tests and explicit local-node overrides.
+    // The normal desktop `--local-node` path should exercise a managed child node over RPC so
+    // the client uses the same runtime path as an external node attachment.
+    cfg!(test) || manage_local_node_requested()
 }
 
 fn manage_local_node_requested() -> bool {
@@ -535,28 +542,14 @@ fn start_local_node_if_needed(
         return Ok(None);
     }
 
-    let mut command = if prefer_workspace_node_command() {
+    let mut command = if let Some(binary) = node_binary_path() {
         let _ = atho_node::dev::append_log(
             "atho-qt",
-            "using cargo-run managed node path for source-matched local testing",
+            &format!(
+                "using bundled athod binary for managed local node network={}",
+                network.id()
+            ),
         );
-        let manifest_path = workspace_manifest_path();
-        let mut command = Command::new("cargo");
-        command
-            .arg("run")
-            .arg("--manifest-path")
-            .arg(manifest_path)
-            .arg("-p")
-            .arg("atho-node")
-            .arg("--bin")
-            .arg("athod")
-            .arg("--")
-            .arg("--network")
-            .arg(network.cli_arg())
-            .arg("--rpc-addr")
-            .arg(rpc_address);
-        command
-    } else if let Some(binary) = node_binary_path() {
         let mut command = Command::new(binary);
         command
             .arg("--network")
@@ -567,7 +560,10 @@ fn start_local_node_if_needed(
     } else {
         let _ = atho_node::dev::append_log(
             "atho-qt",
-            "node binary not found; falling back to cargo run",
+            &format!(
+                "athod binary not found; falling back to cargo run for network={}",
+                network.id()
+            ),
         );
         let manifest_path = workspace_manifest_path();
         let mut command = Command::new("cargo");
@@ -615,13 +611,6 @@ fn start_local_node_if_needed(
             Err(startup_error)
         }
     }
-}
-
-fn prefer_workspace_node_command() -> bool {
-    if std::env::var_os("ATHO_NODE_BIN").is_some() {
-        return false;
-    }
-    cfg!(debug_assertions) && workspace_manifest_path().exists()
 }
 
 fn spawn_bootstrap_watcher(
@@ -929,6 +918,21 @@ mod tests {
         );
 
         handle.join().expect("mock rpc server");
+    }
+
+    #[test]
+    fn local_flag_prefers_embedded_backend_by_default() {
+        let root = temp_data_dir("embedded-local");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        std::env::remove_var(ATHO_QT_FORCE_RPC_ENV);
+
+        let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Regnet, free_rpc_address());
+        let status = wait_for_status(&conn, |status| status.connected && status.running);
+        assert!(status.connected);
+        assert!(status.running);
+        assert!(conn.with_local_system_for_test(|_| true).is_some());
     }
 
     #[test]

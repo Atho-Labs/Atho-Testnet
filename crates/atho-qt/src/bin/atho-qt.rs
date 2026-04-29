@@ -38,16 +38,17 @@ fn main() {
     let network = cli.network.unwrap_or_else(default_network);
     if cli.local_node {
         std::env::set_var("ATHO_QT_LOCAL", "1");
+        std::env::set_var("ATHO_QT_FORCE_RPC", "1");
         let _ = atho_node::dev::append_log(
             "atho-qt",
-            &format!("starting embedded local node mode for {}", network.id()),
+            &format!("starting managed local node mode for {}", network.id()),
         );
     }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Atho")
-            .with_inner_size([1000.0, 660.0])
-            .with_min_inner_size([700.0, 440.0])
+            .with_inner_size([860.0, 560.0])
+            .with_min_inner_size([720.0, 460.0])
             .with_icon(atho_qt::resources::app_icon()),
         follow_system_theme: false,
         default_theme: eframe::Theme::Light,
@@ -152,7 +153,10 @@ fn print_usage() {
     eprintln!(
         "  atho-qt [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--data-dir PATH]"
     );
-    eprintln!("  atho-qt --local-node [--network <mainnet|testnet|regnet>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH]");
+    eprintln!(
+        "  atho-qt --local-node [--network <mainnet|testnet|regnet>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH]"
+    );
+    eprintln!("    --local-node starts a managed athod child process over RPC");
 }
 
 #[cfg(test)]

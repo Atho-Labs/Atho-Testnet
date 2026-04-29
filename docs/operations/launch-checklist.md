@@ -29,6 +29,7 @@ This is the final pre-launch checklist for Atho.
 - [x] Windows quick-start exists
 - [x] VPS full-node guide exists
 - [x] release staging includes node, miner, client, and operator docs
+- [x] canonical bootstrap peer is published and reachable
 
 ## Deployment Readiness
 
@@ -41,7 +42,7 @@ This is the final pre-launch checklist for Atho.
 - [x] a mined block propagates from a remote peer to the VPS node
 - [ ] VPS SSH host identity is verified out of band
 - [ ] DNS seeds are added
-- [ ] final public bootstrap peer list is chosen
+- [x] final public bootstrap peer list is chosen
 
 ## Security Gates Before Public Bring-Up
 
