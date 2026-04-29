@@ -389,7 +389,7 @@ impl NodeSync {
             self.pending_compact_blocks.remove(&block_hash);
             self.remove_buffered_block(peer, &block_hash);
             self.push_scheduled_block_requests(outbound);
-            self.process_buffered_branches(peer, node, outbound)?;
+            self.process_buffered_branches(node, outbound)?;
             return Ok(());
         }
 
@@ -401,7 +401,7 @@ impl NodeSync {
                     self.pending_compact_blocks.remove(&block_hash);
                     self.remove_buffered_block(peer, &block_hash);
                     self.push_scheduled_block_requests(outbound);
-                    self.process_buffered_branches(peer, node, outbound)?;
+                    self.process_buffered_branches(node, outbound)?;
                     return Ok(());
                 }
                 Err(NodeError::Validation(validation))
@@ -415,7 +415,7 @@ impl NodeSync {
         }
 
         self.buffer_peer_block(peer, block);
-        self.process_buffered_branches(peer, node, outbound)?;
+        self.process_buffered_branches(node, outbound)?;
 
         Ok(())
     }
@@ -499,18 +499,19 @@ impl NodeSync {
         best
     }
 
-    fn process_buffered_branches(
+    fn process_buffered_branches_for_peer(
         &mut self,
         peer: &str,
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
-    ) -> Result<(), NodeSyncError> {
+    ) -> Result<bool, NodeSyncError> {
+        let mut progressed = false;
         loop {
             let Some(candidate_branch) = self.best_buffered_branch(peer, node) else {
-                return Ok(());
+                return Ok(progressed);
             };
             if !Self::branch_is_preferred_over_current(&candidate_branch, node.blocks()) {
-                return Ok(());
+                return Ok(progressed);
             }
 
             let candidate_hashes = candidate_branch
@@ -526,10 +527,35 @@ impl NodeSync {
                         self.remove_buffered_block(peer, &hash);
                     }
                     self.push_scheduled_block_requests(outbound);
+                    progressed = true;
                 }
-                Ok(_) => return Ok(()),
-                Err(err) if Self::recoverable_branch_error(&err) => return Ok(()),
+                Ok(_) => return Ok(progressed),
+                Err(NodeError::Storage(StorageError::ForkPointUnavailable)) => {
+                    if let Some(tip_hash) = candidate_hashes.last().copied() {
+                        self.remove_buffered_block(peer, &tip_hash);
+                    }
+                }
+                Err(err) if Self::recoverable_branch_error(&err) => return Ok(progressed),
                 Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn process_buffered_branches(
+        &mut self,
+        node: &mut Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> Result<(), NodeSyncError> {
+        loop {
+            let peers = self.branch_buffers.keys().cloned().collect::<Vec<_>>();
+            let mut progressed = false;
+            for peer in peers {
+                if self.process_buffered_branches_for_peer(&peer, node, outbound)? {
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                return Ok(());
             }
         }
     }
@@ -544,9 +570,7 @@ impl NodeSync {
     fn recoverable_branch_error(error: &NodeError) -> bool {
         match error {
             NodeError::Validation(validation) => Self::recoverable_tip_validation(validation),
-            NodeError::Storage(
-                StorageError::ForkPointUnavailable | StorageError::InvalidBranchSequence,
-            ) => true,
+            NodeError::Storage(StorageError::InvalidBranchSequence) => true,
             _ => false,
         }
     }
@@ -1464,5 +1488,51 @@ mod tests {
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
         assert!(peer.sync.branch_buffers.get("peer").is_none());
+    }
+
+    #[test]
+    fn cross_peer_branch_blocks_reconstruct_after_parent_arrives() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let miner = Miner::new(1);
+        let mut reference_node = Node::new(NodeConfig::new(Network::Regnet));
+
+        let block_1 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 1"),
+        );
+        reference_node
+            .connect_block(&block_1)
+            .expect("connect reference block 1");
+        let block_2 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 2"),
+        );
+        reference_node
+            .connect_block(&block_2)
+            .expect("connect reference block 2");
+        let block_3 = miner.solve_block(
+            reference_node
+                .build_candidate_block(&miner)
+                .expect("candidate block 3"),
+        );
+
+        let mut outbound = Vec::new();
+        peer.sync
+            .handle_received_block("peer-a", block_3.clone(), &mut peer.node, &mut outbound)
+            .expect("buffer tip block from peer-a");
+        peer.sync
+            .handle_received_block("peer-a", block_2.clone(), &mut peer.node, &mut outbound)
+            .expect("buffer middle block from peer-a");
+        peer.sync
+            .handle_received_block("peer-b", block_1.clone(), &mut peer.node, &mut outbound)
+            .expect("reconstruct buffered branch across peers");
+
+        assert!(outbound.is_empty());
+        assert_eq!(peer.node.height(), 3);
+        assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
+        assert!(peer.sync.branch_buffers.get("peer-a").is_none());
+        assert!(peer.sync.branch_buffers.get("peer-b").is_none());
     }
 }

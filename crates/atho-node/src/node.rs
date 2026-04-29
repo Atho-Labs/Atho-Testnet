@@ -9,6 +9,7 @@ use crate::validation::ValidationError;
 use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
+use atho_core::crypto::hash::sha3_256;
 use atho_core::transaction::Transaction;
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
 use atho_p2p::protocol::PeerAddress;
@@ -213,6 +214,21 @@ impl Node {
 
     pub fn mempool_total_fee_atoms(&self) -> u64 {
         self.mempool.total_fee_atoms()
+    }
+
+    pub fn mempool_fingerprint(&self) -> [u8; 32] {
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(self.network().id().as_bytes());
+        preimage.extend_from_slice(&(self.mempool.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(&self.mempool.total_fee_atoms().to_be_bytes());
+        for txid in self.mempool_txids() {
+            preimage.extend_from_slice(&txid);
+        }
+        for (txid, output_index) in self.mempool_spent_inputs() {
+            preimage.extend_from_slice(&txid);
+            preimage.extend_from_slice(&output_index.to_be_bytes());
+        }
+        sha3_256(&preimage)
     }
 
     pub fn mempool_contains(&self, txid: &[u8; 48]) -> bool {

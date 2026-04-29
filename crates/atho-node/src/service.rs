@@ -288,6 +288,7 @@ impl NodeService {
             tip_hash: status.tip_hash,
             mempool_count: status.mempool_count,
             mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+            mempool_fingerprint: self.orchestrator.runtime.node.mempool_fingerprint(),
             running: status.running,
             headers_synced: status.headers_synced,
             sync_best_height: status.sync_best_height,

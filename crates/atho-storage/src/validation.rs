@@ -1,11 +1,12 @@
 use crate::utxo::{UtxoEntry, UtxoSet};
+use atho_core::address::public_key_digest;
 use atho_core::block::Block;
 use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_RAW_BYTES,
-    MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    ADDRESS_DIGEST_BYTES, MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT,
+    MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -172,6 +173,21 @@ pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationEr
     Ok(())
 }
 
+fn locking_script_matches_public_key(
+    network: Network,
+    locking_script: &[u8],
+    public_key: &[u8],
+) -> bool {
+    // Standard payment outputs use a 32-byte address digest, so bind those
+    // outputs to the witness public key. Legacy/test script forms keep the
+    // previous exact-script behavior.
+    if locking_script.len() == ADDRESS_DIGEST_BYTES {
+        public_key_digest(network, public_key).as_slice() == locking_script
+    } else {
+        true
+    }
+}
+
 pub fn validate_transaction(tx: &Transaction, fee_atoms: u64) -> Result<(), ValidationError> {
     validate_transaction_for_height(tx, fee_atoms, 0)
 }
@@ -256,13 +272,54 @@ pub fn validate_transaction_with_context_structure_and_schedule<F>(
     tx: &Transaction,
     fee_atoms: u64,
     spend_height: u64,
-    mut lookup: F,
+    lookup: F,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<u64, ValidationError>
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
     validate_transaction_structure_for_height_with_schedule(tx, fee_atoms, spend_height, schedule)?;
+    let actual_fee =
+        validate_transaction_with_context_common_and_schedule(tx, spend_height, lookup, schedule)?;
+    if actual_fee != fee_atoms {
+        return Err(ValidationError::FeeMismatch);
+    }
+    Ok(actual_fee)
+}
+
+pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
+    tx: &Transaction,
+    minimum_fee_atoms: u64,
+    spend_height: u64,
+    lookup: F,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    validate_transaction_structure_for_height_with_schedule(
+        tx,
+        minimum_fee_atoms,
+        spend_height,
+        schedule,
+    )?;
+    let actual_fee =
+        validate_transaction_with_context_common_and_schedule(tx, spend_height, lookup, schedule)?;
+    if actual_fee < minimum_fee_atoms {
+        return Err(ValidationError::FeeBelowMinimum);
+    }
+    Ok(actual_fee)
+}
+
+fn validate_transaction_with_context_common_and_schedule<F>(
+    tx: &Transaction,
+    spend_height: u64,
+    mut lookup: F,
+    _schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
@@ -277,6 +334,9 @@ where
         let utxo =
             lookup(&input.previous_txid, input.output_index).ok_or(ValidationError::MissingUtxo)?;
         if utxo.locking_script != input.unlocking_script {
+            return Err(ValidationError::InputOwnershipMismatch);
+        }
+        if !locking_script_matches_public_key(utxo.network, &utxo.locking_script, &witness.pubkey) {
             return Err(ValidationError::InputOwnershipMismatch);
         }
         if !utxo.is_spendable_at(spend_height) {
@@ -295,9 +355,6 @@ where
     let actual_fee = input_total
         .checked_sub(output_total)
         .ok_or(ValidationError::FeeMismatch)?;
-    if actual_fee != fee_atoms {
-        return Err(ValidationError::FeeMismatch);
-    }
     Ok(actual_fee)
 }
 
@@ -572,7 +629,7 @@ pub fn validate_block_with_context_and_schedule(
 
         let txid = tx.txid();
         let fee_rate = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let fee = validate_transaction_with_context_structure_and_schedule(
+        let fee = validate_transaction_with_context_minimum_fee_and_schedule(
             tx,
             fee_rate,
             height,
@@ -630,15 +687,19 @@ pub fn validate_block_with_context_and_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::rules::{
         ScheduledActivation, BLOCK_VERSION_V1, BLOCK_VERSION_V2_PLACEHOLDER, RULESET_VERSION_V1,
         RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1, TRANSACTION_VERSION_V2_PLACEHOLDER,
     };
+    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_TRANSACTION_RAW_BYTES};
     use atho_core::crypto::hash::sha3_384;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
-    use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
+    use atho_crypto::falcon::{
+        generate_from_seed, sign, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
+    };
 
     fn solve_block(mut block: Block) -> Block {
         let prefix = block.header.canonical_bytes_without_nonce();
@@ -915,6 +976,65 @@ mod tests {
     }
 
     #[test]
+    fn wrong_public_key_for_standard_output_is_rejected() {
+        let funding = generate_from_seed(b"atho-validation-funding").expect("funding keypair");
+        let wrong = generate_from_seed(b"atho-validation-wrong").expect("wrong keypair");
+        let lock_script = public_key_digest(Network::Mainnet, &funding.public_key.0).to_vec();
+        let utxo = UtxoEntry::new(
+            Network::Mainnet,
+            [9; 48],
+            0,
+            10_000,
+            lock_script.clone(),
+            1,
+            false,
+        );
+        let mut tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: utxo.txid,
+                output_index: utxo.output_index,
+                unlocking_script: lock_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 9_000,
+                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &wrong.secret_key,
+            &transaction_signing_digest(&tx),
+        )
+        .expect("signature");
+        let sig_bytes = signature.0.clone();
+        tx.witness = TxWitness {
+            signature: sig_bytes.clone(),
+            pubkey: wrong.public_key.0.clone(),
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, 0),
+                witness_commit_ref: [0; 16],
+            }],
+        }
+        .canonical_bytes();
+
+        let lookup = |txid: &[u8; 48], output_index: u32| {
+            if *txid == utxo.txid && output_index == utxo.output_index {
+                Some(utxo.clone())
+            } else {
+                None
+            }
+        };
+
+        assert_eq!(
+            validate_transaction_with_context(&tx, tx.vsize_bytes() as u64, 1, lookup),
+            Err(ValidationError::InputOwnershipMismatch)
+        );
+    }
+
+    #[test]
     fn oversized_block_raw_bytes_are_rejected() {
         let coinbase = Transaction {
             version: TRANSACTION_VERSION_V1,
@@ -945,6 +1065,116 @@ mod tests {
         assert_eq!(
             validate_block_without_pow(&block, 1, Network::Mainnet),
             Err(ValidationError::BlockTooLarge)
+        );
+    }
+
+    #[test]
+    fn higher_fee_transactions_are_accepted_in_blocks() {
+        let funding_keypair =
+            generate_from_seed(b"atho-validation-high-fee").expect("funding keypair");
+        let funding_script =
+            public_key_digest(Network::Mainnet, &funding_keypair.public_key.0).to_vec();
+        let funding = UtxoEntry::new(
+            Network::Mainnet,
+            [11; 48],
+            0,
+            10_000,
+            funding_script.clone(),
+            0,
+            false,
+        );
+
+        let mut tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: funding.txid,
+                output_index: funding.output_index,
+                unlocking_script: funding_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 9_000,
+                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let coinbase = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(6).saturating_add(1_000),
+                locking_script: vec![1],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &funding_keypair.secret_key,
+            &transaction_signing_digest(&tx),
+        )
+        .expect("signature");
+        let signature_bytes = signature.0.clone();
+        let staged_witness = TxWitness {
+            signature: signature_bytes.clone(),
+            pubkey: funding_keypair.public_key.0.clone(),
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
+                witness_commit_ref: [0; 16],
+            }],
+        };
+        let staged_tx = Transaction {
+            witness: staged_witness.canonical_bytes(),
+            ..tx.clone()
+        };
+        let staged_transactions = vec![coinbase.clone(), staged_tx.clone()];
+        let block_witness_root = witness_root(&staged_transactions);
+        tx.witness = TxWitness {
+            signature: signature_bytes.clone(),
+            pubkey: funding_keypair.public_key.0.clone(),
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
+                witness_commit_ref: derive_witness_commit_ref(&tx.txid(), &block_witness_root, 0),
+            }],
+        }
+        .canonical_bytes();
+
+        let transactions = vec![coinbase, tx.clone()];
+        let block = Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Mainnet,
+                height: 6,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 1,
+                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+                nonce: 0,
+            },
+            transactions,
+        );
+        let mut block = block;
+        block.fees_total_atoms = 1_000;
+        block.fees_miner_atoms = 1_000;
+        block.fees_burned_atoms = 0;
+        block.fees_pool_atoms = 0;
+        block.cumulative_burned_atoms = 0;
+        let solved = solve_block(block);
+        let mut utxos = UtxoSet::new(Network::Mainnet);
+        utxos.insert(funding).unwrap();
+
+        assert_eq!(
+            validate_block_with_context(
+                &solved,
+                6,
+                Network::Mainnet,
+                [0; 48],
+                pow::initial_target_for_network(Network::Mainnet),
+                &[],
+                utxos,
+            ),
+            Ok(())
         );
     }
 }

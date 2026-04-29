@@ -208,7 +208,7 @@ fn run() -> Result<(), String> {
         network,
         &miner,
         build_double_spend_block(network),
-        Err(ValidationError::MissingUtxo),
+        Err(ValidationError::MempoolConflict),
     )? {
         passed += 1;
     }
@@ -636,7 +636,8 @@ fn build_double_spend_block(network: Network) -> Block {
         witness: vec![],
     };
     let spend_a = make_block_spend_tx();
-    let spend_b = spend_a.clone();
+    let mut spend_b = make_block_spend_tx();
+    spend_b.outputs[0].value_atoms = spend_b.outputs[0].value_atoms.saturating_sub(1);
     let transactions = vec![coinbase, spend_a, spend_b];
     let block_witness_root = witness_root(&transactions);
     let transactions = transactions

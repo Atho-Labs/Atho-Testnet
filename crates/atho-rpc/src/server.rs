@@ -36,6 +36,7 @@ impl RpcServer {
             tip_hash: self.tip_hash,
             mempool_count: self.mempool_count,
             mempool_total_fee_atoms: self.mempool_total_fee_atoms,
+            mempool_fingerprint: [0; 32],
             running: self.running,
             headers_synced: self.headers_synced,
             sync_best_height: self.sync_best_height,

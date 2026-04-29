@@ -22,6 +22,7 @@ pub struct ConnectionStatus {
     pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
+    pub mempool_fingerprint: [u8; 32],
     pub peer_count: usize,
     pub inbound_peer_count: usize,
     pub outbound_peer_count: usize,
@@ -287,6 +288,7 @@ impl ReadOnlyNodeConnection {
                 tip_hash: [0; 48],
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
+                mempool_fingerprint: [0; 32],
                 peer_count: 0,
                 inbound_peer_count: 0,
                 outbound_peer_count: 0,
@@ -354,6 +356,7 @@ impl ReadOnlyNodeConnection {
                         tip_hash: [0; 48],
                         mempool_count: 0,
                         mempool_total_fee_atoms: 0,
+                        mempool_fingerprint: [0; 32],
                         peer_count: 0,
                         inbound_peer_count: 0,
                         outbound_peer_count: 0,
@@ -408,6 +411,7 @@ fn collect_rpc_status(
                 tip_hash: [0; 48],
                 mempool_count: 0,
                 mempool_total_fee_atoms: 0,
+                mempool_fingerprint: [0; 32],
                 peer_count: 0,
                 inbound_peer_count: 0,
                 outbound_peer_count: 0,
@@ -435,6 +439,7 @@ fn collect_rpc_status(
             tip_hash: [0; 48],
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0; 32],
             peer_count: 0,
             inbound_peer_count: 0,
             outbound_peer_count: 0,
@@ -449,7 +454,7 @@ fn collect_rpc_status(
         };
     }
 
-    let network_ok = match client.call(&RpcRequest::GetNetwork) {
+    let _network_ok = match client.call(&RpcRequest::GetNetwork) {
         Ok(RpcResponse::Network(label)) => label == network.id(),
         _ => false,
     };
@@ -457,11 +462,12 @@ fn collect_rpc_status(
         Ok(RpcResponse::BlockCount(count)) => count,
         _ => 0,
     };
-    let mempool_count = match client.call(&RpcRequest::GetMempoolInfo) {
+    let (mempool_count, mempool_total_fee_atoms) = match client.call(&RpcRequest::GetMempoolInfo) {
         Ok(RpcResponse::MempoolInfo(MempoolInfo {
-            transaction_count, ..
-        })) => transaction_count,
-        _ => 0,
+            transaction_count,
+            total_fee_atoms,
+        })) => (transaction_count, total_fee_atoms),
+        _ => (0, 0),
     };
     ConnectionStatus {
         network,
@@ -469,17 +475,20 @@ fn collect_rpc_status(
         block_count,
         tip_hash: [0; 48],
         mempool_count,
-        mempool_total_fee_atoms: 0,
+        mempool_total_fee_atoms,
+        mempool_fingerprint: [0; 32],
         peer_count: 0,
         inbound_peer_count: 0,
         outbound_peer_count: 0,
         bytes_sent: 0,
         bytes_received: 0,
         peers: Vec::new(),
-        running: network_ok,
-        headers_synced: network_ok,
+        // Without a full NodeStatus response, the client can confirm reachability but not
+        // authoritative node readiness or sync state.
+        running: false,
+        headers_synced: false,
         sync_best_height: block_count,
-        connected: network_ok,
+        connected: false,
         startup_error: None,
     }
 }
@@ -497,6 +506,7 @@ fn connection_status_from_node_status(
         tip_hash: status.tip_hash,
         mempool_count: status.mempool_count,
         mempool_total_fee_atoms: status.mempool_total_fee_atoms,
+        mempool_fingerprint: status.mempool_fingerprint,
         peer_count: status.network_diagnostics.peer_count,
         inbound_peer_count: status.network_diagnostics.inbound_peer_count,
         outbound_peer_count: status.network_diagnostics.outbound_peer_count,
@@ -812,6 +822,7 @@ mod tests {
                         tip_hash: [0; 48],
                         mempool_count,
                         mempool_total_fee_atoms: total_fee_atoms,
+                        mempool_fingerprint: [0; 32],
                         running: true,
                         headers_synced: true,
                         sync_best_height: block_count,
@@ -844,6 +855,35 @@ mod tests {
                     RpcRequest::GetMempoolInfo => RpcResponse::MempoolInfo(MempoolInfo {
                         transaction_count: mempool_count,
                         total_fee_atoms,
+                    }),
+                    other => RpcResponse::Error(RpcError::InvalidRequest(format!(
+                        "unexpected request in mock rpc server: {other:?}"
+                    ))),
+                };
+                write_message(&mut stream, &response).expect("response");
+            }
+        });
+        (address, handle)
+    }
+
+    fn spawn_partial_rpc_server(network: Network) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let clone = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(clone);
+                let request: RpcRequest = read_message(&mut reader).expect("request");
+                let response = match request {
+                    RpcRequest::GetNodeStatus => {
+                        RpcResponse::Error(atho_rpc::error::RpcError::MethodNotFound)
+                    }
+                    RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
+                    RpcRequest::GetBlockCount => RpcResponse::BlockCount(77),
+                    RpcRequest::GetMempoolInfo => RpcResponse::MempoolInfo(MempoolInfo {
+                        transaction_count: 5,
+                        total_fee_atoms: 9,
                     }),
                     other => RpcResponse::Error(RpcError::InvalidRequest(format!(
                         "unexpected request in mock rpc server: {other:?}"
@@ -936,6 +976,25 @@ mod tests {
             conn.request(RpcRequest::GetNetwork),
             RpcResponse::Network(String::from("atho-mainnet"))
         );
+
+        handle.join().expect("mock rpc server");
+    }
+
+    #[test]
+    fn rpc_status_without_node_status_does_not_claim_readiness() {
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "0");
+        let (rpc_address, handle) = spawn_partial_rpc_server(Network::Mainnet);
+
+        let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Mainnet, rpc_address);
+        let status = conn.status();
+
+        assert!(!status.connected);
+        assert!(!status.running);
+        assert!(!status.headers_synced);
+        assert_eq!(status.block_count, 77);
+        assert_eq!(status.mempool_count, 5);
+        assert_eq!(status.mempool_total_fee_atoms, 9);
 
         handle.join().expect("mock rpc server");
     }

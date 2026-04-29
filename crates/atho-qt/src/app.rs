@@ -310,12 +310,14 @@ impl DesktopApp {
         let previous_block_count = self.view_model.block_count;
         let previous_mempool_count = self.view_model.mempool_count;
         let previous_tip_hash = self.view_model.tip_hash;
+        let previous_mempool_fingerprint = self.view_model.mempool_fingerprint;
         let startup_error = status.startup_error.clone();
         self.view_model.network_label = status.network.id().to_string();
         self.view_model.block_count = status.block_count;
         self.view_model.tip_hash = status.tip_hash;
         self.view_model.mempool_count = status.mempool_count;
         self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
+        self.view_model.mempool_fingerprint = status.mempool_fingerprint;
         self.view_model.peer_count = status.peer_count;
         self.view_model.inbound_peer_count = status.inbound_peer_count;
         self.view_model.outbound_peer_count = status.outbound_peer_count;
@@ -348,7 +350,8 @@ impl DesktopApp {
         if self.wallet.is_some()
             && (status.block_count != previous_block_count
                 || status.mempool_count != previous_mempool_count
-                || status.tip_hash != previous_tip_hash)
+                || status.tip_hash != previous_tip_hash
+                || status.mempool_fingerprint != previous_mempool_fingerprint)
         {
             self.wallet_cache_dirty = true;
         }
@@ -546,7 +549,7 @@ impl DesktopApp {
 
         let current_height = {
             let status = self.connection.status();
-            status.sync_best_height.max(status.block_count)
+            Self::wallet_scan_height(&status)
         };
         let reserved_inputs = self.mempool_reserved_inputs();
         let address_digests = &self.wallet_address_digests_cache;
@@ -735,6 +738,7 @@ impl DesktopApp {
         if !status.connected || !status.running {
             return Err(String::from("wallet scan deferred: node RPC is not ready"));
         }
+        let snapshot_token = Self::connection_snapshot_token(&status);
         let utxos = match connection.request(RpcRequest::ListUtxos) {
             RpcResponse::Utxos(utxos) => utxos,
             RpcResponse::Error(err) => return Err(format!("utxo lookup failed: {err}")),
@@ -759,7 +763,7 @@ impl DesktopApp {
             .iter()
             .map(|address| address.payment_digest)
             .collect::<HashSet<_>>();
-        let current_height = status.sync_best_height.max(status.block_count);
+        let current_height = Self::wallet_scan_height(&status);
         let mut owned = utxos
             .into_par_iter()
             .filter_map(|utxo| {
@@ -787,6 +791,12 @@ impl DesktopApp {
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
         let wallet_activity_cache =
             Self::request_wallet_activity_rows(&connection, &wallet_addresses_cache)?;
+        let end_status = connection.status();
+        if snapshot_token != Self::connection_snapshot_token(&end_status) {
+            return Err(String::from(
+                "wallet scan deferred: backend state changed during refresh",
+            ));
+        }
 
         Ok(WalletScanOutcome {
             wallet_scan_nonce,
@@ -1005,7 +1015,9 @@ impl DesktopApp {
                 self.apply_wallet_scan_outcome(outcome);
             }
             Ok(Err(err)) => {
-                if err.contains("node RPC is not ready") {
+                if err.contains("node RPC is not ready")
+                    || err.contains("backend state changed during refresh")
+                {
                     self.wallet_cache_dirty = true;
                     self.last_wallet_refresh_at = Instant::now();
                     let _ = atho_node::dev::append_log(
@@ -1068,6 +1080,34 @@ impl DesktopApp {
 
     fn wallet_scan_rpc_ready(&self) -> bool {
         self.ui_state.connected && self.view_model.running
+    }
+
+    fn wallet_scan_height(status: &ConnectionStatus) -> u64 {
+        // Wallet maturity and spendability must follow the local canonical chain height.
+        // Peer-advertised best height is useful for display, but it must not make immature
+        // outputs appear spendable before the node has actually advanced its own tip.
+        status.block_count
+    }
+
+    fn connection_snapshot_token(status: &ConnectionStatus) -> [u8; 32] {
+        let mut preimage = Vec::with_capacity(
+            status.network.id().len()
+                + core::mem::size_of::<u64>() * 4
+                + status.tip_hash.len()
+                + status.mempool_fingerprint.len()
+                + 4,
+        );
+        preimage.extend_from_slice(status.network.id().as_bytes());
+        preimage.extend_from_slice(&status.block_count.to_be_bytes());
+        preimage.extend_from_slice(&status.tip_hash);
+        preimage.extend_from_slice(&status.mempool_count.to_be_bytes());
+        preimage.extend_from_slice(&status.mempool_total_fee_atoms.to_be_bytes());
+        preimage.extend_from_slice(&status.mempool_fingerprint);
+        preimage.push(status.running as u8);
+        preimage.push(status.headers_synced as u8);
+        preimage.extend_from_slice(&status.sync_best_height.to_be_bytes());
+        preimage.push(status.connected as u8);
+        sha3_256(&preimage)
     }
 
     fn start_wallet_preparation_job<F>(&mut self, stage: &str, worker: F)
@@ -2770,7 +2810,9 @@ mod tests {
         recipient_digest: [u8; 32],
         value_atoms: u64,
     ) -> ([u8; 48], u64) {
-        let external_digest = [0x6c; 32];
+        let funding_keypair = test_keypair();
+        let external_digest =
+            atho_core::address::public_key_digest(Network::Regnet, &funding_keypair.public_key.0);
         let mut funding_utxo = None;
         let seeded = app.with_local_system_for_test(|system| {
             system.sandbox_with_node_mut(|node| {
@@ -2943,6 +2985,7 @@ mod tests {
             tip_hash: [0x11; 48],
             mempool_count: 1,
             mempool_total_fee_atoms: 44,
+            mempool_fingerprint: [0x22; 32],
             peer_count: 2,
             inbound_peer_count: 1,
             outbound_peer_count: 1,
@@ -3364,6 +3407,74 @@ mod tests {
 
         assert!(!app.wallet_scan_rpc_ready());
         assert!(app.wallet_scan_job.is_none());
+        assert!(app.wallet_cache_dirty);
+    }
+
+    #[test]
+    fn wallet_scan_height_tracks_local_block_count() {
+        let status = ConnectionStatus {
+            network: Network::Mainnet,
+            rpc_address: String::from("127.0.0.1:18444"),
+            block_count: 12,
+            tip_hash: [0; 48],
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0; 32],
+            peer_count: 0,
+            inbound_peer_count: 0,
+            outbound_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            running: true,
+            headers_synced: false,
+            sync_best_height: 1_000,
+            connected: true,
+            startup_error: None,
+        };
+
+        assert_eq!(DesktopApp::wallet_scan_height(&status), 12);
+    }
+
+    #[test]
+    fn wallet_cache_invalidates_when_mempool_fingerprint_changes() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.wallet = Some(Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[4u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Mainnet,
+        ));
+
+        let status = ConnectionStatus {
+            network: Network::Mainnet,
+            rpc_address: String::from("127.0.0.1:18444"),
+            block_count: 12,
+            tip_hash: [0x11; 48],
+            mempool_count: 3,
+            mempool_total_fee_atoms: 44,
+            mempool_fingerprint: [0x22; 32],
+            peer_count: 0,
+            inbound_peer_count: 0,
+            outbound_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            running: true,
+            headers_synced: true,
+            sync_best_height: 12,
+            connected: true,
+            startup_error: None,
+        };
+        app.apply_connection_status(status.clone());
+        app.wallet_cache_dirty = false;
+
+        let updated = ConnectionStatus {
+            mempool_fingerprint: [0x33; 32],
+            ..status
+        };
+        app.apply_connection_status(updated);
+
         assert!(app.wallet_cache_dirty);
     }
 

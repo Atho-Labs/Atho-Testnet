@@ -227,25 +227,29 @@ impl Chainstate {
             });
         }
 
+        let original_tip = self.tip.clone();
+        let original_tip_hash = self.tip_hash;
+        let original_height = self.height;
+        let original_blocks = self.blocks.clone();
+        let original_utxos = self.utxos.clone();
+        let original_undo_stack = self.undo_stack.clone();
+
         for _ in 0..disconnected.len() {
             self.disconnect_last_block()?;
         }
 
-        let mut connected = 0usize;
         for block in branch {
             if let Err(err) = self.connect_block(block) {
-                while connected > 0 {
-                    self.disconnect_last_block()?;
-                    connected = connected.saturating_sub(1);
-                }
-                for canonical in &disconnected {
-                    if self.connect_block(canonical).is_err() {
-                        return Err(StorageError::RollbackFailure);
-                    }
-                }
+                self.restore_chainstate_state(
+                    original_tip,
+                    original_tip_hash,
+                    original_height,
+                    original_blocks,
+                    original_utxos,
+                    original_undo_stack,
+                )?;
                 return Err(err);
             }
-            connected = connected.saturating_add(1);
         }
 
         Ok(ChainSelectionResult {
@@ -491,6 +495,24 @@ impl Chainstate {
             storage.save_chainstate_snapshot(&snapshot, &utxos)?;
         }
         Ok(())
+    }
+
+    fn restore_chainstate_state(
+        &mut self,
+        tip: Option<BlockHeader>,
+        tip_hash: [u8; 48],
+        height: u64,
+        blocks: Vec<Block>,
+        utxos: UtxoSet,
+        undo_stack: Vec<ChainUndo>,
+    ) -> Result<(), StorageError> {
+        self.tip = tip;
+        self.tip_hash = tip_hash;
+        self.height = height;
+        self.blocks = blocks;
+        self.utxos = utxos;
+        self.undo_stack = undo_stack;
+        self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
     }
 }
 
@@ -1817,7 +1839,7 @@ mod tests {
                     lock_time: 2,
                     witness: vec![],
                 }]),
-                timestamp: genesis_timestamp.saturating_add(2),
+                timestamp: genesis_timestamp.saturating_add(10_000),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
             },
@@ -1934,5 +1956,362 @@ mod tests {
         assert_eq!(result.disconnected[0].header.block_hash(), old_tip);
         assert_eq!(state.height, 3);
         assert_eq!(state.tip_hash, fork_3.header.block_hash());
+    }
+
+    #[test]
+    fn select_branch_restores_exact_state_after_candidate_commit_failure() {
+        let root = temp_workspace("select-branch-rollback");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+
+        let main_1 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(1),
+                        locking_script: vec![1],
+                    }],
+                    lock_time: 1,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(1),
+                        locking_script: vec![1],
+                    }],
+                    lock_time: 1,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(1),
+                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                    Network::Mainnet,
+                ),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(1),
+                    locking_script: vec![1],
+                }],
+                lock_time: 1,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_1).unwrap();
+
+        let main_2 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 2,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![2],
+                    }],
+                    lock_time: 2,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![2],
+                    }],
+                    lock_time: 2,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(2),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(2),
+                    locking_script: vec![2],
+                }],
+                lock_time: 2,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_2).unwrap();
+        let main_3 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 3,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![3],
+                    }],
+                    lock_time: 3,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![3],
+                    }],
+                    lock_time: 3,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(20_000),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(3),
+                    locking_script: vec![3],
+                }],
+                lock_time: 3,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_3).unwrap();
+        let main_4 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 4,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(4),
+                        locking_script: vec![4],
+                    }],
+                    lock_time: 4,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(4),
+                        locking_script: vec![4],
+                    }],
+                    lock_time: 4,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(20_001),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(4),
+                    locking_script: vec![4],
+                }],
+                lock_time: 4,
+                witness: vec![],
+            }],
+        ));
+        state.connect_block(&main_4).unwrap();
+        let before = (
+            state.height,
+            state.tip_hash,
+            state.blocks().len(),
+            state.utxo_count(),
+        );
+
+        let fork_2 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 2,
+                previous_block_hash: main_1.header.block_hash(),
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![22],
+                    }],
+                    lock_time: 22,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(2),
+                        locking_script: vec![22],
+                    }],
+                    lock_time: 22,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(10),
+                difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(2),
+                    locking_script: vec![22],
+                }],
+                lock_time: 22,
+                witness: vec![],
+            }],
+        ));
+        let fork_history = vec![
+            genesis::genesis_state(Network::Mainnet).block,
+            main_1.clone(),
+            fork_2.clone(),
+        ];
+        let fork_3 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 3,
+                previous_block_hash: fork_2.header.block_hash(),
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![33],
+                    }],
+                    lock_time: 33,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(3),
+                        locking_script: vec![33],
+                    }],
+                    lock_time: 33,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(11),
+                difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
+                    Network::Mainnet,
+                    &fork_history,
+                ),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(3),
+                    locking_script: vec![33],
+                }],
+                lock_time: 33,
+                witness: vec![],
+            }],
+        ));
+        let fork_history = vec![
+            genesis::genesis_state(Network::Mainnet).block,
+            main_1.clone(),
+            fork_2.clone(),
+            fork_3.clone(),
+        ];
+        let fork_4 = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 4,
+                previous_block_hash: fork_3.header.block_hash(),
+                merkle_root: merkle_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(4),
+                        locking_script: vec![44],
+                    }],
+                    lock_time: 44,
+                    witness: vec![],
+                }]),
+                witness_root: witness_root(&[Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![TxOutput {
+                        value_atoms: subsidy::block_subsidy_atoms(4),
+                        locking_script: vec![44],
+                    }],
+                    lock_time: 44,
+                    witness: vec![],
+                }]),
+                timestamp: genesis_timestamp.saturating_add(12),
+                difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
+                    Network::Mainnet,
+                    &fork_history,
+                ),
+                nonce: 0,
+            },
+            vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(4),
+                    locking_script: vec![44],
+                }],
+                lock_time: 44,
+                witness: vec![],
+            }],
+        ));
+
+        Database::inject_commit_fault_for_test(CommitFaultPoint::BeforeCommit, 1);
+        assert!(atho_core::consensus::pow::branch_is_preferred(
+            &[fork_2.clone(), fork_3.clone(), fork_4.clone()],
+            &[main_3.clone(), main_4.clone()]
+        ));
+        let result = state.select_branch(&[fork_2, fork_3, fork_4]);
+        Database::clear_commit_fault_for_test();
+
+        assert!(
+            matches!(result, Err(StorageError::Io(_))),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(state.height, before.0);
+        assert_eq!(state.tip_hash, before.1);
+        assert_eq!(state.blocks().len(), before.2);
+        assert_eq!(state.utxo_count(), before.3);
+
+        let db = Database::open(Network::Mainnet).expect("database");
+        let snapshot = db
+            .load_chainstate_snapshot()
+            .expect("snapshot")
+            .expect("present snapshot");
+        assert_eq!(snapshot.height, before.0);
+        assert_eq!(snapshot.tip_hash, before.1);
     }
 }

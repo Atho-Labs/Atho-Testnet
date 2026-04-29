@@ -89,6 +89,8 @@ pub struct NodeStatus {
     pub tip_hash: [u8; 48],
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub mempool_fingerprint: [u8; 32],
     pub running: bool,
     pub headers_synced: bool,
     pub sync_best_height: u64,
