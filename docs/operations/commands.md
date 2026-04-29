@@ -255,6 +255,8 @@ The release script stages:
 
 For GitHub publishing, use [`.github/workflows/publish-packages.yml`](../../.github/workflows/publish-packages.yml). It builds the same per-OS packages and uploads the release assets to GitHub Releases.
 
+The workflow also publishes one combined `Atho-<version>-desktop.zip` package that contains the full `desktop/` tree for all supported OS bundles.
+
 The legacy wrappers still work:
 
 ```bash

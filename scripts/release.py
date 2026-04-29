@@ -824,10 +824,8 @@ def write_desktop_readme(version: str, platform_name: str, arch: str) -> None:
 
 This folder is the shareable desktop release tree.
 
-Current build:
-- version: {version}
-- platform: {platform_name}
-- architecture: {arch}
+Current release version:
+- {version}
 
 Layout:
 - `desktop/releases/<version>/<platform>-<arch>/`
@@ -841,6 +839,7 @@ Layout:
 
 How to use:
 - open the root `desktop/` folder
+- download the combined `Atho-<version>-desktop.zip` release if you want every platform bundle in one file
 - run `install.sh` on Linux or macOS, or launch the native installer directly from the bundle
 - run `install.ps1` on Windows, or launch `Atho Setup.exe` directly from the bundle
 - keep all platform bundles in this folder if you are assembling a multi-OS release set

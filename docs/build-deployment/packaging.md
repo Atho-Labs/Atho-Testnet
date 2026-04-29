@@ -147,6 +147,12 @@ It produces one package set per platform:
 - `macos-arm64`
 - `windows-x86_64`
 
+It also publishes one combined cross-platform download:
+
+- `Atho-<version>-desktop.zip`
+
+That combined package contains the full `desktop/` tree with all platform bundles, so a user can download one file and then run the installer for their OS from inside the extracted folder.
+
 Each release asset contains:
 
 - the platform archive from `dist/releases/<version>/<platform>-<arch>/archives/`
@@ -158,6 +164,8 @@ Download the asset that matches your OS, extract it, and run the native setup fr
 - Windows: `Atho Setup.exe`
 - macOS: `Atho Setup.app`
 - Linux: `Atho Setup`
+
+If you want one download that carries every platform package, pick `Atho-<version>-desktop.zip`.
 
 ## What To Edit Later
 

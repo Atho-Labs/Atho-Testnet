@@ -112,6 +112,8 @@ The root `desktop/install.sh` and `desktop/install.ps1` scripts dispatch to `des
 
 GitHub release publishing is automated by [`.github/workflows/publish-packages.yml`](.github/workflows/publish-packages.yml). It builds Windows, macOS, and Linux packages and publishes the matching archive for each OS to GitHub Releases.
 
+GitHub Releases also gets one combined download named `Atho-<version>-desktop.zip`. That archive contains the full `desktop/` tree with every platform bundle, so you can download one file, extract it, and run the installer for your OS from inside the folder.
+
 ## Runtime Roots
 
 Default runtime root:

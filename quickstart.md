@@ -14,6 +14,8 @@ If you downloaded a packaged release instead of building from source, start with
 
 GitHub Releases will host the per-OS packages produced by the release workflow in [`.github/workflows/publish-packages.yml`](.github/workflows/publish-packages.yml).
 
+If you want one download that contains all OS bundles, use `Atho-<version>-desktop.zip` from GitHub Releases. Extract it, open the extracted `desktop/` folder, and run the installer for your OS.
+
 ## 1. Install
 
 Install these basics first:

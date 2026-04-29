@@ -73,16 +73,17 @@ jobs:
           fi
 
           artifact_dir="release-assets/${BUNDLE_TAG}"
-          mkdir -p "$artifact_dir"
-          cp "$bundle_dir"/archives/* "$artifact_dir"/
-          cp "$bundle_dir/checksums.sha256" "$artifact_dir/Atho-${VERSION}-${BUNDLE_TAG}.checksums.sha256"
-          cp "$bundle_dir/manifest.json" "$artifact_dir/Atho-${VERSION}-${BUNDLE_TAG}.manifest.json"
+          mkdir -p "$artifact_dir/release" "$artifact_dir/desktop"
+          cp "$bundle_dir"/archives/* "$artifact_dir/release"/
+          cp "$bundle_dir/checksums.sha256" "$artifact_dir/release/Atho-${VERSION}-${BUNDLE_TAG}.checksums.sha256"
+          cp "$bundle_dir/manifest.json" "$artifact_dir/release/Atho-${VERSION}-${BUNDLE_TAG}.manifest.json"
+          cp -R desktop/. "$artifact_dir/desktop"/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: atho-${{ matrix.bundle_tag }}
-          path: release-assets/${{ matrix.bundle_tag }}/*
+          path: release-assets/${{ matrix.bundle_tag }}
 
   publish:
     name: Publish GitHub Release
@@ -123,4 +124,26 @@ jobs:
           name: Atho ${{ steps.resolve.outputs.release_version }}
           generate_release_notes: true
           files: |
-            release-assets/**/*
+            release-assets/release/**/*
+
+      - name: Build combined desktop zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.resolve.outputs.release_version }}"
+          desktop_root="release-assets/desktop"
+          if [ ! -d "$desktop_root" ]; then
+            echo "missing merged desktop tree: $desktop_root" >&2
+            exit 1
+          fi
+          (cd release-assets && zip -qr "Atho-${version}-desktop.zip" desktop)
+
+      - name: Publish combined desktop package
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: Atho ${{ steps.resolve.outputs.release_version }}
+          generate_release_notes: false
+          files: |
+            release-assets/Atho-${{ steps.resolve.outputs.release_version }}-desktop.zip
