@@ -5,7 +5,8 @@ use atho_rpc::request::RpcRequest;
 use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcResponse};
 use atho_rpc::transport::RpcClient;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -13,6 +14,7 @@ use std::time::Duration;
 
 const ATHO_QT_LOCAL_ENV: &str = "ATHO_QT_LOCAL";
 const ATHO_QT_FORCE_RPC_ENV: &str = "ATHO_QT_FORCE_RPC";
+const DEFAULT_MAINNET_BOOTSTRAP_PEER: &str = "74.208.219.116:56000";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -606,6 +608,28 @@ fn start_local_node_if_needed(
         command
     };
     let (stdout, stderr) = local_node_stdio(network)?;
+    if let Some(p2p_addr) = managed_local_node_p2p_bind_address(network) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "managed local node p2p bind override network={} addr={}",
+                network.id(),
+                p2p_addr
+            ),
+        );
+        command.env("ATHO_P2P_ADDR", p2p_addr);
+    }
+    if let Some(peer) = managed_local_node_bootstrap_peer(network) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "managed local node bootstrap peer network={} peer={}",
+                network.id(),
+                peer
+            ),
+        );
+        command.env("ATHO_P2P_PEERS", peer);
+    }
     command
         .env("ATHO_RPC_ADDR", rpc_address)
         .env("ATHO_NETWORK", network.cli_arg())
@@ -724,15 +748,116 @@ fn node_binary_path() -> Option<PathBuf> {
     }
 
     let exe = std::env::current_exe().ok()?;
-    let parent = exe.parent()?;
-    let candidate_dir = if parent.ends_with("deps") {
-        parent.parent()?
-    } else {
-        parent
-    };
+    node_binary_candidates_from_exe(&exe)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn node_binary_candidates_from_exe(exe: &Path) -> Vec<PathBuf> {
     let name = if cfg!(windows) { "athod.exe" } else { "athod" };
-    let candidate = candidate_dir.join(name);
-    candidate.exists().then_some(candidate)
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = exe.parent() {
+        let candidate_dir = if parent.ends_with("deps") {
+            parent.parent().unwrap_or(parent)
+        } else {
+            parent
+        };
+        push_unique_candidate(&mut candidates, candidate_dir.join(name));
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Some(app_root) = macos_app_bundle_root(exe) {
+            push_unique_candidate(
+                &mut candidates,
+                app_root.join("Contents").join("MacOS").join(name),
+            );
+            push_unique_candidate(
+                &mut candidates,
+                app_root.join("Contents").join("Resources").join(name),
+            );
+            if let Some(install_root) = app_root.parent() {
+                push_unique_candidate(&mut candidates, install_root.join(name));
+            }
+        }
+    }
+
+    if let Some(workspace_root) = workspace_manifest_path().parent() {
+        push_unique_candidate(
+            &mut candidates,
+            workspace_root.join("target").join("release").join(name),
+        );
+        push_unique_candidate(
+            &mut candidates,
+            workspace_root.join("target").join("debug").join(name),
+        );
+    }
+
+    candidates
+}
+
+fn push_unique_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn macos_app_bundle_root(exe: &Path) -> Option<&Path> {
+    let app_root = exe.parent().and_then(Path::parent).and_then(Path::parent)?;
+    if app_root.extension().and_then(|ext| ext.to_str()) == Some("app") {
+        Some(app_root)
+    } else {
+        None
+    }
+}
+
+fn managed_local_node_bootstrap_peer(network: Network) -> Option<String> {
+    if network != Network::Mainnet {
+        return None;
+    }
+
+    if std::env::var("ATHO_P2P_PEERS")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let peer = std::env::var("ATHO_MAINNET_PEER")
+        .unwrap_or_else(|_| String::from(DEFAULT_MAINNET_BOOTSTRAP_PEER));
+    let peer = peer.trim();
+    if peer.is_empty() {
+        None
+    } else {
+        Some(peer.to_string())
+    }
+}
+
+fn managed_local_node_p2p_bind_address(network: Network) -> Option<String> {
+    managed_local_node_p2p_bind_address_for_probe(
+        network,
+        &atho_node::runtime::default_p2p_bind_address(network),
+    )
+}
+
+fn managed_local_node_p2p_bind_address_for_probe(
+    _network: Network,
+    probe_bind_address: &str,
+) -> Option<String> {
+    if std::env::var("ATHO_P2P_ADDR")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    if TcpListener::bind(probe_bind_address).is_ok() {
+        return None;
+    }
+
+    Some(String::from("127.0.0.1:0"))
 }
 
 fn workspace_manifest_path() -> PathBuf {
@@ -933,6 +1058,7 @@ mod tests {
 
     #[test]
     fn read_only_connection_forwards_rpc_requests() {
+        let _lock = acquire_global_test_lock();
         let conn = ReadOnlyNodeConnection::new(Network::Mainnet);
         assert_eq!(
             conn.request(RpcRequest::GetNetwork),
@@ -1115,5 +1241,73 @@ mod tests {
         let status = wait_for_status(&conn, |status| status.block_count >= 2);
         assert_eq!(status.block_count, 2);
         assert_eq!(status.sync_best_height, 2);
+    }
+
+    #[test]
+    fn macos_bundle_node_binary_candidates_include_bundle_and_install_root() {
+        let app_executable = Path::new("/Applications/Atho/Atho.app/Contents/MacOS/Atho");
+        let candidates = node_binary_candidates_from_exe(app_executable);
+        assert!(candidates.contains(&PathBuf::from(
+            "/Applications/Atho/Atho.app/Contents/MacOS/athod"
+        )));
+        assert!(candidates.contains(&PathBuf::from("/Applications/Atho/athod")));
+    }
+
+    #[test]
+    fn managed_mainnet_local_node_uses_bootstrap_peer_when_no_peer_is_configured() {
+        let _lock = acquire_global_test_lock();
+        let previous_peers = std::env::var_os("ATHO_P2P_PEERS");
+        let previous_mainnet_peer = std::env::var_os("ATHO_MAINNET_PEER");
+        std::env::remove_var("ATHO_P2P_PEERS");
+        std::env::remove_var("ATHO_MAINNET_PEER");
+
+        let peer = managed_local_node_bootstrap_peer(Network::Mainnet);
+        assert_eq!(peer.as_deref(), Some(DEFAULT_MAINNET_BOOTSTRAP_PEER));
+
+        if let Some(previous) = previous_peers {
+            std::env::set_var("ATHO_P2P_PEERS", previous);
+        } else {
+            std::env::remove_var("ATHO_P2P_PEERS");
+        }
+        if let Some(previous) = previous_mainnet_peer {
+            std::env::set_var("ATHO_MAINNET_PEER", previous);
+        } else {
+            std::env::remove_var("ATHO_MAINNET_PEER");
+        }
+    }
+
+    #[test]
+    fn managed_local_node_bootstrap_peer_respects_existing_peer_configuration() {
+        let _lock = acquire_global_test_lock();
+        let previous_peers = std::env::var_os("ATHO_P2P_PEERS");
+        std::env::set_var("ATHO_P2P_PEERS", "127.0.0.1:56000");
+
+        assert!(managed_local_node_bootstrap_peer(Network::Mainnet).is_none());
+        assert!(managed_local_node_bootstrap_peer(Network::Regnet).is_none());
+
+        if let Some(previous) = previous_peers {
+            std::env::set_var("ATHO_P2P_PEERS", previous);
+        } else {
+            std::env::remove_var("ATHO_P2P_PEERS");
+        }
+    }
+
+    #[test]
+    fn managed_local_node_p2p_bind_address_falls_back_when_default_port_is_busy() {
+        let _lock = acquire_global_test_lock();
+        let previous_addr = std::env::var_os("ATHO_P2P_ADDR");
+        std::env::remove_var("ATHO_P2P_ADDR");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve test p2p port");
+        let probe_addr = listener.local_addr().expect("probe addr").to_string();
+
+        let addr = managed_local_node_p2p_bind_address_for_probe(Network::Mainnet, &probe_addr);
+        assert_eq!(addr.as_deref(), Some("127.0.0.1:0"));
+
+        if let Some(previous) = previous_addr {
+            std::env::set_var("ATHO_P2P_ADDR", previous);
+        } else {
+            std::env::remove_var("ATHO_P2P_ADDR");
+        }
+        drop(listener);
     }
 }

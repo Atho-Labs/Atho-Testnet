@@ -590,7 +590,9 @@ fn extract_payload_bytes(bytes: &[u8]) -> Result<BundleLocation, String> {
     Ok(BundleLocation::extracted(root, tempdir))
 }
 
-fn parse_windows_payload_footer(footer: &[u8]) -> Result<(u64, [u8; PAYLOAD_DIGEST_BYTES]), String> {
+fn parse_windows_payload_footer(
+    footer: &[u8],
+) -> Result<(u64, [u8; PAYLOAD_DIGEST_BYTES]), String> {
     if footer.len() != PAYLOAD_FOOTER_SIZE as usize {
         return Err("embedded installer footer has an unexpected length".to_string());
     }
@@ -602,10 +604,9 @@ fn parse_windows_payload_footer(footer: &[u8]) -> Result<(u64, [u8; PAYLOAD_DIGE
             .try_into()
             .expect("payload footer length"),
     );
-    let expected_digest: [u8; PAYLOAD_DIGEST_BYTES] =
-        footer[PAYLOAD_FOOTER_MAGIC.len() + 8..]
-            .try_into()
-            .expect("payload footer digest");
+    let expected_digest: [u8; PAYLOAD_DIGEST_BYTES] = footer[PAYLOAD_FOOTER_MAGIC.len() + 8..]
+        .try_into()
+        .expect("payload footer digest");
     Ok((payload_len, expected_digest))
 }
 

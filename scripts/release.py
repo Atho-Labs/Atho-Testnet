@@ -457,8 +457,10 @@ def stage_macos_client_app(release_root: Path, version: str, arch: str) -> None:
     macos_root = contents_root / "MacOS"
     macos_root.mkdir(parents=True, exist_ok=True)
     copy_binary("atho-qt", macos_root / "Atho")
+    copy_binary("athod", macos_root / "athod")
     write_text_file(contents_root / "Info.plist", macos_client_info_plist(version, arch))
     make_executable(macos_root / "Atho")
+    make_executable(macos_root / "athod")
 
 
 def stage_windows_client_executable(release_root: Path) -> None:
@@ -812,7 +814,7 @@ EOF
 """
 
     macos_command_chmod = (
-        'chmod +x "$app_dir"/Atho.command "$app_dir"/Atho.app/Contents/MacOS/Atho\n'
+        'chmod +x "$app_dir"/Atho.command "$app_dir"/Atho.app/Contents/MacOS/Atho "$app_dir"/Atho.app/Contents/MacOS/athod\n'
         if platform_name == "macos"
         else ""
     )

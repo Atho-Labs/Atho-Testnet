@@ -98,11 +98,7 @@ fn launched_from_macos_app_bundle() -> bool {
 }
 
 fn is_macos_app_bundle_executable(exe: &Path) -> bool {
-    let Some(app_root) = exe
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-    else {
+    let Some(app_root) = exe.parent().and_then(Path::parent).and_then(Path::parent) else {
         return false;
     };
     app_root.extension().and_then(|ext| ext.to_str()) == Some("app")
