@@ -1,0 +1,10 @@
+flowchart LR
+    Wallet[Wallet creation] --> Signing[Local signing]
+    Signing --> Broadcast[Broadcast]
+    Broadcast --> Checks[Mempool checks]
+    Checks --> Selection[Miner selection]
+    Selection --> Inclusion[Block inclusion]
+    Inclusion --> Validation[Block validation]
+    Validation --> Update[UTXO spend/update]
+    Update --> Confirm[Confirmations]
+    Confirm --> Settlement[Final settlement]

@@ -1,0 +1,9 @@
+flowchart LR
+    Seed[Mnemonic or seed] --> Wallet[HD wallet]
+    Wallet --> Address[Receive/change addresses]
+    Wallet --> Builder[Transaction builder]
+    Builder --> Signer[Falcon signing]
+    Signer --> RPC[Local RPC]
+    RPC --> Node[athod]
+    Node --> Status[Status and activity]
+    Status --> Wallet

@@ -1,0 +1,11 @@
+flowchart TD
+    P2P[P2P Network] --> API[API Layer]
+    API --> MEM[Mempool]
+    MEM --> CONS[Consensus Engine]
+    CONS --> TXV[Transaction Validator]
+    CONS --> BLKV[Block Validator]
+    TXV --> STORE[Storage Layer]
+    BLKV --> STORE
+    WALLET[Wallet Interface] --> API
+    MINER[Miner Interface] --> MEM
+    MINER --> CONS

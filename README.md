@@ -209,6 +209,7 @@ desktop/          shareable desktop release tree
 
 Start here:
 
+- [`About Atho`](docs/overview/about-atho.md)
 - [`docs/index.md`](docs/index.md)
 
 Key sections:

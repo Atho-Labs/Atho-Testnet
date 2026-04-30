@@ -1,0 +1,11 @@
+flowchart TD
+    Block[Received block] --> Decode[Decode]
+    Decode --> Header[Header checks]
+    Header --> Parent[Previous hash check]
+    Parent --> Pow[Difficulty and proof-of-work]
+    Pow --> Time[Timestamp check]
+    Time --> Coinbase[Coinbase check]
+    Coinbase --> Tx[Transaction checks]
+    Tx --> UTXO[UTXO updates]
+    UTXO --> Commit[State commitment]
+    Commit --> Store[Store and relay]

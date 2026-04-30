@@ -1,0 +1,10 @@
+word_count=11310
+figure_count=11
+table_count=11
+pdf_path=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/atho-whitepaper-apa.pdf
+pdf_size_bytes=1019565
+source_markdown=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/atho-whitepaper-apa.md
+diagram_dir=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/diagrams
+asset_dir=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/assets
+image_sizes_bytes={'figure_01_system_overview.png': 76679, 'figure_02_node_architecture.png': 108046, 'figure_03_signing_verification.png': 66465, 'figure_04_transaction_lifecycle.png': 68491, 'figure_05_block_validation.png': 85783, 'figure_06_emission_model.png': 96279, 'figure_07_mempool_admission.png': 89346, 'figure_08_node_sync.png': 59735, 'figure_09_wallet_node.png': 84536, 'figure_10_validation_parallel.png': 96689, 'figure_11_storage_commit.png': 91091}
+quality_status=PASS

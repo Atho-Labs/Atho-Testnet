@@ -10,6 +10,7 @@ It is designed to answer three questions clearly:
 
 ## Start Here
 
+- [About Atho](overview/about-atho.md)
 - [Project Overview](overview/project-overview.md)
 - [Repository Structure](overview/repository-structure.md)
 - [System Architecture](architecture/system-architecture.md)

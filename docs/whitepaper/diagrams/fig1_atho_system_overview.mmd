@@ -1,0 +1,9 @@
+flowchart LR
+    Wallet[Wallet] --> Builder[Transaction Builder]
+    Builder --> Signer[Falcon-512 Signing Engine]
+    Signer --> Mempool[Mempool Admission]
+    Mempool --> Miner[Miner Block Candidate]
+    Miner --> Consensus[Consensus Validation]
+    Consensus --> Storage[Block and UTXO Storage]
+    Storage --> Explorer[Explorer and API]
+    Storage --> WalletSync[Wallet Sync]
