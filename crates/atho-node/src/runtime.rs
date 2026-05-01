@@ -5,6 +5,10 @@ use crate::node::Node;
 use crate::system::AthoSystem;
 use crate::tcp_p2p::TcpP2pRuntime;
 use atho_core::network::Network;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, LAUNCH_P2P_BIND_FAILED, LAUNCH_PUBLIC_RPC_DENIED,
+    LAUNCH_RPC_BIND_FAILED, NET_INVALID_NETWORK_SELECTION,
+};
 use atho_p2p::config::network_params;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
@@ -28,6 +32,30 @@ pub enum RuntimeError {
     RpcBindFailed(String),
     #[error("p2p bind failed: {0}")]
     P2pBindFailed(String),
+}
+
+impl AthoErrorMeta for RuntimeError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::InvalidNetwork => &NET_INVALID_NETWORK_SELECTION,
+            Self::PublicRpcDenied(_) => &LAUNCH_PUBLIC_RPC_DENIED,
+            Self::RpcBindFailed(_) => &LAUNCH_RPC_BIND_FAILED,
+            Self::P2pBindFailed(_) => &LAUNCH_P2P_BIND_FAILED,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-node::runtime"
+    }
+
+    fn safe_details(&self) -> Option<String> {
+        match self {
+            Self::PublicRpcDenied(address)
+            | Self::RpcBindFailed(address)
+            | Self::P2pBindFailed(address) => Some(address.clone()),
+            Self::InvalidNetwork => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -305,5 +333,18 @@ mod tests {
     fn config_loader_defaults_to_mainnet() {
         let config = NodeConfig::new(Network::Mainnet);
         assert_eq!(config.network, Network::Mainnet);
+    }
+
+    #[test]
+    fn config_loader_accepts_prunetest_network_from_env() {
+        std::env::set_var("ATHO_NETWORK", "prune-test");
+        let config = load_config_from_env().expect("config");
+        std::env::remove_var("ATHO_NETWORK");
+        assert_eq!(config.network, Network::Prunetest);
+        assert_eq!(
+            default_rpc_bind_address(Network::Prunetest),
+            "127.0.0.1:9310"
+        );
+        assert_eq!(default_p2p_bind_address(Network::Prunetest), "0.0.0.0:9300");
     }
 }

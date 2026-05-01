@@ -27,7 +27,7 @@ Interpretation:
 | Reorg lifecycle | 7/10 | deterministic local branch handling exists; deep pruned history is conservative |
 | Fork lifecycle | 7/10 | local branch selection and rejection logic exist |
 | Version/activation | 7/10 | centralized scaffolding exists; no active V2 deployment yet |
-| Pruning lifecycle | 6/10 | constants, snapshot bundles, and import/export exist, but coverage is still incomplete |
+| Pruning lifecycle | 7/10 | isolated prune-test network exists and snapshot/pruning regressions are stronger, but lifecycle tooling is still incomplete |
 | API/backend lifecycle | 8/10 | local RPC and service ownership are strong; public RPC is denied by default |
 | GUI / Qt lifecycle | 8/10 | functional, backend-synced, and operationally cleaner |
 | Qt sync-to-tip correctness | 8/10 | real RPC tip propagation is tested |
@@ -45,6 +45,7 @@ Interpretation:
 - real mined-block, send, confirm, restart, and rehydrate lifecycle coverage
 - live TCP peer runtime with real-socket sync, reorg, restart, and transaction relay coverage
 - 25-node live cluster convergence and recovery coverage
+- isolated `prunetest` network for pruning, restart, and recovery regression work
 
 ## What Is Still Incomplete
 

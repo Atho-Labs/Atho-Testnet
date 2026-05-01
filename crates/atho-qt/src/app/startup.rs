@@ -163,4 +163,22 @@ fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui,
         "Open an existing wallet or create a new wallet to continue.",
     );
+    ui.add_space(14.0);
+    egui::Frame::none()
+        .fill(widgets::PANEL_BG)
+        .stroke(egui::Stroke::new(1.0, widgets::PANEL_STROKE))
+        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+        .show(ui, |ui| {
+            widgets::section_header(ui, "First Run");
+            ui.add_space(8.0);
+            ui.label("1. Create or open a wallet.");
+            ui.label("2. Use regnet or testnet first to keep the workflow local.");
+            ui.label("3. Open Settings to see whether mining is using GPU or CPU.");
+            ui.label("4. If GPU is unavailable or fails, Atho falls back to CPU automatically.");
+            ui.add_space(8.0);
+            widgets::muted_label(
+                ui,
+                "The Mining panel shows the effective backend and any fallback reason so you can confirm the runtime path before leaving the app running.",
+            );
+        });
 }

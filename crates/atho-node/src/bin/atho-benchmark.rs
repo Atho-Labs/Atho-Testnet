@@ -13,6 +13,7 @@ use atho_node::config::NodeConfig;
 use atho_node::mempool::MempoolEntry;
 use atho_node::miner::Miner;
 use atho_node::node::Node;
+use atho_node::service::NodeService;
 use atho_node::sync::NodeSync;
 use atho_node::validation::{
     derive_sig_ref_short, derive_witness_commit_ref, validate_block_with_context,
@@ -22,6 +23,9 @@ use atho_p2p::protocol::{
     compact_block_from_block, Hash48, MessagePayload, NetworkMessage, VersionMessage,
     LOCAL_NODE_SERVICES,
 };
+use atho_rpc::command::{help_payload, CommandInvocation};
+use atho_rpc::request::RpcRequest;
+use atho_rpc::response::RpcResponse;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +102,14 @@ fn run() -> Result<(), String> {
     }
     let block_validation = bench_block_validation(&fixture, cli.samples)?;
     if debug {
+        eprintln!("benchmark scenario: command help");
+    }
+    let command_help = bench_command_help(cli.samples)?;
+    if debug {
+        eprintln!("benchmark scenario: command workflow");
+    }
+    let command_workflow = bench_command_workflow(&fixture, cli.samples)?;
+    if debug {
         eprintln!("benchmark scenario: mempool admission");
     }
     let mempool_admission = bench_mempool_admission(&fixture, cli.samples)?;
@@ -117,6 +129,8 @@ fn run() -> Result<(), String> {
         &fixture,
         &[
             block_validation,
+            command_help,
+            command_workflow,
             mempool_admission,
             propagation_full,
             propagation_compact,
@@ -300,7 +314,7 @@ impl BenchmarkFixture {
             eprintln!("benchmark fixture: building candidate block");
         }
         let candidate = node
-            .build_candidate_block(&miner)
+            .build_candidate_block()
             .map_err(|err| format!("candidate block build failed: {err}"))?;
         if debug {
             eprintln!("benchmark fixture: solving block");
@@ -521,6 +535,76 @@ fn bench_block_validation(
             fixture.compact_block_frame.len(),
             fixture.block.header.height,
             fixture.block.transactions.len()
+        ),
+    })
+}
+
+fn bench_command_help(samples: usize) -> Result<BenchResult, String> {
+    let mut durations = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let start = Instant::now();
+        let payload = help_payload(None)?;
+        durations.push(start.elapsed());
+        if payload["count"].as_u64().unwrap_or_default() == 0 {
+            return Err(String::from(
+                "command help benchmark returned an empty registry payload",
+            ));
+        }
+    }
+    Ok(BenchResult {
+        name: "command_help_local",
+        tx_count: 1,
+        signature_count: 0,
+        runs: samples,
+        mean: mean_duration(&durations),
+        notes: String::from("steady-state local registry help path; no RPC or node mutation"),
+    })
+}
+
+fn bench_command_workflow(
+    fixture: &BenchmarkFixture,
+    samples: usize,
+) -> Result<BenchResult, String> {
+    let workflow = command_workflow_invocations(fixture.network);
+    let workflow_names = workflow
+        .iter()
+        .map(|invocation| invocation.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let service = NodeService::new(NodeConfig::new(fixture.network));
+    let mut durations = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let start = Instant::now();
+        for invocation in workflow.iter().cloned() {
+            let response = service.handle(RpcRequest::ExecuteCommand(invocation.clone()));
+            match response {
+                RpcResponse::Command(_) => {}
+                RpcResponse::Error(err) => {
+                    return Err(format!(
+                        "command workflow benchmark failed for {}: {} {}",
+                        invocation.name, err.code, err.message
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "command workflow benchmark returned unexpected response for {}: {other:?}",
+                        invocation.name
+                    ));
+                }
+            }
+        }
+        durations.push(start.elapsed());
+    }
+    Ok(BenchResult {
+        name: "command_workflow_rpc",
+        tx_count: workflow.len(),
+        signature_count: 0,
+        runs: samples,
+        mean: mean_duration(&durations),
+        notes: format!(
+            "steady-state command router path; commands={} network={}",
+            workflow_names,
+            fixture.network.id()
         ),
     })
 }
@@ -859,4 +943,53 @@ fn current_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn command_workflow_invocations(network: Network) -> Vec<CommandInvocation> {
+    let address = atho_core::address::encode_base56_address(network, &[7u8; 32]);
+    vec![
+        CommandInvocation::new("help", Vec::new()),
+        CommandInvocation::new("getstatus", Vec::new()),
+        CommandInvocation::new("gethealth", Vec::new()),
+        CommandInvocation::new("getblockchaininfo", Vec::new()),
+        CommandInvocation::new("getnetworkinfo", Vec::new()),
+        CommandInvocation::new("getmempoolinfo", Vec::new()),
+        CommandInvocation::new("gettemplateinfo", Vec::new()),
+        CommandInvocation::new("validateathoaddress", vec![address]),
+        CommandInvocation::new("sha3_384", vec![String::from("414243")]),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_workflow_invocations_cover_console_read_path() {
+        let commands = command_workflow_invocations(Network::Regnet)
+            .into_iter()
+            .map(|invocation| invocation.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            vec![
+                String::from("help"),
+                String::from("getstatus"),
+                String::from("gethealth"),
+                String::from("getblockchaininfo"),
+                String::from("getnetworkinfo"),
+                String::from("getmempoolinfo"),
+                String::from("gettemplateinfo"),
+                String::from("validateathoaddress"),
+                String::from("sha3_384"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bench_command_help_returns_registry_result() {
+        let result = bench_command_help(1).expect("command help bench");
+        assert_eq!(result.name, "command_help_local");
+        assert_eq!(result.runs, 1);
+    }
 }

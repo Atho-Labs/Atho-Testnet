@@ -10,6 +10,7 @@ use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
+use atho_errors::AthoError;
 use atho_p2p::relay::RelayLoop;
 use atho_storage::chainstate::Chainstate;
 use atho_storage::utxo::UtxoEntry;
@@ -96,6 +97,10 @@ fn ensure_layout_for(root: &Path) -> std::io::Result<()> {
 pub fn append_log(component: &str, line: &str) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     append_log_locked(component, line)
+}
+
+pub fn append_atho_error(component: &str, error: &AthoError) -> std::io::Result<()> {
+    append_log(component, &error.log_line())
 }
 
 fn append_log_locked(component: &str, line: &str) -> std::io::Result<()> {
@@ -456,6 +461,7 @@ pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
         Network::Mainnet => ([0x11; 48], 2_000, 0x11),
         Network::Testnet => ([0x22; 48], 1_500, 0x22),
         Network::Regnet => ([0x33; 48], 1_000, 0x33),
+        Network::Prunetest => ([0x44; 48], 750, 0x44),
     }
 }
 

@@ -1,3 +1,4 @@
+use atho_node::mining_backend::MiningBackendKind;
 use atho_wallet::snapshot::WalletSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -6,6 +7,7 @@ pub struct UiState {
     pub connected: bool,
     pub generate_coins: bool,
     pub mining_cores: u32,
+    pub mining_backend: MiningBackendKind,
     pub rotate_coinbase_address: bool,
 }
 
@@ -20,6 +22,10 @@ impl UiState {
 
     pub fn set_mining_cores(&mut self, cores: u32) {
         self.mining_cores = cores;
+    }
+
+    pub fn set_mining_backend(&mut self, backend: MiningBackendKind) {
+        self.mining_backend = backend;
     }
 }
 

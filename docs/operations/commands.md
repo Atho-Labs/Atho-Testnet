@@ -9,12 +9,14 @@ There are three primary binaries:
 1. `athod`
 2. `atho-mine`
 3. `atho-qt`
+4. `atho-cli`
 
 Recommended roles:
 
 - `athod`: full node / daemon / VPS node
 - `atho-mine`: standalone miner process
 - `atho-qt`: desktop wallet and client
+- `atho-cli`: Bitcoin Core-style local RPC command client
 
 ## Quick Start
 
@@ -25,9 +27,12 @@ cargo build --release -p atho-node -p atho-qt
 ./target/release/atho-qt --network regnet --local-node
 ./target/release/athod --network regnet
 ./target/release/atho-mine --network regnet
+./target/release/atho-cli --network regnet getblockchaininfo
 ```
 
 `--local-node` starts a managed `athod` child process over RPC so the desktop client uses the real node path.
+
+For disposable pruning and recovery work, prefer `--network prunetest`.
 
 ## Data Root
 
@@ -115,7 +120,7 @@ Preferred command:
 
 Useful flags:
 
-- `--network <mainnet|testnet|regnet>`
+- `--network <mainnet|testnet|regnet|prunetest>`
 - `--data-dir PATH`
 - `--rpc-addr HOST:PORT`
 - `--p2p-addr HOST:PORT`
@@ -178,7 +183,7 @@ Managed local node with explicit bootstrap peers:
 
 Useful flags:
 
-- `--network <mainnet|testnet|regnet>`
+- `--network <mainnet|testnet|regnet|prunetest>`
 - `--rpc-addr HOST:PORT`
 - `--local-node`
 - `--peer HOST:PORT` (repeatable)
@@ -192,6 +197,30 @@ The settings page includes a controlled network diagnostics view with:
 - sent/received byte counters
 - per-peer endpoint, direction, protocol, and traffic details
 
+The desktop client now also includes a registry-backed `Debug Console` accessible from `Help > Debug Console` or the toolbar `Console` button.
+
+## CLI
+
+Run command-style RPC calls against a local node:
+
+```bash
+./target/release/atho-cli --network regnet getstatus
+./target/release/atho-cli --network regnet getblockchaininfo
+./target/release/atho-cli --format table getpeerinfo
+./target/release/atho-cli help getblocktemplate
+```
+
+Supported flags:
+
+- `--network <mainnet|testnet|regnet|prunetest>`
+- `--rpc-url HOST:PORT`
+- `--format <json|pretty|table>`
+- `--confirm`
+
+Current limitation:
+
+- the current local RPC transport is still local-only and does not yet implement cookie auth or username/password auth
+
 ## Miner
 
 Run the node first, then the miner:
@@ -203,7 +232,7 @@ Run the node first, then the miner:
 
 Useful flags:
 
-- `--network <mainnet|testnet|regnet>`
+- `--network <mainnet|testnet|regnet|prunetest>`
 - `--rpc-addr HOST:PORT`
 - `--cores N`
 - `--data-dir PATH`

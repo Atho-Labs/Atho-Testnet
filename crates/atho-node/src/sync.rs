@@ -1473,7 +1473,7 @@ mod tests {
 
         let block_1 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 1"),
         );
         reference_node
@@ -1481,7 +1481,7 @@ mod tests {
             .expect("connect reference block 1");
         let block_2 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 2"),
         );
         reference_node
@@ -1489,7 +1489,7 @@ mod tests {
             .expect("connect reference block 2");
         let block_3 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 3"),
         );
 
@@ -1518,7 +1518,7 @@ mod tests {
 
         let block_1 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 1"),
         );
         reference_node
@@ -1526,7 +1526,7 @@ mod tests {
             .expect("connect reference block 1");
         let block_2 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 2"),
         );
         reference_node
@@ -1534,7 +1534,7 @@ mod tests {
             .expect("connect reference block 2");
         let block_3 = miner.solve_block(
             reference_node
-                .build_candidate_block(&miner)
+                .build_candidate_block()
                 .expect("candidate block 3"),
         );
 

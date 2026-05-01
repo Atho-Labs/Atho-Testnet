@@ -1,3 +1,4 @@
+use crate::command::CommandInvocation;
 use atho_core::block::Block;
 use atho_core::transaction::Transaction;
 use serde::{Deserialize, Serialize};
@@ -26,4 +27,5 @@ pub enum RpcRequest {
     },
     GetMempoolInfo,
     GetMempoolSpentInputs,
+    ExecuteCommand(CommandInvocation),
 }

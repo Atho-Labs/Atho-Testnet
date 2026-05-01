@@ -5,6 +5,7 @@ pub enum Network {
     Mainnet,
     Testnet,
     Regnet,
+    Prunetest,
 }
 
 impl Network {
@@ -13,6 +14,7 @@ impl Network {
             "mainnet" | "atho-mainnet" => Some(Self::Mainnet),
             "testnet" | "atho-testnet" => Some(Self::Testnet),
             "regnet" | "regtest" | "atho-regnet" => Some(Self::Regnet),
+            "prunetest" | "prune-test" | "prune_test" | "atho-prunetest" => Some(Self::Prunetest),
             _ => None,
         }
     }
@@ -22,6 +24,7 @@ impl Network {
             Self::Mainnet => 1,
             Self::Testnet => 2,
             Self::Regnet => 3,
+            Self::Prunetest => 4,
         }
     }
 
@@ -30,6 +33,7 @@ impl Network {
             1 => Some(Self::Mainnet),
             2 => Some(Self::Testnet),
             3 => Some(Self::Regnet),
+            4 => Some(Self::Prunetest),
             _ => None,
         }
     }
@@ -39,6 +43,7 @@ impl Network {
             Self::Mainnet => "atho-mainnet",
             Self::Testnet => "atho-testnet",
             Self::Regnet => "atho-regnet",
+            Self::Prunetest => "atho-prunetest",
         }
     }
 
@@ -47,6 +52,7 @@ impl Network {
             Self::Mainnet => "mainnet",
             Self::Testnet => "testnet",
             Self::Regnet => "regnet",
+            Self::Prunetest => "prunetest",
         }
     }
 
@@ -59,6 +65,7 @@ impl Network {
             Self::Mainnet => 56_000,
             Self::Testnet => 9_100,
             Self::Regnet => 9_200,
+            Self::Prunetest => 9_300,
         }
     }
 
@@ -67,6 +74,7 @@ impl Network {
             Self::Mainnet => 9_010,
             Self::Testnet => 9_110,
             Self::Regnet => 9_210,
+            Self::Prunetest => 9_310,
         }
     }
 
@@ -75,6 +83,7 @@ impl Network {
             Self::Mainnet => 'A',
             Self::Testnet => 'T',
             Self::Regnet => 'R',
+            Self::Prunetest => 'P',
         }
     }
 
@@ -82,6 +91,7 @@ impl Network {
         match self {
             Self::Mainnet => "ATHO",
             Self::Testnet | Self::Regnet => "ATHT",
+            Self::Prunetest => "ATHP",
         }
     }
 
@@ -90,6 +100,7 @@ impl Network {
             Self::Mainnet => "",
             Self::Testnet => "TEST-UTXO",
             Self::Regnet => "REG-UTXO",
+            Self::Prunetest => "PRUNE-UTXO",
         }
     }
 }
@@ -108,11 +119,15 @@ mod tests {
         assert_eq!(Network::parse("atho-mainnet"), Some(Network::Mainnet));
         assert_eq!(Network::parse("atho-testnet"), Some(Network::Testnet));
         assert_eq!(Network::parse("atho-regnet"), Some(Network::Regnet));
+        assert_eq!(Network::parse("prune-test"), Some(Network::Prunetest));
+        assert_eq!(Network::from_consensus_id(4), Some(Network::Prunetest));
         assert_eq!(Network::Mainnet.p2p_port(), 56_000);
         assert_eq!(Network::Testnet.rpc_port(), 9_110);
         assert_eq!(Network::Regnet.visible_prefix(), 'R');
+        assert_eq!(Network::Prunetest.visible_prefix(), 'P');
         assert_eq!(Network::Mainnet.utxo_flag(), "");
         assert_eq!(Network::Testnet.utxo_flag(), "TEST-UTXO");
         assert_eq!(Network::Regnet.utxo_flag(), "REG-UTXO");
+        assert_eq!(Network::Prunetest.utxo_flag(), "PRUNE-UTXO");
     }
 }

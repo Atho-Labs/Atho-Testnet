@@ -67,6 +67,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block_template_decode"
+path = "fuzz_targets/block_template_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "block_validate"
 path = "fuzz_targets/block_validate.rs"
 test = false

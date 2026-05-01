@@ -8,6 +8,7 @@ pub fn data_dir(network: Network) -> &'static str {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
         Network::Regnet => "regnet",
+        Network::Prunetest => "prunetest",
     }
 }
 
@@ -87,4 +88,21 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_database_dirs_are_unique_and_include_prunetest() {
+        assert_eq!(data_dir(Network::Mainnet), "mainnet");
+        assert_eq!(data_dir(Network::Testnet), "testnet");
+        assert_eq!(data_dir(Network::Regnet), "regnet");
+        assert_eq!(data_dir(Network::Prunetest), "prunetest");
+        assert_ne!(data_dir(Network::Regnet), data_dir(Network::Prunetest));
+        assert!(database_dir(Network::Prunetest)
+            .to_string_lossy()
+            .ends_with("prunetest"));
+    }
 }

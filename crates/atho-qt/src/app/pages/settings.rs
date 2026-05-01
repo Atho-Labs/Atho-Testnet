@@ -2,6 +2,7 @@ use crate::app::{
     mnemonic_ui, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage,
     OpenWalletForm,
 };
+use atho_node::mining_backend::MiningBackendKind;
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -226,6 +227,76 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         widgets::section_header(ui, "Mining");
         ui.add_space(12.0);
+        widgets::muted_label(
+            ui,
+            "Atho defaults to auto-select: it prefers GPU when available and falls back to CPU if GPU initialization or execution fails. Explicit GPU mode now requires a real OpenCL GPU.",
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Backend");
+            let mut selected_backend = app.ui_state.mining_backend;
+            egui::ComboBox::from_id_source("settings_mining_backend")
+                .selected_text(mining_backend_label(selected_backend))
+                .show_ui(ui, |ui: &mut egui::Ui| {
+                    for backend in MiningBackendKind::variants() {
+                        ui.selectable_value(
+                            &mut selected_backend,
+                            backend,
+                            mining_backend_label(backend),
+                        );
+                    }
+                });
+            if selected_backend != app.ui_state.mining_backend {
+                app.ui_state.set_mining_backend(selected_backend);
+                app.refresh_mining_accelerator_info();
+                if app.mining_job.is_some() {
+                    app.restart_mining_job();
+                }
+            }
+            if ui.button("Refresh Probe").clicked() {
+                app.refresh_mining_accelerator_info();
+            }
+        });
+        ui.add_space(8.0);
+        widgets::muted_label(
+            ui,
+            &format!(
+                "Detected accelerator: {}",
+                app.mining_accelerator_info.summary()
+            ),
+        );
+        if let Some(device) = app.mining_accelerator_info.device_name.as_deref() {
+            ui.label(format!("Device: {device}"));
+        }
+        if let Some(vendor) = app.mining_accelerator_info.vendor.as_deref() {
+            ui.label(format!("Vendor: {vendor}"));
+        }
+        if let Some(driver) = app.mining_accelerator_info.driver.as_deref() {
+            ui.label(format!("Driver: {driver}"));
+        }
+        ui.label(format!(
+            "Device type: {}",
+            app.mining_accelerator_info.device_type.label()
+        ));
+        if let Some(compute_units) = app.mining_accelerator_info.compute_units {
+            ui.label(format!("Compute units: {compute_units}"));
+        }
+        if let Some(global_mem_mb) = app.mining_accelerator_info.global_mem_mb {
+            ui.label(format!("Global memory: {global_mem_mb} MiB"));
+        }
+        if let Some(local_mem_kb) = app.mining_accelerator_info.local_mem_kb {
+            ui.label(format!("Local memory: {local_mem_kb} KiB"));
+        }
+        if let Some(clock_mhz) = app.mining_accelerator_info.clock_mhz {
+            ui.label(format!("Clock: {clock_mhz} MHz"));
+        }
+        if let Some(code) = app.mining_accelerator_info.reason_code.as_deref() {
+            ui.label(format!("Probe code: {code}"));
+        }
+        if let Some(reason) = app.mining_accelerator_info.reason_if_not.as_deref() {
+            widgets::muted_label(ui, &format!("Probe note: {reason}"));
+        }
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label("Loop blocks");
             ui.checkbox(&mut app.ui_state.generate_coins, "");
@@ -427,5 +498,13 @@ fn format_quality(peer: &NetworkPeerDiagnostics) -> String {
         (Some(score), Some(failures)) => format!("{score} / fail {failures}"),
         (Some(score), None) => score.to_string(),
         _ => String::from("-"),
+    }
+}
+
+fn mining_backend_label(backend: MiningBackendKind) -> &'static str {
+    match backend {
+        MiningBackendKind::Auto => "Auto (prefer GPU)",
+        MiningBackendKind::Gpu => "GPU only",
+        MiningBackendKind::Cpu => "CPU only",
     }
 }

@@ -2,6 +2,11 @@ use super::{PersistedWalletState, Wallet};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use atho_core::network::Network;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, WALLET_INVALID_HEADER, WALLET_INVALID_PASSWORD, WALLET_IO,
+    WALLET_RANDOMNESS_FAILURE, WALLET_SERIALIZATION, WALLET_UNSUPPORTED_ENCRYPTION_MODE,
+    WALLET_UNSUPPORTED_VERSION,
+};
 use getrandom::getrandom;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
@@ -46,6 +51,32 @@ pub enum WalletDatafileError {
     RandomnessFailure,
     #[error("password rejected or data corrupted")]
     InvalidPassword,
+}
+
+impl AthoErrorMeta for WalletDatafileError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::Io(_) => &WALLET_IO,
+            Self::Encode(_) => &WALLET_SERIALIZATION,
+            Self::InvalidHeader => &WALLET_INVALID_HEADER,
+            Self::UnsupportedVersion => &WALLET_UNSUPPORTED_VERSION,
+            Self::UnsupportedEncryptionMode => &WALLET_UNSUPPORTED_ENCRYPTION_MODE,
+            Self::RandomnessFailure => &WALLET_RANDOMNESS_FAILURE,
+            Self::InvalidPassword => &WALLET_INVALID_PASSWORD,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-wallet::datafile"
+    }
+
+    fn safe_details(&self) -> Option<String> {
+        match self {
+            Self::Io(error) => Some(error.to_string()),
+            Self::Encode(error) => Some(error.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +327,7 @@ mod tests {
     use super::*;
     use crate::mnemonic::{MnemonicLength, MnemonicPhrase};
     use crate::wallet::WALLET_DATAFILE_NAME;
+    use atho_errors::AthoErrorMeta;
     use std::env;
     use std::time::Instant;
 
@@ -379,5 +411,12 @@ mod tests {
 
         assert_eq!(loaded.snapshot, wallet.snapshot);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wallet_errors_stay_sanitized_and_coded() {
+        let error = WalletDatafileError::InvalidPassword.to_atho_error();
+        assert_eq!(error.code().as_str(), "ATHO-WALLET-011");
+        assert!(!error.to_string().contains("hunter2"));
     }
 }

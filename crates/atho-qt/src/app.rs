@@ -12,10 +12,14 @@ use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use atho_crypto::falcon::{
     sign, FalconKeypair, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
 };
+#[cfg(test)]
 use atho_node::miner::Miner;
+use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
 use atho_node::validation::{
     derive_sig_ref_short, derive_witness_commit_ref, finalize_witness_commit_refs,
 };
+use atho_rpc::command::CommandResponse;
+use atho_rpc::command::{command_definition, help_payload, parse_command_line, search_commands};
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
     MempoolSpentInput, RpcResponse, WalletActivityEntry as RpcWalletActivityEntry,
@@ -49,10 +53,10 @@ mod theme;
 mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
-    AddressPoolFilter, CreateWalletForm, ImportWalletForm, LaunchPage, MiningJob, MiningJobResult,
-    MiningOutcome, NavTab, OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord,
-    SendJob, SendOutcome, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
-    WalletManagementForm,
+    AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode,
+    ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, NavTab,
+    OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord, SendJob, SendOutcome,
+    WalletActivityKind, WalletActivityRow, WalletBalanceSummary, WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
@@ -102,6 +106,7 @@ pub struct DesktopApp {
     wallet_scan_job: Option<WalletScanJob>,
     wallet_readiness_gate_active: bool,
     mining_status: String,
+    mining_accelerator_info: MiningAcceleratorInfo,
     mining_job: Option<MiningJob>,
     pending_mining_restart: Option<u32>,
     last_mined_block_hash: Option<[u8; 48]>,
@@ -112,6 +117,12 @@ pub struct DesktopApp {
     transaction_date_filter: usize,
     transaction_type_filter: usize,
     show_about_dialog: bool,
+    debug_console_input: String,
+    debug_console_output_mode: DebugConsoleOutputMode,
+    debug_console_entries: Vec<DebugConsoleEntry>,
+    debug_console_history: Vec<String>,
+    debug_console_history_index: Option<usize>,
+    debug_console_confirmed: bool,
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
     wallet_balance_summary_cache: WalletBalanceSummary,
@@ -214,12 +225,14 @@ impl DesktopApp {
         });
         let launch_page = LaunchPage::Welcome;
         let available_cores = available_mining_cores();
+        let configured_backend = MiningBackendKind::from_env().unwrap_or_default();
 
         let mut app = Self {
             connection,
             status_monitor,
             ui_state: UiState {
                 mining_cores: available_cores,
+                mining_backend: configured_backend,
                 rotate_coinbase_address: true,
                 ..UiState::default()
             },
@@ -260,6 +273,7 @@ impl DesktopApp {
             wallet_scan_job: None,
             wallet_readiness_gate_active: false,
             mining_status: String::from("Idle"),
+            mining_accelerator_info: MiningAcceleratorInfo::unavailable("probe pending"),
             mining_job: None,
             pending_mining_restart: None,
             last_mined_block_hash: None,
@@ -270,6 +284,12 @@ impl DesktopApp {
             transaction_date_filter: 0,
             transaction_type_filter: 0,
             show_about_dialog: false,
+            debug_console_input: String::new(),
+            debug_console_output_mode: DebugConsoleOutputMode::Pretty,
+            debug_console_entries: Vec::new(),
+            debug_console_history: Vec::new(),
+            debug_console_history_index: None,
+            debug_console_confirmed: false,
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
             wallet_balance_summary_cache: WalletBalanceSummary::default(),
@@ -291,6 +311,7 @@ impl DesktopApp {
         } else {
             String::from("Disconnected")
         };
+        app.refresh_mining_accelerator_info();
         app.try_open_existing_wallet_on_startup();
         app
     }
@@ -1345,14 +1366,28 @@ impl DesktopApp {
         match job.receiver.try_recv() {
             Ok(MiningJobResult::Completed(outcome)) => {
                 self.last_mined_block_hash = Some(outcome.block_hash);
-                self.mining_status = format!("{} at height {}", outcome.message, outcome.height);
+                let mut backend_parts = vec![format!("backend={}", outcome.backend_used)];
+                if let Some(accelerator) = outcome.accelerator_label.as_deref() {
+                    backend_parts.push(format!("device={accelerator}"));
+                }
+                if let Some(reason) = outcome.fallback_reason.as_deref() {
+                    backend_parts.push(format!("fallback={reason}"));
+                }
+                let backend_note = backend_parts.join(" ");
+                self.mining_status = format!(
+                    "{} at height {} [{}]",
+                    outcome.message, outcome.height, backend_note
+                );
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     &format!(
-                        "mining outcome accepted={} height={} hash={}",
+                        "mining outcome accepted={} height={} hash={} backend={} accelerator={} fallback={}",
                         outcome.accepted,
                         outcome.height,
-                        hex::encode(outcome.block_hash)
+                        hex::encode(outcome.block_hash),
+                        outcome.backend_used,
+                        outcome.accelerator_label.as_deref().unwrap_or("none"),
+                        outcome.fallback_reason.as_deref().unwrap_or("none")
                     ),
                 );
                 self.last_error = None;
@@ -1484,26 +1519,39 @@ impl DesktopApp {
         let rpc_address = self.connection.rpc_address().to_string();
         let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
         self.ui_state.mining_cores = cores;
+        self.refresh_mining_accelerator_info();
+        let requested_backend = self.mining_backend_status_hint();
+        let mining_backend = self.ui_state.mining_backend;
         let connection = self.connection.clone();
         let reward_script = self.mining_reward_script();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let stop_for_thread = Arc::clone(&stop_requested);
-        self.mining_status = format!("Starting generation with {} thread(s)", cores);
+        self.mining_status = format!(
+            "Starting generation with {} thread(s) [{}]",
+            cores, requested_backend
+        );
         self.last_error = None;
         self.pending_mining_restart = None;
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "starting mining job rpc={} cores={} max_cores={}",
+                "starting mining job rpc={} cores={} max_cores={} backend_hint={}",
                 rpc_address,
                 cores,
-                self.max_mining_cores()
+                self.max_mining_cores(),
+                requested_backend
             ),
         );
 
         std::thread::spawn(move || {
-            let result = mine_via_connection(connection, cores, reward_script, stop_for_thread);
+            let result = mine_via_connection(
+                connection,
+                cores,
+                mining_backend,
+                reward_script,
+                stop_for_thread,
+            );
             let _ = sender.send(result);
         });
 
@@ -1556,21 +1604,56 @@ impl DesktopApp {
         let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
         self.ui_state.mining_cores = cores;
         self.last_error = None;
+        self.refresh_mining_accelerator_info();
+        let requested_backend = self.mining_backend_status_hint();
         if self.mining_job.is_some() {
             self.pending_mining_restart = Some(cores);
             if let Some(job) = &self.mining_job {
                 job.stop_requested.store(true, Ordering::Release);
             }
-            self.mining_status = format!("Restarting miner with {} thread(s)", cores);
+            self.mining_status = format!(
+                "Restarting miner with {} thread(s) [{}]",
+                cores, requested_backend
+            );
             let _ = atho_node::dev::append_log(
                 "atho-qt",
-                &format!("restart miner requested cores={cores}"),
+                &format!("restart miner requested cores={cores} backend_hint={requested_backend}"),
             );
             return;
         }
         if self.ui_state.generate_coins {
             self.start_mining_job();
         }
+    }
+
+    fn refresh_mining_accelerator_info(&mut self) {
+        let cores = self.ui_state.mining_cores.max(1);
+        self.mining_accelerator_info =
+            MiningController::new(self.ui_state.mining_backend, cores).gpu_probe_info();
+    }
+
+    fn mining_backend_status_hint(&self) -> String {
+        let requested = self.ui_state.mining_backend.label();
+        if matches!(self.ui_state.mining_backend, MiningBackendKind::Cpu) {
+            return format!("requested backend={requested}");
+        }
+        if self.mining_accelerator_info.usable {
+            return format!(
+                "requested backend={} target gpu={}",
+                requested,
+                self.mining_accelerator_info
+                    .runtime_label()
+                    .unwrap_or_else(|| String::from("OpenCL GPU"))
+            );
+        }
+        format!(
+            "requested backend={} gpu unavailable={}",
+            requested,
+            self.mining_accelerator_info
+                .reason_if_not
+                .as_deref()
+                .unwrap_or("unknown reason")
+        )
     }
 
     fn generate_create_mnemonic(&mut self) -> Result<(), String> {
@@ -2419,6 +2502,249 @@ impl DesktopApp {
             .map(|request| request.sequence);
     }
 
+    pub(crate) fn debug_console_suggestions(
+        &self,
+    ) -> Vec<&'static atho_rpc::command::CommandDefinition> {
+        let query = self
+            .debug_console_input
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        let mut matches = search_commands(query);
+        matches.truncate(8);
+        matches
+    }
+
+    pub(crate) fn run_debug_console_command(&mut self) {
+        let line = self.debug_console_input.trim().to_string();
+        if line.is_empty() {
+            self.last_error = Some(String::from("debug console command is empty"));
+            return;
+        }
+        self.run_debug_console_line(line, true);
+        self.debug_console_input.clear();
+    }
+
+    pub(crate) fn run_debug_console_line(&mut self, line: String, push_history: bool) {
+        if line.is_empty() {
+            self.last_error = Some(String::from("debug console command is empty"));
+            return;
+        }
+
+        let parsed = match parse_command_line(&line) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                self.last_error = Some(err);
+                return;
+            }
+        };
+
+        let Some(definition) = command_definition(&parsed.name) else {
+            self.last_error = Some(format!("unknown command {}", parsed.name));
+            return;
+        };
+
+        if definition.name.eq_ignore_ascii_case("help") {
+            let payload = match help_payload(parsed.args.first().map(String::as_str)) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    self.last_error = Some(err.clone());
+                    let entry = DebugConsoleEntry {
+                        command_line: line.clone(),
+                        command_name: definition.name.to_string(),
+                        group: definition.group,
+                        permission: definition.permission,
+                        dangerous: definition.dangerous,
+                        success: false,
+                        network_label: self.view_model.network_label.clone(),
+                        output: err,
+                        error_code: None,
+                    };
+                    if push_history
+                        && self
+                            .debug_console_history
+                            .last()
+                            .is_none_or(|previous| previous != &line)
+                    {
+                        self.debug_console_history.push(line);
+                    }
+                    self.debug_console_history_index = None;
+                    self.debug_console_entries.push(entry);
+                    return;
+                }
+            };
+            let entry = DebugConsoleEntry {
+                command_line: line.clone(),
+                command_name: definition.name.to_string(),
+                group: definition.group,
+                permission: definition.permission,
+                dangerous: definition.dangerous,
+                success: true,
+                network_label: self.view_model.network_label.clone(),
+                output: self.format_console_value(&payload),
+                error_code: None,
+            };
+            self.last_error = None;
+            self.send_status = String::from("Command help completed");
+            if push_history
+                && self
+                    .debug_console_history
+                    .last()
+                    .is_none_or(|previous| previous != &line)
+            {
+                self.debug_console_history.push(line);
+            }
+            self.debug_console_history_index = None;
+            self.debug_console_entries.push(entry);
+            return;
+        }
+
+        let mut invocation = parsed;
+        invocation.confirmed = self.debug_console_confirmed;
+        let response = self
+            .connection
+            .request(RpcRequest::ExecuteCommand(invocation.clone()));
+        let entry = match response {
+            RpcResponse::Command(command) => {
+                self.last_error = None;
+                self.send_status = format!("Command {} completed", command.command);
+                self.debug_console_entry_success(line.clone(), command)
+            }
+            RpcResponse::Error(error) => {
+                self.last_error = Some(error.to_string());
+                DebugConsoleEntry {
+                    command_line: line.clone(),
+                    command_name: definition.name.to_string(),
+                    group: definition.group,
+                    permission: definition.permission,
+                    dangerous: definition.dangerous,
+                    success: false,
+                    network_label: self.view_model.network_label.clone(),
+                    output: self.format_console_error(&error),
+                    error_code: Some(error.code),
+                }
+            }
+            other => {
+                let message = format!("unexpected rpc response: {other:?}");
+                self.last_error = Some(message.clone());
+                DebugConsoleEntry {
+                    command_line: line.clone(),
+                    command_name: definition.name.to_string(),
+                    group: definition.group,
+                    permission: definition.permission,
+                    dangerous: definition.dangerous,
+                    success: false,
+                    network_label: self.view_model.network_label.clone(),
+                    output: message,
+                    error_code: None,
+                }
+            }
+        };
+
+        if push_history
+            && self
+                .debug_console_history
+                .last()
+                .is_none_or(|previous| previous != &line)
+        {
+            self.debug_console_history.push(line);
+        }
+        self.debug_console_history_index = None;
+        self.debug_console_entries.push(entry);
+    }
+
+    pub(crate) fn debug_console_use_example(&mut self, command: &str) {
+        self.debug_console_input = command.to_string();
+        self.last_error = None;
+    }
+
+    pub(crate) fn debug_console_previous_history(&mut self) {
+        if self.debug_console_history.is_empty() {
+            return;
+        }
+        let next_index = match self.debug_console_history_index {
+            Some(index) if index > 0 => index - 1,
+            Some(_) => 0,
+            None => self.debug_console_history.len().saturating_sub(1),
+        };
+        self.debug_console_history_index = Some(next_index);
+        self.debug_console_input = self.debug_console_history[next_index].clone();
+    }
+
+    pub(crate) fn debug_console_next_history(&mut self) {
+        let Some(index) = self.debug_console_history_index else {
+            return;
+        };
+        if index + 1 >= self.debug_console_history.len() {
+            self.debug_console_history_index = None;
+            self.debug_console_input.clear();
+            return;
+        }
+        let next_index = index + 1;
+        self.debug_console_history_index = Some(next_index);
+        self.debug_console_input = self.debug_console_history[next_index].clone();
+    }
+
+    fn debug_console_entry_success(
+        &self,
+        command_line: String,
+        command: CommandResponse,
+    ) -> DebugConsoleEntry {
+        DebugConsoleEntry {
+            command_line,
+            command_name: command.command.clone(),
+            group: command.group,
+            permission: command.permission,
+            dangerous: command.dangerous,
+            success: true,
+            network_label: command.network,
+            output: self.format_console_value(&command.data),
+            error_code: None,
+        }
+    }
+
+    fn format_console_value(&self, value: &serde_json::Value) -> String {
+        match self.debug_console_output_mode {
+            DebugConsoleOutputMode::Pretty => {
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+            }
+            DebugConsoleOutputMode::Json => value.to_string(),
+            DebugConsoleOutputMode::Table => format_table_value(value).unwrap_or_else(|| {
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+            }),
+        }
+    }
+
+    fn format_console_error(&self, error: &atho_rpc::error::RpcError) -> String {
+        let value = serde_json::json!({
+            "success": false,
+            "error": {
+                "code": error.code,
+                "title": error.title,
+                "message": error.message,
+                "severity": error.severity,
+                "details": error.details,
+            }
+        });
+        match self.debug_console_output_mode {
+            DebugConsoleOutputMode::Json => value.to_string(),
+            DebugConsoleOutputMode::Pretty | DebugConsoleOutputMode::Table => {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn copy_latest_debug_console_output(&self, ui: &mut egui::Ui) {
+        if let Some(entry) = self.debug_console_entries.last() {
+            Self::copy_text(ui, entry.output.clone());
+        }
+    }
+
+    pub(crate) fn clear_debug_console(&mut self) {
+        self.debug_console_entries.clear();
+        self.debug_console_history_index = None;
+    }
+
     fn copy_text(ui: &mut egui::Ui, text: String) {
         ui.output_mut(|output| {
             output.copied_text = text;
@@ -2502,6 +2828,89 @@ impl DesktopApp {
     }
 }
 
+fn format_table_value(value: &serde_json::Value) -> Option<String> {
+    let rows = value.as_array()?;
+    if rows.is_empty() {
+        return Some(String::from("(empty)"));
+    }
+    let objects: Vec<_> = rows.iter().map(|row| row.as_object()).collect();
+    if objects.iter().any(|row| row.is_none()) {
+        return None;
+    }
+
+    let mut columns = Vec::<String>::new();
+    for row in objects.iter().flatten() {
+        for key in row.keys() {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut widths = columns
+        .iter()
+        .map(|column| column.len())
+        .collect::<Vec<_>>();
+    let rendered_rows = objects
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let cell = row
+                        .get(column)
+                        .map(render_table_cell)
+                        .unwrap_or_else(|| String::from("-"));
+                    widths[index] = widths[index].max(cell.len());
+                    cell
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut output = String::new();
+    output.push_str(&render_table_row(&columns, &widths));
+    output.push('\n');
+    output.push_str(&render_table_separator(&widths));
+    for row in rendered_rows {
+        output.push('\n');
+        output.push_str(&render_table_row(&row, &widths));
+    }
+    Some(output)
+}
+
+fn render_table_row(row: &[String], widths: &[usize]) -> String {
+    row.iter()
+        .zip(widths.iter())
+        .map(|(cell, width)| format!("{cell:<width$}", width = *width))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn render_table_separator(widths: &[usize]) -> String {
+    widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("-+-")
+}
+
+fn render_table_cell(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::from("-"),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| String::from("?")),
+    }
+}
+
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.theme_initialized {
@@ -2579,6 +2988,7 @@ fn available_mining_cores() -> u32 {
 fn mine_via_connection(
     connection: crate::connection::ReadOnlyNodeConnection,
     cores: u32,
+    backend: MiningBackendKind,
     reward_script: Option<Vec<u8>>,
     stop_requested: Arc<AtomicBool>,
 ) -> MiningJobResult {
@@ -2594,25 +3004,40 @@ fn mine_via_connection(
     let block = if let Some(reward_script) = reward_script.as_deref() {
         rewrite_reward_script(&template.block, reward_script)
     } else {
-        template.block
+        template.block.clone()
     };
 
-    let miner = Miner::new(cores);
+    let controller = MiningController::new(backend, cores);
     let _ = atho_node::dev::append_log(
         "atho-qt",
         &format!(
-            "solving block height={} cores={} txs={} reward_bound={}",
+            "solving block height={} cores={} requested_backend={} txs={} reward_bound={}",
             template.height,
             cores,
+            controller.backend().label(),
             template.transaction_count,
             reward_script.is_some()
         ),
     );
-    let block = match miner.solve_block_with_cancel(block, stop_requested) {
-        Ok(block) => block,
-        Err(_) => return MiningJobResult::Cancelled,
+    let mined_template = atho_rpc::response::BlockTemplate {
+        block,
+        ..template.clone()
     };
+    let report = match controller.mine_block_reported(mined_template, stop_requested) {
+        Ok(report) => report,
+        Err(atho_node::mining_backend::MiningBackendError::Cancelled) => {
+            return MiningJobResult::Cancelled;
+        }
+        Err(err) => return MiningJobResult::Failed(err.to_string()),
+    };
+    let accelerator_label = report
+        .accelerator
+        .as_ref()
+        .and_then(|info| info.runtime_label());
+    let block = report.block;
     let block_hash = block.header.block_hash();
+    let backend_used = report.backend_used.label().to_string();
+    let fallback_reason = report.fallback_reason.clone();
     match connection.request(RpcRequest::SubmitBlock(block)) {
         RpcResponse::BlockSubmitted { accepted: true, .. } => {
             MiningJobResult::Completed(MiningOutcome {
@@ -2624,6 +3049,9 @@ fn mine_via_connection(
                     hex::encode(block_hash),
                     template.height
                 ),
+                backend_used: backend_used.clone(),
+                accelerator_label: accelerator_label.clone(),
+                fallback_reason: fallback_reason.clone(),
             })
         }
         RpcResponse::BlockSubmitted {
@@ -2633,6 +3061,9 @@ fn mine_via_connection(
             block_hash,
             accepted: false,
             message: format!("Block {} rejected", hex::encode(block_hash)),
+            backend_used,
+            accelerator_label,
+            fallback_reason,
         }),
         RpcResponse::Error(err) => MiningJobResult::Failed(err.to_string()),
         other => MiningJobResult::Failed(format!("unexpected rpc response: {other:?}")),
@@ -3750,5 +4181,63 @@ mod tests {
             row.kind == WalletActivityKind::Received
                 && row.reference == widgets::short_hash(&funding_txid)
         }));
+    }
+
+    #[test]
+    fn debug_console_help_runs_without_rpc_dependency() {
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.debug_console_input = String::from("help");
+        app.run_debug_console_command();
+
+        assert!(app.last_error.is_none());
+        assert_eq!(app.debug_console_entries.len(), 1);
+        let entry = app.debug_console_entries.last().expect("console entry");
+        assert!(entry.success);
+        assert_eq!(entry.command_name, "help");
+        assert!(entry.output.contains("getblockchaininfo"));
+        assert_eq!(app.debug_console_history, vec![String::from("help")]);
+    }
+
+    #[test]
+    fn debug_console_history_navigation_replays_commands() {
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.debug_console_history = vec![
+            String::from("help"),
+            String::from("getstatus"),
+            String::from("getblockchaininfo"),
+        ];
+
+        app.debug_console_previous_history();
+        assert_eq!(app.debug_console_input, "getblockchaininfo");
+        app.debug_console_previous_history();
+        assert_eq!(app.debug_console_input, "getstatus");
+        app.debug_console_next_history();
+        assert_eq!(app.debug_console_input, "getblockchaininfo");
+        app.debug_console_next_history();
+        assert_eq!(app.debug_console_input, "");
+    }
+
+    #[test]
+    fn debug_console_executes_status_command_against_local_node() {
+        let root = temp_sandbox_root("debug-console-status");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.debug_console_input = String::from("getstatus");
+        app.run_debug_console_command();
+
+        assert!(app.last_error.is_none());
+        let entry = app.debug_console_entries.last().expect("console entry");
+        assert!(entry.success);
+        assert_eq!(entry.command_name, "getstatus");
+        assert!(entry.output.contains("\"network\""));
+        assert_eq!(entry.network_label, "atho-regnet");
     }
 }

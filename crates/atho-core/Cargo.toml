@@ -5,6 +5,7 @@ edition = "2021"
 license = "Proprietary"
 
 [dependencies]
+atho-errors = { path = "../atho-errors" }
 hex = "0.4"
 hex-literal = "0.4"
 num-bigint = "0.4"

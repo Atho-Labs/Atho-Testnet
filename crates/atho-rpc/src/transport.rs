@@ -1,5 +1,9 @@
 use crate::request::RpcRequest;
 use crate::response::RpcResponse;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, RPC_EMPTY_RESPONSE, RPC_MESSAGE_TOO_LARGE,
+    RPC_SERIALIZATION, RPC_TRANSPORT_IO,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -20,6 +24,29 @@ pub enum RpcTransportError {
     EmptyResponse,
     #[error("rpc transport message exceeded the allowed size")]
     MessageTooLarge,
+}
+
+impl AthoErrorMeta for RpcTransportError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::Io(_) => &RPC_TRANSPORT_IO,
+            Self::Serialization(_) => &RPC_SERIALIZATION,
+            Self::EmptyResponse => &RPC_EMPTY_RESPONSE,
+            Self::MessageTooLarge => &RPC_MESSAGE_TOO_LARGE,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-rpc::transport"
+    }
+
+    fn safe_details(&self) -> Option<String> {
+        match self {
+            Self::Io(error) => Some(error.to_string()),
+            Self::Serialization(error) => Some(error.to_string()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

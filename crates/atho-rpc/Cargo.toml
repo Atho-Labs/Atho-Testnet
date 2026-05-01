@@ -6,6 +6,7 @@ license = "Proprietary"
 
 [dependencies]
 atho-core = { path = "../atho-core" }
+atho-errors = { path = "../atho-errors" }
 atho-storage = { path = "../atho-storage" }
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"

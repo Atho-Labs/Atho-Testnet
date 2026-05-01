@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2021"
 license = "Proprietary"
 
+[features]
+default = []
+gpu-native = ["atho-node/gpu-native"]
+
 [dependencies]
 arboard = "3"
 atho-core = { path = "../atho-core" }
 atho-crypto = { path = "../atho-crypto" }
+atho-errors = { path = "../atho-errors" }
 atho-node = { path = "../atho-node" }
 atho-rpc = { path = "../atho-rpc" }
 atho-storage = { path = "../atho-storage" }

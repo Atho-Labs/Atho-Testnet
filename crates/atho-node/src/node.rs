@@ -356,15 +356,15 @@ impl Node {
     }
 
     pub fn mine_candidate_block(&self, miner: &Miner) -> Result<Block, NodeError> {
-        miner.mine_candidate_block(self)
+        Ok(miner.solve_block(self.build_candidate_block()?))
     }
 
-    pub fn build_candidate_block(&self, miner: &Miner) -> Result<Block, NodeError> {
-        miner.build_candidate_block(self)
+    pub fn build_candidate_block(&self) -> Result<Block, NodeError> {
+        crate::mining::build_candidate_block(self)
     }
 
     pub fn mine_and_connect_candidate_block(&mut self, miner: &Miner) -> Result<Block, NodeError> {
-        let block = miner.mine_candidate_block(self)?;
+        let block = self.mine_candidate_block(miner)?;
         self.connect_block(&block)?;
         Ok(block)
     }
@@ -853,6 +853,35 @@ mod tests {
         assert_eq!(reloaded.tip_hash(), tip_hash);
         assert_eq!(reloaded.difficulty_target_for_next_block(), next_target);
         assert_eq!(reloaded.utxo_count(), 2);
+    }
+
+    #[test]
+    fn prunetest_node_mines_and_restarts_in_an_isolated_database_root() {
+        let root = temp_data_dir("prunetest-restart");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut node = Node::load_or_new(NodeConfig::new(Network::Prunetest));
+        let first = node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine first prune block");
+        let second = node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine second prune block");
+        let tip_hash = second.header.block_hash();
+        assert_eq!(first.header.network_id, Network::Prunetest);
+        assert_eq!(second.header.network_id, Network::Prunetest);
+        assert_eq!(node.height(), 2);
+        assert_eq!(
+            atho_storage::path::database_dir(Network::Prunetest),
+            root.join("prunetest")
+        );
+        drop(node);
+
+        let reloaded = Node::load_or_new(NodeConfig::new(Network::Prunetest));
+        assert_eq!(reloaded.height(), 2);
+        assert_eq!(reloaded.tip_hash(), tip_hash);
+        assert_eq!(reloaded.canonical_blocks().expect("canonical").len(), 3);
     }
 
     #[test]

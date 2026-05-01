@@ -184,10 +184,7 @@ fn build_fixture_inner() -> ValidationFixture {
         fees.push(fee_atoms);
     }
 
-    let miner = Miner::new(1);
-    let candidate = miner
-        .build_candidate_block(&node)
-        .expect("build candidate block");
+    let candidate = node.build_candidate_block().expect("build candidate block");
     let solved = solve_block(candidate);
     let compact_block = compact_block_from_block(&solved);
 

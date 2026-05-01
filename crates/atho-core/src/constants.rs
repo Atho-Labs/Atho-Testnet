@@ -19,6 +19,18 @@ pub const POW_MAX_ADJUST_DOWN_PERCENT: u64 = 32;
 pub const SHA3_384_HASH_BITS: usize = 384;
 pub const SHA3_384_HASH_HEX_CHARS: usize = 96;
 pub const WITNESS_SCALE_FACTOR: usize = 4;
+// Falcon-512 is the active signature profile for Atho transaction witnesses.
+pub const FALCON_512_LOGN: u32 = 9;
+pub const FALCON_512_PUBLIC_KEY_BYTES: usize = 897;
+pub const FALCON_512_SECRET_KEY_BYTES: usize = 1_281;
+pub const FALCON_512_SIGNATURE_BYTES: usize = 666;
+pub const MIN_TRANSACTION_FULL_BYTES_WITH_ONE_INPUT_AND_ONE_OUTPUT: usize = 88;
+pub const TX_WITNESS_FIXED_BYTES: usize =
+    4 + FALCON_512_SIGNATURE_BYTES + 4 + FALCON_512_PUBLIC_KEY_BYTES + 4;
+pub const MAX_WITNESS_INPUT_REFS: usize = (MAX_TRANSACTION_RAW_BYTES
+    - MIN_TRANSACTION_FULL_BYTES_WITH_ONE_INPUT_AND_ONE_OUTPUT
+    - TX_WITNESS_FIXED_BYTES)
+    / 18;
 pub const MAX_BLOCK_VBYTES: usize = 3_000_000;
 pub const MAX_BLOCK_RAW_BYTES: usize = 12_000_000;
 pub const MAX_BLOCK_SIZE_BYTES: usize = MAX_BLOCK_VBYTES;

@@ -517,6 +517,7 @@ dependencies = [
 name = "atho-core"
 version = "0.1.0"
 dependencies = [
+ "atho-errors",
  "criterion",
  "hex",
  "hex-literal",
@@ -534,11 +535,30 @@ name = "atho-crypto"
 version = "0.1.0"
 dependencies = [
  "atho-core",
+ "atho-errors",
  "criterion",
  "fn-dsa",
  "getrandom 0.2.17",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "atho-errors"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "atho-gpu-native"
+version = "0.1.0"
+dependencies = [
+ "atho-core",
+ "atho-errors",
+ "cc",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -558,6 +578,8 @@ version = "0.1.0"
 dependencies = [
  "atho-core",
  "atho-crypto",
+ "atho-errors",
+ "atho-gpu-native",
  "atho-p2p",
  "atho-rpc",
  "atho-storage",
@@ -574,6 +596,7 @@ name = "atho-p2p"
 version = "0.1.0"
 dependencies = [
  "atho-core",
+ "atho-errors",
  "bincode",
  "criterion",
  "hex",
@@ -589,6 +612,7 @@ dependencies = [
  "arboard",
  "atho-core",
  "atho-crypto",
+ "atho-errors",
  "atho-node",
  "atho-rpc",
  "atho-storage",
@@ -608,6 +632,7 @@ name = "atho-rpc"
 version = "0.1.0"
 dependencies = [
  "atho-core",
+ "atho-errors",
  "atho-storage",
  "serde",
  "serde-big-array",
@@ -621,6 +646,7 @@ version = "0.1.0"
 dependencies = [
  "atho-core",
  "atho-crypto",
+ "atho-errors",
  "bincode",
  "hex",
  "lmdb",
@@ -637,6 +663,7 @@ dependencies = [
  "aes-gcm",
  "atho-core",
  "atho-crypto",
+ "atho-errors",
  "bincode",
  "criterion",
  "getrandom 0.2.17",

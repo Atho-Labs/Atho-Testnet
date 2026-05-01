@@ -6,6 +6,7 @@ license = "Proprietary"
 
 [dependencies]
 atho-core = { path = "../atho-core" }
+atho-errors = { path = "../atho-errors" }
 fn-dsa = { path = "../../Falcon 512 rs/fn-dsa" }
 getrandom = "0.2"
 thiserror = "1"

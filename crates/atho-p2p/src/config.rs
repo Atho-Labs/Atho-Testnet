@@ -6,6 +6,7 @@ pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 pub const MAINNET_DNS_SEEDS: &[&str] = &[];
 pub const TESTNET_DNS_SEEDS: &[&str] = &[];
 pub const REGNET_DNS_SEEDS: &[&str] = &[];
+pub const PRUNETEST_DNS_SEEDS: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct P2pLimits {
@@ -88,13 +89,27 @@ pub fn network_params(network: Network) -> NetworkParams {
             dns_seeds: REGNET_DNS_SEEDS,
             limits: DEFAULT_LIMITS,
         },
+        Network::Prunetest => NetworkParams {
+            network,
+            magic: [0xa7, 0x54, 0x48, 0x04],
+            default_port: network.p2p_port(),
+            protocol_version: PROTOCOL_VERSION,
+            min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+            dns_seeds: PRUNETEST_DNS_SEEDS,
+            limits: DEFAULT_LIMITS,
+        },
     }
 }
 
 pub fn network_from_magic(magic: [u8; 4]) -> Option<Network> {
-    [Network::Mainnet, Network::Testnet, Network::Regnet]
-        .into_iter()
-        .find(|network| network_params(*network).magic == magic)
+    [
+        Network::Mainnet,
+        Network::Testnet,
+        Network::Regnet,
+        Network::Prunetest,
+    ]
+    .into_iter()
+    .find(|network| network_params(*network).magic == magic)
 }
 
 #[cfg(test)]
@@ -106,13 +121,19 @@ mod tests {
         let main = network_params(Network::Mainnet);
         let test = network_params(Network::Testnet);
         let reg = network_params(Network::Regnet);
+        let prune = network_params(Network::Prunetest);
         assert_ne!(main.magic, test.magic);
         assert_ne!(main.magic, reg.magic);
+        assert_ne!(main.magic, prune.magic);
         assert_ne!(test.magic, reg.magic);
+        assert_ne!(test.magic, prune.magic);
+        assert_ne!(reg.magic, prune.magic);
         assert!(main.dns_seeds.is_empty());
         assert!(test.dns_seeds.is_empty());
         assert!(reg.dns_seeds.is_empty());
+        assert!(prune.dns_seeds.is_empty());
         assert_eq!(main.default_port, Network::Mainnet.p2p_port());
         assert_eq!(main.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(network_from_magic(prune.magic), Some(Network::Prunetest));
     }
 }

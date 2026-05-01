@@ -1,3 +1,8 @@
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, WALLET_INVALID_ENTROPY_LENGTH,
+    WALLET_INVALID_MNEMONIC_CHECKSUM, WALLET_INVALID_MNEMONIC_WORD,
+    WALLET_INVALID_MNEMONIC_WORD_COUNT,
+};
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -54,6 +59,21 @@ pub enum MnemonicError {
     InvalidWord,
     #[error("mnemonic checksum mismatch")]
     ChecksumMismatch,
+}
+
+impl AthoErrorMeta for MnemonicError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::InvalidWordCount => &WALLET_INVALID_MNEMONIC_WORD_COUNT,
+            Self::InvalidEntropyLength => &WALLET_INVALID_ENTROPY_LENGTH,
+            Self::InvalidWord => &WALLET_INVALID_MNEMONIC_WORD,
+            Self::ChecksumMismatch => &WALLET_INVALID_MNEMONIC_CHECKSUM,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-wallet::mnemonic"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]

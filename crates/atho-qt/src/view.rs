@@ -1,5 +1,4 @@
 use crate::state::UiState;
-use atho_rpc::error::RpcError;
 use atho_rpc::response::{NetworkPeerDiagnostics, RpcResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,15 +60,13 @@ impl ViewModel {
             RpcResponse::BlockTemplate(_)
             | RpcResponse::NodeStatus(_)
             | RpcResponse::BlockSubmitted { .. }
+            | RpcResponse::Command(_)
             | RpcResponse::TransactionSubmitted(_)
             | RpcResponse::Utxos(_)
             | RpcResponse::WalletActivity(_)
             | RpcResponse::MempoolInfo(_)
             | RpcResponse::MempoolSpentInputs(_) => {}
-            RpcResponse::Error(RpcError::MethodNotFound)
-            | RpcResponse::Error(RpcError::InvalidRequest(_))
-            | RpcResponse::Error(RpcError::Validation(_))
-            | RpcResponse::Error(RpcError::Internal) => {
+            RpcResponse::Error(_) => {
                 self.sync_stage = String::from("Disconnected");
             }
         }

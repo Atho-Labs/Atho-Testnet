@@ -1,3 +1,4 @@
+use crate::command::CommandResponse;
 use crate::error::RpcError;
 use atho_core::block::Block;
 use atho_core::network::Network;
@@ -15,6 +16,16 @@ pub struct BlockTemplate {
     pub transaction_count: usize,
     pub fees_atoms: u64,
     pub block: Block,
+}
+
+impl BlockTemplate {
+    pub fn header_bytes_without_nonce(&self) -> Vec<u8> {
+        self.block.header.canonical_bytes_without_nonce()
+    }
+
+    pub fn nonce_offset_bytes(&self) -> usize {
+        self.block.header.canonical_size_bytes_without_nonce()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +108,7 @@ pub struct NodeStatus {
     pub network_diagnostics: NetworkDiagnostics,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RpcResponse {
     BlockCount(u64),
     Network(String),
@@ -113,6 +124,7 @@ pub enum RpcResponse {
     WalletActivity(Vec<WalletActivityEntry>),
     MempoolInfo(MempoolInfo),
     MempoolSpentInputs(Vec<MempoolSpentInput>),
+    Command(CommandResponse),
     Error(RpcError),
 }
 
@@ -123,8 +135,30 @@ mod tests {
     #[test]
     fn typed_error_response_is_stable() {
         assert_eq!(
-            RpcResponse::Error(RpcError::InvalidRequest(String::from("bad request"))),
-            RpcResponse::Error(RpcError::InvalidRequest(String::from("bad request")))
+            RpcResponse::Error(RpcError::invalid_request("bad request")),
+            RpcResponse::Error(RpcError::invalid_request("bad request"))
+        );
+    }
+
+    #[test]
+    fn block_template_exposes_canonical_header_bytes() {
+        let template = BlockTemplate {
+            network: Network::Mainnet,
+            height: 0,
+            previous_block_hash: [0; 48],
+            target: [0; 48],
+            transaction_count: 0,
+            fees_atoms: 0,
+            block: Block::default(),
+        };
+
+        assert_eq!(
+            template.header_bytes_without_nonce(),
+            template.block.header.canonical_bytes_without_nonce()
+        );
+        assert_eq!(
+            template.nonce_offset_bytes(),
+            template.block.header.canonical_size_bytes_without_nonce()
         );
     }
 }

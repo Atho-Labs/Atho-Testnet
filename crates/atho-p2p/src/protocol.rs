@@ -6,6 +6,14 @@ use atho_core::crypto::hash::sha3_256;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, NET_GENESIS_MISMATCH, NET_RULESET_MISMATCH,
+    NET_UNSUPPORTED_NETWORK, P2P_HANDSHAKE_INCOMPLETE, P2P_INVALID_COMPACT_BLOCK,
+    P2P_INVALID_HEADERS_SEQUENCE, P2P_MALFORMED_PAYLOAD, P2P_PAYLOAD_TOO_LARGE, P2P_PEER_BOOK_FULL,
+    P2P_TOO_MANY_HEADERS, P2P_TOO_MANY_INVENTORY, P2P_TOO_MANY_LOCATORS,
+    P2P_TOO_MANY_PEER_ADDRESSES, P2P_UNEXPECTED_PAYLOAD, P2P_UNKNOWN_COMMAND,
+    P2P_UNSUPPORTED_PROTOCOL, P2P_USER_AGENT_TOO_LONG,
+};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -197,6 +205,34 @@ pub enum ProtocolError {
     TooManyLocatorHashes,
     #[error("invalid compact block")]
     InvalidCompactBlock,
+}
+
+impl AthoErrorMeta for ProtocolError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::UnsupportedNetwork => &NET_UNSUPPORTED_NETWORK,
+            Self::UnknownMessageCommand => &P2P_UNKNOWN_COMMAND,
+            Self::PayloadTooLarge => &P2P_PAYLOAD_TOO_LARGE,
+            Self::MalformedPayload => &P2P_MALFORMED_PAYLOAD,
+            Self::UnexpectedPayload => &P2P_UNEXPECTED_PAYLOAD,
+            Self::UnsupportedProtocolVersion => &P2P_UNSUPPORTED_PROTOCOL,
+            Self::UserAgentTooLong => &P2P_USER_AGENT_TOO_LONG,
+            Self::GenesisMismatch => &NET_GENESIS_MISMATCH,
+            Self::RulesetMismatch => &NET_RULESET_MISMATCH,
+            Self::TooManyPeerAddresses => &P2P_TOO_MANY_PEER_ADDRESSES,
+            Self::TooManyInventoryEntries => &P2P_TOO_MANY_INVENTORY,
+            Self::TooManyHeaders => &P2P_TOO_MANY_HEADERS,
+            Self::InvalidHeadersSequence => &P2P_INVALID_HEADERS_SEQUENCE,
+            Self::PeerBookFull => &P2P_PEER_BOOK_FULL,
+            Self::HandshakeIncomplete => &P2P_HANDSHAKE_INCOMPLETE,
+            Self::TooManyLocatorHashes => &P2P_TOO_MANY_LOCATORS,
+            Self::InvalidCompactBlock => &P2P_INVALID_COMPACT_BLOCK,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-p2p::protocol"
+    }
 }
 
 impl MessageCommand {

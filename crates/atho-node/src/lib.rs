@@ -7,6 +7,8 @@ pub mod error;
 pub mod logging;
 pub mod mempool;
 pub mod miner;
+pub mod mining;
+pub mod mining_backend;
 pub mod node;
 pub mod orchestrator;
 pub mod runtime;

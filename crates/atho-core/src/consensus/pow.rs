@@ -52,6 +52,7 @@ pub const DIFFICULTY_PROFILE: DifficultyTargetProfile = DifficultyTargetProfile 
 pub const MAINNET_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.genesis_target;
 pub const TESTNET_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.genesis_target;
 pub const REGNET_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.genesis_target;
+pub const PRUNETEST_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.min_difficulty_target;
 
 pub fn expected_timespan_seconds() -> u64 {
     expected_timespan_seconds_for_window(POW_PROFILE.averaging_window_blocks as usize)
@@ -79,6 +80,7 @@ pub fn initial_target_for_network(network: Network) -> [u8; 48] {
         Network::Mainnet => MAINNET_INITIAL_TARGET,
         Network::Testnet => TESTNET_INITIAL_TARGET,
         Network::Regnet => REGNET_INITIAL_TARGET,
+        Network::Prunetest => PRUNETEST_INITIAL_TARGET,
     }
 }
 
@@ -308,6 +310,9 @@ mod tests {
         )));
         assert!(target_within_bounds(&initial_target_for_network(
             Network::Regnet
+        )));
+        assert!(target_within_bounds(&initial_target_for_network(
+            Network::Prunetest
         )));
         assert_eq!(
             clamp_target([0xFF; 48]),

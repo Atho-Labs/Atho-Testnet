@@ -464,10 +464,10 @@ fn parse_network(value: &str) -> Option<Network> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  athod [--network <mainnet|testnet|regnet>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc]");
-    eprintln!("  athod wipe --network <mainnet|testnet|regnet> --data-dir PATH --all [--dangerously-allow-mainnet]");
-    eprintln!("  athod status [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
-    eprintln!("  athod verify [--network <mainnet|testnet|regnet>] [--data-dir PATH]");
+    eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc]");
+    eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--dangerously-allow-mainnet]");
+    eprintln!("  athod status [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
+    eprintln!("  athod verify [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine> [options]");
     eprintln!();
     eprintln!("legacy compatibility:");
@@ -535,5 +535,12 @@ mod tests {
         assert_eq!(parsed.network, Some(Network::Regnet));
         assert_eq!(parsed.rpc_addr.as_deref(), Some("127.0.0.1:9210"));
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
+    }
+
+    #[test]
+    fn runtime_cli_accepts_prunetest_network() {
+        let args = vec![String::from("--network"), String::from("prune-test")];
+        let parsed = parse_runtime_cli(&args).expect("parse");
+        assert_eq!(parsed.network, Some(Network::Prunetest));
     }
 }

@@ -1338,6 +1338,7 @@ fn genesis_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
                     Network::Mainnet => 'A',
                     Network::Testnet => 'T',
                     Network::Regnet => 'R',
+                    Network::Prunetest => 'P',
                 }
             );
         }));

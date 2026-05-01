@@ -4,6 +4,10 @@ use crate::error::NodeError;
 use crate::service::NodeService;
 use crate::sync::SyncNotice;
 use atho_core::network::Network;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, LAUNCH_INVALID_PEER_ADDRESS, LAUNCH_P2P_BIND_FAILED,
+    P2P_IO_FAILURE,
+};
 use atho_p2p::codec::{CodecError, WireCodec};
 use atho_p2p::config::network_params;
 use atho_p2p::connection::ConnectionEvent;
@@ -41,6 +45,35 @@ pub enum TcpP2pError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Codec(#[from] CodecError),
+}
+
+impl AthoErrorMeta for TcpP2pError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::Bind(_) => &LAUNCH_P2P_BIND_FAILED,
+            Self::InvalidPeerAddress(_) => &LAUNCH_INVALID_PEER_ADDRESS,
+            Self::Node(error) => error.descriptor(),
+            Self::Io(_) => &P2P_IO_FAILURE,
+            Self::Codec(error) => error.descriptor(),
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        match self {
+            Self::Node(error) => error.source_module(),
+            Self::Codec(error) => error.source_module(),
+            _ => "atho-node::tcp_p2p",
+        }
+    }
+
+    fn safe_details(&self) -> Option<String> {
+        match self {
+            Self::Bind(value) | Self::InvalidPeerAddress(value) => Some(value.clone()),
+            Self::Io(error) => Some(error.to_string()),
+            Self::Node(error) => error.safe_details(),
+            Self::Codec(error) => error.safe_details(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

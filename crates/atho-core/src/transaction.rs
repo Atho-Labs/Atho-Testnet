@@ -1,3 +1,6 @@
+use crate::constants::{
+    FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES, MAX_WITNESS_INPUT_REFS,
+};
 use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
@@ -84,10 +87,23 @@ impl TxWitness {
         };
 
         let sig_len = read_u32(bytes, &mut offset)? as usize;
+        if sig_len != FALCON_512_SIGNATURE_BYTES {
+            return None;
+        }
         let signature = read_vec(bytes, &mut offset, sig_len)?;
         let pubkey_len = read_u32(bytes, &mut offset)? as usize;
+        if pubkey_len != FALCON_512_PUBLIC_KEY_BYTES {
+            return None;
+        }
         let pubkey = read_vec(bytes, &mut offset, pubkey_len)?;
         let ref_count = read_u32(bytes, &mut offset)? as usize;
+        if ref_count > MAX_WITNESS_INPUT_REFS {
+            return None;
+        }
+        let input_ref_bytes = ref_count.checked_mul(18)?;
+        if bytes.len() != offset.checked_add(input_ref_bytes)? {
+            return None;
+        }
         let mut input_refs = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
             let sig_ref_short = {
@@ -340,6 +356,9 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{
+        FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES, MAX_WITNESS_INPUT_REFS,
+    };
 
     #[test]
     fn txid_is_stable_for_canonical_encoding() {
@@ -410,8 +429,8 @@ mod tests {
     #[test]
     fn witness_payload_round_trips() {
         let payload = TxWitness {
-            signature: vec![1, 2, 3],
-            pubkey: vec![4, 5],
+            signature: vec![1; FALCON_512_SIGNATURE_BYTES],
+            pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![
                 WitnessInputRef {
                     sig_ref_short: [6, 7],
@@ -426,5 +445,59 @@ mod tests {
         let encoded = payload.canonical_bytes();
         let decoded = TxWitness::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn witness_payload_rejects_oversized_signature_length() {
+        let payload = TxWitness {
+            signature: vec![1; FALCON_512_SIGNATURE_BYTES + 1],
+            pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: [6, 7],
+                witness_commit_ref: [8; 16],
+            }],
+        };
+        let encoded = payload.canonical_bytes();
+        assert!(TxWitness::from_bytes(&encoded).is_none());
+    }
+
+    #[test]
+    fn witness_payload_rejects_oversized_pubkey_length() {
+        let payload = TxWitness {
+            signature: vec![1; FALCON_512_SIGNATURE_BYTES],
+            pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES + 1],
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: [6, 7],
+                witness_commit_ref: [8; 16],
+            }],
+        };
+        let encoded = payload.canonical_bytes();
+        assert!(TxWitness::from_bytes(&encoded).is_none());
+    }
+
+    #[test]
+    fn witness_payload_rejects_truncated_payload() {
+        let payload = TxWitness {
+            signature: vec![1; FALCON_512_SIGNATURE_BYTES],
+            pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
+            input_refs: vec![WitnessInputRef {
+                sig_ref_short: [6, 7],
+                witness_commit_ref: [8; 16],
+            }],
+        };
+        let mut encoded = payload.canonical_bytes();
+        encoded.pop();
+        assert!(TxWitness::from_bytes(&encoded).is_none());
+    }
+
+    #[test]
+    fn witness_payload_rejects_ref_count_above_budget() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(FALCON_512_SIGNATURE_BYTES as u32).to_le_bytes());
+        encoded.extend_from_slice(&vec![1u8; FALCON_512_SIGNATURE_BYTES]);
+        encoded.extend_from_slice(&(FALCON_512_PUBLIC_KEY_BYTES as u32).to_le_bytes());
+        encoded.extend_from_slice(&vec![4u8; FALCON_512_PUBLIC_KEY_BYTES]);
+        encoded.extend_from_slice(&((MAX_WITNESS_INPUT_REFS + 1) as u32).to_le_bytes());
+        assert!(TxWitness::from_bytes(&encoded).is_none());
     }
 }

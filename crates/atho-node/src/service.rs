@@ -3,16 +3,25 @@ use crate::dev;
 use crate::error::rpc_error_from_node;
 use crate::error::NodeError;
 use crate::mempool::MempoolEntry;
+#[cfg(test)]
 use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
 use crate::sync::{NodeSyncError, SyncNotice};
 use crate::tcp_p2p::next_outbound_retry_delay;
 use crate::wallet_history;
+use atho_core::address::decode_base56_address;
 use atho_core::block::Block;
+use atho_core::consensus::{pow, rules};
+use atho_core::crypto::hash::sha3_384;
+use atho_core::genesis;
 use atho_core::network::Network;
 use atho_p2p::address_manager::format_remote_addr;
+use atho_p2p::config::network_params;
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
 use atho_p2p::protocol::NetworkMessage;
+use atho_rpc::command::{
+    command_definition, help_payload, CommandDefinition, CommandInvocation, CommandResponse,
+};
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
     BlockTemplate, MempoolInfo, MempoolSpentInput, NetworkDiagnostics, NetworkPeerDiagnostics,
@@ -20,6 +29,7 @@ use atho_rpc::response::{
 };
 use atho_storage::db::PeerHealthRecord;
 use atho_wallet::snapshot::WalletSnapshot;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,9 +140,9 @@ impl NodeService {
                 Ok(activity) => RpcResponse::WalletActivity(activity),
                 Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
             },
+            RpcRequest::ExecuteCommand(invocation) => self.execute_command(invocation),
             RpcRequest::GetBlockTemplate => {
-                let miner = Miner::new(1);
-                match self.orchestrator.runtime.node.build_candidate_block(&miner) {
+                match self.orchestrator.runtime.node.build_candidate_block() {
                     Ok(block) => {
                         let _ = dev::append_log(
                             "athod",
@@ -149,15 +159,16 @@ impl NodeService {
                 }
             }
             RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => {
-                RpcResponse::Error(atho_rpc::error::RpcError::InvalidRequest(String::from(
+                RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
                     "submit requests require mutable RPC handling",
-                )))
+                ))
             }
         }
     }
 
     pub fn handle_mut(&mut self, request: RpcRequest) -> RpcResponse {
         match request {
+            RpcRequest::ExecuteCommand(invocation) => self.execute_command(invocation),
             RpcRequest::SubmitTransaction {
                 transaction,
                 fee_atoms,
@@ -190,6 +201,19 @@ impl NodeService {
                             "athod",
                             &format!("rpc tx rejected error={err} {tx_summary}"),
                         );
+                        if let Some(descriptor) = atho_errors::registry_descriptor(&err.code) {
+                            let _ = dev::append_atho_error(
+                                "athod",
+                                &atho_errors::AthoError::new(
+                                    descriptor,
+                                    "atho-node::service",
+                                    err.message.clone(),
+                                )
+                                .with_safe_details(
+                                    err.details.clone().unwrap_or_else(|| tx_summary.clone()),
+                                ),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -227,6 +251,19 @@ impl NodeService {
                             "athod",
                             &format!("rpc block rejected error={err} {block_summary}"),
                         );
+                        if let Some(descriptor) = atho_errors::registry_descriptor(&err.code) {
+                            let _ = dev::append_atho_error(
+                                "athod",
+                                &atho_errors::AthoError::new(
+                                    descriptor,
+                                    "atho-node::service",
+                                    err.message.clone(),
+                                )
+                                .with_safe_details(
+                                    err.details.clone().unwrap_or_else(|| block_summary.clone()),
+                                ),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -256,6 +293,77 @@ impl NodeService {
             .entries()
             .cloned()
             .collect()
+    }
+
+    fn execute_command(&self, invocation: CommandInvocation) -> RpcResponse {
+        let name = invocation.name.trim();
+        let Some(definition) = command_definition(name) else {
+            return RpcResponse::Error(atho_rpc::error::RpcError::method_not_found());
+        };
+
+        if definition.dangerous && !invocation.confirmed {
+            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(format!(
+                "command {} requires confirmation",
+                definition.name
+            )));
+        }
+        if !definition.mainnet_allowed && self.network() == Network::Mainnet {
+            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(format!(
+                "command {} is blocked on mainnet",
+                definition.name
+            )));
+        }
+        if definition.test_only && !matches!(self.network(), Network::Regnet | Network::Prunetest) {
+            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(format!(
+                "command {} is only available on test networks",
+                definition.name
+            )));
+        }
+
+        let data = match self.execute_command_data(definition, &invocation.args) {
+            Ok(data) => data,
+            Err(err) => return RpcResponse::Error(err),
+        };
+        RpcResponse::Command(CommandResponse {
+            command: definition.name.to_string(),
+            group: definition.group,
+            permission: definition.permission,
+            dangerous: definition.dangerous,
+            network: self.network().id().to_string(),
+            data,
+        })
+    }
+
+    fn execute_command_data(
+        &self,
+        definition: &'static CommandDefinition,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        match definition.name {
+            "help" => self.command_help(args),
+            "getstatus" => self.command_getstatus(args),
+            "gethealth" => self.command_gethealth(args),
+            "getversion" => self.command_getversion(args),
+            "geterrorcodes" => self.command_geterrorcodes(args),
+            "getblockcount" => self.command_getblockcount(args),
+            "getbestblockhash" => self.command_getbestblockhash(args),
+            "getblockhash" => self.command_getblockhash(args),
+            "getblock" => self.command_getblock(args),
+            "getblockheader" => self.command_getblockheader(args),
+            "getblockchaininfo" => self.command_getblockchaininfo(args),
+            "getnetworkinfo" => self.command_getnetworkinfo(args),
+            "getconnectioncount" => self.command_getconnectioncount(args),
+            "getpeerinfo" => self.command_getpeerinfo(args),
+            "getmempoolinfo" => self.command_getmempoolinfo(args),
+            "getblocktemplate" => self.command_getblocktemplate(args),
+            "gettemplateinfo" => self.command_gettemplateinfo(args),
+            "getmininginfo" => self.command_getmininginfo(args),
+            "getnetworkparams" => self.command_getnetworkparams(args),
+            "getgenesisinfo" => self.command_getgenesisinfo(args),
+            "validateathoaddress" => self.command_validate_athoaddress(args),
+            "sha3_384" => self.command_sha3_384(args),
+            _ => Err(atho_rpc::error::RpcError::method_not_found()),
+        }
     }
 
     fn wallet_activity(
@@ -654,6 +762,407 @@ impl NodeService {
         self.refresh_runtime_views();
         result
     }
+
+    fn command_help(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        if args.len() > 1 {
+            return Err(atho_rpc::error::RpcError::invalid_request(
+                "help accepts at most one query",
+            ));
+        }
+        help_payload(args.first().map(String::as_str))
+            .map_err(atho_rpc::error::RpcError::invalid_request)
+    }
+
+    fn command_getstatus(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getstatus", args)?;
+        Ok(serde_json::to_value(self.node_status()).expect("node status serializes"))
+    }
+
+    fn command_gethealth(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("gethealth", args)?;
+        let status = self.node_status();
+        let mut warnings = Vec::new();
+        if !status.running {
+            warnings.push("node runtime is not running");
+        }
+        if !status.headers_synced {
+            warnings.push("headers are not fully synced");
+        }
+        if status.network_diagnostics.peer_count == 0
+            && !matches!(status.network, Network::Regnet | Network::Prunetest)
+        {
+            warnings.push("no peers are connected");
+        }
+        Ok(json!({
+            "network": status.network.id(),
+            "running": status.running,
+            "synced": status.headers_synced,
+            "height": status.block_count,
+            "best_block_hash": hex::encode(status.tip_hash),
+            "peer_count": status.network_diagnostics.peer_count,
+            "mempool_count": status.mempool_count,
+            "pruned": false,
+            "warning_count": warnings.len(),
+            "warnings": warnings,
+        }))
+    }
+
+    fn command_getversion(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getversion", args)?;
+        Ok(json!({
+            "client_name": "Atho",
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": rules::PROTOCOL_VERSION,
+            "storage_schema_version": rules::STORAGE_SCHEMA_VERSION,
+            "network": self.network().id(),
+        }))
+    }
+
+    fn command_geterrorcodes(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("geterrorcodes", args)?;
+        let rendered = atho_errors::render_json_registry()
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))?;
+        serde_json::from_str(&rendered)
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+    }
+
+    fn command_getblockcount(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getblockcount", args)?;
+        Ok(json!({
+            "height": self.orchestrator.runtime.node.height(),
+        }))
+    }
+
+    fn command_getbestblockhash(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getbestblockhash", args)?;
+        Ok(json!({
+            "best_block_hash": hex::encode(self.orchestrator.runtime.node.tip_hash()),
+        }))
+    }
+
+    fn command_getblockhash(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        let height = self.parse_single_u64_arg("getblockhash", args, "height")?;
+        let block = self.canonical_block_by_height(height)?.ok_or_else(|| {
+            atho_rpc::error::RpcError::invalid_request(format!("unknown block height {height}"))
+        })?;
+        Ok(json!({
+            "height": height,
+            "block_hash": hex::encode(block.header.block_hash()),
+        }))
+    }
+
+    fn command_getblock(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        let block = self.parse_single_block_arg("getblock", args)?;
+        serde_json::to_value(block)
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+    }
+
+    fn command_getblockheader(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        let block = self.parse_single_block_arg("getblockheader", args)?;
+        serde_json::to_value(block.header)
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+    }
+
+    fn command_getblockchaininfo(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getblockchaininfo", args)?;
+        let status = self.node_status();
+        let blocks = self
+            .orchestrator
+            .runtime
+            .node
+            .canonical_blocks()
+            .map_err(rpc_error_from_node)?;
+        let chainwork = pow::accumulated_chain_work(&blocks).to_str_radix(16);
+        let tip = blocks
+            .last()
+            .map(|block| block.header.clone())
+            .ok_or_else(|| atho_rpc::error::RpcError::internal())?;
+        let ruleset = rules::rules_at_height(status.block_count);
+        let verification_progress =
+            if status.sync_best_height == 0 || status.block_count >= status.sync_best_height {
+                1.0
+            } else {
+                status.block_count as f64 / status.sync_best_height as f64
+            };
+        Ok(json!({
+            "network": status.network.id(),
+            "height": status.block_count,
+            "best_block_hash": hex::encode(status.tip_hash),
+            "best_block_time": tip.timestamp,
+            "difficulty_target": hex::encode(tip.difficulty_target_or_bits),
+            "next_target": hex::encode(self.orchestrator.runtime.node.difficulty_target_for_next_block()),
+            "chainwork": chainwork,
+            "ruleset_id": format!("atho-ruleset-v{}", ruleset.ruleset_version),
+            "ruleset_version": ruleset.ruleset_version,
+            "genesis_hash": hex::encode(genesis::genesis_hash(status.network)),
+            "pruned": false,
+            "verification_progress": verification_progress,
+        }))
+    }
+
+    fn command_getnetworkinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getnetworkinfo", args)?;
+        let status = self.node_status();
+        let params = network_params(status.network);
+        Ok(json!({
+            "network": status.network.id(),
+            "network_magic": hex::encode(params.magic),
+            "default_port": params.default_port,
+            "protocol_version": params.protocol_version,
+            "min_supported_protocol_version": params.min_supported_protocol_version,
+            "peer_count": status.network_diagnostics.peer_count,
+            "inbound_peer_count": status.network_diagnostics.inbound_peer_count,
+            "outbound_peer_count": status.network_diagnostics.outbound_peer_count,
+            "bytes_sent": status.network_diagnostics.bytes_sent,
+            "bytes_received": status.network_diagnostics.bytes_received,
+            "dns_seeds": params.dns_seeds,
+            "network_active": status.running,
+        }))
+    }
+
+    fn command_getconnectioncount(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getconnectioncount", args)?;
+        Ok(json!({
+            "connection_count": self.network_diagnostics().peer_count,
+        }))
+    }
+
+    fn command_getpeerinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getpeerinfo", args)?;
+        serde_json::to_value(self.network_diagnostics().peers)
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+    }
+
+    fn command_getmempoolinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getmempoolinfo", args)?;
+        Ok(json!({
+            "transaction_count": self.orchestrator.runtime.node.mempool_len(),
+            "total_fee_atoms": self.orchestrator.runtime.node.mempool_total_fee_atoms(),
+            "spent_inputs_count": self.orchestrator.runtime.node.mempool_spent_inputs().len(),
+            "dust_relay_value_atoms": 50u64,
+            "min_fee_rate_atoms_per_vbyte": atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS,
+        }))
+    }
+
+    fn command_getblocktemplate(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getblocktemplate", args)?;
+        let block = self
+            .orchestrator
+            .runtime
+            .node
+            .build_candidate_block()
+            .map_err(rpc_error_from_node)?;
+        let template = self.block_template(block);
+        serde_json::to_value(template)
+            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+    }
+
+    fn command_gettemplateinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("gettemplateinfo", args)?;
+        let block = self
+            .orchestrator
+            .runtime
+            .node
+            .build_candidate_block()
+            .map_err(rpc_error_from_node)?;
+        let template = self.block_template(block.clone());
+        Ok(json!({
+            "network": template.network.id(),
+            "height": template.height,
+            "previous_block_hash": hex::encode(template.previous_block_hash),
+            "target": hex::encode(template.target),
+            "transaction_count": template.transaction_count,
+            "fees_atoms": template.fees_atoms,
+            "header_bytes_without_nonce": hex::encode(template.header_bytes_without_nonce()),
+            "nonce_offset_bytes": template.nonce_offset_bytes(),
+            "coinbase_txid": hex::encode(block.transactions.first().map(|tx| tx.txid()).unwrap_or([0; 48])),
+        }))
+    }
+
+    fn command_getmininginfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getmininginfo", args)?;
+        let node = &self.orchestrator.runtime.node;
+        Ok(json!({
+            "network": self.network().id(),
+            "height": node.height(),
+            "best_block_hash": hex::encode(node.tip_hash()),
+            "next_target": hex::encode(node.difficulty_target_for_next_block()),
+            "mempool_transaction_count": node.mempool_len(),
+            "mempool_total_fee_atoms": node.mempool_total_fee_atoms(),
+            "headers_synced": self.orchestrator.sync.sync_state().headers_synced,
+        }))
+    }
+
+    fn command_getnetworkparams(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getnetworkparams", args)?;
+        let network = self.network();
+        let params = network_params(network);
+        Ok(json!({
+            "network": network.id(),
+            "consensus_id": network.consensus_id(),
+            "domain_tag": network.domain_tag(),
+            "p2p_port": network.p2p_port(),
+            "rpc_port": network.rpc_port(),
+            "visible_prefix": network.visible_prefix().to_string(),
+            "internal_hpk_prefix": network.internal_hpk_prefix(),
+            "utxo_flag": network.utxo_flag(),
+            "magic": hex::encode(params.magic),
+            "protocol_version": params.protocol_version,
+            "min_supported_protocol_version": params.min_supported_protocol_version,
+            "dns_seeds": params.dns_seeds,
+        }))
+    }
+
+    fn command_getgenesisinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        self.expect_no_args("getgenesisinfo", args)?;
+        let state = genesis::genesis_state(self.network());
+        Ok(json!({
+            "network": state.network.id(),
+            "genesis_hash": hex::encode(state.block_hash),
+            "coinbase_txid": hex::encode(state.coinbase_txid),
+            "reward_address": state.reward_address,
+            "utxo_flag": state.utxo_flag,
+            "timestamp": state.block.header.timestamp,
+            "target": hex::encode(state.block.header.difficulty_target_or_bits),
+            "nonce": state.block.header.nonce,
+        }))
+    }
+
+    fn command_validate_athoaddress(
+        &self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        let address = self.parse_single_string_arg("validateathoaddress", args, "address")?;
+        match decode_base56_address(&address) {
+            Ok((digest, network)) => Ok(json!({
+                "is_valid": true,
+                "address": address,
+                "network": network.id(),
+                "visible_prefix": network.visible_prefix().to_string(),
+                "payment_digest": hex::encode(digest),
+                "matches_active_network": network == self.network(),
+            })),
+            Err(err) => Ok(json!({
+                "is_valid": false,
+                "address": address,
+                "error": err.to_string(),
+                "active_network": self.network().id(),
+            })),
+        }
+    }
+
+    fn command_sha3_384(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
+        let input = self.parse_single_string_arg("sha3_384", args, "input")?;
+        let (input_format, bytes) = if let Some(hex_input) = input.strip_prefix("0x") {
+            (
+                "hex",
+                hex::decode(hex_input).map_err(|_| {
+                    atho_rpc::error::RpcError::invalid_request(
+                        "sha3_384 expected valid hex after 0x prefix",
+                    )
+                })?,
+            )
+        } else {
+            ("utf8", input.as_bytes().to_vec())
+        };
+        Ok(json!({
+            "input_format": input_format,
+            "digest": hex::encode(sha3_384(&bytes)),
+        }))
+    }
+
+    fn expect_no_args(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<(), atho_rpc::error::RpcError> {
+        if args.is_empty() {
+            Ok(())
+        } else {
+            Err(atho_rpc::error::RpcError::invalid_request(format!(
+                "{command} does not accept arguments"
+            )))
+        }
+    }
+
+    fn parse_single_string_arg(
+        &self,
+        command: &str,
+        args: &[String],
+        label: &str,
+    ) -> Result<String, atho_rpc::error::RpcError> {
+        if args.len() != 1 {
+            return Err(atho_rpc::error::RpcError::invalid_request(format!(
+                "{command} expects exactly one {label} argument"
+            )));
+        }
+        Ok(args[0].clone())
+    }
+
+    fn parse_single_u64_arg(
+        &self,
+        command: &str,
+        args: &[String],
+        label: &str,
+    ) -> Result<u64, atho_rpc::error::RpcError> {
+        let value = self.parse_single_string_arg(command, args, label)?;
+        value.parse::<u64>().map_err(|_| {
+            atho_rpc::error::RpcError::invalid_request(format!(
+                "{command} expected {label} as unsigned integer"
+            ))
+        })
+    }
+
+    fn parse_single_block_arg(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<Block, atho_rpc::error::RpcError> {
+        let value = self.parse_single_string_arg(command, args, "hash|height")?;
+        if let Ok(height) = value.parse::<u64>() {
+            return self.canonical_block_by_height(height)?.ok_or_else(|| {
+                atho_rpc::error::RpcError::invalid_request(format!("unknown block height {height}"))
+            });
+        }
+        let hash = parse_hash48(&value)?;
+        self.orchestrator
+            .runtime
+            .node
+            .block_by_hash(hash)
+            .ok_or_else(|| {
+                atho_rpc::error::RpcError::invalid_request(format!("unknown block hash {value}"))
+            })
+    }
+
+    fn canonical_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<Block>, atho_rpc::error::RpcError> {
+        let blocks = self
+            .orchestrator
+            .runtime
+            .node
+            .canonical_blocks()
+            .map_err(rpc_error_from_node)?;
+        Ok(blocks
+            .into_iter()
+            .find(|block| block.header.height == height))
+    }
 }
 
 impl NodeService {
@@ -702,6 +1211,8 @@ impl Drop for NodeService {
 mod tests {
     use super::*;
     use crate::test_support::acquire_global_test_lock;
+    use atho_core::address::encode_base56_address;
+    use atho_rpc::request::RpcRequest;
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use std::ffi::OsString;
     use std::fs;
@@ -816,6 +1327,92 @@ mod tests {
         assert!(peers.iter().any(|peer| peer == "9.9.9.9:9200"));
         assert!(!peers.iter().any(|peer| peer == "7.7.7.7:9200"));
     }
+
+    #[test]
+    fn block_template_exposes_canonical_header_bytes_for_miners() {
+        let root = temp_data_dir("block-template");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let response = service.handle(RpcRequest::GetBlockTemplate);
+        let RpcResponse::BlockTemplate(template) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+
+        assert_eq!(
+            template.header_bytes_without_nonce(),
+            template.block.header.canonical_bytes_without_nonce()
+        );
+        assert_eq!(
+            template.nonce_offset_bytes(),
+            template.block.header.canonical_size_bytes_without_nonce()
+        );
+        assert_eq!(
+            template.transaction_count,
+            template.block.transactions.len()
+        );
+        assert_eq!(template.fees_atoms, template.block.fees_total_atoms);
+    }
+
+    #[test]
+    fn execute_command_help_returns_registry_data() {
+        let root = temp_data_dir("command-help");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let response = service.handle(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "help",
+            Vec::new(),
+        )));
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(command.command, "help");
+        assert!(command.data["count"].as_u64().unwrap_or_default() > 0);
+        assert!(command.data["groups"].is_object());
+    }
+
+    #[test]
+    fn execute_command_getblockchaininfo_reports_active_network() {
+        let root = temp_data_dir("command-blockchaininfo");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let response = service.handle(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "getblockchaininfo",
+            Vec::new(),
+        )));
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(command.command, "getblockchaininfo");
+        assert_eq!(command.data["network"], "atho-regnet");
+        assert_eq!(command.data["height"], 0);
+    }
+
+    #[test]
+    fn execute_command_validate_address_reports_matching_network() {
+        let root = temp_data_dir("command-validate-address");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let address = encode_base56_address(Network::Regnet, &[7u8; 32]);
+        let response = service.handle(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "validateathoaddress",
+            vec![address.clone()],
+        )));
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(command.command, "validateathoaddress");
+        assert_eq!(command.data["is_valid"], true);
+        assert_eq!(command.data["address"], address);
+        assert_eq!(command.data["matches_active_network"], true);
+    }
 }
 
 fn sync_error_into_node(error: NodeSyncError) -> NodeError {
@@ -831,4 +1428,17 @@ fn unix_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn parse_hash48(value: &str) -> Result<[u8; 48], atho_rpc::error::RpcError> {
+    let bytes = hex::decode(value)
+        .map_err(|_| atho_rpc::error::RpcError::invalid_request("expected 48-byte hex hash"))?;
+    if bytes.len() != 48 {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "expected 48-byte hex hash",
+        ));
+    }
+    let mut hash = [0u8; 48];
+    hash.copy_from_slice(&bytes);
+    Ok(hash)
 }

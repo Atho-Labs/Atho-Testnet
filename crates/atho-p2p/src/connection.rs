@@ -4,6 +4,10 @@ use crate::config::network_params;
 use crate::handshake::{HandshakeAction, HandshakeState};
 use crate::protocol::{MessagePayload, NetworkMessage, PeerAddress, ProtocolError, VersionMessage};
 use atho_core::network::Network;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, P2P_BANNED_PEER, P2P_INBOUND_LIMIT, P2P_OUTBOUND_LIMIT,
+    P2P_PEER_ALREADY_CONNECTED, P2P_UNKNOWN_PEER,
+};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -65,6 +69,26 @@ pub enum ConnectionError {
     InboundLimitReached,
     #[error("outbound peer limit reached")]
     OutboundLimitReached,
+}
+
+impl AthoErrorMeta for ConnectionError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::Protocol(error) => error.descriptor(),
+            Self::PeerAlreadyConnected => &P2P_PEER_ALREADY_CONNECTED,
+            Self::UnknownPeer => &P2P_UNKNOWN_PEER,
+            Self::BannedPeer => &P2P_BANNED_PEER,
+            Self::InboundLimitReached => &P2P_INBOUND_LIMIT,
+            Self::OutboundLimitReached => &P2P_OUTBOUND_LIMIT,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        match self {
+            Self::Protocol(error) => error.source_module(),
+            _ => "atho-p2p::connection",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

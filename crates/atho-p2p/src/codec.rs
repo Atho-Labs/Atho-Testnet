@@ -1,6 +1,10 @@
 use crate::config::{network_from_magic, network_params};
 use crate::protocol::{MessageCommand, NetworkMessage, ProtocolError};
 use atho_core::crypto::hash::sha3_256;
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, HASH_CHECKSUM_MISMATCH, NET_INVALID_MAGIC,
+    P2P_MESSAGE_TOO_SHORT, P2P_PAYLOAD_TOO_LARGE,
+};
 use thiserror::Error;
 
 const FRAME_HEADER_BYTES: usize = 24;
@@ -17,6 +21,25 @@ pub enum CodecError {
     PayloadTooLarge,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+}
+
+impl AthoErrorMeta for CodecError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::MessageTooShort => &P2P_MESSAGE_TOO_SHORT,
+            Self::InvalidMagic => &NET_INVALID_MAGIC,
+            Self::ChecksumMismatch => &HASH_CHECKSUM_MISMATCH,
+            Self::PayloadTooLarge => &P2P_PAYLOAD_TOO_LARGE,
+            Self::Protocol(error) => error.descriptor(),
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        match self {
+            Self::Protocol(error) => error.source_module(),
+            _ => "atho-p2p::codec",
+        }
+    }
 }
 
 #[derive(Debug, Default)]

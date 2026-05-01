@@ -1,8 +1,10 @@
 use atho_core::network::Network;
-use atho_node::miner::Miner;
+use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MinerCli {
@@ -10,6 +12,8 @@ struct MinerCli {
     rpc_addr: Option<String>,
     data_dir: Option<String>,
     cores: Option<usize>,
+    backend: Option<MiningBackendKind>,
+    probe_gpu: bool,
 }
 
 impl MinerCli {
@@ -41,13 +45,24 @@ fn run() -> Result<(), String> {
     }
     let cli = parse_cli(&args)?;
     cli.apply_env();
+    let requested_backend = cli
+        .backend
+        .or_else(MiningBackendKind::from_env)
+        .unwrap_or_default();
+    if cli.probe_gpu {
+        let info = MiningController::new(requested_backend, 1).gpu_probe_info();
+        print_gpu_probe(&info);
+        return Ok(());
+    }
     let network = cli.network.unwrap_or_else(default_network);
     let cores = cli.cores.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
     });
-    let miner = Miner::new(cores as u32);
+    let backend = requested_backend;
+    let controller = MiningController::new(backend, cores as u32);
+    let gpu_info = controller.gpu_probe_info();
     let rpc_address = cli
         .rpc_addr
         .clone()
@@ -56,16 +71,21 @@ fn run() -> Result<(), String> {
     let _ = atho_node::dev::append_log(
         "miner",
         &format!(
-            "cli mining request network={} rpc={} cores={cores}",
+            "cli mining request network={} rpc={} cores={cores} backend={}",
             network.id(),
-            rpc_address
+            rpc_address,
+            controller.backend().label()
         ),
     );
     println!(
-        "mining on {} rpc={} cores={cores}",
+        "mining on {} rpc={} cores={cores} backend={}",
         network.id(),
-        rpc_address
+        rpc_address,
+        controller.backend().label()
     );
+    if !matches!(controller.backend(), MiningBackendKind::Cpu) {
+        println!("{}", gpu_info.summary());
+    }
     println!("requesting block template...");
     let template = match client.call(&RpcRequest::GetBlockTemplate) {
         Ok(RpcResponse::BlockTemplate(template)) => template,
@@ -73,8 +93,21 @@ fn run() -> Result<(), String> {
         Ok(other) => return Err(format!("unexpected rpc response: {other:?}")),
         Err(err) => return Err(err.to_string()),
     };
-    println!("solving block at height {}", template.height);
-    let block = miner.solve_block(template.block);
+    println!(
+        "solving block at height {} with requested backend {}",
+        template.height,
+        controller.backend().label()
+    );
+    let report = controller
+        .mine_block_reported(template, Arc::new(AtomicBool::new(false)))
+        .map_err(|err| err.to_string())?;
+    let effective_backend = report.backend_used.label();
+    let fallback_reason = report.fallback_reason.clone();
+    let accelerator = report.accelerator.clone();
+    if let Some(reason) = fallback_reason.as_deref() {
+        println!("backend fallback: {reason}");
+    }
+    let block = report.block;
     match client.call(&RpcRequest::SubmitBlock(block.clone())) {
         Ok(RpcResponse::BlockSubmitted { accepted: true, .. }) => {}
         Ok(RpcResponse::BlockSubmitted {
@@ -87,6 +120,11 @@ fn run() -> Result<(), String> {
 
     println!("network={}", network.id());
     println!("cores={cores}");
+    println!("requested_backend={}", controller.backend().label());
+    println!("effective_backend={effective_backend}");
+    if let Some(accelerator) = &accelerator {
+        print_gpu_probe(accelerator);
+    }
     println!("rpc_address={rpc_address}");
     println!("height={}", block.header.height);
     println!("hash={}", hex::encode(block.header.block_hash()));
@@ -114,12 +152,57 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn print_gpu_probe(info: &MiningAcceleratorInfo) {
+    println!("gpu_backend={}", info.backend);
+    println!("gpu_usable={}", info.usable);
+    println!("gpu_device_type={}", info.device_type.label());
+    if let Some(name) = &info.device_name {
+        println!("gpu_device_name={name}");
+    }
+    if let Some(vendor) = &info.vendor {
+        println!("gpu_vendor={vendor}");
+    }
+    if let Some(driver) = &info.driver {
+        println!("gpu_driver={driver}");
+    }
+    if let Some(compute_units) = info.compute_units {
+        println!("gpu_compute_units={compute_units}");
+    }
+    if let Some(global_mem_mb) = info.global_mem_mb {
+        println!("gpu_global_mem_mb={global_mem_mb}");
+    }
+    if let Some(local_mem_kb) = info.local_mem_kb {
+        println!("gpu_local_mem_kb={local_mem_kb}");
+    }
+    if let Some(clock_mhz) = info.clock_mhz {
+        println!("gpu_clock_mhz={clock_mhz}");
+    }
+    if let Some(kernel_path) = &info.kernel_path {
+        println!("gpu_kernel_path={}", kernel_path.display());
+    }
+    println!("gpu_supports_fixed={}", info.supports_fixed);
+    println!("gpu_supports_template={}", info.supports_template);
+    if let Some(max_batch) = info.max_batch {
+        println!("gpu_max_batch={max_batch}");
+    }
+    if let Some(template_max_bytes) = info.template_max_bytes {
+        println!("gpu_template_max_bytes={template_max_bytes}");
+    }
+    if let Some(code) = &info.reason_code {
+        println!("gpu_unavailable_code={code}");
+    }
+    if let Some(reason) = &info.reason_if_not {
+        println!("gpu_unavailable_reason={reason}");
+    }
+}
+
 fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
     let mut cli = MinerCli::default();
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "mainnet" | "testnet" | "regnet" | "regtest" => {
+            "mainnet" | "testnet" | "regnet" | "regtest" | "prunetest" | "prune-test"
+            | "prune_test" => {
                 cli.network = parse_network(&args[i]);
                 i += 1;
             }
@@ -162,6 +245,20 @@ fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
                 );
                 i += 2;
             }
+            "--backend" | "-b" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "missing backend value".to_string())?;
+                cli.backend = MiningBackendKind::parse(value);
+                if cli.backend.is_none() {
+                    return Err(format!("invalid backend {value}"));
+                }
+                i += 2;
+            }
+            "--probe-gpu" => {
+                cli.probe_gpu = true;
+                i += 1;
+            }
             value => {
                 return Err(format!("unrecognized argument {value}"));
             }
@@ -181,7 +278,9 @@ fn default_network() -> Network {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  atho-mine [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH]");
+    eprintln!(
+        "  atho-mine [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH] [--backend <cpu|gpu|auto>] [--probe-gpu]  (default backend: auto)"
+    );
 }
 
 fn default_rpc_address(network: Network) -> String {
@@ -203,11 +302,32 @@ mod tests {
             String::from("4"),
             String::from("--data-dir"),
             String::from("/tmp/atho"),
+            String::from("--backend"),
+            String::from("gpu"),
         ];
         let parsed = parse_cli(&args).expect("parse");
         assert_eq!(parsed.network, Some(Network::Regnet));
         assert_eq!(parsed.rpc_addr.as_deref(), Some("127.0.0.1:9210"));
         assert_eq!(parsed.cores, Some(4));
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
+        assert_eq!(parsed.backend, Some(MiningBackendKind::Gpu));
+    }
+
+    #[test]
+    fn miner_cli_defaults_to_auto_when_backend_not_set() {
+        let cli = parse_cli(&[String::from("--network"), String::from("regnet")]).unwrap();
+        assert_eq!(cli.backend, None);
+    }
+
+    #[test]
+    fn miner_cli_parses_probe_gpu_flag() {
+        let cli = parse_cli(&[String::from("--probe-gpu")]).unwrap();
+        assert!(cli.probe_gpu);
+    }
+
+    #[test]
+    fn miner_cli_accepts_prunetest_shorthand() {
+        let cli = parse_cli(&[String::from("prune-test")]).unwrap();
+        assert_eq!(cli.network, Some(Network::Prunetest));
     }
 }

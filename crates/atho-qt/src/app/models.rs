@@ -1,5 +1,6 @@
 use super::default_wallet_path;
 use atho_core::network::Network;
+use atho_rpc::command::{CommandGroup, CommandPermission};
 use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
 use atho_wallet::wallet::WalletAddress;
 use atho_wallet::wallet::DEFAULT_RESTORE_GAP_LIMIT;
@@ -13,6 +14,7 @@ pub(crate) enum NavTab {
     Send,
     Receive,
     Transactions,
+    DebugConsole,
     Settings,
 }
 
@@ -80,9 +82,40 @@ impl NavTab {
             NavTab::Send => "Send",
             NavTab::Receive => "Receive",
             NavTab::Transactions => "Transactions",
+            NavTab::DebugConsole => "Debug Console",
             NavTab::Settings => "Settings",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugConsoleOutputMode {
+    Pretty,
+    Json,
+    Table,
+}
+
+impl DebugConsoleOutputMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Pretty => "Pretty",
+            Self::Json => "JSON",
+            Self::Table => "Table",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DebugConsoleEntry {
+    pub(crate) command_line: String,
+    pub(crate) command_name: String,
+    pub(crate) group: CommandGroup,
+    pub(crate) permission: CommandPermission,
+    pub(crate) dangerous: bool,
+    pub(crate) success: bool,
+    pub(crate) network_label: String,
+    pub(crate) output: String,
+    pub(crate) error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,6 +290,9 @@ pub(crate) struct MiningOutcome {
     pub(crate) block_hash: [u8; 48],
     pub(crate) accepted: bool,
     pub(crate) message: String,
+    pub(crate) backend_used: String,
+    pub(crate) accelerator_label: Option<String>,
+    pub(crate) fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,120 @@
+name: Atho Production Readiness
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  quick-linux:
+    name: Quick Linux Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run fast deterministic suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p atho-errors
+          cargo test -p atho-core
+          cargo test -p atho-crypto
+          cargo test -p atho-storage
+          cargo test -p atho-p2p
+          cargo test -p atho-rpc
+          cargo test -p atho-wallet
+          cargo test -p atho-node
+
+      - name: Build-check fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  nightly-hardening:
+    name: Nightly Hardening
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace
+
+      - name: Run pruning and snapshot regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p atho-node prunetest_node_mines_and_restarts_in_an_isolated_database_root
+          cargo test -p atho-storage chainstate_prunes_old_history_after_retention_window
+          cargo test -p atho-storage snapshot_bundle_uses_canonical_storage_after_pruning_memory_tail
+
+      - name: Run network convergence regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p atho-node tcp_runtime_25_node_cluster_converges_restarts_and_recovers
+
+      - name: Build-check fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  cross-os-node-smoke:
+    name: Cross-OS Node Smoke (${{ matrix.os }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build node binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p atho-node --bin athod
+          cargo build -p atho-node --bin atho-mine
+
+      - name: Run prune-test CLI smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p atho-node config_loader_accepts_prunetest_network_from_env
+          cargo test -p atho-node runtime_cli_accepts_prunetest_network
+          cargo test -p atho-node miner_cli_accepts_prunetest_shorthand

@@ -43,7 +43,14 @@ It is designed to answer three questions clearly:
 
 - [Quick Start](../quickstart.md)
 - [Commands](operations/commands.md)
+- [Atho CLI Commands](ATHO_CLI_COMMANDS.md)
+- [Atho RPC API](ATHO_RPC_API.md)
+- [Atho Debug Console](ATHO_DEBUG_CONSOLE.md)
+- [Atho Command Permissions](ATHO_COMMAND_PERMISSIONS.md)
+- [Atho Dangerous Commands](ATHO_DANGEROUS_COMMANDS.md)
 - [Runtime Model](operations/runtime-model.md)
+- [GPU Mining](operations/gpu-mining.md)
+- [Atho Error Codes](ATHO_ERROR_CODES.md)
 - [Optimizations and Max Parallelization Speed](operations/optimizations-and-max-parallelization-speed.md)
 - [Linux Quick Start](operations/linux-quick-start.md)
 - [macOS Quick Start](operations/macos-quick-start.md)
@@ -56,6 +63,9 @@ It is designed to answer three questions clearly:
 
 ## Quality, Testing, And Status
 
+- [Production Readiness Test Plan](ATHO_PRODUCTION_READINESS_TEST_PLAN.md)
+- [Test Matrix](ATHO_TEST_MATRIX.md)
+- [Security Test Checklist](ATHO_SECURITY_TEST_CHECKLIST.md)
 - [Testing and Hardening](testing-audits/testing-and-hardening.md)
 - [Current Production Status](production-readiness/current-status.md)
 - [Roadmap to Production](production-readiness/roadmap.md)
@@ -75,6 +85,7 @@ As of the latest sandbox hardening pass:
 - the Qt client follows the real backend tip through RPC
 - the Qt settings page now exposes operator-local peer and traffic diagnostics
 - the node can mine, validate, persist, reload, and reorg locally
+- an isolated `prunetest` network now exists for pruning and recovery regressions
 - DNS seeds are intentionally blank
 - the live TCP peer runtime exists, but still needs broader public-network hardening and soak coverage
 

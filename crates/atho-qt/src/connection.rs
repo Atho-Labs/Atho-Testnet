@@ -1,5 +1,6 @@
 use atho_core::network::Network;
 use atho_node::system::AthoSystem;
+use atho_rpc::command::command_requires_mutable_access;
 use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcResponse};
@@ -236,10 +237,14 @@ impl ReadOnlyNodeConnection {
         match &self.backend {
             ConnectionBackend::Local(system) => {
                 let mut system = system.lock().expect("local node mutex poisoned");
-                if matches!(
-                    &request,
-                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. }
-                ) {
+                let requires_mutable = match &request {
+                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => true,
+                    RpcRequest::ExecuteCommand(invocation) => {
+                        command_requires_mutable_access(&invocation.name)
+                    }
+                    _ => false,
+                };
+                if requires_mutable {
                     system.handle_mut(request)
                 } else {
                     system.handle(request)
@@ -248,7 +253,7 @@ impl ReadOnlyNodeConnection {
             ConnectionBackend::Rpc { client, node } => {
                 if let Some(node) = node {
                     if let Some(error) = node.observe_exit(self.network) {
-                        return RpcResponse::Error(RpcError::InvalidRequest(error));
+                        return RpcResponse::Error(RpcError::invalid_request(error));
                     }
                 }
                 match client.call(&request) {
@@ -256,19 +261,19 @@ impl ReadOnlyNodeConnection {
                     Err(err) => {
                         if let Some(node) = node {
                             if let Some(error) = node.observe_exit(self.network) {
-                                return RpcResponse::Error(RpcError::InvalidRequest(error));
+                                return RpcResponse::Error(RpcError::invalid_request(error));
                             }
-                            return RpcResponse::Error(RpcError::InvalidRequest(format!(
+                            return RpcResponse::Error(RpcError::invalid_request(format!(
                                 "local node RPC is not ready yet: {err}"
                             )));
                         }
                         let _ = atho_node::dev::append_log("atho-qt", &format!("rpc error: {err}"));
-                        RpcResponse::Error(RpcError::Internal)
+                        RpcResponse::Error(RpcError::internal())
                     }
                 }
             }
             ConnectionBackend::Unavailable { startup_error } => {
-                RpcResponse::Error(RpcError::InvalidRequest(startup_error.clone()))
+                RpcResponse::Error(RpcError::invalid_request(startup_error.clone()))
             }
         }
     }
@@ -995,7 +1000,7 @@ mod tests {
                         transaction_count: mempool_count,
                         total_fee_atoms,
                     }),
-                    other => RpcResponse::Error(RpcError::InvalidRequest(format!(
+                    other => RpcResponse::Error(RpcError::invalid_request(format!(
                         "unexpected request in mock rpc server: {other:?}"
                     ))),
                 };
@@ -1016,7 +1021,7 @@ mod tests {
                 let request: RpcRequest = read_message(&mut reader).expect("request");
                 let response = match request {
                     RpcRequest::GetNodeStatus => {
-                        RpcResponse::Error(atho_rpc::error::RpcError::MethodNotFound)
+                        RpcResponse::Error(atho_rpc::error::RpcError::method_not_found())
                     }
                     RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
                     RpcRequest::GetBlockCount => RpcResponse::BlockCount(77),
@@ -1024,7 +1029,7 @@ mod tests {
                         transaction_count: 5,
                         total_fee_atoms: 9,
                     }),
-                    other => RpcResponse::Error(RpcError::InvalidRequest(format!(
+                    other => RpcResponse::Error(RpcError::invalid_request(format!(
                         "unexpected request in mock rpc server: {other:?}"
                     ))),
                 };

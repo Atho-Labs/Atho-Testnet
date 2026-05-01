@@ -742,6 +742,7 @@ fn parse_network() -> Network {
                         "mainnet" => Network::Mainnet,
                         "testnet" => Network::Testnet,
                         "regnet" | "regtest" => Network::Regnet,
+                        "prunetest" | "prune-test" | "prune_test" => Network::Prunetest,
                         _ => Network::Regnet,
                     };
                 }
@@ -749,6 +750,7 @@ fn parse_network() -> Network {
             "mainnet" => return Network::Mainnet,
             "testnet" => return Network::Testnet,
             "regnet" | "regtest" => return Network::Regnet,
+            "prunetest" | "prune-test" | "prune_test" => return Network::Prunetest,
             _ => {}
         }
     }
@@ -766,5 +768,6 @@ fn other_network(network: Network) -> Network {
         Network::Mainnet => Network::Testnet,
         Network::Testnet => Network::Regnet,
         Network::Regnet => Network::Mainnet,
+        Network::Prunetest => Network::Regnet,
     }
 }

@@ -101,6 +101,11 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Debug Console").clicked() {
+                        app.active_tab = NavTab::DebugConsole;
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("About Atho").clicked() {
                         app.show_about_dialog = true;
                         ui.close_menu();
@@ -147,6 +152,7 @@ fn render_toolbar(app: &mut DesktopApp, ctx: &egui::Context) {
                             tab.label(),
                             resources::history_icon(26.0),
                         ),
+                        NavTab::DebugConsole => continue,
                         NavTab::Settings => continue,
                     };
                     if response.clicked() {
@@ -162,6 +168,13 @@ fn render_toolbar(app: &mut DesktopApp, ctx: &egui::Context) {
                     if let Err(err) = app.refresh() {
                         app.last_error = Some(err.to_string());
                     }
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized([90.0, 28.0], egui::Button::new("Console"))
+                    .clicked()
+                {
+                    app.active_tab = NavTab::DebugConsole;
                 }
             });
         });

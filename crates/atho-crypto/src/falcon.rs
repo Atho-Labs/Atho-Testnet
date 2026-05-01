@@ -262,12 +262,58 @@ mod tests {
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::transaction::{Transaction, TxInput, TxOutput};
 
+    #[derive(Clone, Copy)]
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            // Xorshift64* keeps the test deterministic without pulling in an extra dependency.
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn fill_bytes(&mut self, out: &mut [u8]) {
+            for chunk in out.chunks_mut(8) {
+                let bytes = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+
+        fn next_len(&mut self, max: usize) -> usize {
+            (self.next_u64() as usize % max).saturating_add(1)
+        }
+    }
+
     #[test]
     fn falcon512_lengths_are_frozen() {
         assert_eq!(FALCON_512_LOGN, 9);
         assert_eq!(FALCON_512_PUBLIC_KEY_BYTES, 897);
         assert_eq!(FALCON_512_SECRET_KEY_BYTES, 1_281);
         assert_eq!(FALCON_512_SIGNATURE_BYTES, 666);
+    }
+
+    #[test]
+    fn falcon512_lengths_match_protocol_constants() {
+        assert_eq!(
+            FALCON_512_PUBLIC_KEY_BYTES,
+            atho_core::constants::FALCON_512_PUBLIC_KEY_BYTES
+        );
+        assert_eq!(
+            FALCON_512_SECRET_KEY_BYTES,
+            atho_core::constants::FALCON_512_SECRET_KEY_BYTES
+        );
+        assert_eq!(
+            FALCON_512_SIGNATURE_BYTES,
+            atho_core::constants::FALCON_512_SIGNATURE_BYTES
+        );
     }
 
     #[test]
@@ -335,7 +381,56 @@ mod tests {
     fn falcon_length_validation_rejects_wrong_sizes() {
         let err = validate_key_lengths(&[], &[]).unwrap_err();
         assert_eq!(err, CryptoError::InvalidKeyLength);
+        assert!(signature_len_ok(FALCON_512_SIGNATURE_BYTES));
         assert!(!signature_len_ok(665));
+        assert!(!signature_len_ok(FALCON_512_SIGNATURE_BYTES + 1));
+        assert!(public_key_len_ok(FALCON_512_PUBLIC_KEY_BYTES));
         assert!(!public_key_len_ok(896));
+        assert!(!public_key_len_ok(FALCON_512_PUBLIC_KEY_BYTES + 1));
+    }
+
+    #[test]
+    fn falcon_signature_audit_over_10k_random_messages_stays_fixed_size() {
+        const SAMPLE_COUNT: usize = 10_000;
+
+        let keypair = generate_from_seed(b"atho-falcon-signature-size-audit").unwrap();
+        let mut rng = TestRng::new(0x9E37_79B9_7F4A_7C15);
+        let mut message = vec![0u8; 1];
+        let mut total_len = 0usize;
+        let mut min_len = usize::MAX;
+        let mut max_len = 0usize;
+
+        for _ in 0..SAMPLE_COUNT {
+            let message_len = rng.next_len(256);
+            message.resize(message_len, 0);
+            rng.fill_bytes(&mut message);
+
+            let signature = sign(AthoSignatureDomain::TestDev, &keypair.secret_key, &message)
+                .expect("falcon signature");
+            assert!(verify(
+                AthoSignatureDomain::TestDev,
+                &keypair.public_key,
+                &message,
+                &signature,
+            )
+            .expect("falcon verification"));
+
+            let len = signature.as_bytes().len();
+            total_len += len;
+            if len < min_len {
+                min_len = len;
+            }
+            if len > max_len {
+                max_len = len;
+            }
+        }
+
+        let avg_len = total_len / SAMPLE_COUNT;
+        println!(
+            "falcon signature audit: count={SAMPLE_COUNT} min={min_len} max={max_len} avg={avg_len} bytes"
+        );
+        assert_eq!(min_len, FALCON_512_SIGNATURE_BYTES);
+        assert_eq!(max_len, FALCON_512_SIGNATURE_BYTES);
+        assert_eq!(avg_len, FALCON_512_SIGNATURE_BYTES);
     }
 }

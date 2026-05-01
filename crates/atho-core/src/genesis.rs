@@ -5,6 +5,7 @@ use crate::constants::GENESIS_COINBASE_ATOMS;
 use crate::network::Network;
 use crate::transaction::{Transaction, TxOutput};
 use hex_literal::hex;
+use std::sync::OnceLock;
 
 const MAINNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHO9529a6358612b193cc100b4150f46235505a948caacf331b15a171993ad3124c008f45d692886ecc6417aa6ab964488c";
@@ -54,6 +55,15 @@ const REGNET_GENESIS_WITNESS_ROOT: [u8; 48] = REGNET_GENESIS_COINBASE_TXID;
 const REGNET_GENESIS_BLOCK_HASH: [u8; 48] =
     hex!("0000747cfb613e8e66e9cf9af1c6eb1c666f4879aa3a99fb90b5dc948c129587ed20112e5fd43d131c8eaedeca7d465a");
 
+const PRUNETEST_GENESIS_REWARD_ADDRESS: &str =
+    "ATHP22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
+const PRUNETEST_GENESIS_REWARD_SCRIPT: [u8; 48] = TESTNET_GENESIS_REWARD_SCRIPT;
+const PRUNETEST_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
+const PRUNETEST_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
+const PRUNETEST_GENESIS_LOCK_TIME: u32 = 0;
+const PRUNETEST_GENESIS_TIMESTAMP: u64 = 1_773_360_490;
+const PRUNETEST_GENESIS_TARGET: [u8; 48] = pow::PRUNETEST_INITIAL_TARGET;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenesisState {
     pub network: Network,
@@ -86,6 +96,7 @@ pub fn genesis_state(network: Network) -> GenesisState {
         Network::Mainnet => mainnet(),
         Network::Testnet => testnet(),
         Network::Regnet => regnet(),
+        Network::Prunetest => prunetest(),
     }
 }
 
@@ -143,6 +154,15 @@ pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
                 REGNET_GENESIS_LOCK_TIME,
                 REGNET_GENESIS_TIMESTAMP,
                 REGNET_GENESIS_TARGET,
+            ),
+            Network::Prunetest => (
+                PRUNETEST_GENESIS_REWARD_ADDRESS,
+                PRUNETEST_GENESIS_REWARD_SCRIPT,
+                PRUNETEST_GENESIS_BLOCK_VERSION,
+                PRUNETEST_GENESIS_TX_VERSION,
+                PRUNETEST_GENESIS_LOCK_TIME,
+                PRUNETEST_GENESIS_TIMESTAMP,
+                PRUNETEST_GENESIS_TARGET,
             ),
         };
 
@@ -253,6 +273,31 @@ fn regnet() -> GenesisState {
     )
 }
 
+fn prunetest() -> GenesisState {
+    static STATE: OnceLock<GenesisState> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            let profile = regenerate_genesis_profile(Network::Prunetest);
+            genesis_state_from_parts(
+                profile.network,
+                PRUNETEST_GENESIS_REWARD_ADDRESS,
+                profile.reward_script,
+                profile.block_version,
+                profile.tx_version,
+                profile.lock_time,
+                profile.timestamp,
+                profile.nonce,
+                profile.target,
+                profile.merkle_root,
+                profile.witness_root,
+                Network::Prunetest.utxo_flag(),
+                profile.coinbase_txid,
+                profile.block_hash,
+            )
+        })
+        .clone()
+}
+
 fn genesis_state_from_parts(
     network: Network,
     reward_address: &str,
@@ -339,11 +384,14 @@ mod tests {
         let main = genesis_state(Network::Mainnet);
         let test = genesis_state(Network::Testnet);
         let reg = genesis_state(Network::Regnet);
+        let prune = genesis_state(Network::Prunetest);
         assert_eq!(main.network, Network::Mainnet);
         assert_eq!(test.network, Network::Testnet);
         assert_eq!(reg.network, Network::Regnet);
+        assert_eq!(prune.network, Network::Prunetest);
         assert_ne!(main.block_hash, test.block_hash);
         assert_ne!(test.block_hash, reg.block_hash);
+        assert_ne!(reg.block_hash, prune.block_hash);
         assert_eq!(
             main.block.transactions[0].outputs[0].value_atoms,
             GENESIS_COINBASE_ATOMS
@@ -378,5 +426,12 @@ mod tests {
         assert_eq!(main.block.cumulative_burned_atoms, 0);
         assert_eq!(test.utxo_flag, "TEST-UTXO");
         assert_eq!(reg.utxo_flag, "REG-UTXO");
+        assert_eq!(prune.utxo_flag, "PRUNE-UTXO");
+        assert_eq!(prune.reward_address, PRUNETEST_GENESIS_REWARD_ADDRESS);
+        assert_eq!(prune.block.header.network_id, Network::Prunetest);
+        assert_eq!(
+            prune.block.header.difficulty_target_or_bits,
+            PRUNETEST_GENESIS_TARGET
+        );
     }
 }

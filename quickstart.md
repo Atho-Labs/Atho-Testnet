@@ -6,6 +6,10 @@ Atho has three primary commands:
 - `atho-mine` for the miner
 - `atho-qt` for the desktop client
 
+There is also a new operator/debug client:
+
+- `atho-cli` for Bitcoin Core-style local RPC commands
+
 If you downloaded a packaged release instead of building from source, start with the native installer:
 
 - Windows: `Atho Setup.exe`
@@ -40,6 +44,17 @@ cargo build --release -p atho-node -p atho-qt
 
 Built binaries live in `target/release/`.
 
+If you want GPU mining, build the relevant binary with the native feature enabled:
+
+```bash
+cargo build --release -p atho-node --bin atho-mine --features gpu-native
+cargo build --release -p atho-qt --features gpu-native
+```
+
+That feature enables the native FFI wrapper and keeps the node as the final authority.
+`--backend gpu` requires a real OpenCL GPU.
+`--backend auto` prefers GPU and falls back to CPU, and Atho surfaces the fallback reason in the miner status.
+
 ## 3. Run The Client
 
 Linux or macOS:
@@ -55,6 +70,8 @@ Windows PowerShell:
 ```
 
 `--local-node` starts a managed `athod` child process over RPC, so the client uses the real node path.
+
+If you want a disposable pruning and recovery sandbox, use `--network prunetest` instead of `regnet`.
 
 ## 4. Run The Full Node
 
@@ -91,6 +108,13 @@ Windows PowerShell:
 ```
 
 The miner uses the network default RPC port unless you override `--rpc-addr`.
+
+For GPU mining, use `--backend gpu` or `--backend auto` and build with `--features gpu-native`.
+If you omit `--backend`, the miner defaults to auto-select.
+Use `./target/release/atho-mine --probe-gpu` to print the detected device name, vendor, driver, and OpenCL capability before starting a long mining session.
+If probe fails, the output now includes a stable code such as `ATHO-MINE-102` or `ATHO-MINE-103`.
+
+In Qt, open `Settings > Mining` to pick `Auto`, `GPU only`, or `CPU only` and inspect the detected device details directly in the app.
 
 ## 6. Testnet And Mainnet
 
@@ -156,8 +180,12 @@ $env:ATHO_DATA_DIR = "D:\Atho"
 
 ## 10. Key Commands
 
-- `athod --network <mainnet|testnet|regnet>`
-- `atho-qt --network <mainnet|testnet|regnet> --local-node`
-- `atho-mine --network <mainnet|testnet|regnet>`
-- `athod status --network <mainnet|testnet|regnet>`
-- `athod verify --network <mainnet|testnet|regnet>`
+- `athod --network <mainnet|testnet|regnet|prunetest>`
+- `atho-qt --network <mainnet|testnet|regnet|prunetest> --local-node`
+- `atho-mine --network <mainnet|testnet|regnet|prunetest>`
+- `atho-cli --network <mainnet|testnet|regnet|prunetest> getblockchaininfo`
+- `atho-cli help getblocktemplate`
+- `athod status --network <mainnet|testnet|regnet|prunetest>`
+- `athod verify --network <mainnet|testnet|regnet|prunetest>`
+
+The Qt client also includes a built-in `Debug Console` entry under `Help`, backed by the same command registry as `atho-cli`.

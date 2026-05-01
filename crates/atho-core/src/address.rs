@@ -168,7 +168,7 @@ pub fn is_base56_char(c: char) -> bool {
 }
 
 pub fn is_visible_prefix(c: char) -> bool {
-    matches!(c, 'A' | 'T' | 'R')
+    matches!(c, 'A' | 'T' | 'R' | 'P')
 }
 
 pub fn encode_base56_address(network: Network, digest: &[u8; ADDRESS_DIGEST_BYTES]) -> String {
@@ -207,6 +207,7 @@ pub fn decode_base56_address(
         'A' => Network::Mainnet,
         'T' => Network::Testnet,
         'R' => Network::Regnet,
+        'P' => Network::Prunetest,
         _ => return Err(crate::error::AddressError::InvalidPrefix),
     };
     let expected_checksum = address_checksum(prefix, body);
@@ -236,6 +237,7 @@ mod tests {
         assert!(is_visible_prefix('A'));
         assert!(is_visible_prefix('T'));
         assert!(is_visible_prefix('R'));
+        assert!(is_visible_prefix('P'));
         assert!(is_base56_char('2'));
         assert!(!is_base56_char('0'));
     }
@@ -273,6 +275,14 @@ mod tests {
         let address = encode_base56_address(Network::Regnet, &digest);
         let (_, network) = decode_base56_address(&address).unwrap();
         assert_eq!(network, Network::Regnet);
+    }
+
+    #[test]
+    fn prunetest_addresses_round_trip_as_prunetest() {
+        let digest = [9u8; ADDRESS_DIGEST_BYTES];
+        let address = encode_base56_address(Network::Prunetest, &digest);
+        let (_, network) = decode_base56_address(&address).unwrap();
+        assert_eq!(network, Network::Prunetest);
     }
 
     #[test]

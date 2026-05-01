@@ -5,14 +5,24 @@ use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    ADDRESS_DIGEST_BYTES, MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT,
-    MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    ADDRESS_DIGEST_BYTES, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
+    MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_RAW_BYTES,
+    MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
-use atho_crypto::falcon::{
-    self, FalconPublicKey, FalconSignature, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
+use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
+use atho_errors::{
+    AthoErrorDescriptor, AthoErrorMeta, BLK_BLOCK_TOO_LARGE, BLK_COINBASE_REWARD_MISMATCH,
+    BLK_DUPLICATE_TRANSACTION_ID, BLK_EMPTY_BLOCK, BLK_INVALID_COINBASE, BLK_INVALID_HEIGHT,
+    BLK_INVALID_TIMESTAMP, BLK_INVALID_VERSION, BLK_MERKLE_ROOT_MISMATCH, BLK_MULTIPLE_COINBASE,
+    BLK_PARENT_HASH_MISMATCH, BLK_POW_INVALID, BLK_TARGET_OUT_OF_BOUNDS, BLK_WITNESS_ROOT_MISMATCH,
+    CONS_MONETARY_SUPPLY_EXCEEDED, MEM_MEMPOOL_CONFLICT, NET_BLOCK_NETWORK_MISMATCH,
+    SIG_INVALID_WITNESS, SIG_WITNESS_INPUT_REF_MISMATCH, TX_DUPLICATE_INPUT, TX_FEE_BELOW_MINIMUM,
+    TX_FEE_MISMATCH, TX_INPUT_OWNERSHIP_MISMATCH, TX_INSUFFICIENT_CONFIRMATIONS,
+    TX_INVALID_VERSION, TX_MISSING_UTXO, TX_NO_INPUTS, TX_NO_OUTPUTS, TX_TOO_LARGE,
+    TX_ZERO_VALUE_OUTPUT,
 };
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -80,6 +90,47 @@ pub enum ValidationError {
     BlockNetworkMismatch,
     #[error("multiple coinbase transactions")]
     MultipleCoinbaseTransactions,
+}
+
+impl AthoErrorMeta for ValidationError {
+    fn descriptor(&self) -> &'static AthoErrorDescriptor {
+        match self {
+            Self::NoInputs => &TX_NO_INPUTS,
+            Self::NoOutputs => &TX_NO_OUTPUTS,
+            Self::FeeBelowMinimum => &TX_FEE_BELOW_MINIMUM,
+            Self::TransactionTooLarge => &TX_TOO_LARGE,
+            Self::InvalidTransactionVersion => &TX_INVALID_VERSION,
+            Self::DuplicateInput => &TX_DUPLICATE_INPUT,
+            Self::ZeroValueOutput => &TX_ZERO_VALUE_OUTPUT,
+            Self::InvalidWitness => &SIG_INVALID_WITNESS,
+            Self::InvalidCoinbase => &BLK_INVALID_COINBASE,
+            Self::CoinbaseRewardMismatch => &BLK_COINBASE_REWARD_MISMATCH,
+            Self::EmptyBlock => &BLK_EMPTY_BLOCK,
+            Self::BlockTooLarge => &BLK_BLOCK_TOO_LARGE,
+            Self::BlockMerkleRootMismatch => &BLK_MERKLE_ROOT_MISMATCH,
+            Self::BlockWitnessRootMismatch => &BLK_WITNESS_ROOT_MISMATCH,
+            Self::BlockTargetOutOfBounds => &BLK_TARGET_OUT_OF_BOUNDS,
+            Self::ProofOfWorkInvalid => &BLK_POW_INVALID,
+            Self::BlockParentHashMismatch => &BLK_PARENT_HASH_MISMATCH,
+            Self::DuplicateTransactionId => &BLK_DUPLICATE_TRANSACTION_ID,
+            Self::MissingUtxo => &TX_MISSING_UTXO,
+            Self::InputOwnershipMismatch => &TX_INPUT_OWNERSHIP_MISMATCH,
+            Self::InsufficientConfirmations => &TX_INSUFFICIENT_CONFIRMATIONS,
+            Self::MonetarySupplyExceeded => &CONS_MONETARY_SUPPLY_EXCEEDED,
+            Self::WitnessInputReferenceMismatch => &SIG_WITNESS_INPUT_REF_MISMATCH,
+            Self::FeeMismatch => &TX_FEE_MISMATCH,
+            Self::MempoolConflict => &MEM_MEMPOOL_CONFLICT,
+            Self::InvalidBlockHeight => &BLK_INVALID_HEIGHT,
+            Self::InvalidBlockVersion => &BLK_INVALID_VERSION,
+            Self::InvalidBlockTimestamp => &BLK_INVALID_TIMESTAMP,
+            Self::BlockNetworkMismatch => &NET_BLOCK_NETWORK_MISMATCH,
+            Self::MultipleCoinbaseTransactions => &BLK_MULTIPLE_COINBASE,
+        }
+    }
+
+    fn source_module(&self) -> &'static str {
+        "atho-storage::validation"
+    }
 }
 
 pub fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
@@ -1175,6 +1226,40 @@ mod tests {
                 utxos,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn validation_error_codes_are_stable_for_key_failures() {
+        use atho_errors::AthoErrorMeta;
+
+        assert_eq!(
+            ValidationError::InvalidWitness
+                .to_atho_error()
+                .code()
+                .as_str(),
+            "ATHO-SIG-001"
+        );
+        assert_eq!(
+            ValidationError::ProofOfWorkInvalid
+                .to_atho_error()
+                .code()
+                .as_str(),
+            "ATHO-BLK-005"
+        );
+        assert_eq!(
+            ValidationError::MempoolConflict
+                .to_atho_error()
+                .code()
+                .as_str(),
+            "ATHO-MEM-001"
+        );
+        assert_eq!(
+            ValidationError::BlockNetworkMismatch
+                .to_atho_error()
+                .code()
+                .as_str(),
+            "ATHO-NET-002"
         );
     }
 }

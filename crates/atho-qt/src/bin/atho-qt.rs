@@ -194,10 +194,10 @@ fn default_network() -> Network {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  atho-qt [--network <mainnet|testnet|regnet>] [--rpc-addr HOST:PORT] [--data-dir PATH]"
+        "  atho-qt [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]"
     );
     eprintln!(
-        "  atho-qt --local-node [--network <mainnet|testnet|regnet>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH]"
+        "  atho-qt --local-node [--network <mainnet|testnet|regnet|prunetest>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH]"
     );
     eprintln!("    --local-node starts a managed athod child process over RPC");
 }
@@ -246,5 +246,17 @@ mod tests {
 
         let plain_executable = Path::new("C:/Program Files/Atho/atho-qt.exe");
         assert!(!is_windows_client_entrypoint_executable(plain_executable));
+    }
+
+    #[test]
+    fn qt_cli_accepts_prunetest_network() {
+        let args = vec![
+            String::from("--network"),
+            String::from("prune-test"),
+            String::from("--local-node"),
+        ];
+        let parsed = parse_args_from(args).expect("parse");
+        assert_eq!(parsed.network, Some(Network::Prunetest));
+        assert!(parsed.local_node);
     }
 }
