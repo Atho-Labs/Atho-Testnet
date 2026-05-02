@@ -185,9 +185,14 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         let guard = system.lock().expect("node runtime mutex poisoned");
         guard.status()
     };
+    let chain_synced = status.headers_synced && status.block_count >= status.sync_best_height;
     println!(
-        "node status height={} mempool={} synced={}",
-        status.block_count, status.mempool_count, status.headers_synced
+        "node status height={} target={} mempool={} headers_synced={} chain_synced={}",
+        status.block_count,
+        status.sync_best_height,
+        status.mempool_count,
+        status.headers_synced,
+        chain_synced
     );
     let _ = dev::append_log(
         "athod",

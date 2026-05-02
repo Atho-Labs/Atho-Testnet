@@ -107,6 +107,28 @@ impl RelayLoop {
         self.sync.accept_headers(self.network, headers)
     }
 
+    pub fn note_local_chain_progress(&mut self, blocks: &[Block], peer_best_height: Option<u64>) {
+        let local_best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
+        self.sync.best_height = self
+            .sync
+            .best_height
+            .max(peer_best_height.unwrap_or(local_best_height))
+            .max(local_best_height);
+        if let Some(block) = blocks.last() {
+            let block_hash = Hash48::from(block.header.block_hash());
+            self.sync.locator_hashes.retain(|hash| *hash != block_hash);
+            self.sync.locator_hashes.insert(0, block_hash);
+            self.sync.locator_hashes.truncate(32);
+            if local_best_height >= self.sync.best_height {
+                self.sync.best_tip = Some(block_hash);
+            }
+        }
+        if local_best_height >= self.sync.best_height {
+            self.sync.headers_synced = true;
+            self.sync.inflight_headers_peer = None;
+        }
+    }
+
     pub fn refresh_sync_target(&mut self, blocks: &[Block], peer_best_height: Option<u64>) {
         let local_best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
         self.sync.best_height = peer_best_height
@@ -228,6 +250,23 @@ mod tests {
         assert!(relay.sync.headers_synced);
         assert_eq!(
             relay.sync.best_tip,
+            Some(Hash48::from(local_blocks[0].header.block_hash()))
+        );
+    }
+
+    #[test]
+    fn local_progress_preserves_remote_sync_target_until_local_height_catches_up() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = false;
+        relay.note_local_chain_progress(&local_blocks, Some(128));
+
+        assert_eq!(relay.sync.best_height, 128);
+        assert!(!relay.sync.headers_synced);
+        assert_eq!(
+            relay.sync.locator_hashes.first().copied(),
             Some(Hash48::from(local_blocks[0].header.block_hash()))
         );
     }

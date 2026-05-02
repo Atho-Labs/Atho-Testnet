@@ -72,18 +72,17 @@ impl SyncState {
                 return Err(ProtocolError::InvalidHeadersSequence);
             }
         }
-        if let Some(first) = headers.first() {
-            self.best_height = headers
-                .last()
-                .map(|header| header.height)
-                .unwrap_or(self.best_height);
-            self.best_tip = headers
-                .last()
-                .map(|header| Hash48::from(header.block_hash()));
-            self.headers_synced =
-                headers.len() < network_params(network).limits.max_headers_per_message;
+        if let Some(last) = headers.last() {
+            let prior_target = self.best_height;
+            self.best_height = self.best_height.max(last.height);
+            self.best_tip = Some(Hash48::from(last.block_hash()));
+            self.headers_synced = headers.len()
+                < network_params(network).limits.max_headers_per_message
+                && last.height >= prior_target;
             self.locator_hashes
-                .insert(0, Hash48::from(first.block_hash()));
+                .retain(|hash| *hash != Hash48::from(last.block_hash()));
+            self.locator_hashes
+                .insert(0, Hash48::from(last.block_hash()));
             self.locator_hashes.truncate(32);
             self.inflight_headers_peer = None;
             crate::audit::append_log(
@@ -181,6 +180,44 @@ mod tests {
         assert_eq!(
             state.accept_headers(Network::Mainnet, &[first, second]),
             Err(ProtocolError::InvalidHeadersSequence)
+        );
+    }
+
+    #[test]
+    fn short_header_batch_does_not_shrink_a_higher_advertised_sync_target() {
+        let mut state = SyncState {
+            best_height: 128,
+            headers_synced: false,
+            ..SyncState::default()
+        };
+        let first = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
+            previous_block_hash: [0; 48],
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            timestamp: 1_700_000_001,
+            difficulty_target_or_bits: [3; 48],
+            nonce: 1,
+        };
+        let mut second = first.clone();
+        second.height = 2;
+        second.previous_block_hash = first.block_hash();
+        let mut third = second.clone();
+        third.height = 3;
+        third.previous_block_hash = second.block_hash();
+
+        state
+            .accept_headers(Network::Mainnet, &[first, second, third.clone()])
+            .expect("accept headers");
+
+        assert_eq!(state.best_height, 128);
+        assert!(!state.headers_synced);
+        assert_eq!(state.best_tip, Some(Hash48::from(third.block_hash())));
+        assert_eq!(
+            state.locator_hashes.first().copied(),
+            Some(Hash48::from(third.block_hash()))
         );
     }
 }

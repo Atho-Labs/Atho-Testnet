@@ -44,7 +44,7 @@ impl NodeOrchestrator {
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "orchestrator started network={} height={} mempool={} best_height={} synced={}",
+                "orchestrator started network={} height={} mempool={} best_height={} headers_synced={}",
                 self.runtime.node.config.network.id(),
                 self.runtime.node.height(),
                 self.runtime.node.mempool_len(),

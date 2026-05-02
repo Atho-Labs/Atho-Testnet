@@ -1,4 +1,5 @@
 //! Node sync notices and background synchronization bookkeeping.
+use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
 use crate::validation::{finalize_witness_commit_refs, ValidationError};
@@ -198,6 +199,16 @@ impl NodeSync {
                     }
                     self.downloader.note_peer_ready(peer.clone());
                     self.record_peer_observation(node, &peer, best_height)?;
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "sync ready peer={} local_height={} peer_best_height={} target_height={}",
+                            peer,
+                            node.height(),
+                            best_height,
+                            self.sync_state().best_height
+                        ),
+                    );
                     notices.push(SyncNotice::Ready {
                         peer: peer.clone(),
                         best_height,
@@ -230,6 +241,18 @@ impl NodeSync {
             .max();
         self.relay
             .refresh_sync_target(node.blocks(), peer_best_height);
+    }
+
+    fn note_local_chain_progress(&mut self, node: &Node) {
+        let peer_best_height = self
+            .connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+            .filter_map(|peer| peer.best_height)
+            .max();
+        self.relay
+            .note_local_chain_progress(node.blocks(), peer_best_height);
     }
 
     fn handle_message(
@@ -385,6 +408,20 @@ impl NodeSync {
             .downloader
             .assignments(limits.max_blocks_in_flight, limits.max_requests_per_peer)
         {
+            let requested = assignment
+                .inventory
+                .iter()
+                .map(|item| short_hash(&item.hash.into_inner()))
+                .collect::<Vec<_>>();
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "requesting blocks peer={} count={} hashes=[{}]",
+                    assignment.peer,
+                    assignment.inventory.len(),
+                    requested.join(",")
+                ),
+            );
             outbound.push(ConnectionEvent::Send {
                 peer: assignment.peer,
                 message: NetworkMessage::new(
@@ -406,6 +443,15 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         let block_hash = block.header.block_hash();
         if node.contains_block(&block_hash) {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "received duplicate block peer={} height={} hash={}",
+                    peer,
+                    block.header.height,
+                    short_hash(&block_hash)
+                ),
+            );
             self.downloader.note_block_received(block_hash);
             self.pending_compact_blocks.remove(&block_hash);
             self.remove_buffered_block(peer, &block_hash);
@@ -417,7 +463,18 @@ impl NodeSync {
         if block.header.previous_block_hash == node.tip_hash() {
             match node.submit_block(&block) {
                 Ok(()) => {
-                    self.relay.prime(node.blocks());
+                    self.note_local_chain_progress(node);
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "accepted block peer={} height={} hash={} new_local_height={} target_height={}",
+                            peer,
+                            block.header.height,
+                            short_hash(&block_hash),
+                            node.height(),
+                            self.sync_state().best_height
+                        ),
+                    );
                     self.downloader.note_block_received(block_hash);
                     self.pending_compact_blocks.remove(&block_hash);
                     self.remove_buffered_block(peer, &block_hash);
@@ -428,13 +485,46 @@ impl NodeSync {
                 Err(NodeError::Validation(validation))
                     if Self::recoverable_tip_validation(&validation) =>
                 {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "buffering recoverable block peer={} height={} hash={} reason={}",
+                            peer,
+                            block.header.height,
+                            short_hash(&block_hash),
+                            validation
+                        ),
+                    );
                     // Keep the block buffered so fork-choice can re-evaluate it once the
                     // branch is complete enough to compare by cumulative work.
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "rejecting block peer={} height={} hash={} error={}",
+                            peer,
+                            block.header.height,
+                            short_hash(&block_hash),
+                            err
+                        ),
+                    );
+                    return Err(err.into());
+                }
             }
         }
 
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "buffering block peer={} height={} hash={} prev={} local_tip={}",
+                peer,
+                block.header.height,
+                short_hash(&block_hash),
+                short_hash(&block.header.previous_block_hash),
+                short_hash(&node.tip_hash())
+            ),
+        );
         self.buffer_peer_block(peer, block);
         self.process_buffered_branches(node, outbound)?;
 
@@ -541,7 +631,7 @@ impl NodeSync {
                 .collect::<Vec<_>>();
             match node.consider_branch(&candidate_branch) {
                 Ok(selection) if selection.outcome != ChainSelectionOutcome::KeptCurrent => {
-                    self.relay.prime(node.blocks());
+                    self.note_local_chain_progress(node);
                     for hash in candidate_hashes {
                         self.downloader.note_block_received(hash);
                         self.pending_compact_blocks.remove(&hash);
@@ -766,6 +856,15 @@ impl NodeSync {
             match vector.kind {
                 InventoryKind::Block => {
                     if let Some(block) = node.block_by_hash(vector.hash.into_inner()) {
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "serving block peer={} height={} hash={}",
+                                peer,
+                                block.header.height,
+                                short_hash(&block.header.block_hash())
+                            ),
+                        );
                         outbound.push(ConnectionEvent::Send {
                             peer: peer.to_string(),
                             message: NetworkMessage::new(
@@ -793,6 +892,19 @@ impl NodeSync {
             }
         }
         if !not_found.is_empty() {
+            let missing = not_found
+                .iter()
+                .map(|item| short_hash(&item.hash.into_inner()))
+                .collect::<Vec<_>>();
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "getdata notfound peer={} count={} hashes=[{}]",
+                    peer,
+                    not_found.len(),
+                    missing.join(",")
+                ),
+            );
             outbound.push(ConnectionEvent::Send {
                 peer: peer.to_string(),
                 message: NetworkMessage::new(
@@ -835,6 +947,10 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn short_hash(hash: &[u8; 48]) -> String {
+    hex::encode(hash)[..12].to_string()
 }
 
 #[cfg(test)]
