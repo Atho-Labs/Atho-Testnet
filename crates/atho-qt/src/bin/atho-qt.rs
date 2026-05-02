@@ -9,6 +9,7 @@ struct QtCli {
     local_node: bool,
     data_dir: Option<String>,
     p2p_addr: Option<String>,
+    renderer: Option<RendererChoice>,
     peers: Vec<String>,
 }
 
@@ -22,6 +23,31 @@ impl QtCli {
         }
         if !self.peers.is_empty() {
             std::env::set_var("ATHO_P2P_PEERS", self.peers.join(","));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendererChoice {
+    Glow,
+    Wgpu,
+}
+
+impl RendererChoice {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "glow" => Some(Self::Glow),
+            "wgpu" => Some(Self::Wgpu),
+            _ => None,
+        }
+    }
+}
+
+impl From<RendererChoice> for eframe::Renderer {
+    fn from(value: RendererChoice) -> Self {
+        match value {
+            RendererChoice::Glow => Self::Glow,
+            RendererChoice::Wgpu => Self::Wgpu,
         }
     }
 }
@@ -49,12 +75,16 @@ fn main() {
             &format!("starting managed local node mode for {}", network.id()),
         );
     }
+    let renderer = cli
+        .renderer
+        .unwrap_or_else(|| default_renderer_choice(cfg!(target_os = "windows")));
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Atho")
             .with_inner_size([860.0, 560.0])
             .with_min_inner_size([720.0, 460.0])
             .with_icon(atho_qt::resources::app_icon()),
+        renderer: renderer.into(),
         follow_system_theme: false,
         default_theme: eframe::Theme::Light,
         ..Default::default()
@@ -169,6 +199,16 @@ fn parse_args_from(args: Vec<String>) -> Result<QtCli, String> {
                 );
                 i += 2;
             }
+            "--renderer" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "missing renderer value".to_string())?;
+                cli.renderer = RendererChoice::parse(value);
+                if cli.renderer.is_none() {
+                    return Err(format!("invalid renderer {value}; expected glow or wgpu"));
+                }
+                i += 2;
+            }
             "--peer" => {
                 cli.peers.push(
                     args.get(i + 1)
@@ -191,13 +231,24 @@ fn default_network() -> Network {
         .unwrap_or(Network::Mainnet)
 }
 
+fn default_renderer_choice(is_windows: bool) -> RendererChoice {
+    if is_windows {
+        // Windows is the only platform currently failing in the field on the
+        // WGL ES-context path. Prefer wgpu there so source and packaged builds
+        // avoid the missing-extension startup failure.
+        RendererChoice::Wgpu
+    } else {
+        RendererChoice::Glow
+    }
+}
+
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  atho-qt [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]"
+        "  atho-qt [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
     );
     eprintln!(
-        "  atho-qt --local-node [--network <mainnet|testnet|regnet|prunetest>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH]"
+        "  atho-qt --local-node [--network <mainnet|testnet|regnet|prunetest>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
     );
     eprintln!("    --local-node starts a managed athod child process over RPC");
 }
@@ -216,6 +267,8 @@ mod tests {
             String::from("127.0.0.1:9210"),
             String::from("--p2p-addr"),
             String::from("0.0.0.0:9200"),
+            String::from("--renderer"),
+            String::from("wgpu"),
             String::from("--peer"),
             String::from("127.0.0.1:9300"),
             String::from("--data-dir"),
@@ -226,6 +279,7 @@ mod tests {
         assert_eq!(parsed.network, Some(Network::Regnet));
         assert_eq!(parsed.rpc_address.as_deref(), Some("127.0.0.1:9210"));
         assert_eq!(parsed.p2p_addr.as_deref(), Some("0.0.0.0:9200"));
+        assert_eq!(parsed.renderer, Some(RendererChoice::Wgpu));
         assert_eq!(parsed.peers, vec![String::from("127.0.0.1:9300")]);
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho"));
     }
@@ -258,5 +312,17 @@ mod tests {
         let parsed = parse_args_from(args).expect("parse");
         assert_eq!(parsed.network, Some(Network::Prunetest));
         assert!(parsed.local_node);
+    }
+
+    #[test]
+    fn qt_cli_rejects_invalid_renderer() {
+        let args = vec![String::from("--renderer"), String::from("metal")];
+        assert!(parse_args_from(args).is_err());
+    }
+
+    #[test]
+    fn default_renderer_prefers_wgpu_on_windows() {
+        assert_eq!(default_renderer_choice(true), RendererChoice::Wgpu);
+        assert_eq!(default_renderer_choice(false), RendererChoice::Glow);
     }
 }

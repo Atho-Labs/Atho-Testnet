@@ -100,6 +100,12 @@ The managed local-node path uses the same DNS-seed-first bootstrap flow on mainn
 py -3 .\runmainnet.py
 ```
 
+Renderer note:
+
+- Windows now defaults the desktop client to `wgpu`
+- that avoids the `glutin` WGL ES-context startup failure seen on some machines
+- if you need to override it manually, pass `--renderer glow` or `--renderer wgpu`
+
 ## Run The Miner
 
 Start the node first, then the miner:

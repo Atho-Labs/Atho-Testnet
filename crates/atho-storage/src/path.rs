@@ -88,7 +88,13 @@ fn platform_data_home() -> PathBuf {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(
+    not(test),
+    any(
+        target_os = "macos",
+        all(not(target_os = "windows"), not(target_os = "macos"))
+    )
+))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)

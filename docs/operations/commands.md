@@ -218,6 +218,7 @@ Useful flags:
 - `--network <mainnet|testnet|regnet|prunetest>`
 - `--rpc-addr HOST:PORT`
 - `--local-node`
+- `--renderer <glow|wgpu>`
 - `--peer HOST:PORT` (repeatable)
 - `--p2p-addr HOST:PORT`
 - `--data-dir PATH`
@@ -230,6 +231,11 @@ The settings page includes a controlled network diagnostics view with:
 - per-peer endpoint, direction, protocol, and traffic details
 
 The desktop client now also includes a registry-backed `Debug Console` accessible from `Help > Debug Console` or the toolbar `Console` button.
+
+Renderer note:
+
+- Windows now defaults to `wgpu` to avoid the WGL ES-context startup failure seen on some machines
+- use `--renderer glow` or `--renderer wgpu` only when you need to override the default deliberately
 
 ## CLI
 

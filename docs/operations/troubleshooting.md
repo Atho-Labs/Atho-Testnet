@@ -52,6 +52,28 @@ Then inspect:
 - `logs/athod.log`
 - `logs/athod-mainnet-stdio.log`
 
+## Windows Qt Fails With A `glutin` ES-Context Error
+
+If the desktop client fails with:
+
+```text
+failed to launch atho-qt: glutin error: extension to create ES context with wgl is not present
+```
+
+the Windows default has already been changed to use `wgpu` instead of the failing OpenGL ES path.
+
+If you still need to override the renderer manually:
+
+```powershell
+py -3 .\runmainnet.py --renderer wgpu
+```
+
+or for the raw binary:
+
+```powershell
+.\target\release\atho-qt.exe --network mainnet --local-node --renderer wgpu
+```
+
 ## Node Does Not Sync
 
 Current likely cause:
