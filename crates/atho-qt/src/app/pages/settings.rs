@@ -57,6 +57,10 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             &mut app.ui_state.rotate_coinbase_address,
             "Rotate coinbase to a fresh receive address",
         );
+        widgets::muted_label(
+            ui,
+            "Off by default. The current spend path signs one wallet address at a time, so rotating every mining reward can fragment spendable balance.",
+        );
     });
 
     ui.add_space(14.0);
@@ -229,7 +233,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         widgets::muted_label(
             ui,
-            "Atho defaults to auto-select: it prefers GPU when available and falls back to CPU if GPU initialization or execution fails. Explicit GPU mode now requires a real OpenCL GPU.",
+            "Atho prefers GPU when available and falls back to CPU when GPU probing, initialization, or execution fails. CPU-only mode skips accelerator checks entirely.",
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -251,50 +255,60 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 app.refresh_mining_accelerator_info();
                 if app.mining_job.is_some() {
                     app.restart_mining_job();
+                } else {
+                    app.mining_status = String::from("Idle");
                 }
             }
-            if ui.button("Refresh Probe").clicked() {
-                app.refresh_mining_accelerator_info();
-            }
-        });
-        ui.add_space(8.0);
-        widgets::muted_label(
-            ui,
-            &format!(
-                "Detected accelerator: {}",
-                app.mining_accelerator_info.summary()
-            ),
+        })
+        .response
+        .on_hover_text(
+            "Auto prefers GPU and safely falls back to CPU. CPU-only skips accelerator probing. GPU mode now also falls back to CPU if GPU probing or execution fails.",
         );
-        if let Some(device) = app.mining_accelerator_info.device_name.as_deref() {
-            ui.label(format!("Device: {device}"));
-        }
-        if let Some(vendor) = app.mining_accelerator_info.vendor.as_deref() {
-            ui.label(format!("Vendor: {vendor}"));
-        }
-        if let Some(driver) = app.mining_accelerator_info.driver.as_deref() {
-            ui.label(format!("Driver: {driver}"));
-        }
-        ui.label(format!(
-            "Device type: {}",
-            app.mining_accelerator_info.device_type.label()
-        ));
-        if let Some(compute_units) = app.mining_accelerator_info.compute_units {
-            ui.label(format!("Compute units: {compute_units}"));
-        }
-        if let Some(global_mem_mb) = app.mining_accelerator_info.global_mem_mb {
-            ui.label(format!("Global memory: {global_mem_mb} MiB"));
-        }
-        if let Some(local_mem_kb) = app.mining_accelerator_info.local_mem_kb {
-            ui.label(format!("Local memory: {local_mem_kb} KiB"));
-        }
-        if let Some(clock_mhz) = app.mining_accelerator_info.clock_mhz {
-            ui.label(format!("Clock: {clock_mhz} MHz"));
-        }
-        if let Some(code) = app.mining_accelerator_info.reason_code.as_deref() {
-            ui.label(format!("Probe code: {code}"));
-        }
-        if let Some(reason) = app.mining_accelerator_info.reason_if_not.as_deref() {
-            widgets::muted_label(ui, &format!("Probe note: {reason}"));
+        ui.add_space(8.0);
+        if matches!(app.ui_state.mining_backend, MiningBackendKind::Cpu) {
+            widgets::muted_label(
+                ui,
+                "CPU-only mode is active. The miner will skip GPU probing and run on CPU threads only.",
+            );
+        } else {
+            widgets::muted_label(
+                ui,
+                &format!(
+                    "Detected accelerator: {}",
+                    app.mining_accelerator_info.summary()
+                ),
+            );
+            if let Some(device) = app.mining_accelerator_info.device_name.as_deref() {
+                ui.label(format!("Device: {device}"));
+            }
+            if let Some(vendor) = app.mining_accelerator_info.vendor.as_deref() {
+                ui.label(format!("Vendor: {vendor}"));
+            }
+            if let Some(driver) = app.mining_accelerator_info.driver.as_deref() {
+                ui.label(format!("Driver: {driver}"));
+            }
+            ui.label(format!(
+                "Device type: {}",
+                app.mining_accelerator_info.device_type.label()
+            ));
+            if let Some(compute_units) = app.mining_accelerator_info.compute_units {
+                ui.label(format!("Compute units: {compute_units}"));
+            }
+            if let Some(global_mem_mb) = app.mining_accelerator_info.global_mem_mb {
+                ui.label(format!("Global memory: {global_mem_mb} MiB"));
+            }
+            if let Some(local_mem_kb) = app.mining_accelerator_info.local_mem_kb {
+                ui.label(format!("Local memory: {local_mem_kb} KiB"));
+            }
+            if let Some(clock_mhz) = app.mining_accelerator_info.clock_mhz {
+                ui.label(format!("Clock: {clock_mhz} MHz"));
+            }
+            if let Some(code) = app.mining_accelerator_info.reason_code.as_deref() {
+                ui.label(format!("Probe code: {code}"));
+            }
+            if let Some(reason) = app.mining_accelerator_info.reason_if_not.as_deref() {
+                widgets::muted_label(ui, &format!("Probe note: {reason}"));
+            }
         }
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -318,6 +332,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             let ready = app.ui_state.connected && app.wallet.is_some();
             if ui
                 .add_enabled(ready, egui::Button::new("Mine Once"))
+                .on_hover_text("Mine one block with the selected backend and current thread count.")
                 .clicked()
             {
                 app.ui_state.generate_coins = false;
@@ -329,6 +344,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             }
             if ui
                 .add_enabled(ready, egui::Button::new("Mine Loop"))
+                .on_hover_text("Keep mining blocks until you stop the miner or change settings.")
                 .clicked()
             {
                 app.ui_state.generate_coins = true;
@@ -338,7 +354,11 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                     app.start_mining_job();
                 }
             }
-            if ui.button("Stop Miner").clicked() {
+            if ui
+                .button("Stop Miner")
+                .on_hover_text("Stop the active miner loop and return the miner to Idle.")
+                .clicked()
+            {
                 app.stop_mining_job();
             }
         });
@@ -504,7 +524,7 @@ fn format_quality(peer: &NetworkPeerDiagnostics) -> String {
 fn mining_backend_label(backend: MiningBackendKind) -> &'static str {
     match backend {
         MiningBackendKind::Auto => "Auto (prefer GPU)",
-        MiningBackendKind::Gpu => "GPU only",
+        MiningBackendKind::Gpu => "GPU (fallback to CPU)",
         MiningBackendKind::Cpu => "CPU only",
     }
 }

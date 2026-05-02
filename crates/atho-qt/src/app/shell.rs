@@ -1,6 +1,6 @@
 use super::{
-    pages, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage, NavTab,
-    OpenWalletForm,
+    pages, widgets, CreateWalletForm, DebugWindowTab, DesktopApp, ImportWalletForm, LaunchPage,
+    NavTab, OpenWalletForm,
 };
 use crate::resources;
 use eframe::egui;
@@ -10,6 +10,7 @@ pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
     render_toolbar(app, ctx);
     render_status_bar(app, ctx);
     render_about_window(app, ctx);
+    pages::console::render_window(app, ctx);
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(widgets::SHELL_BG))
@@ -53,13 +54,6 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Refresh").clicked() {
-                        if let Err(err) = app.refresh() {
-                            app.last_error = Some(err.to_string());
-                        }
-                        ui.close_menu();
-                    }
-                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -100,9 +94,23 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                     }
                 });
 
+                ui.menu_button("Window", |ui| {
+                    if ui.button("Main Window").clicked() {
+                        app.close_debug_window();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    for tab in DebugWindowTab::variants() {
+                        if ui.button(tab.label()).clicked() {
+                            app.open_debug_window(tab);
+                            ui.close_menu();
+                        }
+                    }
+                });
+
                 ui.menu_button("Help", |ui| {
-                    if ui.button("Debug Console").clicked() {
-                        app.active_tab = NavTab::DebugConsole;
+                    if ui.button("Node Window").clicked() {
+                        app.open_debug_window(DebugWindowTab::Console);
                         ui.close_menu();
                     }
                     ui.separator();
@@ -160,21 +168,12 @@ fn render_toolbar(app: &mut DesktopApp, ctx: &egui::Context) {
                     }
                 }
 
-                ui.add_space(2.0);
-                if ui
-                    .add_sized([80.0, 28.0], egui::Button::new("Refresh"))
-                    .clicked()
-                {
-                    if let Err(err) = app.refresh() {
-                        app.last_error = Some(err.to_string());
-                    }
-                }
                 ui.add_space(4.0);
                 if ui
                     .add_sized([90.0, 28.0], egui::Button::new("Console"))
                     .clicked()
                 {
-                    app.active_tab = NavTab::DebugConsole;
+                    app.open_debug_window(DebugWindowTab::Console);
                 }
             });
         });

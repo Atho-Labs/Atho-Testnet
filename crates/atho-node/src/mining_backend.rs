@@ -341,7 +341,7 @@ impl MiningController {
     ) -> Result<MiningReport, MiningBackendError> {
         match self.backend {
             MiningBackendKind::Cpu => self.mine_cpu_reported(template, stop_requested, None),
-            MiningBackendKind::Gpu => self.mine_gpu_required(template, stop_requested),
+            MiningBackendKind::Gpu => self.mine_gpu_preferred(template, stop_requested),
             MiningBackendKind::Auto => self.mine_gpu_or_cpu(template, stop_requested),
         }
     }
@@ -364,26 +364,55 @@ impl MiningController {
         })
     }
 
-    fn mine_gpu_required(
+    fn mine_gpu_preferred(
         &self,
         template: BlockTemplate,
         stop_requested: Arc<AtomicBool>,
     ) -> Result<MiningReport, MiningBackendError> {
         let accelerator = self.gpu.probe_info();
         if !accelerator.usable {
-            return Err(MiningBackendError::Message(format!(
-                "GPU backend unavailable: {}",
-                accelerator.fallback_reason()
-            )));
+            return self
+                .mine_cpu_reported(
+                    template,
+                    stop_requested,
+                    Some(format!(
+                        "requested GPU backend but {}; using CPU",
+                        accelerator.fallback_reason()
+                    )),
+                )
+                .map(|mut report| {
+                    report.accelerator = Some(accelerator);
+                    report
+                });
         }
 
-        let block = self.gpu.mine(template, stop_requested)?;
-        Ok(MiningReport {
-            block,
-            backend_used: MiningBackendUsed::Gpu,
-            fallback_reason: None,
-            accelerator: Some(accelerator),
-        })
+        match self.gpu.mine(template.clone(), Arc::clone(&stop_requested)) {
+            Ok(block) => Ok(MiningReport {
+                block,
+                backend_used: MiningBackendUsed::Gpu,
+                fallback_reason: None,
+                accelerator: Some(accelerator),
+            }),
+            Err(MiningBackendError::Cancelled) => Err(MiningBackendError::Cancelled),
+            Err(err) => {
+                let fallback_reason =
+                    format!("requested GPU backend but GPU execution failed: {err}; using CPU");
+                match self.mine_cpu_reported(
+                    template,
+                    stop_requested,
+                    Some(fallback_reason.clone()),
+                ) {
+                    Ok(mut report) => {
+                        report.fallback_reason = Some(fallback_reason);
+                        report.accelerator = Some(accelerator);
+                        Ok(report)
+                    }
+                    Err(cpu_err) => Err(MiningBackendError::Message(format!(
+                        "{fallback_reason}; CPU fallback failed: {cpu_err}"
+                    ))),
+                }
+            }
+        }
     }
 
     fn mine_gpu_or_cpu(
@@ -667,25 +696,26 @@ mod tests {
     }
 
     #[test]
-    fn gpu_requested_errors_when_real_gpu_or_kernel_is_unavailable() {
+    fn gpu_requested_falls_back_to_cpu_when_real_gpu_or_kernel_is_unavailable() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _kernel = EnvGuard::set(
             "ATHO_GPU_KERNEL_PATH",
             "/definitely/not/present/sha3_384.cl",
         );
         let controller = MiningController::new(MiningBackendKind::Gpu, 1);
-        let err = controller
+        let report = controller
             .mine_block_reported(easy_template(), Arc::new(AtomicBool::new(false)))
-            .expect_err("explicit gpu should fail when unavailable");
+            .expect("explicit gpu should recover to cpu");
+        assert_eq!(report.backend_used, MiningBackendUsed::Cpu);
+        let fallback_reason = report.fallback_reason.as_deref().unwrap_or_default();
         #[cfg(feature = "gpu-native")]
-        assert!(err
-            .to_string()
-            .contains("GPU backend unavailable: ATHO-MINE-103: gpu kernel file not found"));
+        assert!(fallback_reason.contains("ATHO-MINE-103: gpu kernel file not found"));
         #[cfg(not(feature = "gpu-native"))]
         assert_eq!(
-            err.to_string(),
-            "GPU backend unavailable: ATHO-MINE-101: gpu-native feature is not enabled"
+            fallback_reason,
+            "requested GPU backend but ATHO-MINE-101: gpu-native feature is not enabled; using CPU"
         );
+        assert!(fallback_reason.ends_with("; using CPU"));
     }
 
     #[test]

@@ -206,6 +206,38 @@ pub fn accumulated_chain_work(blocks: &[Block]) -> BigUint {
     total
 }
 
+pub fn difficulty_ratio_scaled(target: &[u8; 48], scale: u64) -> u64 {
+    let target = target_to_biguint(target);
+    if target.is_zero() {
+        return u64::MAX;
+    }
+    let numerator =
+        target_to_biguint(&DIFFICULTY_PROFILE.min_difficulty_target) * BigUint::from(scale);
+    let ratio = numerator / target;
+    u64::try_from(ratio).unwrap_or(u64::MAX)
+}
+
+pub fn estimated_hashes_per_second(blocks: &[Block]) -> u64 {
+    if blocks.len() < 2 {
+        return 0;
+    }
+    let elapsed = blocks
+        .last()
+        .map(|block| block.header.timestamp)
+        .unwrap_or_default()
+        .saturating_sub(
+            blocks
+                .first()
+                .map(|block| block.header.timestamp)
+                .unwrap_or_default(),
+        );
+    if elapsed == 0 {
+        return 0;
+    }
+    let work = accumulated_chain_work(blocks) / BigUint::from(elapsed);
+    u64::try_from(work).unwrap_or(u64::MAX)
+}
+
 pub fn compare_branch_work(candidate: &[Block], current: &[Block]) -> Ordering {
     let candidate_work = accumulated_chain_work(candidate);
     let current_work = accumulated_chain_work(current);

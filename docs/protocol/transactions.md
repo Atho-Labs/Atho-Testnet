@@ -149,11 +149,13 @@ Why:
 Current fee floor:
 
 - `1 atom / vbyte`
+- relay dust floor: `50 atoms`
 
 Constants:
 
 - `MIN_TX_FEE_PER_VBYTE_ATOMS`
 - `MIN_TX_FEE_ATOMS`
+- `DUST_RELAY_VALUE_ATOMS`
 
 Why:
 

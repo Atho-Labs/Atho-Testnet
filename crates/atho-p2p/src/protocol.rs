@@ -124,9 +124,6 @@ pub struct CompactBlockMessage {
     pub prefilled_transactions: Vec<PrefilledTransaction>,
     pub fees_total_atoms: u64,
     pub fees_miner_atoms: u64,
-    pub fees_burned_atoms: u64,
-    pub fees_pool_atoms: u64,
-    pub cumulative_burned_atoms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -505,9 +502,6 @@ pub fn compact_block_from_block(block: &Block) -> CompactBlockMessage {
             .unwrap_or_default(),
         fees_total_atoms: block.fees_total_atoms,
         fees_miner_atoms: block.fees_miner_atoms,
-        fees_burned_atoms: block.fees_burned_atoms,
-        fees_pool_atoms: block.fees_pool_atoms,
-        cumulative_burned_atoms: block.cumulative_burned_atoms,
     }
 }
 
@@ -569,9 +563,6 @@ where
         witnesses: Default::default(),
         fees_total_atoms: message.fees_total_atoms,
         fees_miner_atoms: message.fees_miner_atoms,
-        fees_burned_atoms: message.fees_burned_atoms,
-        fees_pool_atoms: message.fees_pool_atoms,
-        cumulative_burned_atoms: message.cumulative_burned_atoms,
     }))
 }
 
@@ -798,9 +789,6 @@ mod tests {
             witnesses: Default::default(),
             fees_total_atoms: 5,
             fees_miner_atoms: 5,
-            fees_burned_atoms: 0,
-            fees_pool_atoms: 0,
-            cumulative_burned_atoms: 0,
         };
         let compact = compact_block_from_block(&block);
         let reconstructed = reconstruct_compact_block(
@@ -840,9 +828,6 @@ mod tests {
             }],
             fees_total_atoms: 0,
             fees_miner_atoms: 0,
-            fees_burned_atoms: 0,
-            fees_pool_atoms: 0,
-            cumulative_burned_atoms: 0,
         };
         assert_eq!(
             reconstruct_compact_block(&message, |_| None, &BTreeMap::new()),

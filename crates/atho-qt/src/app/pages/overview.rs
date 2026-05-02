@@ -101,14 +101,31 @@ fn render_recent_transactions(
 
         for row in rows.iter().take(6) {
             ui.horizontal(|ui| {
-                widgets::muted_label(ui, &row.when);
-                ui.add_space(18.0);
-                ui.label(row.kind.label());
+                ui.add_sized(
+                    [68.0, 0.0],
+                    egui::Label::new(
+                        egui::RichText::new(&row.when)
+                            .size(11.0)
+                            .color(widgets::MUTED),
+                    ),
+                );
+                ui.add_sized([84.0, 0.0], egui::Label::new(row.kind.label()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     widgets::row_value_signed(ui, row.amount_atoms);
                 });
             });
-            widgets::elided_label(ui, &row.label, 72);
+            let response = ui.add_sized(
+                [ui.available_width(), 0.0],
+                egui::Label::new(
+                    egui::RichText::new(&row.label)
+                        .size(11.0)
+                        .color(widgets::TEXT),
+                )
+                .truncate(true),
+            );
+            if response.hovered() {
+                response.on_hover_text(&row.label);
+            }
             ui.add_space(6.0);
         }
     });

@@ -143,7 +143,7 @@ pub fn summarize_transaction(tx: &Transaction, fee_atoms: Option<u64>) -> String
 
 pub fn summarize_block(block: &Block) -> String {
     format!(
-        "hash={} height={} prev={} merkle={} witness={} txs={} size={} weight={} vsize={} nonce={} target={} fees_total={} fees_miner={} fees_burned={} fees_pool={}",
+        "hash={} height={} prev={} merkle={} witness={} txs={} size={} weight={} vsize={} nonce={} target={} fees_total={} fees_miner={}",
         hex::encode(block.header.block_hash()),
         block.header.height,
         hex::encode(block.header.previous_block_hash),
@@ -156,9 +156,7 @@ pub fn summarize_block(block: &Block) -> String {
         block.header.nonce,
         hex::encode(block.header.difficulty_target_or_bits),
         block.fees_total_atoms,
-        block.fees_miner_atoms,
-        block.fees_burned_atoms,
-        block.fees_pool_atoms
+        block.fees_miner_atoms
     )
 }
 
@@ -244,7 +242,7 @@ pub fn export_chain(_chainstate: &Chainstate) -> std::io::Result<PathBuf> {
     copy_or_init(
         &chain_blocks_file(),
         &path,
-        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms",
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms",
     )?;
     Ok(path)
 }
@@ -281,7 +279,7 @@ pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, Pa
     copy_or_init(
         &chain_blocks_file(),
         &chain,
-        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms",
+        "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms",
     )?;
     copy_or_init(&chain_transactions_file(), &txs, "height\tblock_hash\ttx_index\ttxid\twtxid\tversion\tlock_time\tinput_count\toutput_count\tsize_bytes\tweight_bytes\tvsize_bytes\twitness_bytes\toutput_value_atoms\tcanonical_bytes_hex")?;
     copy_or_init(&chain_inputs_file(), &inputs, "height\tblock_hash\ttx_index\tinput_index\tprevious_txid\toutput_index\tunlocking_script_hex")?;
@@ -481,12 +479,12 @@ fn append_block_row(path: &PathBuf, height: u64, block: &Block) -> std::io::Resu
     if !exists {
         writeln!(
             file,
-            "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms\tfees_burned_atoms\tfees_pool_atoms"
+            "height\tblock_hash\tprevious_block_hash\tmerkle_root\twitness_root\ttimestamp\ttarget\tnonce\ttx_count\tsize_bytes\tweight_bytes\tvsize_bytes\tfees_total_atoms\tfees_miner_atoms"
         )?;
     }
     writeln!(
         file,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         height,
         hex::encode(block.header.block_hash()),
         hex::encode(block.header.previous_block_hash),
@@ -500,9 +498,7 @@ fn append_block_row(path: &PathBuf, height: u64, block: &Block) -> std::io::Resu
         block.weight_bytes(),
         block.vsize_bytes(),
         block.fees_total_atoms,
-        block.fees_miner_atoms,
-        block.fees_burned_atoms,
-        block.fees_pool_atoms
+        block.fees_miner_atoms
     )?;
     Ok(())
 }

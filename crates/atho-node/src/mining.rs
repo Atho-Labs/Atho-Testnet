@@ -17,11 +17,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let utxos = node.utxo_snapshot();
     let height = node.height().saturating_add(1);
-    let (validated_entries, _) = node
+    let (validated_entries, _, skipped_entries) = node
         .mempool
-        .validated_entries(height, |txid, output_index| {
+        .validated_entries_for_mining(height, |txid, output_index| {
             utxos.get(*txid, output_index).cloned()
-        })?;
+        });
+    if skipped_entries > 0 {
+        let _ = dev::append_log(
+            "miner",
+            &format!(
+                "candidate block skipped {} stale or invalid mempool entr{} at height={}",
+                skipped_entries,
+                if skipped_entries == 1 { "y" } else { "ies" },
+                height
+            ),
+        );
+    }
     let active_rules = rules::rules_at_height(height);
     let subsidy_atoms = subsidy::block_subsidy_atoms(node.height().saturating_add(1));
     let (reward_address, reward_script) = reward_target_for_height(node.network(), height);
@@ -134,9 +145,6 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let mut block = Block::new(header, transactions);
     block.fees_total_atoms = selected_fee_atoms;
     block.fees_miner_atoms = selected_fee_atoms;
-    block.fees_burned_atoms = 0;
-    block.fees_pool_atoms = 0;
-    block.cumulative_burned_atoms = 0;
     let _ = dev::append_log(
         "miner",
         &format!(

@@ -345,9 +345,6 @@ fn genesis_state_from_parts(
         witnesses: Default::default(),
         fees_total_atoms: 0,
         fees_miner_atoms: 0,
-        fees_burned_atoms: 0,
-        fees_pool_atoms: 0,
-        cumulative_burned_atoms: 0,
     };
     assert_eq!(block.transactions[0].version, tx_version);
     assert_eq!(block.transactions[0].lock_time, lock_time);
@@ -421,9 +418,6 @@ mod tests {
         assert_eq!(main.block.header.witness_root, MAINNET_GENESIS_WITNESS_ROOT);
         assert_eq!(main.block.fees_total_atoms, 0);
         assert_eq!(main.block.fees_miner_atoms, 0);
-        assert_eq!(main.block.fees_burned_atoms, 0);
-        assert_eq!(main.block.fees_pool_atoms, 0);
-        assert_eq!(main.block.cumulative_burned_atoms, 0);
         assert_eq!(test.utxo_flag, "TEST-UTXO");
         assert_eq!(reg.utxo_flag, "REG-UTXO");
         assert_eq!(prune.utxo_flag, "PRUNE-UTXO");

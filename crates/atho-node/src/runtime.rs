@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -62,6 +62,7 @@ impl AthoErrorMeta for RuntimeError {
 pub struct NodeRuntime {
     pub node: Node,
     pub running: bool,
+    pub started_at_unix: Option<u64>,
 }
 
 impl NodeRuntime {
@@ -69,6 +70,7 @@ impl NodeRuntime {
         Self {
             node: Node::new(config),
             running: false,
+            started_at_unix: None,
         }
     }
 
@@ -76,6 +78,7 @@ impl NodeRuntime {
         Self {
             node: Node::load_or_new(config),
             running: false,
+            started_at_unix: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl NodeRuntime {
         Ok(Self {
             node: Node::try_load_or_new(config)?,
             running: false,
+            started_at_unix: None,
         })
     }
 
@@ -90,11 +94,18 @@ impl NodeRuntime {
         Ok(Self {
             node: Node::try_load_or_recover(config)?,
             running: false,
+            started_at_unix: None,
         })
     }
 
     pub fn start(&mut self) {
         self.running = true;
+        self.started_at_unix = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
         let _ = dev::append_log(
             "athod",
             &format!(

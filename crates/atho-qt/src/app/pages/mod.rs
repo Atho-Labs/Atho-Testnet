@@ -1,4 +1,4 @@
-mod console;
+pub(crate) mod console;
 mod overview;
 mod receive;
 mod send;

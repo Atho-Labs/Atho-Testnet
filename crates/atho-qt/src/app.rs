@@ -5,7 +5,7 @@ use crate::view::ViewModel;
 use atho_core::address::decode_base56_address;
 use atho_core::block::{merkle_root, Block};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-use atho_core::constants::{ATOMS_PER_ATHO, MIN_TX_FEE_PER_VBYTE_ATOMS};
+use atho_core::constants::{ATOMS_PER_ATHO, DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_PER_VBYTE_ATOMS};
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
@@ -14,7 +14,9 @@ use atho_crypto::falcon::{
 };
 #[cfg(test)]
 use atho_node::miner::Miner;
-use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
+use atho_node::mining_backend::{
+    MiningAcceleratorInfo, MiningBackendKind, MiningController, MiningDeviceType,
+};
 use atho_node::validation::{
     derive_sig_ref_short, derive_witness_commit_ref, finalize_witness_commit_refs,
 };
@@ -53,10 +55,11 @@ mod theme;
 mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
-    AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode,
+    AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode, DebugWindowTab,
     ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, NavTab,
-    OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord, SendJob, SendOutcome,
-    WalletActivityKind, WalletActivityRow, WalletBalanceSummary, WalletManagementForm,
+    NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord,
+    SendJob, SendOutcome, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
+    WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
@@ -97,6 +100,7 @@ pub struct DesktopApp {
     receive_amount: String,
     receive_message: String,
     send_status: String,
+    debug_console_status: String,
     send_job: Option<SendJob>,
     wallet_preparation_job: Option<WalletPreparationJob>,
     wallet_preparation_stage: String,
@@ -117,12 +121,18 @@ pub struct DesktopApp {
     transaction_date_filter: usize,
     transaction_type_filter: usize,
     show_about_dialog: bool,
+    show_debug_window: bool,
+    debug_window_tab: DebugWindowTab,
     debug_console_input: String,
     debug_console_output_mode: DebugConsoleOutputMode,
     debug_console_entries: Vec<DebugConsoleEntry>,
     debug_console_history: Vec<String>,
     debug_console_history_index: Option<usize>,
     debug_console_confirmed: bool,
+    debug_console_font_size: f32,
+    debug_selected_peer: Option<String>,
+    network_traffic_samples: Vec<NetworkTrafficSample>,
+    last_network_traffic_snapshot: Option<(Instant, u64, u64)>,
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
     wallet_balance_summary_cache: WalletBalanceSummary,
@@ -233,7 +243,7 @@ impl DesktopApp {
             ui_state: UiState {
                 mining_cores: available_cores,
                 mining_backend: configured_backend,
-                rotate_coinbase_address: true,
+                rotate_coinbase_address: false,
                 ..UiState::default()
             },
             view_model: ViewModel::default(),
@@ -264,6 +274,7 @@ impl DesktopApp {
             receive_amount: String::new(),
             receive_message: String::new(),
             send_status: String::from("Enter a destination and ATHO amount."),
+            debug_console_status: String::from("Type help to see commands grouped by area."),
             send_job: None,
             wallet_preparation_job: None,
             wallet_preparation_stage: String::new(),
@@ -284,12 +295,18 @@ impl DesktopApp {
             transaction_date_filter: 0,
             transaction_type_filter: 0,
             show_about_dialog: false,
+            show_debug_window: false,
+            debug_window_tab: DebugWindowTab::Console,
             debug_console_input: String::new(),
             debug_console_output_mode: DebugConsoleOutputMode::Pretty,
             debug_console_entries: Vec::new(),
             debug_console_history: Vec::new(),
             debug_console_history_index: None,
             debug_console_confirmed: false,
+            debug_console_font_size: 13.0,
+            debug_selected_peer: None,
+            network_traffic_samples: Vec::new(),
+            last_network_traffic_snapshot: None,
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
             wallet_balance_summary_cache: WalletBalanceSummary::default(),
@@ -348,6 +365,8 @@ impl DesktopApp {
         self.view_model.running = status.running;
         self.view_model.headers_synced = status.headers_synced;
         self.view_model.sync_best_height = status.sync_best_height.max(status.block_count);
+        self.record_network_traffic_sample(&status);
+        self.ensure_debug_peer_selection();
         self.view_model.sync_stage = if let Some(error) = startup_error.as_ref() {
             format!("Startup error: {error}")
         } else if status.connected {
@@ -686,6 +705,43 @@ impl DesktopApp {
                 HashSet::new()
             }
         }
+    }
+
+    fn spendable_wallet_inputs(
+        &self,
+        reserved_inputs: &HashSet<([u8; 48], u32)>,
+    ) -> Result<Vec<SpendableWalletUtxo>, String> {
+        if self.wallet_utxos_cache.is_empty() {
+            return Err(String::from(
+                "No cached wallet UTXOs available; wait for the wallet scan to complete",
+            ));
+        }
+        if self.wallet_address_index_cache.is_empty() {
+            return Err(String::from(
+                "Wallet discovery is still scanning; try again after the refresh completes",
+            ));
+        }
+
+        let wallet_addresses = &self.wallet_addresses_cache;
+        let wallet_address_index_cache = &self.wallet_address_index_cache;
+        let mut entries = Vec::new();
+        for utxo in self.wallet_utxos_cache.clone() {
+            if reserved_inputs.contains(&(utxo.txid, utxo.output_index)) {
+                continue;
+            }
+            let digest: [u8; 32] = match utxo.locking_script.as_slice().try_into() {
+                Ok(digest) => digest,
+                Err(_) => continue,
+            };
+            let Some(&index) = wallet_address_index_cache.get(&digest) else {
+                continue;
+            };
+            entries.push(SpendableWalletUtxo {
+                address: wallet_addresses[index].clone(),
+                utxo,
+            });
+        }
+        Ok(entries)
     }
 
     fn wallet_activity_rows(&self) -> &[WalletActivityRow] {
@@ -1433,7 +1489,7 @@ impl DesktopApp {
                 }
             }
             Ok(MiningJobResult::Failed(err)) => {
-                self.mining_status = String::from("Mining failed");
+                self.mining_status = format!("Mining failed: {err}");
                 self.last_error = Some(err.clone());
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -1627,6 +1683,28 @@ impl DesktopApp {
     }
 
     fn refresh_mining_accelerator_info(&mut self) {
+        if matches!(self.ui_state.mining_backend, MiningBackendKind::Cpu) {
+            self.mining_accelerator_info = MiningAcceleratorInfo {
+                backend: String::from("cpu"),
+                device_type: MiningDeviceType::Cpu,
+                device_name: Some(String::from("CPU threads")),
+                vendor: None,
+                driver: None,
+                compute_units: None,
+                global_mem_mb: None,
+                local_mem_kb: None,
+                clock_mhz: None,
+                kernel_path: None,
+                supports_fixed: false,
+                supports_template: false,
+                max_batch: None,
+                template_max_bytes: None,
+                usable: false,
+                reason_code: None,
+                reason_if_not: None,
+            };
+            return;
+        }
         let cores = self.ui_state.mining_cores.max(1);
         self.mining_accelerator_info =
             MiningController::new(self.ui_state.mining_backend, cores).gpu_probe_info();
@@ -1971,6 +2049,9 @@ impl DesktopApp {
         if amount == 0 {
             return Err(String::from("Amount must be greater than zero"));
         }
+        if !self.send_include_fee_in_total && amount < DUST_RELAY_VALUE_ATOMS {
+            return Err(Self::dust_amount_error_message());
+        }
 
         let (recipient_digest, network) =
             decode_base56_address(destination).map_err(|err| err.to_string())?;
@@ -1978,45 +2059,12 @@ impl DesktopApp {
             return Err(format!("Address belongs to {}", network.id()));
         }
 
-        if self.wallet_utxos_cache.is_empty() {
-            return Err(String::from(
-                "No cached wallet UTXOs available; refresh the wallet first",
-            ));
-        }
         let reserved_inputs = self.mempool_reserved_inputs();
-
-        if self.wallet_address_index_cache.is_empty() {
-            if self.wallet_scan_job.is_none() {
-                self.wallet_cache_dirty = true;
-                self.start_wallet_scan_job();
-            }
-            return Err(String::from(
-                "Wallet discovery is still scanning; try again after the refresh completes",
-            ));
+        if self.wallet_address_index_cache.is_empty() && self.wallet_scan_job.is_none() {
+            self.wallet_cache_dirty = true;
+            self.start_wallet_scan_job();
         }
-
-        let spendable_inputs = {
-            let wallet_addresses = &self.wallet_addresses_cache;
-            let wallet_address_index_cache = &self.wallet_address_index_cache;
-            let mut entries = Vec::new();
-            for utxo in self.wallet_utxos_cache.clone() {
-                if reserved_inputs.contains(&(utxo.txid, utxo.output_index)) {
-                    continue;
-                }
-                let digest: [u8; 32] = match utxo.locking_script.as_slice().try_into() {
-                    Ok(digest) => digest,
-                    Err(_) => continue,
-                };
-                let Some(&index) = wallet_address_index_cache.get(&digest) else {
-                    continue;
-                };
-                entries.push(SpendableWalletUtxo {
-                    address: wallet_addresses[index].clone(),
-                    utxo,
-                });
-            }
-            entries
-        };
+        let spendable_inputs = self.spendable_wallet_inputs(&reserved_inputs)?;
 
         if spendable_inputs.is_empty() {
             return Err(String::from(
@@ -2025,15 +2073,11 @@ impl DesktopApp {
         }
 
         let selected_plan = Self::select_wallet_utxos(
-            spendable_inputs,
+            spendable_inputs.clone(),
             amount,
             self.send_include_fee_in_total,
         )?
-        .ok_or_else(|| {
-            String::from(
-                "No input combination covers the requested amount; try a smaller amount or consolidate UTXOs first",
-            )
-        })?;
+        .ok_or_else(|| self.unspendable_send_amount_message(amount, &spendable_inputs))?;
 
         let keypair = {
             let wallet = self
@@ -2077,6 +2121,16 @@ impl DesktopApp {
                     .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
                 (amount, change_atoms)
             };
+            if recipient_atoms < DUST_RELAY_VALUE_ATOMS {
+                return Err(if self.send_include_fee_in_total {
+                    format!(
+                        "Recipient amount after fees must be at least {}",
+                        widgets::format_atoms(DUST_RELAY_VALUE_ATOMS)
+                    )
+                } else {
+                    Self::dust_amount_error_message()
+                });
+            }
             let transaction = Self::build_signed_spend_transaction(
                 &keypair,
                 &selected_plan.utxos,
@@ -2162,72 +2216,190 @@ impl DesktopApp {
         Ok(())
     }
 
+    pub(crate) fn use_max_sendable_amount(&mut self) -> Result<(), String> {
+        let reserved_inputs = self.mempool_reserved_inputs();
+        if self.wallet_address_index_cache.is_empty() && self.wallet_scan_job.is_none() {
+            self.wallet_cache_dirty = true;
+            self.start_wallet_scan_job();
+        }
+        let spendable_inputs = self.spendable_wallet_inputs(&reserved_inputs)?;
+        if spendable_inputs.is_empty() {
+            return Err(String::from(
+                "No spendable wallet UTXOs are available for a new transaction",
+            ));
+        }
+        let sendable_atoms = Self::max_single_address_sendable_atoms(
+            spendable_inputs,
+            self.send_include_fee_in_total,
+        );
+        if sendable_atoms == 0 {
+            return Err(String::from(
+                "No single wallet address has enough confirmed balance to cover a spendable transaction fee",
+            ));
+        }
+        self.send_amount = Self::format_send_amount_input(sendable_atoms);
+        self.last_error = None;
+        self.send_status = if self.send_include_fee_in_total {
+            format!(
+                "Filled the largest currently spendable total amount: {}",
+                widgets::format_atoms(sendable_atoms)
+            )
+        } else {
+            format!(
+                "Filled the largest currently spendable recipient amount: {}",
+                widgets::format_atoms(sendable_atoms)
+            )
+        };
+        Ok(())
+    }
+
+    fn unspendable_send_amount_message(
+        &self,
+        amount: u64,
+        spendable_inputs: &[SpendableWalletUtxo],
+    ) -> String {
+        let max_sendable = Self::max_single_address_sendable_atoms(
+            spendable_inputs.to_vec(),
+            self.send_include_fee_in_total,
+        );
+        if max_sendable == 0 {
+            return String::from(
+                "No single wallet address has enough confirmed balance to cover a spendable transaction fee",
+            );
+        }
+        format!(
+            "No single wallet address can cover {}. The current spend path signs one address at a time. Max spendable now: {}. Use a smaller amount or keep future mining rewards on one address.",
+            widgets::format_atoms(amount),
+            widgets::format_atoms(max_sendable)
+        )
+    }
+
     fn select_wallet_utxos(
-        mut candidates: Vec<SpendableWalletUtxo>,
+        candidates: Vec<SpendableWalletUtxo>,
         amount_atoms: u64,
         include_fee_in_total: bool,
     ) -> Result<Option<SelectedSpendPlan>, String> {
-        candidates.sort_by(|left, right| {
-            right
-                .utxo
-                .value_atoms
-                .cmp(&left.utxo.value_atoms)
-                .then(left.utxo.txid.cmp(&right.utxo.txid))
-                .then(left.utxo.output_index.cmp(&right.utxo.output_index))
-        });
-
         let mut best: Option<SelectedSpendPlan> = None;
-        let mut selected = Vec::new();
-        let mut total = 0u64;
+        for mut group in Self::group_spendable_inputs_by_address(candidates).into_values() {
+            group.sort_by(|left, right| {
+                right
+                    .utxo
+                    .value_atoms
+                    .cmp(&left.utxo.value_atoms)
+                    .then(left.utxo.txid.cmp(&right.utxo.txid))
+                    .then(left.utxo.output_index.cmp(&right.utxo.output_index))
+            });
 
-        for candidate in candidates {
-            total = total.saturating_add(candidate.utxo.value_atoms);
-            selected.push(candidate);
-            let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
-            let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+            let mut selected = Vec::new();
+            let mut total = 0u64;
 
-            let candidate_output_count = if include_fee_in_total {
-                if total == amount_atoms && amount_atoms > estimate_exact_fee {
-                    Some(1)
-                } else if total > amount_atoms && amount_atoms > estimate_change_fee {
-                    Some(2)
+            for candidate in group {
+                total = total.saturating_add(candidate.utxo.value_atoms);
+                selected.push(candidate);
+                let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
+                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+
+                let candidate_output_count = if include_fee_in_total {
+                    let recipient_one_output = amount_atoms.saturating_sub(estimate_exact_fee);
+                    let recipient_two_output = amount_atoms.saturating_sub(estimate_change_fee);
+                    let excess = total.saturating_sub(amount_atoms);
+                    if total >= amount_atoms
+                        && excess < DUST_RELAY_VALUE_ATOMS
+                        && recipient_one_output >= DUST_RELAY_VALUE_ATOMS
+                    {
+                        Some(1)
+                    } else if total > amount_atoms
+                        && excess >= DUST_RELAY_VALUE_ATOMS
+                        && recipient_two_output >= DUST_RELAY_VALUE_ATOMS
+                    {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                } else if amount_atoms >= DUST_RELAY_VALUE_ATOMS {
+                    let exact_target = amount_atoms.checked_add(estimate_exact_fee);
+                    let change_target = amount_atoms.checked_add(estimate_change_fee);
+                    if exact_target.is_some_and(|target| {
+                        total >= target && total.saturating_sub(target) < DUST_RELAY_VALUE_ATOMS
+                    }) {
+                        Some(1)
+                    } else if change_target.is_some_and(|target| {
+                        total > target && total.saturating_sub(target) >= DUST_RELAY_VALUE_ATOMS
+                    }) {
+                        Some(2)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                let exact_target = amount_atoms.checked_add(estimate_exact_fee);
-                let change_target = amount_atoms.checked_add(estimate_change_fee);
-                if exact_target == Some(total) {
-                    Some(1)
-                } else if change_target.is_some_and(|target| total > target) {
-                    Some(2)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(output_count) = candidate_output_count {
-                let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
-                let signing_address = selected
-                    .first()
-                    .expect("selected spend plan must have at least one input")
-                    .address
-                    .clone();
-                let candidate = SelectedSpendPlan {
-                    address: signing_address,
-                    utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
-                    total_input_atoms: total,
-                    output_count,
-                    estimated_fee_atoms,
                 };
-                best = Self::prefer_candidate(best, candidate);
-                if output_count == 1 {
-                    break;
+
+                if let Some(output_count) = candidate_output_count {
+                    let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
+                    let signing_address = selected
+                        .first()
+                        .expect("selected spend plan must have at least one input")
+                        .address
+                        .clone();
+                    let candidate = SelectedSpendPlan {
+                        address: signing_address,
+                        utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
+                        total_input_atoms: total,
+                        output_count,
+                        estimated_fee_atoms,
+                    };
+                    best = Self::prefer_candidate(best, candidate);
+                    if output_count == 1 {
+                        break;
+                    }
                 }
             }
         }
 
         Ok(best)
+    }
+
+    fn group_spendable_inputs_by_address(
+        candidates: Vec<SpendableWalletUtxo>,
+    ) -> std::collections::BTreeMap<[u8; 32], Vec<SpendableWalletUtxo>> {
+        let mut groups = std::collections::BTreeMap::<[u8; 32], Vec<SpendableWalletUtxo>>::new();
+        for candidate in candidates {
+            groups
+                .entry(candidate.address.payment_digest)
+                .or_default()
+                .push(candidate);
+        }
+        groups
+    }
+
+    fn max_single_address_sendable_atoms(
+        candidates: Vec<SpendableWalletUtxo>,
+        include_fee_in_total: bool,
+    ) -> u64 {
+        let mut best = 0u64;
+        for group in Self::group_spendable_inputs_by_address(candidates).into_values() {
+            let total = group
+                .iter()
+                .map(|entry| entry.utxo.value_atoms)
+                .sum::<u64>();
+            let fee = Self::estimate_fee(group.len(), 1);
+            let sendable = if include_fee_in_total {
+                if total > fee && total.saturating_sub(fee) >= DUST_RELAY_VALUE_ATOMS {
+                    total
+                } else {
+                    0
+                }
+            } else {
+                let recipient_atoms = total.saturating_sub(fee);
+                if recipient_atoms >= DUST_RELAY_VALUE_ATOMS {
+                    recipient_atoms
+                } else {
+                    0
+                }
+            };
+            best = best.max(sendable);
+        }
+        best
     }
 
     fn prefer_candidate(
@@ -2305,6 +2477,10 @@ impl DesktopApp {
         change_address: Option<WalletAddress>,
         lock_time: u32,
     ) -> Result<Transaction, String> {
+        if amount_atoms < DUST_RELAY_VALUE_ATOMS {
+            return Err(Self::dust_amount_error_message());
+        }
+        let change_atoms = Self::normalize_change_atoms(change_atoms);
         let mut outputs = vec![TxOutput {
             value_atoms: amount_atoms,
             locking_script: recipient_digest.to_vec(),
@@ -2371,6 +2547,21 @@ impl DesktopApp {
         }
         .canonical_bytes();
         Ok(tx)
+    }
+
+    fn normalize_change_atoms(change_atoms: u64) -> u64 {
+        if change_atoms < DUST_RELAY_VALUE_ATOMS {
+            0
+        } else {
+            change_atoms
+        }
+    }
+
+    fn dust_amount_error_message() -> String {
+        format!(
+            "Spendable outputs must be at least {}",
+            widgets::format_atoms(DUST_RELAY_VALUE_ATOMS)
+        )
     }
 
     fn transaction_lock_time_nonce() -> u32 {
@@ -2472,6 +2663,87 @@ impl DesktopApp {
             .unwrap_or_default()
     }
 
+    pub(crate) fn open_debug_window(&mut self, tab: DebugWindowTab) {
+        self.show_debug_window = true;
+        self.debug_window_tab = tab;
+        self.ensure_debug_peer_selection();
+    }
+
+    pub(crate) fn close_debug_window(&mut self) {
+        self.show_debug_window = false;
+    }
+
+    fn ensure_debug_peer_selection(&mut self) {
+        if let Some(selected) = self.debug_selected_peer.as_ref() {
+            if self
+                .view_model
+                .peers
+                .iter()
+                .any(|peer| &peer.remote_addr == selected)
+            {
+                return;
+            }
+        }
+        self.debug_selected_peer = self
+            .view_model
+            .peers
+            .first()
+            .map(|peer| peer.remote_addr.clone());
+    }
+
+    fn record_network_traffic_sample(&mut self, status: &ConnectionStatus) {
+        let now = Instant::now();
+        let timestamp_unix = current_unix_seconds();
+        let Some((previous_at, previous_sent, previous_received)) =
+            self.last_network_traffic_snapshot
+        else {
+            self.network_traffic_samples.clear();
+            self.network_traffic_samples.push(NetworkTrafficSample {
+                timestamp_unix,
+                bytes_sent_per_second: 0.0,
+                bytes_received_per_second: 0.0,
+                total_bytes_sent: status.bytes_sent,
+                total_bytes_received: status.bytes_received,
+            });
+            self.last_network_traffic_snapshot =
+                Some((now, status.bytes_sent, status.bytes_received));
+            return;
+        };
+
+        let elapsed = now.saturating_duration_since(previous_at).as_secs_f64();
+        if elapsed <= f64::EPSILON {
+            return;
+        }
+
+        if status.bytes_sent < previous_sent || status.bytes_received < previous_received {
+            self.network_traffic_samples.clear();
+        }
+
+        let sent_delta = status.bytes_sent.saturating_sub(previous_sent) as f64;
+        let received_delta = status.bytes_received.saturating_sub(previous_received) as f64;
+        self.network_traffic_samples.push(NetworkTrafficSample {
+            timestamp_unix,
+            bytes_sent_per_second: sent_delta / elapsed,
+            bytes_received_per_second: received_delta / elapsed,
+            total_bytes_sent: status.bytes_sent,
+            total_bytes_received: status.bytes_received,
+        });
+        if self.network_traffic_samples.len() > 180 {
+            let drop_count = self.network_traffic_samples.len() - 180;
+            self.network_traffic_samples.drain(0..drop_count);
+        }
+        self.last_network_traffic_snapshot = Some((now, status.bytes_sent, status.bytes_received));
+    }
+
+    pub(crate) fn clear_network_traffic_samples(&mut self) {
+        self.network_traffic_samples.clear();
+        self.last_network_traffic_snapshot = Some((
+            Instant::now(),
+            self.view_model.bytes_sent,
+            self.view_model.bytes_received,
+        ));
+    }
+
     fn current_receive_address_row(&self) -> Option<&ReceiveAddressRow> {
         let digest = self.current_receive_address.as_ref()?.payment_digest;
         self.receive_address_rows
@@ -2502,23 +2774,15 @@ impl DesktopApp {
             .map(|request| request.sequence);
     }
 
-    pub(crate) fn debug_console_suggestions(
-        &self,
-    ) -> Vec<&'static atho_rpc::command::CommandDefinition> {
-        let query = self
-            .debug_console_input
-            .split_whitespace()
-            .next()
-            .unwrap_or_default();
-        let mut matches = search_commands(query);
-        matches.truncate(8);
-        matches
-    }
-
     pub(crate) fn run_debug_console_command(&mut self) {
         let line = self.debug_console_input.trim().to_string();
         if line.is_empty() {
-            self.last_error = Some(String::from("debug console command is empty"));
+            self.record_debug_console_problem(
+                String::from("(empty)"),
+                String::from("debug console command is empty"),
+                Vec::new(),
+                None,
+            );
             return;
         }
         self.run_debug_console_line(line, true);
@@ -2530,17 +2794,28 @@ impl DesktopApp {
             self.last_error = Some(String::from("debug console command is empty"));
             return;
         }
+        let timestamp_unix = current_unix_seconds();
 
         let parsed = match parse_command_line(&line) {
             Ok(parsed) => parsed,
             Err(err) => {
-                self.last_error = Some(err);
+                self.record_debug_console_problem(line, err, Vec::new(), None);
                 return;
             }
         };
 
         let Some(definition) = command_definition(&parsed.name) else {
-            self.last_error = Some(format!("unknown command {}", parsed.name));
+            let suggestions = self
+                .debug_console_suggestions(&parsed.name)
+                .into_iter()
+                .filter(|suggestion| suggestion != &parsed.name)
+                .collect::<Vec<_>>();
+            self.record_debug_console_problem(
+                line,
+                format!("unknown command {}", parsed.name),
+                suggestions,
+                Some(parsed.name),
+            );
             return;
         };
 
@@ -2548,32 +2823,19 @@ impl DesktopApp {
             let payload = match help_payload(parsed.args.first().map(String::as_str)) {
                 Ok(payload) => payload,
                 Err(err) => {
-                    self.last_error = Some(err.clone());
-                    let entry = DebugConsoleEntry {
-                        command_line: line.clone(),
-                        command_name: definition.name.to_string(),
-                        group: definition.group,
-                        permission: definition.permission,
-                        dangerous: definition.dangerous,
-                        success: false,
-                        network_label: self.view_model.network_label.clone(),
-                        output: err,
-                        error_code: None,
-                    };
-                    if push_history
-                        && self
-                            .debug_console_history
-                            .last()
-                            .is_none_or(|previous| previous != &line)
-                    {
-                        self.debug_console_history.push(line);
-                    }
-                    self.debug_console_history_index = None;
-                    self.debug_console_entries.push(entry);
+                    self.record_debug_console_problem(
+                        line,
+                        err,
+                        self.debug_console_suggestions(
+                            parsed.args.first().map(String::as_str).unwrap_or_default(),
+                        ),
+                        Some(definition.name.to_string()),
+                    );
                     return;
                 }
             };
             let entry = DebugConsoleEntry {
+                timestamp_unix,
                 command_line: line.clone(),
                 command_name: definition.name.to_string(),
                 group: definition.group,
@@ -2581,21 +2843,12 @@ impl DesktopApp {
                 dangerous: definition.dangerous,
                 success: true,
                 network_label: self.view_model.network_label.clone(),
-                output: self.format_console_value(&payload),
+                output: self.format_console_help_payload(&payload),
                 error_code: None,
             };
             self.last_error = None;
-            self.send_status = String::from("Command help completed");
-            if push_history
-                && self
-                    .debug_console_history
-                    .last()
-                    .is_none_or(|previous| previous != &line)
-            {
-                self.debug_console_history.push(line);
-            }
-            self.debug_console_history_index = None;
-            self.debug_console_entries.push(entry);
+            self.debug_console_status = String::from("Command help completed");
+            self.push_debug_console_entry(line, push_history, entry);
             return;
         }
 
@@ -2607,12 +2860,13 @@ impl DesktopApp {
         let entry = match response {
             RpcResponse::Command(command) => {
                 self.last_error = None;
-                self.send_status = format!("Command {} completed", command.command);
-                self.debug_console_entry_success(line.clone(), command)
+                self.debug_console_status = format!("Command {} completed", command.command);
+                self.debug_console_entry_success(line.clone(), timestamp_unix, command)
             }
             RpcResponse::Error(error) => {
                 self.last_error = Some(error.to_string());
                 DebugConsoleEntry {
+                    timestamp_unix,
                     command_line: line.clone(),
                     command_name: definition.name.to_string(),
                     group: definition.group,
@@ -2628,6 +2882,7 @@ impl DesktopApp {
                 let message = format!("unexpected rpc response: {other:?}");
                 self.last_error = Some(message.clone());
                 DebugConsoleEntry {
+                    timestamp_unix,
                     command_line: line.clone(),
                     command_name: definition.name.to_string(),
                     group: definition.group,
@@ -2641,21 +2896,7 @@ impl DesktopApp {
             }
         };
 
-        if push_history
-            && self
-                .debug_console_history
-                .last()
-                .is_none_or(|previous| previous != &line)
-        {
-            self.debug_console_history.push(line);
-        }
-        self.debug_console_history_index = None;
-        self.debug_console_entries.push(entry);
-    }
-
-    pub(crate) fn debug_console_use_example(&mut self, command: &str) {
-        self.debug_console_input = command.to_string();
-        self.last_error = None;
+        self.push_debug_console_entry(line, push_history, entry);
     }
 
     pub(crate) fn debug_console_previous_history(&mut self) {
@@ -2688,9 +2929,11 @@ impl DesktopApp {
     fn debug_console_entry_success(
         &self,
         command_line: String,
+        timestamp_unix: u64,
         command: CommandResponse,
     ) -> DebugConsoleEntry {
         DebugConsoleEntry {
+            timestamp_unix,
             command_line,
             command_name: command.command.clone(),
             group: command.group,
@@ -2698,21 +2941,122 @@ impl DesktopApp {
             dangerous: command.dangerous,
             success: true,
             network_label: command.network,
-            output: self.format_console_value(&command.data),
+            output: self.format_console_command_output(&command.command, &command.data),
             error_code: None,
         }
     }
 
+    fn format_console_command_output(
+        &self,
+        command_name: &str,
+        value: &serde_json::Value,
+    ) -> String {
+        if command_name.eq_ignore_ascii_case("help") {
+            return self.format_console_help_payload(value);
+        }
+        self.format_console_value(value)
+    }
+
     fn format_console_value(&self, value: &serde_json::Value) -> String {
         match self.debug_console_output_mode {
-            DebugConsoleOutputMode::Pretty => {
+            DebugConsoleOutputMode::Pretty | DebugConsoleOutputMode::Json => {
                 serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
             }
-            DebugConsoleOutputMode::Json => value.to_string(),
             DebugConsoleOutputMode::Table => format_table_value(value).unwrap_or_else(|| {
                 serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
             }),
         }
+    }
+
+    fn format_console_help_payload(&self, payload: &serde_json::Value) -> String {
+        if matches!(self.debug_console_output_mode, DebugConsoleOutputMode::Json) {
+            return serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
+        }
+
+        if let Some(groups) = payload.get("groups").and_then(|value| value.as_object()) {
+            let mut out = String::from("Atho RPC Commands\n");
+            out.push_str("Type help <command> for usage details.\n");
+            for (group, commands) in groups {
+                out.push_str(&format!("\n== {} ==\n", group));
+                if let Some(items) = commands.as_array() {
+                    for item in items {
+                        let name = item
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?");
+                        let description = item
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        out.push_str(&format!("  {name:<24} {description}\n"));
+                    }
+                }
+            }
+            return out.trim_end().to_string();
+        }
+
+        if let Some(name) = payload.get("name").and_then(|value| value.as_str()) {
+            let group = payload
+                .get("group")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let description = payload
+                .get("description")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let usage = payload
+                .get("usage")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let permission = payload
+                .get("permission")
+                .and_then(|value| value.as_str())
+                .unwrap_or("UNKNOWN");
+            let examples = payload
+                .get("examples")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut out = format!(
+                "{name}\n  Group: {group}\n  Permission: {permission}\n  Description: {description}\n  Usage: {usage}"
+            );
+            if !examples.is_empty() {
+                out.push_str("\n  Examples:");
+                for example in examples {
+                    if let Some(example) = example.as_str() {
+                        out.push_str(&format!("\n    {example}"));
+                    }
+                }
+            }
+            return out;
+        }
+
+        if let Some(commands) = payload.get("commands").and_then(|value| value.as_array()) {
+            let query = payload
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let mut out = format!("Matches for {query}\n");
+            for item in commands {
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let group = item
+                    .get("group")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let description = item
+                    .get("description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("  [{group}] {name:<24} {description}\n"));
+            }
+            return out.trim_end().to_string();
+        }
+
+        serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
     }
 
     fn format_console_error(&self, error: &atho_rpc::error::RpcError) -> String {
@@ -2727,8 +3071,9 @@ impl DesktopApp {
             }
         });
         match self.debug_console_output_mode {
-            DebugConsoleOutputMode::Json => value.to_string(),
-            DebugConsoleOutputMode::Pretty | DebugConsoleOutputMode::Table => {
+            DebugConsoleOutputMode::Json
+            | DebugConsoleOutputMode::Pretty
+            | DebugConsoleOutputMode::Table => {
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
             }
         }
@@ -2743,6 +3088,97 @@ impl DesktopApp {
     pub(crate) fn clear_debug_console(&mut self) {
         self.debug_console_entries.clear();
         self.debug_console_history_index = None;
+        self.debug_console_status = String::from("Console cleared");
+    }
+
+    fn push_debug_console_entry(
+        &mut self,
+        line: String,
+        push_history: bool,
+        entry: DebugConsoleEntry,
+    ) {
+        if push_history
+            && self
+                .debug_console_history
+                .last()
+                .is_none_or(|previous| previous != &line)
+        {
+            self.debug_console_history.push(line);
+        }
+        self.debug_console_history_index = None;
+        self.debug_console_entries.push(entry);
+    }
+
+    fn record_debug_console_problem(
+        &mut self,
+        line: String,
+        message: String,
+        suggestions: Vec<String>,
+        command_name: Option<String>,
+    ) {
+        let timestamp_unix = current_unix_seconds();
+        self.last_error = Some(message.clone());
+        self.debug_console_status = String::from("Command failed");
+        let output = if suggestions.is_empty() {
+            message
+        } else {
+            format!("{message}\nDid you mean:\n  {}", suggestions.join("\n  "))
+        };
+        let entry = DebugConsoleEntry {
+            timestamp_unix,
+            command_line: line.clone(),
+            command_name: command_name.unwrap_or_else(|| String::from("unknown")),
+            group: atho_rpc::command::CommandGroup::Debug,
+            permission: atho_rpc::command::CommandPermission::PublicRead,
+            dangerous: false,
+            success: false,
+            network_label: self.view_model.network_label.clone(),
+            output,
+            error_code: None,
+        };
+        let push_history = !line.trim().is_empty() && line != "(empty)";
+        self.push_debug_console_entry(line, push_history, entry);
+    }
+
+    pub(crate) fn debug_console_suggestions(&self, query: &str) -> Vec<String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let token = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        let normalized = token.to_ascii_lowercase();
+        let mut suggestions = search_commands(token)
+            .into_iter()
+            .map(|definition| definition.name.to_string())
+            .filter(|name| name.starts_with(&normalized))
+            .collect::<Vec<_>>();
+        if suggestions.is_empty() {
+            suggestions = search_commands(token)
+                .into_iter()
+                .map(|definition| definition.name.to_string())
+                .collect::<Vec<_>>();
+        }
+        if suggestions.is_empty() {
+            let mut ranked = search_commands("")
+                .into_iter()
+                .map(|definition| {
+                    (
+                        levenshtein_distance(&normalized, definition.name),
+                        definition.name.to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            suggestions = ranked
+                .into_iter()
+                .filter(|(distance, _)| *distance <= 4)
+                .map(|(_, name)| name)
+                .collect();
+        }
+        suggestions.sort();
+        suggestions.dedup();
+        suggestions.truncate(8);
+        suggestions
     }
 
     fn copy_text(ui: &mut egui::Ui, text: String) {
@@ -2911,11 +3347,42 @@ fn render_table_cell(value: &serde_json::Value) -> String {
     }
 }
 
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    if left_chars.is_empty() {
+        return right_chars.len();
+    }
+    if right_chars.is_empty() {
+        return left_chars.len();
+    }
+
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0usize; right_chars.len() + 1];
+
+    for (i, left_char) in left_chars.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_char != right_char);
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            current[j + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
+}
+
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.theme_initialized {
             theme::install_fonts(ctx);
             self.theme_initialized = true;
+        }
+        if self.active_tab == NavTab::DebugConsole {
+            self.open_debug_window(DebugWindowTab::Console);
+            self.active_tab = NavTab::Overview;
         }
         if self.wallet.is_none() && !self.compact_viewport {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(700.0, 440.0)));
@@ -2972,6 +3439,13 @@ fn alternate_wallet_path(network: Network) -> PathBuf {
     let file_name = format!("{}.2", Wallet::datafile_name());
     path.set_file_name(file_name);
     path
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn backup_wallet_path(wallet_path: &str) -> String {
@@ -3089,9 +3563,6 @@ fn rewrite_reward_script(block: &Block, reward_script: &[u8]) -> Block {
     let mut rebuilt = Block::new(header, transactions);
     rebuilt.fees_total_atoms = block.fees_total_atoms;
     rebuilt.fees_miner_atoms = block.fees_miner_atoms;
-    rebuilt.fees_burned_atoms = block.fees_burned_atoms;
-    rebuilt.fees_pool_atoms = block.fees_pool_atoms;
-    rebuilt.cumulative_burned_atoms = block.cumulative_burned_atoms;
     rebuilt
 }
 
@@ -3474,7 +3945,74 @@ mod tests {
     }
 
     #[test]
-    fn select_wallet_utxos_can_span_multiple_addresses() {
+    fn build_signed_spend_transaction_omits_dust_change_outputs() {
+        let keypair = test_keypair();
+        let change_address = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x6du8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        )
+        .checkout_change_address();
+        let funding = UtxoEntry::new(
+            Network::Regnet,
+            [0x31; 48],
+            0,
+            10_000,
+            atho_core::address::public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec(),
+            24,
+            false,
+        );
+
+        let tx = DesktopApp::build_signed_spend_transaction(
+            &keypair,
+            std::slice::from_ref(&funding),
+            [0x22; 32],
+            9_000,
+            DUST_RELAY_VALUE_ATOMS - 1,
+            Some(change_address),
+            1,
+        )
+        .expect("build transaction");
+
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].value_atoms, 9_000);
+    }
+
+    #[test]
+    fn select_wallet_utxos_prefers_single_output_when_remaining_change_would_be_dust() {
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x6eu8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let address = wallet.checkout_receive_address();
+        let exact_fee = DesktopApp::estimate_fee(1, 1);
+        let total_input_atoms = 20_000u64;
+        let amount_atoms = total_input_atoms
+            .saturating_sub(exact_fee)
+            .saturating_sub(DUST_RELAY_VALUE_ATOMS - 1);
+        let candidates = vec![SpendableWalletUtxo {
+            address: address.clone(),
+            utxo: UtxoEntry::new(
+                Network::Regnet,
+                [0x41; 48],
+                0,
+                total_input_atoms,
+                address.payment_digest.to_vec(),
+                24,
+                false,
+            ),
+        }];
+
+        let plan = DesktopApp::select_wallet_utxos(candidates, amount_atoms, false)
+            .expect("selection")
+            .expect("plan");
+
+        assert_eq!(plan.output_count, 1);
+    }
+
+    #[test]
+    fn select_wallet_utxos_does_not_span_multiple_addresses() {
         let mut wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[0x6au8; 32], MnemonicLength::Words24).unwrap(),
             "",
@@ -3511,15 +4049,108 @@ mod tests {
         ];
 
         let plan = DesktopApp::select_wallet_utxos(candidates, 100 * ATOMS_PER_ATHO, false)
+            .expect("selection");
+
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn select_wallet_utxos_can_use_multiple_inputs_from_one_address() {
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x6bu8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let address = wallet.checkout_receive_address();
+
+        let candidates = vec![
+            SpendableWalletUtxo {
+                address: address.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x11; 48],
+                    0,
+                    60 * ATOMS_PER_ATHO,
+                    address.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+            SpendableWalletUtxo {
+                address: address.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x22; 48],
+                    0,
+                    60 * ATOMS_PER_ATHO,
+                    address.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+        ];
+
+        let plan = DesktopApp::select_wallet_utxos(candidates, 100 * ATOMS_PER_ATHO, false)
             .expect("selection")
-            .expect("multi-address plan");
+            .expect("single-address plan");
 
         assert_eq!(plan.utxos.len(), 2);
         assert_eq!(plan.total_input_atoms, 120 * ATOMS_PER_ATHO);
-        assert!(
-            plan.address.payment_digest == first.payment_digest
-                || plan.address.payment_digest == second.payment_digest
+        assert_eq!(plan.address.payment_digest, address.payment_digest);
+    }
+
+    #[test]
+    fn max_sendable_amount_prefers_largest_single_address_group() {
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x6cu8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
         );
+        let first = wallet.checkout_receive_address();
+        let second = wallet.checkout_receive_address();
+
+        let candidates = vec![
+            SpendableWalletUtxo {
+                address: first.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x11; 48],
+                    0,
+                    25 * ATOMS_PER_ATHO,
+                    first.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+            SpendableWalletUtxo {
+                address: first.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x12; 48],
+                    0,
+                    20 * ATOMS_PER_ATHO,
+                    first.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+            SpendableWalletUtxo {
+                address: second.clone(),
+                utxo: UtxoEntry::new(
+                    Network::Regnet,
+                    [0x21; 48],
+                    0,
+                    60 * ATOMS_PER_ATHO,
+                    second.payment_digest.to_vec(),
+                    24,
+                    false,
+                ),
+            },
+        ];
+
+        let sendable = DesktopApp::max_single_address_sendable_atoms(candidates, false);
+        assert!(sendable > 59 * ATOMS_PER_ATHO);
+        assert!(sendable < 60 * ATOMS_PER_ATHO);
     }
 
     #[test]
@@ -4186,6 +4817,7 @@ mod tests {
     #[test]
     fn debug_console_help_runs_without_rpc_dependency() {
         let mut app = DesktopApp::new(Network::Mainnet);
+        let original_send_status = app.send_status.clone();
         app.debug_console_input = String::from("help");
         app.run_debug_console_command();
 
@@ -4194,7 +4826,9 @@ mod tests {
         let entry = app.debug_console_entries.last().expect("console entry");
         assert!(entry.success);
         assert_eq!(entry.command_name, "help");
+        assert!(entry.output.contains("Atho RPC Commands"));
         assert!(entry.output.contains("getblockchaininfo"));
+        assert_eq!(app.send_status, original_send_status);
         assert_eq!(app.debug_console_history, vec![String::from("help")]);
     }
 
@@ -4239,5 +4873,18 @@ mod tests {
         assert_eq!(entry.command_name, "getstatus");
         assert!(entry.output.contains("\"network\""));
         assert_eq!(entry.network_label, "atho-regnet");
+    }
+
+    #[test]
+    fn debug_console_unknown_command_records_suggestions() {
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.debug_console_input = String::from("getblok");
+        app.run_debug_console_command();
+
+        assert!(app.last_error.is_some());
+        let entry = app.debug_console_entries.last().expect("console entry");
+        assert!(!entry.success);
+        assert!(entry.output.contains("Did you mean"));
+        assert!(entry.output.contains("getblock"));
     }
 }

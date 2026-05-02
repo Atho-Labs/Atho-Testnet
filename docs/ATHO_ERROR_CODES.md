@@ -402,6 +402,16 @@ This registry is generated from `crates/atho-errors` and is the canonical source
 - Common Cause: The same outpoint is already reserved by another pending transaction.
 - Suggested Fix: Wait for the conflicting transaction to confirm or replace it intentionally.
 
+## ATHO-MEM-002
+- Category: `MEM`
+- Title: Dust Output Rejected
+- Severity: `error`
+- User Facing: `true`
+- Consensus Critical: `false`
+- Explanation: The transaction creates an output below Atho's relay dust floor.
+- Common Cause: A wallet or sender attempted to create an output smaller than the 50-atom relay minimum.
+- Suggested Fix: Raise every spendable output to at least 50 atoms or combine the value into fees.
+
 ## ATHO-SIG-001
 - Category: `SIG`
 - Title: Invalid Witness

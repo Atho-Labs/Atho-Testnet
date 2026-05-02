@@ -1,5 +1,5 @@
 use crate::dev;
-use crate::validation::{validate_transaction_with_context, ValidationError};
+use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -108,7 +108,7 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let fee = validate_transaction_with_context(
+        let fee = validate_transaction_with_context_for_mempool(
             &entry.transaction,
             entry.fee_atoms,
             spend_height,
@@ -210,6 +210,14 @@ impl Mempool {
             .collect()
     }
 
+    pub fn entry(&self, txid: &[u8; 48]) -> Option<MempoolEntry> {
+        self.entries.get(txid).cloned()
+    }
+
+    pub fn entries(&self) -> Vec<MempoolEntry> {
+        self.entries.values().cloned().collect()
+    }
+
     pub fn txids(&self) -> Vec<[u8; 48]> {
         self.entries.keys().copied().collect()
     }
@@ -255,7 +263,7 @@ impl Mempool {
         let mut entries = Vec::with_capacity(ordered.len());
         let mut fees = 0u64;
         for (_, entry) in ordered {
-            let fee = validate_transaction_with_context(
+            let fee = validate_transaction_with_context_for_mempool(
                 &entry.transaction,
                 entry.fee_atoms,
                 spend_height,
@@ -265,6 +273,49 @@ impl Mempool {
             entries.push(entry.clone());
         }
         Ok((entries, fees))
+    }
+
+    pub fn validated_entries_for_mining<F>(
+        &self,
+        spend_height: u64,
+        mut lookup: F,
+    ) -> (Vec<MempoolEntry>, u64, usize)
+    where
+        F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+    {
+        let mut ordered: Vec<([u8; 48], &MempoolEntry)> = self
+            .entries
+            .iter()
+            .map(|(txid, entry)| (*txid, entry))
+            .collect();
+        ordered.sort_by(|(left_txid, left), (right_txid, right)| {
+            right
+                .feerate_atoms_per_vbyte()
+                .cmp(&left.feerate_atoms_per_vbyte())
+                .then_with(|| right.fee_atoms.cmp(&left.fee_atoms))
+                .then_with(|| left_txid.cmp(right_txid))
+        });
+
+        let mut entries = Vec::with_capacity(ordered.len());
+        let mut fees = 0u64;
+        let mut skipped = 0usize;
+        for (_, entry) in ordered {
+            match validate_transaction_with_context_for_mempool(
+                &entry.transaction,
+                entry.fee_atoms,
+                spend_height,
+                |txid, output_index| lookup(txid, output_index),
+            ) {
+                Ok(fee) => {
+                    fees = fees.saturating_add(fee);
+                    entries.push(entry.clone());
+                }
+                Err(_) => {
+                    skipped = skipped.saturating_add(1);
+                }
+            }
+        }
+        (entries, fees, skipped)
     }
 
     pub fn total_fee_atoms(&self) -> u64 {
@@ -283,6 +334,11 @@ impl Mempool {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked(&mut self, entry: MempoolEntry) {
+        self.entries.insert(entry.txid(), entry);
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +346,7 @@ mod tests {
     use super::*;
     use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::constants::DUST_RELAY_VALUE_ATOMS;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
 
@@ -407,6 +464,64 @@ mod tests {
     }
 
     #[test]
+    fn mempool_rejects_sub_dust_outputs() {
+        let mut mempool = Mempool::new();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [6; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let err = mempool
+            .admit(MempoolEntry::new(tx, 10_000), 10, |_, _| None)
+            .unwrap_err();
+        assert_eq!(err, ValidationError::DustOutput);
+    }
+
+    #[test]
+    fn mining_view_skips_unchecked_dust_entries() {
+        let mut mempool = Mempool::new();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [16; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let txid = tx.txid();
+        mempool.insert_unchecked(MempoolEntry::new(tx, 10_000));
+
+        let (entries, fees, skipped) = mempool.validated_entries_for_mining(10, |_, _| None);
+        assert!(entries.is_empty());
+        assert_eq!(fees, 0);
+        assert_eq!(skipped, 1);
+        assert!(!entries.iter().any(|entry| entry.txid() == txid));
+    }
+
+    #[test]
     fn valid_transactions_are_sorted_by_feerate() {
         let mut mempool = Mempool::new();
         let low = Transaction {
@@ -517,5 +632,75 @@ mod tests {
             .admit(MempoolEntry::new(tx, 2_500), 10, |_, _| None)
             .unwrap_err();
         assert_eq!(err, ValidationError::InvalidTransactionVersion);
+    }
+
+    #[test]
+    fn mining_view_skips_invalid_entries_instead_of_failing_whole_selection() {
+        let mut mempool = Mempool::new();
+        let valid = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [11; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_000,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let valid = Transaction {
+            witness: witness_bytes_for_tx(&valid),
+            ..valid
+        };
+        let invalid = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [12; 48],
+                output_index: 0,
+                unlocking_script: vec![3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_000,
+                locking_script: vec![4],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let invalid = Transaction {
+            witness: witness_bytes_for_tx(&invalid),
+            ..invalid
+        };
+
+        let valid_entry = MempoolEntry::new(valid.clone(), 3_000);
+        let invalid_entry = MempoolEntry::new(invalid.clone(), 3_000);
+        let _ = mempool.entries.insert(valid.txid(), valid_entry);
+        let _ = mempool.entries.insert(invalid.txid(), invalid_entry);
+
+        let mut utxos = std::collections::BTreeMap::new();
+        utxos.insert(
+            ([11; 48], 0),
+            UtxoEntry::new(
+                atho_core::network::Network::Mainnet,
+                [11; 48],
+                0,
+                10_000,
+                vec![1],
+                0,
+                false,
+            ),
+        );
+
+        let (entries, fees, skipped) = mempool
+            .validated_entries_for_mining(7, |txid, output_index| {
+                utxos.get(&(*txid, output_index)).cloned()
+            });
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].txid(), valid.txid());
+        assert_eq!(fees, 3_000);
+        assert_eq!(skipped, 1);
     }
 }

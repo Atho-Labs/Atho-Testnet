@@ -442,7 +442,7 @@ TABLES: Dict[str, TableSpec] = {
             ["Coinbase maturity", "150 blocks", "`constants.rs`; `storage/utxo.rs`", "Required confirmations before mined outputs are spendable."],
             ["Standard confirmations", "7 blocks", "`constants.rs`; `storage/utxo.rs`", "Wallet-facing settlement convention for non-coinbase outputs."],
             ["Minimum fee rate", "1 atom per vbyte", "`constants.rs`; `storage/validation.rs`", "Baseline anti-spam policy."],
-            ["Dust threshold", "TBD", "No explicit dust constant found.", "A future policy value should be documented if added."],
+            ["Dust threshold", "50 atoms", "`crates/atho-core/src/constants.rs`", "Relay and wallet policy floor for spendable outputs."],
         ],
     ),
     "t6": TableSpec(
@@ -995,9 +995,8 @@ SECTIONS: List[Dict[str, object]] = [
             witness-weighted model: base data is weighted more heavily than witness
             data, and vbytes are derived from total weight. Current limits are
             250,000 raw bytes and 250,000 vbytes per transaction. The minimum fee
-            policy is 1 atom per vbyte, and zero-value outputs are rejected. No
-            explicit dust threshold constant was found in the repository, so dust
-            policy is marked TBD.
+            policy is 1 atom per vbyte, zero-value outputs are rejected, and relay
+            and wallet policy reject spendable outputs below 50 atoms.
             """
         ),
         p(
@@ -1200,10 +1199,10 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             Several policies are intentionally marked as not yet active or TBD. No
-            explicit mempool expiry rule, replacement-by-fee policy, memory-size cap,
-            or dust threshold constant was found in the source files inspected for
-            this paper. The current fee floor and size limits provide baseline spam
-            resistance, but production hardening should add explicit memory and
+            explicit mempool expiry rule, replacement-by-fee policy, or memory-size
+            cap was found in the source files inspected for this paper. The current
+            fee floor, 50-atom relay dust floor, and size limits provide baseline
+            spam resistance, but production hardening should add explicit memory and
             expiry behavior so long-running public nodes can bound resource use under
             adversarial load. Figure 7 shows the current admission flow.
             """
@@ -2662,7 +2661,7 @@ def write_changelog(word_count: int) -> None:
             - Rendered the PDF deliverable at `docs/whitepaper/atho-whitepaper-apa.pdf`.
             - Added APA-style title page, abstract, keywords, table of contents, list of figures, list of tables, references, and appendices.
             - Included 11 rendered figures, 11 tables, Mermaid source files, and an emission CSV/chart asset.
-            - Sourced Atho constants from Rust source files and marked undefined policy values, such as dust threshold and public API authentication, as TBD or not currently active.
+            - Sourced Atho constants from Rust source files, including the 50-atom dust floor, and marked other undefined policy values, such as public API authentication, as TBD or not currently active.
             - Included code reference map and pseudocode appendices for transaction validation, block validation, mempool admission, coinbase reward validation, reorg rollback, wallet signing, and difficulty checking.
             - Added external citations for NIST PQC/FIPS status, Falcon, SHA3, Rust, proof-of-work, and quantum-signature risk.
 

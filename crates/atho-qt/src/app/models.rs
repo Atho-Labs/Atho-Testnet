@@ -105,8 +105,37 @@ impl DebugConsoleOutputMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugWindowTab {
+    Information,
+    Console,
+    NetworkTraffic,
+    Peers,
+}
+
+impl DebugWindowTab {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Information => "Information",
+            Self::Console => "Console",
+            Self::NetworkTraffic => "Network Traffic",
+            Self::Peers => "Peers",
+        }
+    }
+
+    pub(crate) fn variants() -> [DebugWindowTab; 4] {
+        [
+            Self::Information,
+            Self::Console,
+            Self::NetworkTraffic,
+            Self::Peers,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DebugConsoleEntry {
+    pub(crate) timestamp_unix: u64,
     pub(crate) command_line: String,
     pub(crate) command_name: String,
     pub(crate) group: CommandGroup,
@@ -116,6 +145,15 @@ pub(crate) struct DebugConsoleEntry {
     pub(crate) network_label: String,
     pub(crate) output: String,
     pub(crate) error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NetworkTrafficSample {
+    pub(crate) timestamp_unix: u64,
+    pub(crate) bytes_sent_per_second: f64,
+    pub(crate) bytes_received_per_second: f64,
+    pub(crate) total_bytes_sent: u64,
+    pub(crate) total_bytes_received: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

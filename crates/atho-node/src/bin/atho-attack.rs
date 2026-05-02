@@ -2,7 +2,8 @@ use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES,
+    MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -58,7 +59,7 @@ fn run() -> Result<(), String> {
     }
 
     total += 1;
-    if tx_case("dust_like_spend_accepts", network, tx_dust_like())? {
+    if tx_case("dust_like_spend_rejects", network, tx_dust_like())? {
         passed += 1;
     }
 
@@ -408,12 +409,12 @@ fn tx_bad_witness_ref() -> BuiltTransaction {
 
 fn tx_dust_like() -> BuiltTransaction {
     let input_value = 10_000u64;
-    let output_value = 1u64;
+    let output_value = DUST_RELAY_VALUE_ATOMS - 1;
     let tx = make_spend_tx(input_value, output_value, false, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
-        expected: Ok(()),
+        expected: Err(ValidationError::DustOutput),
     }
 }
 

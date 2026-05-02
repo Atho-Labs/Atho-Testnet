@@ -5,9 +5,9 @@ use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    ADDRESS_DIGEST_BYTES, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
-    MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT, MAX_TRANSACTION_RAW_BYTES,
-    MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
+    ADDRESS_DIGEST_BYTES, DUST_RELAY_VALUE_ATOMS, FALCON_512_PUBLIC_KEY_BYTES,
+    FALCON_512_SIGNATURE_BYTES, MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT,
+    MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -18,11 +18,11 @@ use atho_errors::{
     BLK_DUPLICATE_TRANSACTION_ID, BLK_EMPTY_BLOCK, BLK_INVALID_COINBASE, BLK_INVALID_HEIGHT,
     BLK_INVALID_TIMESTAMP, BLK_INVALID_VERSION, BLK_MERKLE_ROOT_MISMATCH, BLK_MULTIPLE_COINBASE,
     BLK_PARENT_HASH_MISMATCH, BLK_POW_INVALID, BLK_TARGET_OUT_OF_BOUNDS, BLK_WITNESS_ROOT_MISMATCH,
-    CONS_MONETARY_SUPPLY_EXCEEDED, MEM_MEMPOOL_CONFLICT, NET_BLOCK_NETWORK_MISMATCH,
-    SIG_INVALID_WITNESS, SIG_WITNESS_INPUT_REF_MISMATCH, TX_DUPLICATE_INPUT, TX_FEE_BELOW_MINIMUM,
-    TX_FEE_MISMATCH, TX_INPUT_OWNERSHIP_MISMATCH, TX_INSUFFICIENT_CONFIRMATIONS,
-    TX_INVALID_VERSION, TX_MISSING_UTXO, TX_NO_INPUTS, TX_NO_OUTPUTS, TX_TOO_LARGE,
-    TX_ZERO_VALUE_OUTPUT,
+    CONS_MONETARY_SUPPLY_EXCEEDED, MEM_DUST_OUTPUT, MEM_MEMPOOL_CONFLICT,
+    NET_BLOCK_NETWORK_MISMATCH, SIG_INVALID_WITNESS, SIG_WITNESS_INPUT_REF_MISMATCH,
+    TX_DUPLICATE_INPUT, TX_FEE_BELOW_MINIMUM, TX_FEE_MISMATCH, TX_INPUT_OWNERSHIP_MISMATCH,
+    TX_INSUFFICIENT_CONFIRMATIONS, TX_INVALID_VERSION, TX_MISSING_UTXO, TX_NO_INPUTS,
+    TX_NO_OUTPUTS, TX_TOO_LARGE, TX_ZERO_VALUE_OUTPUT,
 };
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -44,6 +44,8 @@ pub enum ValidationError {
     DuplicateInput,
     #[error("zero-value output")]
     ZeroValueOutput,
+    #[error("dust output below relay policy minimum")]
+    DustOutput,
     #[error("invalid witness")]
     InvalidWitness,
     #[error("coinbase transaction invalid")]
@@ -102,6 +104,7 @@ impl AthoErrorMeta for ValidationError {
             Self::InvalidTransactionVersion => &TX_INVALID_VERSION,
             Self::DuplicateInput => &TX_DUPLICATE_INPUT,
             Self::ZeroValueOutput => &TX_ZERO_VALUE_OUTPUT,
+            Self::DustOutput => &MEM_DUST_OUTPUT,
             Self::InvalidWitness => &SIG_INVALID_WITNESS,
             Self::InvalidCoinbase => &BLK_INVALID_COINBASE,
             Self::CoinbaseRewardMismatch => &BLK_COINBASE_REWARD_MISMATCH,
@@ -241,6 +244,19 @@ fn locking_script_matches_public_key(
 
 pub fn validate_transaction(tx: &Transaction, fee_atoms: u64) -> Result<(), ValidationError> {
     validate_transaction_for_height(tx, fee_atoms, 0)
+}
+
+pub fn transaction_contains_dust_outputs(tx: &Transaction) -> bool {
+    tx.outputs
+        .iter()
+        .any(|output| output.value_atoms > 0 && output.value_atoms < DUST_RELAY_VALUE_ATOMS)
+}
+
+pub fn validate_transaction_standard_policy(tx: &Transaction) -> Result<(), ValidationError> {
+    if transaction_contains_dust_outputs(tx) {
+        return Err(ValidationError::DustOutput);
+    }
+    Ok(())
 }
 
 pub fn validate_transaction_for_height(
@@ -425,6 +441,19 @@ where
         lookup,
         &rules::SCHEDULED_ACTIVATIONS,
     )
+}
+
+pub fn validate_transaction_with_context_for_mempool<F>(
+    tx: &Transaction,
+    fee_atoms: u64,
+    spend_height: u64,
+    lookup: F,
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    validate_transaction_standard_policy(tx)?;
+    validate_transaction_with_context(tx, fee_atoms, spend_height, lookup)
 }
 
 pub fn validate_transaction_with_context_and_schedule<F>(
@@ -727,9 +756,7 @@ pub fn validate_block_with_context_and_schedule(
     if sum_fees != block.fees_total_atoms {
         return Err(ValidationError::FeeMismatch);
     }
-    if block.fees_total_atoms
-        != block.fees_miner_atoms + block.fees_burned_atoms + block.fees_pool_atoms
-    {
+    if block.fees_total_atoms != block.fees_miner_atoms {
         return Err(ValidationError::FeeMismatch);
     }
     Ok(())
@@ -745,7 +772,9 @@ mod tests {
         RULESET_VERSION_V2_PLACEHOLDER, TRANSACTION_VERSION_V1, TRANSACTION_VERSION_V2_PLACEHOLDER,
     };
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-    use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_TRANSACTION_RAW_BYTES};
+    use atho_core::constants::{
+        DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_RAW_BYTES, MAX_TRANSACTION_RAW_BYTES,
+    };
     use atho_core::crypto::hash::sha3_384;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{
@@ -1027,6 +1056,30 @@ mod tests {
     }
 
     #[test]
+    fn standard_policy_rejects_sub_dust_outputs() {
+        let tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: [7; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+
+        assert!(transaction_contains_dust_outputs(&tx));
+        assert_eq!(
+            validate_transaction_standard_policy(&tx),
+            Err(ValidationError::DustOutput)
+        );
+    }
+
+    #[test]
     fn wrong_public_key_for_standard_output_is_rejected() {
         let funding = generate_from_seed(b"atho-validation-funding").expect("funding keypair");
         let wrong = generate_from_seed(b"atho-validation-wrong").expect("wrong keypair");
@@ -1208,9 +1261,6 @@ mod tests {
         let mut block = block;
         block.fees_total_atoms = 1_000;
         block.fees_miner_atoms = 1_000;
-        block.fees_burned_atoms = 0;
-        block.fees_pool_atoms = 0;
-        block.cumulative_burned_atoms = 0;
         let solved = solve_block(block);
         let mut utxos = UtxoSet::new(Network::Mainnet);
         utxos.insert(funding).unwrap();

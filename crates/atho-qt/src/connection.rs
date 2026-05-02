@@ -16,6 +16,8 @@ use std::time::Duration;
 const ATHO_QT_LOCAL_ENV: &str = "ATHO_QT_LOCAL";
 const ATHO_QT_FORCE_RPC_ENV: &str = "ATHO_QT_FORCE_RPC";
 const DEFAULT_MAINNET_BOOTSTRAP_PEER: &str = "74.208.219.116:56000";
+const LOCAL_RPC_READY_RETRY_ATTEMPTS: usize = 20;
+const LOCAL_RPC_READY_RETRY_DELAY_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -256,21 +258,31 @@ impl ReadOnlyNodeConnection {
                         return RpcResponse::Error(RpcError::invalid_request(error));
                     }
                 }
-                match client.call(&request) {
-                    Ok(response) => response,
-                    Err(err) => {
-                        if let Some(node) = node {
-                            if let Some(error) = node.observe_exit(self.network) {
-                                return RpcResponse::Error(RpcError::invalid_request(error));
+                for attempt in 0..LOCAL_RPC_READY_RETRY_ATTEMPTS {
+                    match client.call(&request) {
+                        Ok(response) => return response,
+                        Err(err) => {
+                            if let Some(node) = node {
+                                if let Some(error) = node.observe_exit(self.network) {
+                                    return RpcResponse::Error(RpcError::invalid_request(error));
+                                }
+                                if attempt + 1 < LOCAL_RPC_READY_RETRY_ATTEMPTS {
+                                    thread::sleep(Duration::from_millis(
+                                        LOCAL_RPC_READY_RETRY_DELAY_MS,
+                                    ));
+                                    continue;
+                                }
+                                return RpcResponse::Error(RpcError::invalid_request(format!(
+                                    "local node RPC is not ready yet: {err}"
+                                )));
                             }
-                            return RpcResponse::Error(RpcError::invalid_request(format!(
-                                "local node RPC is not ready yet: {err}"
-                            )));
+                            let _ =
+                                atho_node::dev::append_log("atho-qt", &format!("rpc error: {err}"));
+                            return RpcResponse::Error(RpcError::internal());
                         }
-                        let _ = atho_node::dev::append_log("atho-qt", &format!("rpc error: {err}"));
-                        RpcResponse::Error(RpcError::internal())
                     }
                 }
+                RpcResponse::Error(RpcError::internal())
             }
             ConnectionBackend::Unavailable { startup_error } => {
                 RpcResponse::Error(RpcError::invalid_request(startup_error.clone()))
@@ -753,9 +765,21 @@ fn node_binary_path() -> Option<PathBuf> {
     }
 
     let exe = std::env::current_exe().ok()?;
+    if prefer_workspace_cargo_runner(&exe) {
+        return None;
+    }
     node_binary_candidates_from_exe(&exe)
         .into_iter()
         .find(|candidate| candidate.exists())
+}
+
+fn prefer_workspace_cargo_runner(exe: &Path) -> bool {
+    let manifest_path = workspace_manifest_path();
+    let Some(workspace_root) = manifest_path.parent() else {
+        return false;
+    };
+    let target_root = workspace_root.join("target");
+    exe.starts_with(&target_root)
 }
 
 fn node_binary_candidates_from_exe(exe: &Path) -> Vec<PathBuf> {
@@ -1256,6 +1280,23 @@ mod tests {
             "/Applications/Atho/Atho.app/Contents/MacOS/athod"
         )));
         assert!(candidates.contains(&PathBuf::from("/Applications/Atho/athod")));
+    }
+
+    #[test]
+    fn workspace_target_executables_prefer_cargo_runner() {
+        let exe = workspace_manifest_path()
+            .parent()
+            .expect("workspace root")
+            .join("target")
+            .join("debug")
+            .join("atho-qt");
+        assert!(prefer_workspace_cargo_runner(&exe));
+    }
+
+    #[test]
+    fn packaged_executables_do_not_force_cargo_runner() {
+        let exe = Path::new("/Applications/Atho/Atho.app/Contents/MacOS/Atho");
+        assert!(!prefer_workspace_cargo_runner(exe));
     }
 
     #[test]

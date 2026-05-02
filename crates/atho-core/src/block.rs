@@ -29,9 +29,6 @@ pub struct Block {
     pub witnesses: BTreeMap<[u8; 48], TxWitness>,
     pub fees_total_atoms: u64,
     pub fees_miner_atoms: u64,
-    pub fees_burned_atoms: u64,
-    pub fees_pool_atoms: u64,
-    pub cumulative_burned_atoms: u64,
 }
 
 impl Default for Block {
@@ -52,9 +49,6 @@ impl Default for Block {
             witnesses: BTreeMap::new(),
             fees_total_atoms: 0,
             fees_miner_atoms: 0,
-            fees_burned_atoms: 0,
-            fees_pool_atoms: 0,
-            cumulative_burned_atoms: 0,
         }
     }
 }

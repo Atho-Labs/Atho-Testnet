@@ -239,6 +239,14 @@ impl Node {
         self.mempool.transaction(txid)
     }
 
+    pub fn mempool_entry(&self, txid: &[u8; 48]) -> Option<MempoolEntry> {
+        self.mempool.entry(txid)
+    }
+
+    pub fn mempool_entries(&self) -> Vec<MempoolEntry> {
+        self.mempool.entries()
+    }
+
     pub fn mempool_transactions(&self) -> Vec<Transaction> {
         self.mempool.transactions()
     }
@@ -487,7 +495,7 @@ mod tests {
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::{pow, subsidy};
-    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_PER_VBYTE_ATOMS};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
@@ -750,6 +758,49 @@ mod tests {
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(node.chainstate.height, 7);
         assert_eq!(node.mempool.len(), 0);
+    }
+
+    #[test]
+    fn node_rejects_sub_dust_transaction_submission() {
+        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        node.chainstate
+            .insert_utxo(UtxoEntry::new(
+                Network::Mainnet,
+                [0x19; 48],
+                0,
+                2_000,
+                vec![1],
+                0,
+                false,
+            ))
+            .unwrap();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [0x19; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            ..tx
+        };
+        let fee_atoms = 2_000 - (DUST_RELAY_VALUE_ATOMS - 1);
+
+        let err = node
+            .submit_transaction(MempoolEntry::new(tx, fee_atoms))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::Validation(crate::validation::ValidationError::DustOutput)
+        ));
     }
 
     #[test]
