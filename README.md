@@ -15,7 +15,7 @@ Current posture:
 - the default runtime root is OS-native instead of working-directory driven
 - the live TCP peer runtime exists and is sandbox-tested over real sockets
 - the public VPS node path now has live restart/recovery and one-block propagation coverage
-- DNS seeds are still intentionally blank, so mainnet currently falls back to the built-in bootstrap peer unless you provide explicit peers
+- mainnet and testnet now resolve their configured DNS seed first and keep a static fallback peer as a last resort
 
 Production-readiness summary:
 
@@ -52,7 +52,7 @@ If you are using a packaged release, run the native installer first:
 
 ## How To Run Atho
 
-There are three primary binaries:
+There are four primary binaries:
 
 1. `athod`
 2. `atho-mine`
@@ -64,13 +64,32 @@ Recommended roles:
 - `atho-mine`: standalone miner process
 - `atho-qt`: desktop wallet and client
 
+### Main Entry Commands
+
+For normal use, start Atho with one of these top-level launchers:
+
+```bash
+python runmainnet.py
+python runtest.py
+```
+
+They:
+
+- build `athod` and `atho-qt` automatically when missing or stale
+- reuse existing release binaries when they are current
+- prepare the runtime root
+- launch `atho-qt` in managed-local-node mode
+- leave the Rust client and Rust node as the real runtime path
+
+Because the Python wrapper replaces itself with `atho-qt`, it does not stay in the blockchain hot path.
+
 ### Full Node
 
 ```bash
 cargo run -p atho-node --bin athod -- --network mainnet
 ```
 
-Mainnet currently uses the built-in bootstrap peer when no explicit peers are supplied.
+Mainnet now resolves the configured DNS seed first and keeps the static fallback peer as a last resort when no explicit peers are supplied.
 Use `--peer HOST:PORT` only when you want to override or add peers manually.
 
 ### Desktop Client
@@ -79,11 +98,23 @@ Use `--peer HOST:PORT` only when you want to override or add peers manually.
 cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
 ```
 
+For the simplest production-style local flow, prefer the launcher:
+
+```bash
+python runmainnet.py
+```
+
+For testnet:
+
+```bash
+python runtest.py
+```
+
 For repeated local launches after the first build, run the binary directly:
 
 ```bash
-cargo build -p atho-qt
-./target/debug/atho-qt --network mainnet --local-node
+cargo build --release -p atho-node -p atho-qt
+./target/release/atho-qt --network mainnet --local-node
 ```
 
 ### Miner
@@ -182,7 +213,7 @@ Important defaults:
 
 - RPC stays on loopback
 - P2P listens publicly
-- because DNS seeds are still blank, mainnet currently falls back to the built-in bootstrap peer unless you pass explicit `--peer` values
+- mainnet and testnet resolve their configured DNS seed first and keep the static fallback peer as a last resort unless you pass explicit `--peer` values
 
 Full VPS guidance:
 

@@ -1,13 +1,10 @@
 # Atho Quick Start
 
-Atho has three primary commands:
+Atho has four primary binaries:
 
 - `athod` for a full node
 - `atho-mine` for the miner
 - `atho-qt` for the desktop client
-
-There is also a new operator/debug client:
-
 - `atho-cli` for Bitcoin Core-style local RPC commands
 
 If you downloaded a packaged release instead of building from source, start with the native installer:
@@ -34,15 +31,39 @@ Platform notes:
 - macOS: Xcode Command Line Tools
 - Windows: Visual Studio Build Tools with C++ support and the MSVC Rust toolchain
 
-## 2. Clone And Build
+## 2. Clone
 
 ```bash
 git clone https://github.com/Atho-Labs/Atho-Alpha.git
 cd Atho-Alpha
-cargo build --release -p atho-node -p atho-qt
 ```
 
-Built binaries live in `target/release/`.
+## 3. Main Entry Commands
+
+The intended top-level user commands are:
+
+```bash
+python runmainnet.py
+python runtest.py
+```
+
+They:
+
+- build `athod` and `atho-qt` automatically if they are missing
+- rebuild them if the source tree is newer than the release binaries
+- prepare the runtime root
+- launch the desktop client in managed-local-node mode
+
+Extra flags can still be passed through when needed:
+
+```bash
+python runmainnet.py --peer HOST:PORT
+python runtest.py --data-dir /absolute/path
+```
+
+If your shell exposes Python as `python3` instead of `python`, use `python3 runmainnet.py` or `python3 runtest.py`.
+
+Built binaries still live in `target/release/`, and the launchers reuse them when they are already current.
 
 If you want GPU mining, build the relevant binary with the native feature enabled:
 
@@ -55,25 +76,37 @@ That feature enables the native FFI wrapper and keeps the node as the final auth
 `--backend gpu` requires a real OpenCL GPU.
 `--backend auto` prefers GPU and falls back to CPU, and Atho surfaces the fallback reason in the miner status.
 
-## 3. Run The Client
+## 4. Run The Client
 
 Linux or macOS:
 
 ```bash
-./target/release/atho-qt --network regnet --local-node
+python runmainnet.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\target\release\atho-qt.exe --network regnet --local-node
+py -3 .\runmainnet.py
 ```
 
-`--local-node` starts a managed `athod` child process over RPC, so the client uses the real node path.
+For testnet:
+
+```bash
+python runtest.py
+```
+
+or on Windows:
+
+```powershell
+py -3 .\runtest.py
+```
+
+The launchers end by executing `atho-qt --local-node`, so the client still uses the real Rust node path.
 
 If you want a disposable pruning and recovery sandbox, use `--network prunetest` instead of `regnet`.
 
-## 4. Run The Full Node
+## 5. Raw Binary Commands
 
 Linux or macOS:
 
@@ -95,7 +128,7 @@ Mainnet now resolves the configured DNS seed first and still keeps the static fa
 
 Use `--peer HOST:PORT` only when you want to override or add peers manually.
 
-## 5. Run The Miner
+## 6. Run The Miner
 
 Linux or macOS:
 
@@ -118,25 +151,26 @@ If probe fails, the output now includes a stable code such as `ATHO-MINE-102` or
 
 In Qt, open `Settings > Mining` to pick `Auto`, `GPU only`, or `CPU only` and inspect the detected device details directly in the app.
 
-## 6. Testnet And Mainnet
+## 7. Testnet And Mainnet
+
+Mainnet:
+
+```bash
+python runmainnet.py
+./target/release/athod --network mainnet
+./target/release/atho-mine --network mainnet
+```
 
 Testnet:
 
 ```bash
+python runtest.py
 ./target/release/athod --network testnet
 ./target/release/atho-qt --network testnet --local-node
 ./target/release/atho-mine --network testnet
 ```
 
-Mainnet:
-
-```bash
-./target/release/athod --network mainnet
-./target/release/atho-qt --network mainnet --local-node
-./target/release/atho-mine --network mainnet
-```
-
-## 7. Know Sync Is Working
+## 8. Know Sync Is Working
 
 Run the status command against the node:
 
@@ -159,14 +193,15 @@ In the Qt client, the Settings page should show:
 - sent and received bytes
 - per-peer height, protocol, and traffic details
 
-## 8. What To Expect On First Run
+## 9. What To Expect On First Run
 
 - the runtime root is created automatically under the OS-native Atho data directory
+- the top-level launcher builds release binaries automatically if they are missing or stale
 - the first wallet open or import may take a little longer while it scans
 - `--local-node` may take a moment while the managed node starts
-- mainnet sync uses the built-in bootstrap fallback unless you provide explicit peers
+- mainnet and testnet resolve their configured DNS seed first and keep a static fallback peer as a last resort
 
-## 9. Override The Data Root
+## 10. Override The Data Root
 
 Use a custom root if you want all state in one place:
 
@@ -180,8 +215,12 @@ or:
 $env:ATHO_DATA_DIR = "D:\Atho"
 ```
 
-## 10. Key Commands
+The launchers honor the same environment variable.
 
+## 11. Key Commands
+
+- `python runmainnet.py`
+- `python runtest.py`
 - `athod --network <mainnet|testnet|regnet|prunetest>`
 - `atho-qt --network <mainnet|testnet|regnet|prunetest> --local-node`
 - `atho-mine --network <mainnet|testnet|regnet|prunetest>`

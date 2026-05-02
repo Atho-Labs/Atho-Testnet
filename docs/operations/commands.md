@@ -4,7 +4,7 @@ This is the canonical operator command guide for Atho.
 
 ## Stable Entry Points
 
-There are three primary binaries:
+There are four primary binaries:
 
 1. `athod`
 2. `atho-mine`
@@ -18,13 +18,39 @@ Recommended roles:
 - `atho-qt`: desktop wallet and client
 - `atho-cli`: Bitcoin Core-style local RPC command client
 
+## Main Entry Commands
+
+These are the primary beginner and operator entry points:
+
+```bash
+python runmainnet.py
+python runtest.py
+```
+
+They:
+
+- build release binaries when missing or stale
+- reuse current release binaries when they are already valid
+- prepare the runtime root
+- launch `atho-qt` in managed-local-node mode
+- keep the Rust client and Rust node as the real runtime path
+
+Any extra flags are forwarded to `atho-qt`, so advanced operators can still do things like:
+
+```bash
+python runmainnet.py --peer HOST:PORT
+python runmainnet.py --data-dir /absolute/path
+```
+
+They are orchestration only. After startup, the Python wrapper replaces itself with the Rust desktop client and does not stay in the hot path.
+
 ## Quick Start
 
 The shortest useful commands are:
 
 ```bash
-cargo build --release -p atho-node -p atho-qt
-./target/release/atho-qt --network regnet --local-node
+python runmainnet.py
+python runtest.py
 ./target/release/athod --network regnet
 ./target/release/atho-mine --network regnet
 ./target/release/atho-cli --network regnet getblockchaininfo
@@ -79,6 +105,8 @@ Build release binaries:
 ```bash
 cargo build --release -p atho-node -p atho-qt
 ```
+
+The launchers run that build step automatically when needed.
 
 ## Test
 
@@ -162,9 +190,16 @@ Important:
 
 - RPC is local-only by default
 - P2P listens publicly by default
-- DNS seeds are still blank, so mainnet currently falls back to the built-in bootstrap peer
+- mainnet and testnet resolve their configured DNS seed first and keep a static fallback peer as a last resort
 
 ## Desktop Client
+
+Preferred production-style local commands:
+
+```bash
+python runmainnet.py
+python runtest.py
+```
 
 Attach to an existing node:
 
@@ -173,12 +208,6 @@ Attach to an existing node:
 ```
 
 Start a managed local node:
-
-```bash
-./target/release/atho-qt --network mainnet --local-node
-```
-
-Managed local node:
 
 ```bash
 ./target/release/atho-qt --network mainnet --local-node

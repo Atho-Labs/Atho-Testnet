@@ -16,15 +16,23 @@ Use a normal PowerShell window for the commands below.
 
 ## Build
 
-Clone the repo and build the release binaries:
+Clone the repo:
 
 ```powershell
 git clone https://github.com/Atho-Labs/Atho-Alpha.git
 cd Atho-Alpha
-cargo build --release -p atho-node -p atho-qt
 ```
 
-Built binaries:
+Main entry commands:
+
+```powershell
+py -3 .\runmainnet.py
+py -3 .\runtest.py
+```
+
+The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.
+
+Built binaries still land in:
 
 - `target\release\athod.exe`
 - `target\release\atho-mine.exe`
@@ -75,7 +83,7 @@ Check status:
 Use the simplest desktop path first:
 
 ```powershell
-.\target\release\atho-qt.exe --network regnet --local-node
+py -3 .\runmainnet.py
 ```
 
 If you installed the packaged Windows release, launch `Atho.exe` from the Start Menu or Desktop shortcut instead of the raw `atho-qt.exe` binary.
@@ -89,7 +97,7 @@ If you want the client to connect to an already-running node instead:
 The managed local-node path uses the same DNS-seed-first bootstrap flow on mainnet:
 
 ```powershell
-.\target\release\atho-qt.exe --network mainnet --local-node
+py -3 .\runmainnet.py
 ```
 
 ## Run The Miner

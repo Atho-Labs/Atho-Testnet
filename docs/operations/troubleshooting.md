@@ -43,7 +43,7 @@ Typical causes:
 Try the managed local-node path first:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+python runmainnet.py
 ```
 
 Then inspect:
@@ -56,18 +56,20 @@ Then inspect:
 
 Current likely cause:
 
-- DNS seeds are still blank
+- the local network path is blocked
+- the selected peer is down
+- your local state is pointing at the wrong data root
 
 Fix:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet
+python runmainnet.py
 ```
 
 For the desktop client:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+python runmainnet.py
 ```
 
 What to check after that:
@@ -93,7 +95,7 @@ Why:
 Use an explicit root:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network regnet --data-dir /absolute/path
+python runmainnet.py --data-dir /absolute/path
 ```
 
 or:

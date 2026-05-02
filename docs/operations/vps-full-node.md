@@ -128,7 +128,7 @@ Under the runtime root:
 
 ## Current Caveats
 
-- DNS seeds are still blank, so mainnet currently falls back to the built-in bootstrap peer unless the operator passes explicit peers
+- mainnet and testnet resolve their configured DNS seed first and keep a static fallback peer as a last resort unless the operator passes explicit peers
 - public P2P bind, restart/recovery, and one-block propagation have been exercised against a real VPS node
 - longer multi-peer public soak coverage is still pending
 - snapshot sync is not yet a peer-served protocol

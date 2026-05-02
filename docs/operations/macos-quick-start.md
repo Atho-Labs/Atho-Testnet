@@ -22,15 +22,23 @@ curl https://sh.rustup.rs -sSf | sh
 
 ## Build
 
-Clone the repo and build the release binaries:
+Clone the repo:
 
 ```bash
 git clone https://github.com/Atho-Labs/Atho-Alpha.git
 cd Atho-Alpha
-cargo build --release -p atho-node -p atho-qt
 ```
 
-Built binaries:
+Main entry commands:
+
+```bash
+python runmainnet.py
+python runtest.py
+```
+
+The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.
+
+Built binaries still land in:
 
 - `target/release/athod`
 - `target/release/atho-mine`
@@ -83,7 +91,7 @@ What to look for:
 Use the simplest desktop path first:
 
 ```bash
-./target/release/atho-qt --network regnet --local-node
+python runmainnet.py
 ```
 
 If you want the client to connect to an already-running node instead:
@@ -95,7 +103,7 @@ If you want the client to connect to an already-running node instead:
 The managed local-node path uses the same DNS-seed-first bootstrap flow on mainnet:
 
 ```bash
-./target/release/atho-qt --network mainnet --local-node
+python runmainnet.py
 ```
 
 The settings page includes a local-only diagnostics section with peer counts, byte counters, and per-peer transport details.
