@@ -769,10 +769,11 @@ impl NodeService {
     }
 
     pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
-        let notice = self
-            .orchestrator
-            .sync
-            .disconnect_peer(remote_addr, reason.clone());
+        let notice = self.orchestrator.sync.disconnect_peer(
+            remote_addr,
+            reason.clone(),
+            &self.orchestrator.runtime.node,
+        );
         self.network_runtime.peers.remove(remote_addr);
         if notice.is_some() && reason != "runtime stopping" {
             let now = unix_timestamp();

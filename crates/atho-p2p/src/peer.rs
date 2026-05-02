@@ -160,8 +160,8 @@ mod tests {
     }
 
     #[test]
-    fn peer_book_keeps_dns_seeds_blank() {
+    fn peer_book_exposes_configured_dns_seeds() {
         let peers = PeerBook::new(Network::Mainnet);
-        assert!(peers.dns_seeds().is_empty());
+        assert_eq!(peers.dns_seeds(), crate::config::MAINNET_DNS_SEEDS);
     }
 }

@@ -43,10 +43,10 @@ Example:
 ./athod --network mainnet --data-dir /var/lib/atho --rpc-addr 127.0.0.1:9010 --p2p-addr 0.0.0.0:56000
 ```
 
-Because DNS seeds are still blank, other nodes should use the canonical bootstrap peer for live sync:
+Mainnet now uses the configured DNS seed first and keeps the static fallback peer as a last resort:
 
 ```bash
-./athod --network mainnet --data-dir /var/lib/atho --peer 74.208.219.116:56000
+./athod --network mainnet --data-dir /var/lib/atho
 ```
 
 ## Network Exposure
@@ -82,7 +82,7 @@ Wants=network-online.target
 Type=simple
 User=atho
 WorkingDirectory=/opt/atho
-ExecStart=/opt/atho/athod --network mainnet --data-dir /var/lib/atho --peer 74.208.219.116:56000
+ExecStart=/opt/atho/athod --network mainnet --data-dir /var/lib/atho
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -128,7 +128,7 @@ Under the runtime root:
 
 ## Current Caveats
 
-- DNS seeds are still blank, so peer bootstrap is manual and currently centers on `74.208.219.116:56000`
+- DNS seeds are still blank, so mainnet currently falls back to the built-in bootstrap peer unless the operator passes explicit peers
 - public P2P bind, restart/recovery, and one-block propagation have been exercised against a real VPS node
 - longer multi-peer public soak coverage is still pending
 - snapshot sync is not yet a peer-served protocol

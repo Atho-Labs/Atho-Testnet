@@ -127,6 +127,7 @@ impl NodeSync {
         {
             Ok(events) => events,
             Err(atho_p2p::connection::ConnectionError::Protocol(error)) => {
+                self.refresh_sync_target_from_live_peers(node);
                 return Ok((
                     Vec::new(),
                     vec![SyncNotice::Disconnected {
@@ -156,12 +157,18 @@ impl NodeSync {
         )
     }
 
-    pub fn disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
+    pub fn disconnect_peer(
+        &mut self,
+        remote_addr: &str,
+        reason: String,
+        node: &Node,
+    ) -> Option<SyncNotice> {
         if !self.connections.disconnect(remote_addr) {
             return None;
         }
         self.downloader.note_peer_disconnected(remote_addr);
         self.branch_buffers.remove(remote_addr);
+        self.refresh_sync_target_from_live_peers(node);
         Some(SyncNotice::Disconnected {
             peer: remote_addr.to_string(),
             reason,
@@ -182,6 +189,7 @@ impl NodeSync {
                 ConnectionEvent::Disconnect { peer, reason } => {
                     self.downloader.note_peer_disconnected(&peer);
                     self.branch_buffers.remove(&peer);
+                    self.refresh_sync_target_from_live_peers(node);
                     notices.push(SyncNotice::Disconnected { peer, reason });
                 }
                 ConnectionEvent::Ready { peer, best_height } => {
@@ -210,6 +218,18 @@ impl NodeSync {
         }
 
         Ok((outbound, notices))
+    }
+
+    fn refresh_sync_target_from_live_peers(&mut self, node: &Node) {
+        let peer_best_height = self
+            .connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+            .filter_map(|peer| peer.best_height)
+            .max();
+        self.relay
+            .refresh_sync_target(node.blocks(), peer_best_height);
     }
 
     fn handle_message(
@@ -1156,6 +1176,68 @@ mod tests {
         assert_eq!(left.node.height(), right.node.height());
         assert_eq!(left.node.tip_hash(), right.node.tip_hash());
         assert_eq!(left.sync.sync_state().best_height, right.node.height());
+    }
+
+    #[test]
+    fn disconnecting_last_ready_peer_resets_sync_target_to_local_height() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let miner = Miner::new(1);
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine first");
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine second");
+        right.sync.prime(&right.node);
+
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        collect_events(&mut queue, &mut notices, &left.id, events);
+
+        let left_version = queue.pop_front().expect("left version");
+        let (events, mut new_notices) = right
+            .sync
+            .receive(&left_version.from, left_version.message, &mut right.node)
+            .expect("right receives version");
+        collect_events(&mut queue, &mut notices, &right.id, events);
+        notices.append(&mut new_notices);
+
+        for _ in 0..2 {
+            let queued = queue.pop_front().expect("right handshake reply");
+            let (events, mut new_notices) = left
+                .sync
+                .receive(&queued.from, queued.message, &mut left.node)
+                .expect("left receives handshake reply");
+            collect_events(&mut queue, &mut notices, &left.id, events);
+            notices.append(&mut new_notices);
+        }
+
+        assert_eq!(left.node.height(), 0);
+        assert_eq!(left.sync.sync_state().best_height, right.node.height());
+        assert!(!left.sync.sync_state().headers_synced);
+
+        let notice = left
+            .sync
+            .disconnect_peer(&right.id, String::from("peer dropped"), &left.node)
+            .expect("disconnect notice");
+        assert!(matches!(
+            notice,
+            SyncNotice::Disconnected { peer, .. } if peer == right.id
+        ));
+        assert_eq!(left.sync.sync_state().best_height, left.node.height());
+        assert!(left.sync.sync_state().headers_synced);
     }
 
     #[test]

@@ -549,32 +549,22 @@ def run(command: list[str]) -> None:
 
 
 def unix_launcher_script(network: str) -> str:
-    peer_line = ""
-    if network == "mainnet":
-        peer_line = f'  args+=(--peer "${{ATHO_MAINNET_PEER:-{BOOTSTRAP_PEER}}}")\n'
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${{BASH_SOURCE[0]}}")" && pwd)"
 args=(--network {network} --local-node)
-{peer_line}exec "$script_dir/atho-qt" "${{args[@]}}" "$@"
+exec "$script_dir/atho-qt" "${{args[@]}}" "$@"
 """
 
 
 def windows_launcher_cmd(network: str) -> str:
-    peer_block = ""
-    if network == "mainnet":
-        peer_block = (
-            'if "%PEER_ARG%"=="" set "PEER_ARG=--peer %ATHO_MAINNET_PEER%"\n'
-            f'if "%ATHO_MAINNET_PEER%"=="" set "PEER_ARG=--peer {BOOTSTRAP_PEER}"\n'
-        )
     return f"""@echo off
 setlocal EnableDelayedExpansion
 set "NETWORK={network}"
 if not "%ATHO_NETWORK%"=="" set "NETWORK=%ATHO_NETWORK%"
-set "PEER_ARG="
-{peer_block}set "SCRIPT_DIR=%~dp0"
-"%SCRIPT_DIR%atho-qt.exe" --network %NETWORK% --local-node %PEER_ARG% %*
+set "SCRIPT_DIR=%~dp0"
+"%SCRIPT_DIR%atho-qt.exe" --network %NETWORK% --local-node %*
 endlocal
 """
 

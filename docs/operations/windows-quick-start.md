@@ -58,10 +58,10 @@ Start a node:
 .\target\release\athod.exe --network regnet
 ```
 
-Because DNS seeds are still blank, add peers explicitly for live network sync:
+Mainnet now uses the configured DNS seed first and keeps the static fallback peer as a last resort:
 
 ```powershell
-.\target\release\athod.exe --network mainnet --peer 74.208.219.116:56000
+.\target\release\athod.exe --network mainnet
 ```
 
 Check status:
@@ -86,10 +86,10 @@ If you want the client to connect to an already-running node instead:
 .\target\release\atho-qt.exe --network regnet --rpc-addr 127.0.0.1:9210
 ```
 
-If the managed local node must bootstrap manually:
+The managed local-node path uses the same DNS-seed-first bootstrap flow on mainnet:
 
 ```powershell
-.\target\release\atho-qt.exe --network mainnet --local-node --peer 74.208.219.116:56000
+.\target\release\atho-qt.exe --network mainnet --local-node
 ```
 
 ## Run The Miner

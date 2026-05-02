@@ -16,7 +16,7 @@
 ## Current Network State
 
 - message framing, handshake, peer/session logic, and headers-first sync scaffolding exist
-- DNS seeds are intentionally blank
+- DNS seed hosts are configured for mainnet and testnet, with static fallback peers kept as last-resort bootstrap targets
 - the live TCP runtime is not complete yet
 
 ## Shipping Caveats

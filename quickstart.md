@@ -87,11 +87,13 @@ Windows PowerShell:
 .\target\release\athod.exe --network regnet
 ```
 
-Mainnet uses the canonical bootstrap peer until DNS seeds are added:
+Mainnet now resolves the configured DNS seed first and still keeps the static fallback peer as a last resort:
 
 ```bash
-./target/release/athod --network mainnet --peer 74.208.219.116:56000
+./target/release/athod --network mainnet
 ```
+
+Use `--peer HOST:PORT` only when you want to override or add peers manually.
 
 ## 5. Run The Miner
 
@@ -129,8 +131,8 @@ Testnet:
 Mainnet:
 
 ```bash
-./target/release/athod --network mainnet --peer 74.208.219.116:56000
-./target/release/atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
+./target/release/athod --network mainnet
+./target/release/atho-qt --network mainnet --local-node
 ./target/release/atho-mine --network mainnet
 ```
 
@@ -162,7 +164,7 @@ In the Qt client, the Settings page should show:
 - the runtime root is created automatically under the OS-native Atho data directory
 - the first wallet open or import may take a little longer while it scans
 - `--local-node` may take a moment while the managed node starts
-- mainnet sync will not move until you point at the bootstrap peer or another live peer
+- mainnet sync uses the built-in bootstrap fallback unless you provide explicit peers
 
 ## 9. Override The Data Root
 

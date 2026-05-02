@@ -16,7 +16,7 @@ use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, LAUNCH_P2P_BIND_FAILED, LAUNCH_PUBLIC_RPC_DENIED,
     LAUNCH_RPC_BIND_FAILED, NET_INVALID_NETWORK_SELECTION,
 };
-use atho_p2p::config::network_params;
+use atho_p2p::config::{configured_bootstrap_peers, network_params};
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
@@ -172,11 +172,8 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         let mut guard = system.lock().expect("node runtime mutex poisoned");
         guard.p2p_bootstrap_peers(bootstrap_limit)
     };
-    let mut seen = BTreeSet::new();
-    for peer in p2p_peer_addresses().into_iter().chain(bootstrap_peers) {
-        if seen.insert(peer.clone()) {
-            p2p_runtime.maintain_outbound(peer);
-        }
+    for peer in initial_outbound_peers(network, bootstrap_peers) {
+        p2p_runtime.maintain_outbound(peer);
     }
     let rpc_address = rpc_bind_address(config.network);
     validate_rpc_bind_address(&rpc_address)?;
@@ -298,18 +295,16 @@ pub fn default_p2p_bind_address(network: Network) -> String {
     format!("0.0.0.0:{}", network.p2p_port())
 }
 
-pub fn p2p_peer_addresses() -> Vec<String> {
-    std::env::var("ATHO_P2P_PEERS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+fn initial_outbound_peers(
+    network: Network,
+    discovered_bootstrap_peers: Vec<String>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    configured_bootstrap_peers(network)
+        .into_iter()
+        .chain(discovered_bootstrap_peers)
+        .filter(|peer| seen.insert(peer.clone()))
+        .collect()
 }
 
 pub fn run() -> Result<(), NodeError> {
@@ -375,5 +370,27 @@ mod tests {
             "127.0.0.1:9310"
         );
         assert_eq!(default_p2p_bind_address(Network::Prunetest), "0.0.0.0:9300");
+    }
+
+    #[test]
+    fn initial_outbound_peers_keep_operator_defaults_and_deduplicate_discovered_peers() {
+        std::env::remove_var("ATHO_P2P_PEERS");
+        std::env::remove_var("ATHO_MAINNET_PEER");
+
+        let peers = initial_outbound_peers(
+            Network::Mainnet,
+            vec![
+                String::from("74.208.219.116:56000"),
+                String::from("203.0.113.10:56000"),
+            ],
+        );
+
+        assert_eq!(
+            peers.first().map(String::as_str),
+            Some("mainnet-node1.atho.io:56000")
+        );
+        assert_eq!(peers.len(), 3);
+        assert!(peers.iter().any(|peer| peer == "74.208.219.116:56000"));
+        assert!(peers.iter().any(|peer| peer == "203.0.113.10:56000"));
     }
 }

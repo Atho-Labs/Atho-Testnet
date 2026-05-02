@@ -16,7 +16,6 @@ use std::time::Duration;
 
 const ATHO_QT_LOCAL_ENV: &str = "ATHO_QT_LOCAL";
 const ATHO_QT_FORCE_RPC_ENV: &str = "ATHO_QT_FORCE_RPC";
-const DEFAULT_MAINNET_BOOTSTRAP_PEER: &str = "74.208.219.116:56000";
 const LOCAL_RPC_READY_RETRY_ATTEMPTS: usize = 20;
 const LOCAL_RPC_READY_RETRY_DELAY_MS: u64 = 100;
 const LOCAL_RPC_STATUS_ERROR_RETRY_ATTEMPTS: usize = 2;
@@ -753,17 +752,6 @@ fn start_local_node_if_needed(
         );
         command.env("ATHO_P2P_ADDR", p2p_addr);
     }
-    if let Some(peer) = managed_local_node_bootstrap_peer(network) {
-        let _ = atho_node::dev::append_log(
-            "atho-qt",
-            &format!(
-                "managed local node bootstrap peer network={} peer={}",
-                network.id(),
-                peer
-            ),
-        );
-        command.env("ATHO_P2P_PEERS", peer);
-    }
     command
         .env("ATHO_RPC_ADDR", rpc_address)
         .env("ATHO_NETWORK", network.cli_arg())
@@ -954,29 +942,6 @@ fn macos_app_bundle_root(exe: &Path) -> Option<&Path> {
         Some(app_root)
     } else {
         None
-    }
-}
-
-fn managed_local_node_bootstrap_peer(network: Network) -> Option<String> {
-    if network != Network::Mainnet {
-        return None;
-    }
-
-    if std::env::var("ATHO_P2P_PEERS")
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-
-    let peer = std::env::var("ATHO_MAINNET_PEER")
-        .unwrap_or_else(|_| String::from(DEFAULT_MAINNET_BOOTSTRAP_PEER));
-    let peer = peer.trim();
-    if peer.is_empty() {
-        None
-    } else {
-        Some(peer.to_string())
     }
 }
 
@@ -1642,45 +1607,6 @@ mod tests {
     fn packaged_executables_do_not_force_cargo_runner() {
         let exe = Path::new("/Applications/Atho/Atho.app/Contents/MacOS/Atho");
         assert!(!prefer_workspace_cargo_runner(exe));
-    }
-
-    #[test]
-    fn managed_mainnet_local_node_uses_bootstrap_peer_when_no_peer_is_configured() {
-        let _lock = acquire_global_test_lock();
-        let previous_peers = std::env::var_os("ATHO_P2P_PEERS");
-        let previous_mainnet_peer = std::env::var_os("ATHO_MAINNET_PEER");
-        std::env::remove_var("ATHO_P2P_PEERS");
-        std::env::remove_var("ATHO_MAINNET_PEER");
-
-        let peer = managed_local_node_bootstrap_peer(Network::Mainnet);
-        assert_eq!(peer.as_deref(), Some(DEFAULT_MAINNET_BOOTSTRAP_PEER));
-
-        if let Some(previous) = previous_peers {
-            std::env::set_var("ATHO_P2P_PEERS", previous);
-        } else {
-            std::env::remove_var("ATHO_P2P_PEERS");
-        }
-        if let Some(previous) = previous_mainnet_peer {
-            std::env::set_var("ATHO_MAINNET_PEER", previous);
-        } else {
-            std::env::remove_var("ATHO_MAINNET_PEER");
-        }
-    }
-
-    #[test]
-    fn managed_local_node_bootstrap_peer_respects_existing_peer_configuration() {
-        let _lock = acquire_global_test_lock();
-        let previous_peers = std::env::var_os("ATHO_P2P_PEERS");
-        std::env::set_var("ATHO_P2P_PEERS", "127.0.0.1:56000");
-
-        assert!(managed_local_node_bootstrap_peer(Network::Mainnet).is_none());
-        assert!(managed_local_node_bootstrap_peer(Network::Regnet).is_none());
-
-        if let Some(previous) = previous_peers {
-            std::env::set_var("ATHO_P2P_PEERS", previous);
-        } else {
-            std::env::remove_var("ATHO_P2P_PEERS");
-        }
     }
 
     #[test]

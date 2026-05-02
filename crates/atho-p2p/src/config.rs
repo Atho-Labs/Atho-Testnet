@@ -4,10 +4,17 @@ use atho_core::network::Network;
 
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
-pub const MAINNET_DNS_SEEDS: &[&str] = &[];
-pub const TESTNET_DNS_SEEDS: &[&str] = &[];
+const MAINNET_BOOTSTRAP_PEER_ENV: &str = "ATHO_MAINNET_PEER";
+
+pub const MAINNET_DNS_SEEDS: &[&str] = &["mainnet-node1.atho.io"];
+pub const TESTNET_DNS_SEEDS: &[&str] = &["testnet-node1.atho.io"];
 pub const REGNET_DNS_SEEDS: &[&str] = &[];
 pub const PRUNETEST_DNS_SEEDS: &[&str] = &[];
+
+pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &["74.208.219.116:56000"];
+pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &["162.222.206.163:9100"];
+pub const REGNET_BOOTSTRAP_PEERS: &[&str] = &[];
+pub const PRUNETEST_BOOTSTRAP_PEERS: &[&str] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct P2pLimits {
@@ -106,12 +113,91 @@ pub fn network_from_magic(magic: [u8; 4]) -> Option<Network> {
     Network::from_p2p_magic(magic)
 }
 
+/// Returns explicit peer addresses supplied through `ATHO_P2P_PEERS`.
+///
+/// This stays separate from network defaults so callers can treat an explicit
+/// operator peer list as authoritative and only fall back to built-in bootstrap
+/// peers when nothing was configured.
+pub fn configured_peer_addresses_from_env() -> Vec<String> {
+    std::env::var("ATHO_P2P_PEERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Returns the built-in bootstrap peer list for a network.
+///
+/// Static bootstrap peers remain as a last-resort fallback if DNS seed
+/// resolution is unavailable or an operator wants direct peer overrides.
+pub fn default_bootstrap_peers(network: Network) -> &'static [&'static str] {
+    match network {
+        Network::Mainnet => MAINNET_BOOTSTRAP_PEERS,
+        Network::Testnet => TESTNET_BOOTSTRAP_PEERS,
+        Network::Regnet => REGNET_BOOTSTRAP_PEERS,
+        Network::Prunetest => PRUNETEST_BOOTSTRAP_PEERS,
+    }
+}
+
+/// Returns DNS seed targets formatted as `host:port` for outbound bootstrap.
+pub fn dns_seed_targets(network: Network) -> Vec<String> {
+    network_params(network)
+        .dns_seeds
+        .iter()
+        .map(|host| format!("{host}:{}", network.p2p_port()))
+        .collect()
+}
+
+/// Returns the operator-configured peer list or the network fallback peers.
+///
+/// Explicit peers supplied by `ATHO_P2P_PEERS` always win. Mainnet also
+/// supports a single-peer environment override through `ATHO_MAINNET_PEER`.
+/// When no override exists, Atho tries DNS seeds first and then falls back to
+/// static peer addresses.
+pub fn configured_bootstrap_peers(network: Network) -> Vec<String> {
+    let explicit = configured_peer_addresses_from_env();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+
+    if network == Network::Mainnet {
+        if let Ok(peer) = std::env::var(MAINNET_BOOTSTRAP_PEER_ENV) {
+            let peer = peer.trim();
+            if !peer.is_empty() {
+                return vec![peer.to_owned()];
+            }
+        }
+    }
+
+    let mut peers = dns_seed_targets(network);
+    peers.extend(
+        default_bootstrap_peers(network)
+            .iter()
+            .map(|peer| (*peer).to_owned()),
+    );
+    peers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
 
     #[test]
-    fn network_params_have_unique_magic_and_blank_dns_seeds() {
+    fn network_params_have_unique_magic_and_expected_dns_seeds() {
         let main = network_params(Network::Mainnet);
         let test = network_params(Network::Testnet);
         let reg = network_params(Network::Regnet);
@@ -122,12 +208,77 @@ mod tests {
         assert_ne!(test.magic, reg.magic);
         assert_ne!(test.magic, prune.magic);
         assert_ne!(reg.magic, prune.magic);
-        assert!(main.dns_seeds.is_empty());
-        assert!(test.dns_seeds.is_empty());
+        assert_eq!(main.dns_seeds, MAINNET_DNS_SEEDS);
+        assert_eq!(test.dns_seeds, TESTNET_DNS_SEEDS);
         assert!(reg.dns_seeds.is_empty());
         assert!(prune.dns_seeds.is_empty());
         assert_eq!(main.default_port, Network::Mainnet.p2p_port());
         assert_eq!(main.protocol_version, PROTOCOL_VERSION);
         assert_eq!(network_from_magic(prune.magic), Some(Network::Prunetest));
+    }
+
+    #[test]
+    fn configured_bootstrap_peers_default_to_dns_seed_then_fallback_when_no_env_is_set() {
+        let _lock = env_lock();
+        std::env::remove_var("ATHO_P2P_PEERS");
+        std::env::remove_var(MAINNET_BOOTSTRAP_PEER_ENV);
+
+        let peers = configured_bootstrap_peers(Network::Mainnet);
+        assert_eq!(
+            peers,
+            vec![
+                String::from("mainnet-node1.atho.io:56000"),
+                String::from(MAINNET_BOOTSTRAP_PEERS[0]),
+            ]
+        );
+        assert_eq!(
+            configured_bootstrap_peers(Network::Testnet),
+            vec![
+                String::from("testnet-node1.atho.io:9100"),
+                String::from(TESTNET_BOOTSTRAP_PEERS[0]),
+            ]
+        );
+        assert!(configured_bootstrap_peers(Network::Regnet).is_empty());
+    }
+
+    #[test]
+    fn configured_bootstrap_peers_prefer_explicit_env_peers() {
+        let _lock = env_lock();
+        std::env::set_var("ATHO_P2P_PEERS", "1.1.1.1:56000, 2.2.2.2:56000");
+        std::env::set_var(MAINNET_BOOTSTRAP_PEER_ENV, "9.9.9.9:56000");
+
+        let peers = configured_bootstrap_peers(Network::Mainnet);
+        assert_eq!(
+            peers,
+            vec![String::from("1.1.1.1:56000"), String::from("2.2.2.2:56000")]
+        );
+
+        std::env::remove_var("ATHO_P2P_PEERS");
+        std::env::remove_var(MAINNET_BOOTSTRAP_PEER_ENV);
+    }
+
+    #[test]
+    fn configured_bootstrap_peers_allow_mainnet_override_without_full_peer_list() {
+        let _lock = env_lock();
+        std::env::remove_var("ATHO_P2P_PEERS");
+        std::env::set_var(MAINNET_BOOTSTRAP_PEER_ENV, "9.9.9.9:56000");
+
+        let peers = configured_bootstrap_peers(Network::Mainnet);
+        assert_eq!(peers, vec![String::from("9.9.9.9:56000")]);
+
+        std::env::remove_var(MAINNET_BOOTSTRAP_PEER_ENV);
+    }
+
+    #[test]
+    fn dns_seed_targets_use_network_default_ports() {
+        assert_eq!(
+            dns_seed_targets(Network::Mainnet),
+            vec![String::from("mainnet-node1.atho.io:56000")]
+        );
+        assert_eq!(
+            dns_seed_targets(Network::Testnet),
+            vec![String::from("testnet-node1.atho.io:9100")]
+        );
+        assert!(dns_seed_targets(Network::Regnet).is_empty());
     }
 }

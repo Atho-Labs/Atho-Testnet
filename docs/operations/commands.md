@@ -34,6 +34,9 @@ cargo build --release -p atho-node -p atho-qt
 
 For disposable pruning and recovery work, prefer `--network prunetest`.
 
+Mainnet now tries the configured DNS seed first and keeps the static fallback peer as a last resort.
+Use `--peer HOST:PORT` only when you want to override or add peers manually.
+
 ## Data Root
 
 Default Atho runtime root:
@@ -85,16 +88,16 @@ Run the full workspace:
 cargo test
 ```
 
-Run the adversarial campaign:
-
-```bash
-cargo run --release -p atho-node --bin atho-adversarial -- --cases 52000 --seed 12345
-```
-
 Run the targeted attack sweep:
 
 ```bash
 cargo run -p atho-node --bin atho-attack -- --network regnet
+```
+
+Optional long-running audit harness:
+
+```bash
+cargo run --release -p atho-node --bin atho-adversarial -- --cases 52000 --seed 12345
 ```
 
 Run the end-to-end benchmark harness:
@@ -131,7 +134,7 @@ Examples:
 
 ```bash
 ./target/release/athod --network regnet --data-dir /tmp/atho-regnet
-./target/release/athod --network mainnet --peer 74.208.219.116:56000
+./target/release/athod --network mainnet
 ./target/release/athod --network mainnet --rpc-addr 127.0.0.1:9010
 ```
 
@@ -159,7 +162,7 @@ Important:
 
 - RPC is local-only by default
 - P2P listens publicly by default
-- DNS seeds are still blank, so use `--peer 74.208.219.116:56000` for live mainnet bootstrap
+- DNS seeds are still blank, so mainnet currently falls back to the built-in bootstrap peer
 
 ## Desktop Client
 
@@ -175,10 +178,10 @@ Start a managed local node:
 ./target/release/atho-qt --network mainnet --local-node
 ```
 
-Managed local node with explicit bootstrap peers:
+Managed local node:
 
 ```bash
-./target/release/atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
+./target/release/atho-qt --network mainnet --local-node
 ```
 
 Useful flags:

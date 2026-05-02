@@ -107,24 +107,26 @@ That root contains:
 
 ## Network Bootstrap
 
-DNS seeds are intentionally blank right now.
+Mainnet and testnet now have configured DNS seed hosts.
 
-That means manual peers are still required for live sync.
-The current canonical bootstrap peer is:
+If the operator does not provide explicit peers, Atho tries the configured DNS
+seed first and then falls back to the built-in static peer list if resolution or
+bootstrap fails.
+The shortest mainnet node command is:
 
 ```bash
-athod --network mainnet --peer 74.208.219.116:56000
+athod --network mainnet
 ```
 
 The same applies to the desktop client when it manages a local node:
 
 ```bash
-atho-qt --network mainnet --local-node --peer 74.208.219.116:56000
+atho-qt --network mainnet --local-node
 ```
 
 Why:
 
-- the operator surface should already support the right manual bootstrap path before DNS seeds exist
+- the node runtime should own fallback bootstrap behavior instead of each client or launcher carrying its own duplicate peer injection logic
 
 ## Related Documentation
 

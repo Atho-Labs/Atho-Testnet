@@ -15,7 +15,7 @@ Current posture:
 - the default runtime root is OS-native instead of working-directory driven
 - the live TCP peer runtime exists and is sandbox-tested over real sockets
 - the public VPS node path now has live restart/recovery and one-block propagation coverage
-- DNS seeds are still intentionally blank, so live bootstrap still needs manual peers
+- DNS seeds are still intentionally blank, so mainnet currently falls back to the built-in bootstrap peer unless you provide explicit peers
 
 Production-readiness summary:
 
@@ -69,6 +69,9 @@ Recommended roles:
 ```bash
 cargo run -p atho-node --bin athod -- --network mainnet
 ```
+
+Mainnet currently uses the built-in bootstrap peer when no explicit peers are supplied.
+Use `--peer HOST:PORT` only when you want to override or add peers manually.
 
 ### Desktop Client
 
@@ -172,14 +175,14 @@ Full Windows instructions:
 Recommended command shape:
 
 ```bash
-./athod --network mainnet --data-dir /var/lib/atho --peer 198.51.100.10:56000
+./athod --network mainnet --data-dir /var/lib/atho
 ```
 
 Important defaults:
 
 - RPC stays on loopback
 - P2P listens publicly
-- because DNS seeds are still blank, manual `--peer` values are still required for live bootstrap
+- because DNS seeds are still blank, mainnet currently falls back to the built-in bootstrap peer unless you pass explicit `--peer` values
 
 Full VPS guidance:
 

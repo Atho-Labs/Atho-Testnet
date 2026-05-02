@@ -107,6 +107,20 @@ impl RelayLoop {
         self.sync.accept_headers(self.network, headers)
     }
 
+    pub fn refresh_sync_target(&mut self, blocks: &[Block], peer_best_height: Option<u64>) {
+        let local_best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
+        self.sync.best_height = peer_best_height
+            .unwrap_or(local_best_height)
+            .max(local_best_height);
+        self.sync.headers_synced = self.sync.best_height <= local_best_height;
+        if self.sync.headers_synced {
+            self.sync.best_tip = blocks
+                .last()
+                .map(|block| Hash48::from(block.header.block_hash()));
+            self.sync.inflight_headers_peer = None;
+        }
+    }
+
     pub fn relay_block(&self, block_hash: &[u8; 48], tx_count: usize) -> NetworkMessage {
         crate::audit::append_log(
             "p2p",
@@ -185,10 +199,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relay_loop_keeps_dns_seeds_blank_and_builds_versions() {
+    fn relay_loop_tracks_configured_dns_seeds_and_builds_versions() {
         let relay = RelayLoop::new(Network::Mainnet);
         let version = relay.build_version_message(&[genesis::genesis_block(Network::Mainnet)]);
-        assert_eq!(relay.dns_seed_count(), 0);
+        assert_eq!(
+            relay.dns_seed_count(),
+            crate::config::MAINNET_DNS_SEEDS.len()
+        );
         match version.payload {
             MessagePayload::Version(version) => {
                 assert_eq!(version.network, Network::Mainnet);
@@ -196,5 +213,22 @@ mod tests {
             }
             _ => panic!("expected version message"),
         }
+    }
+
+    #[test]
+    fn refresh_sync_target_drops_stale_remote_height_once_peers_are_gone() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = false;
+        relay.refresh_sync_target(&local_blocks, None);
+
+        assert_eq!(relay.sync.best_height, 0);
+        assert!(relay.sync.headers_synced);
+        assert_eq!(
+            relay.sync.best_tip,
+            Some(Hash48::from(local_blocks[0].header.block_hash()))
+        );
     }
 }

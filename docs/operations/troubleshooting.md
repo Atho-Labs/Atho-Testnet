@@ -61,13 +61,13 @@ Current likely cause:
 Fix:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet --peer 74.208.219.116:56000
+cargo run -p atho-node --bin athod -- --network mainnet
 ```
 
 For the desktop client:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node --peer 74.208.219.116:56000
+cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
 ```
 
 What to check after that:

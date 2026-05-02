@@ -13,7 +13,7 @@ This is the final pre-launch checklist for Atho.
 - [x] Qt client follows the backend tip over the real RPC path
 - [x] node restart and recovery paths are exercised
 - [x] schema mismatch still fails closed
-- [x] adversarial mutation campaign is green
+- [ ] long-running adversarial mutation campaign has completed at the intended release target count
 - [x] standalone miner flow is green
 - [x] headless node flow is green
 
@@ -29,7 +29,7 @@ This is the final pre-launch checklist for Atho.
 - [x] Windows quick-start exists
 - [x] VPS full-node guide exists
 - [x] release staging includes node, miner, client, and operator docs
-- [x] canonical bootstrap peer is published and reachable
+- [x] built-in mainnet bootstrap fallback is configured and reachable
 
 ## Deployment Readiness
 
@@ -42,7 +42,7 @@ This is the final pre-launch checklist for Atho.
 - [x] a mined block propagates from a remote peer to the VPS node
 - [ ] VPS SSH host identity is verified out of band
 - [ ] DNS seeds are added
-- [x] final public bootstrap peer list is chosen
+- [ ] multi-peer public bootstrap plan is finalized
 
 ## Security Gates Before Public Bring-Up
 
@@ -50,7 +50,7 @@ Do not proceed until all of these are true:
 
 1. the VPS SSH host key is verified out of band
 2. the deployment operator confirms the intended public P2P port exposure
-3. the initial bootstrap peer plan is finalized
+3. the initial bootstrap peer plan is finalized beyond the single built-in fallback peer
 4. the public P2P wire path remains stable through longer multi-peer soak coverage
 5. DNS seeds are added only after the node software and deployment path are confirmed stable
 
@@ -58,8 +58,9 @@ Do not proceed until all of these are true:
 
 1. verify and update the VPS SSH host key for `74.208.219.116`
 2. complete longer multi-peer public-network soak coverage
-3. add DNS seeds
-4. bring the network online
+3. finalize a multi-peer bootstrap plan
+4. add DNS seeds
+5. bring the network online
 
 ## Related Documentation
 

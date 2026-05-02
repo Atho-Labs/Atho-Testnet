@@ -16,8 +16,7 @@ use atho_p2p::protocol::{Hash48, InventoryKind, InventoryVector, MessagePayload,
 use atho_storage::db::PeerHealthRecord;
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::str::FromStr;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -148,6 +147,7 @@ impl TcpP2pRuntime {
                         ConnectionRole::Inbound,
                         stream,
                         remote_addr,
+                        remote_addr.to_string(),
                         Arc::clone(&listener_state),
                         Arc::clone(&listener_stop),
                         Some(Arc::clone(&listener_active_inbound)),
@@ -217,10 +217,8 @@ impl TcpP2pRuntime {
     }
 
     pub fn connect_outbound(&self, remote_addr: impl AsRef<str>) -> Result<(), TcpP2pError> {
-        let remote_addr = SocketAddr::from_str(remote_addr.as_ref())
-            .map_err(|_| TcpP2pError::InvalidPeerAddress(remote_addr.as_ref().to_string()))?;
-        spawn_outbound_session(
-            remote_addr,
+        connect_outbound_target(
+            remote_addr.as_ref(),
             Arc::clone(&self.state),
             Arc::clone(&self.stop_requested),
             Arc::clone(&self.peer_threads),
@@ -293,6 +291,7 @@ impl Drop for TcpP2pRuntime {
 }
 
 fn spawn_outbound_session(
+    peer_id: String,
     remote_addr: SocketAddr,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
@@ -303,6 +302,7 @@ fn spawn_outbound_session(
         ConnectionRole::Outbound,
         stream,
         remote_addr,
+        peer_id,
         state,
         stop_requested,
         None,
@@ -350,61 +350,34 @@ fn spawn_outbound_maintainer(
                 continue;
             }
 
-            match SocketAddr::from_str(&remote_addr) {
-                Ok(socket_addr) => match spawn_outbound_session(
-                    socket_addr,
-                    Arc::clone(&state),
-                    Arc::clone(&stop_requested),
-                    Arc::clone(&peer_threads),
-                ) {
-                    Ok(()) => {
-                        health.quality_score = health
-                            .quality_score
-                            .saturating_add(PEER_QUALITY_SUCCESS_RECOVERY)
-                            .min(PEER_QUALITY_MAX_SCORE);
-                        health.consecutive_failures = 0;
-                        health.backoff_until_unix = 0;
-                        health.last_success_unix = Some(now_unix);
-                        persist_peer_health(&state, &health);
-                        if last_failure.take().is_some() {
-                            let _ = dev::append_log(
-                                "p2p",
-                                &format!(
-                                    "outbound connect recovered peer={remote_addr} quality={} backoff_cleared=true",
-                                    health.quality_score
-                                ),
-                            );
-                        }
-                        sleep_with_stop(&stop_requested, Duration::from_millis(250));
+            match connect_outbound_target(
+                &remote_addr,
+                Arc::clone(&state),
+                Arc::clone(&stop_requested),
+                Arc::clone(&peer_threads),
+            ) {
+                Ok(()) => {
+                    health.quality_score = health
+                        .quality_score
+                        .saturating_add(PEER_QUALITY_SUCCESS_RECOVERY)
+                        .min(PEER_QUALITY_MAX_SCORE);
+                    health.consecutive_failures = 0;
+                    health.backoff_until_unix = 0;
+                    health.last_success_unix = Some(now_unix);
+                    persist_peer_health(&state, &health);
+                    if last_failure.take().is_some() {
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "outbound connect recovered peer={remote_addr} quality={} backoff_cleared=true",
+                                health.quality_score
+                            ),
+                        );
                     }
-                    Err(err) => {
-                        let failure = err.to_string();
-                        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-                        let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
-                        health.backoff_until_unix =
-                            now_unix.saturating_add(retry_delay.as_secs().max(1));
-                        health.quality_score = health
-                            .quality_score
-                            .saturating_sub(PEER_QUALITY_FAILURE_PENALTY);
-                        health.last_failure_unix = Some(now_unix);
-                        persist_peer_health(&state, &health);
-                        if last_failure.as_deref() != Some(failure.as_str()) {
-                            let _ = dev::append_log(
-                                "p2p",
-                                &format!(
-                                    "outbound connect retry failed peer={remote_addr} error={failure} retry_in_secs={} failures={} quality={}",
-                                    retry_delay.as_secs().max(1),
-                                    health.consecutive_failures,
-                                    health.quality_score
-                                ),
-                            );
-                            last_failure = Some(failure);
-                        }
-                        sleep_with_stop(&stop_requested, retry_delay);
-                    }
-                },
-                Err(_) => {
-                    let failure = format!("invalid peer address: {remote_addr}");
+                    sleep_with_stop(&stop_requested, Duration::from_millis(250));
+                }
+                Err(err) => {
+                    let failure = err.to_string();
                     health.consecutive_failures = health.consecutive_failures.saturating_add(1);
                     let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
                     health.backoff_until_unix =
@@ -415,7 +388,15 @@ fn spawn_outbound_maintainer(
                     health.last_failure_unix = Some(now_unix);
                     persist_peer_health(&state, &health);
                     if last_failure.as_deref() != Some(failure.as_str()) {
-                        let _ = dev::append_log("p2p", &failure);
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "outbound connect retry failed peer={remote_addr} error={failure} retry_in_secs={} failures={} quality={}",
+                                retry_delay.as_secs().max(1),
+                                health.consecutive_failures,
+                                health.quality_score
+                            ),
+                        );
                         last_failure = Some(failure);
                     }
                     sleep_with_stop(&stop_requested, retry_delay);
@@ -423,6 +404,45 @@ fn spawn_outbound_maintainer(
             }
         }
     })
+}
+
+fn connect_outbound_target(
+    remote_addr: &str,
+    state: Arc<Mutex<NodeService>>,
+    stop_requested: Arc<AtomicBool>,
+    peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) -> Result<(), TcpP2pError> {
+    let peer_id = remote_addr.trim();
+    let candidates = resolve_outbound_target(peer_id)?;
+    let mut last_error = None;
+    for socket_addr in candidates {
+        match spawn_outbound_session(
+            peer_id.to_string(),
+            socket_addr,
+            Arc::clone(&state),
+            Arc::clone(&stop_requested),
+            Arc::clone(&peer_threads),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| TcpP2pError::InvalidPeerAddress(peer_id.to_string())))
+}
+
+fn resolve_outbound_target(remote_addr: &str) -> Result<Vec<SocketAddr>, TcpP2pError> {
+    let remote_addr = remote_addr.trim();
+    if remote_addr.is_empty() {
+        return Err(TcpP2pError::InvalidPeerAddress(String::new()));
+    }
+    let unique = remote_addr
+        .to_socket_addrs()
+        .map_err(|_| TcpP2pError::InvalidPeerAddress(remote_addr.to_string()))?
+        .collect::<BTreeSet<_>>();
+    if unique.is_empty() {
+        return Err(TcpP2pError::InvalidPeerAddress(remote_addr.to_string()));
+    }
+    Ok(unique.into_iter().collect())
 }
 
 fn spawn_peer_discovery(
@@ -507,14 +527,14 @@ enum ConnectionRole {
 fn spawn_peer_thread(
     role: ConnectionRole,
     mut stream: TcpStream,
-    remote_addr: SocketAddr,
+    _remote_addr: SocketAddr,
+    peer_id: String,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
     inbound_slot_counter: Option<Arc<AtomicUsize>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let _inbound_slot = inbound_slot_counter.map(InboundThreadGuard::new);
-        let peer_id = remote_addr.to_string();
         let disconnect_reason = (|| -> String {
             if let Err(err) = configure_stream(&stream) {
                 return format!("stream configure error: {err}");
@@ -1053,6 +1073,20 @@ mod tests {
                 && right_snapshot.tip_hash == left_snapshot.tip_hash
                 && left_snapshot.headers_synced
                 && right_snapshot.headers_synced
+        });
+    }
+
+    #[test]
+    fn tcp_runtime_connect_outbound_accepts_hostname_targets() {
+        let left = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("left");
+        let right = TcpP2pRuntime::new_in_memory(Network::Regnet, "127.0.0.1:0").expect("right");
+
+        right
+            .connect_outbound(format!("localhost:{}", left.bind_addr().port()))
+            .expect("connect outbound via hostname");
+
+        wait_until("hostname peer handshake", Duration::from_secs(10), || {
+            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
         });
     }
 
