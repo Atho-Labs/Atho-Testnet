@@ -487,6 +487,67 @@ impl Chainstate {
         storage.load_block(block_hash)
     }
 
+    pub fn headers_after_locator(
+        &self,
+        locator_hashes: &[[u8; 48]],
+        stop_hash: [u8; 48],
+        max_headers: usize,
+    ) -> Result<Vec<BlockHeader>, StorageError> {
+        if max_headers == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start_height = locator_hashes
+            .iter()
+            .find_map(|hash| {
+                self.height_for_known_block(*hash)
+                    .map(|height| height.saturating_add(1))
+            })
+            .unwrap_or(0);
+
+        let Some(storage) = &self.storage else {
+            let blocks = &self.blocks;
+            if blocks.is_empty() {
+                return Ok(Vec::new());
+            }
+            let start_index = locator_hashes
+                .iter()
+                .find_map(|hash| {
+                    blocks
+                        .iter()
+                        .position(|block| block.header.block_hash() == *hash)
+                        .map(|index| index.saturating_add(1))
+                })
+                .unwrap_or(0);
+
+            let mut headers = Vec::new();
+            for block in blocks.iter().skip(start_index) {
+                if headers.len() >= max_headers {
+                    break;
+                }
+                headers.push(block.header.clone());
+                if stop_hash != [0; 48] && block.header.block_hash() == stop_hash {
+                    break;
+                }
+            }
+            return Ok(headers);
+        };
+
+        let mut headers = Vec::new();
+        let mut next_height = start_height;
+        while headers.len() < max_headers && next_height <= self.height {
+            let Some(record) = storage.load_block_record_by_height(next_height)? else {
+                break;
+            };
+            headers.push(record.header());
+            if stop_hash != [0; 48] && record.block_hash == stop_hash {
+                break;
+            }
+            next_height = next_height.saturating_add(1);
+        }
+        Ok(headers)
+    }
+
     pub fn prune_depth(&self) -> u64 {
         effective_prune_depth(self.network)
     }
@@ -625,6 +686,20 @@ impl Chainstate {
         self.utxos = utxos;
         self.undo_stack = undo_stack;
         self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
+    }
+
+    fn height_for_known_block(&self, block_hash: [u8; 48]) -> Option<u64> {
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.block_hash() == block_hash)
+        {
+            return Some(block.header.height);
+        }
+        self.storage
+            .as_ref()
+            .and_then(|storage| storage.load_block_record(block_hash).ok().flatten())
+            .map(|record| record.height)
     }
 }
 
@@ -1607,6 +1682,68 @@ mod tests {
         let reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
         assert_eq!(reloaded.height, 1);
         assert_eq!(reloaded.tip_hash, tip_hash);
+    }
+
+    #[test]
+    fn reloaded_chainstate_serves_headers_from_persisted_canonical_history() {
+        let root = temp_workspace("headers-reload");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let genesis_hash = genesis::genesis_hash(Network::Prunetest);
+        let genesis = genesis::genesis_state(Network::Prunetest).block;
+        let mut blocks = vec![genesis.clone()];
+        let mut previous_hash = genesis.header.block_hash();
+        let mut previous_timestamp = genesis.header.timestamp;
+        for height in 1..=40u64 {
+            let transactions = vec![Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    locking_script: vec![height as u8],
+                }],
+                lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+                witness: vec![],
+            }];
+            let block = Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Prunetest,
+                    height,
+                    previous_block_hash: previous_hash,
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    timestamp: previous_timestamp.saturating_add(1),
+                    difficulty_target_or_bits:
+                        atho_core::consensus::pow::initial_target_for_network(Network::Prunetest),
+                    nonce: height,
+                },
+                transactions,
+            );
+            previous_hash = block.header.block_hash();
+            previous_timestamp = block.header.timestamp;
+            blocks.push(block);
+        }
+
+        let db = Database::open(Network::Prunetest).expect("database");
+        let snapshot = ChainstateSnapshot {
+            height: 40,
+            tip_hash: previous_hash,
+            tip_header: blocks.last().map(|block| block.header.clone()),
+        };
+        db.replace_chainstate(&snapshot, &[], &blocks)
+            .expect("replace chainstate");
+
+        let reloaded = Chainstate::try_load_or_new(Network::Prunetest).expect("reload");
+        assert_eq!(reloaded.height, 40);
+        assert!(reloaded.blocks().len() < 41);
+
+        let headers = reloaded
+            .headers_after_locator(&[genesis_hash], [0; 48], 64)
+            .expect("headers");
+        assert!(!headers.is_empty());
+        assert_eq!(headers.first().map(|header| header.height), Some(1));
+        assert_eq!(headers.last().map(|header| header.height), Some(40));
     }
 
     #[test]

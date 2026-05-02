@@ -345,11 +345,16 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             }
         });
         ui.add_space(12.0);
+        let mining_block_reason = app.wallet_mining_block_reason();
+        let mining_ready = mining_block_reason.is_none();
         ui.horizontal(|ui| {
-            let ready = app.ui_state.connected && app.wallet.is_some();
             if ui
-                .add_enabled(ready, egui::Button::new("Mine Once"))
-                .on_hover_text("Mine one block with the selected backend and current thread count.")
+                .add_enabled(mining_ready, egui::Button::new("Mine Once"))
+                .on_hover_text(
+                    mining_block_reason
+                        .as_deref()
+                        .unwrap_or("Mine one block with the selected backend and current thread count."),
+                )
                 .clicked()
             {
                 app.ui_state.generate_coins = false;
@@ -360,8 +365,12 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 }
             }
             if ui
-                .add_enabled(ready, egui::Button::new("Mine Loop"))
-                .on_hover_text("Keep mining blocks until you stop the miner or change settings.")
+                .add_enabled(mining_ready, egui::Button::new("Mine Loop"))
+                .on_hover_text(
+                    mining_block_reason
+                        .as_deref()
+                        .unwrap_or("Keep mining blocks until you stop the miner or change settings."),
+                )
                 .clicked()
             {
                 app.ui_state.generate_coins = true;

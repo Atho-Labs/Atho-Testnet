@@ -279,6 +279,12 @@ impl ConnectionManager {
         })
     }
 
+    pub fn direction(&self, remote_addr: &str) -> Option<ConnectionDirection> {
+        self.sessions
+            .get(remote_addr)
+            .map(|session| session.direction)
+    }
+
     pub fn remote_version(&self, remote_addr: &str) -> Option<&VersionMessage> {
         self.sessions
             .get(remote_addr)

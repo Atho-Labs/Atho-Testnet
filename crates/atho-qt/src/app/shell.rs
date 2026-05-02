@@ -326,12 +326,10 @@ fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
     };
     let blocks_left_label = if app.view_model.headers_synced {
         blocks_left.to_string()
+    } else if target > app.view_model.block_count {
+        format!("{blocks_left} (known target; syncing headers)")
     } else {
-        format!(
-            "Unknown. Syncing headers ({}, {:.2}%)",
-            target,
-            progress * 100.0
-        )
+        String::from("Unknown. Discovering network tip")
     };
 
     let mut open = app.show_sync_status_dialog;
@@ -347,7 +345,7 @@ fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
                 let warning = if app.view_model.chain_synced() {
                     "The local Atho chain is caught up with the advertised network target."
                 } else {
-                    "Recent wallet transactions and balances may still change while the local Atho chain is synchronizing. Transactions that depend on not-yet-synced history may be rejected."
+                    "The local Atho chain is still synchronizing to the network tip. Sending transactions and mining stay blocked until sync completes because balances, history, and spendability may still change."
                 };
                 ui.horizontal_top(|ui| {
                     ui.add(resources::warning_icon(22.0));

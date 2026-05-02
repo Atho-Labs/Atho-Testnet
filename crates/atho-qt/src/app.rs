@@ -223,6 +223,12 @@ struct WalletBackupMetadata {
     next_change_index: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletStartupMetadata {
+    wallet_path: String,
+    recorded_at_unix: u64,
+}
+
 impl DesktopApp {
     pub fn new(network: Network) -> Self {
         Self::new_with_rpc(network, None)
@@ -1450,6 +1456,15 @@ impl DesktopApp {
         if self.wallet_session_password.is_none() {
             self.wallet_session_password = Some(String::new());
         }
+        if let Err(err) = self.persist_startup_wallet_metadata() {
+            self.last_error = Some(format!(
+                "Wallet loaded, but startup metadata save failed: {err}"
+            ));
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!("persist startup wallet metadata failed error={err}"),
+            );
+        }
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
         self.sync_wallet_recovery_window_form();
         self.wallet_readiness_gate_active = self.connection.has_local_node();
@@ -1647,8 +1662,10 @@ impl DesktopApp {
             self.mining_status = String::from("Mining already running");
             return;
         }
-        if !self.ui_state.connected {
-            self.mining_status = String::from("Node is not connected yet");
+        if let Some(reason) = self.wallet_mining_block_reason() {
+            self.ui_state.generate_coins = false;
+            self.mining_status = reason.clone();
+            self.last_error = Some(reason);
             return;
         }
 
@@ -1996,6 +2013,23 @@ impl DesktopApp {
         fs::write(metadata_path, metadata_bytes).map_err(|err| err.to_string())
     }
 
+    fn persist_startup_wallet_metadata(&self) -> Result<(), String> {
+        let wallet_path = self
+            .wallet_path
+            .as_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let metadata = WalletStartupMetadata {
+            wallet_path: wallet_path.clone(),
+            recorded_at_unix: current_unix_seconds(),
+        };
+        let metadata_path = startup_wallet_metadata_path(self.connection.network());
+        if let Some(parent) = metadata_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|err| err.to_string())?;
+        fs::write(metadata_path, bytes).map_err(|err| err.to_string())
+    }
+
     fn change_wallet_passphrase(&mut self, password: &str) -> Result<(), String> {
         let wallet_path = self
             .wallet_path
@@ -2014,11 +2048,10 @@ impl DesktopApp {
     }
 
     fn try_open_existing_wallet_on_startup(&mut self) {
-        let path = default_wallet_path(self.connection.network());
-        if !path.exists() {
+        let Some(path) = startup_wallet_path(self.connection.network()) else {
             self.launch_page = LaunchPage::Welcome;
             return;
-        }
+        };
 
         let wallet_path = path.to_string_lossy().into_owned();
         self.open_form.wallet_path = wallet_path.clone();
@@ -2067,7 +2100,9 @@ impl DesktopApp {
         let wallet = self
             .wallet_ref()
             .ok_or_else(|| String::from("Load or create a wallet first"))?;
-        Self::save_wallet_to_path(wallet, &wallet_path, &password)
+        Self::save_wallet_to_path(wallet, &wallet_path, &password)?;
+        self.persist_startup_wallet_metadata()?;
+        Ok(())
     }
 
     fn generate_receive_address(&mut self) {
@@ -2202,6 +2237,28 @@ impl DesktopApp {
         if self.wallet_readiness_gate_active {
             return Some(String::from(
                 "Cannot send until the wallet finishes its initial chain scan",
+            ));
+        }
+        None
+    }
+
+    fn wallet_mining_block_reason(&self) -> Option<String> {
+        if self.wallet.is_none() {
+            return Some(String::from("Load or create a wallet first"));
+        }
+        if !self.ui_state.connected || !self.view_model.running {
+            return Some(String::from(
+                "Cannot mine while the local node is disconnected or still starting",
+            ));
+        }
+        if !self.view_model.chain_synced() {
+            return Some(String::from(
+                "Cannot mine while Atho is still synchronizing to the network tip. Mining stays disabled until sync completes.",
+            ));
+        }
+        if self.wallet_readiness_gate_active {
+            return Some(String::from(
+                "Cannot mine until the wallet finishes its initial chain scan",
             ));
         }
         None
@@ -3650,6 +3707,27 @@ fn default_wallet_path(network: Network) -> PathBuf {
         .join(Wallet::datafile_name())
 }
 
+fn startup_wallet_metadata_path(network: Network) -> PathBuf {
+    atho_node::dev::wallet_dir()
+        .join(network.id())
+        .join("last-wallet.json")
+}
+
+fn startup_wallet_path(network: Network) -> Option<PathBuf> {
+    let metadata_path = startup_wallet_metadata_path(network);
+    if let Ok(bytes) = fs::read(&metadata_path) {
+        if let Ok(metadata) = serde_json::from_slice::<WalletStartupMetadata>(&bytes) {
+            let candidate = PathBuf::from(metadata.wallet_path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let default = default_wallet_path(network);
+    default.exists().then_some(default)
+}
+
 fn alternate_wallet_path(network: Network) -> PathBuf {
     let mut path = default_wallet_path(network);
     let file_name = format!("{}.2", Wallet::datafile_name());
@@ -4083,7 +4161,12 @@ mod tests {
     fn desktop_app_refreshes_view_state() {
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
-        app.refresh().unwrap();
+        wait_until(
+            "desktop app reaches connected state",
+            &mut app,
+            Duration::from_secs(5),
+            |app| app.ui_state.connected,
+        );
         assert!(app.ui_state.connected);
         assert_eq!(app.view_model.network_label, "atho-mainnet");
         assert!(matches!(
@@ -4590,6 +4673,48 @@ mod tests {
     }
 
     #[test]
+    fn startup_auto_open_prefers_the_last_opened_non_default_wallet_path() {
+        let root = temp_sandbox_root("startup-remembered-wallet");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
+
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x37u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let wallet_path = alternate_wallet_path(Network::Regnet);
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save remembered wallet");
+
+        let mut remembered = DesktopApp::new(Network::Regnet);
+        remembered.attach_wallet(wallet, wallet_path.to_string_lossy().into_owned());
+        drop(remembered);
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        assert_eq!(
+            app.open_form.wallet_path,
+            wallet_path.to_string_lossy().into_owned()
+        );
+        wait_until(
+            "remembered wallet auto-open completes",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),
+        );
+        assert_eq!(
+            app.wallet_path.as_deref(),
+            Some(wallet_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     fn startup_auto_open_reports_compact_local_node_timings() {
         let root = temp_sandbox_root("startup-timings");
         let home = root.join("home");
@@ -4728,6 +4853,39 @@ mod tests {
                 .expect("current receive address")
                 .payment_digest,
             last.payment_digest
+        );
+    }
+
+    #[test]
+    fn mining_is_blocked_until_chain_sync_completes() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x47u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(wallet, String::from("wallet.dat"));
+        app.ui_state.connected = true;
+        app.view_model.running = true;
+        app.view_model.headers_synced = false;
+        app.view_model.block_count = 3;
+        app.view_model.sync_best_height = 10;
+        app.ui_state.generate_coins = true;
+
+        let reason = app
+            .wallet_mining_block_reason()
+            .expect("mining block reason");
+        assert!(reason.contains("synchronizing"));
+
+        app.start_mining_job();
+
+        assert!(app.mining_job.is_none());
+        assert!(!app.ui_state.generate_coins);
+        assert!(
+            app.mining_status.contains("synchronizing"),
+            "unexpected mining status: {}",
+            app.mining_status
         );
     }
 

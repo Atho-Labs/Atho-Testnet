@@ -21,7 +21,16 @@ tmp/
 **/tmp/
 *~
 #*#
+wallet.data
+wallet.data.bak
+wallet.data.old
+wallet.data.backup
+wallet.data.*   
 
+blockchain.data
+blockchain.data.bak
+blockchain.data.old
+blockchain.data.backup  
 # Ignore dev directories and their contents
 **/dev/
 

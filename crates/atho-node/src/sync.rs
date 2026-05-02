@@ -7,7 +7,7 @@ use atho_core::block::Block;
 use atho_core::consensus::pow;
 use atho_core::network::Network;
 use atho_p2p::config::network_params;
-use atho_p2p::connection::{ConnectionEvent, ConnectionManager};
+use atho_p2p::connection::{ConnectionDirection, ConnectionEvent, ConnectionManager};
 use atho_p2p::downloader::BlockDownloadScheduler;
 use atho_p2p::protocol::{
     compact_block_from_block, compact_short_id, reconstruct_compact_block, BlockTxnMessage,
@@ -270,7 +270,9 @@ impl NodeSync {
                             .note_inventory(peer, vector.hash.into_inner());
                     }
                 }
-                let requests = self.missing_inventory_requests(node, &inventory);
+                let chain_synced = self.sync_state().headers_synced
+                    && node.height() >= self.sync_state().best_height;
+                let requests = self.missing_inventory_requests(node, &inventory, chain_synced);
                 if !requests.is_empty() {
                     outbound.push(ConnectionEvent::Send {
                         peer: peer.to_string(),
@@ -398,7 +400,12 @@ impl NodeSync {
         peer: &str,
         observed_height: u64,
     ) -> Result<(), NodeSyncError> {
-        node.observe_peer(peer.to_string(), observed_height, now_unix())?;
+        if matches!(
+            self.connections.direction(peer),
+            Some(ConnectionDirection::Outbound)
+        ) {
+            node.observe_peer(peer.to_string(), observed_height, now_unix())?;
+        }
         Ok(())
     }
 
@@ -829,11 +836,14 @@ impl NodeSync {
         &self,
         node: &Node,
         inventory: &[InventoryVector],
+        allow_block_requests: bool,
     ) -> Vec<InventoryVector> {
         inventory
             .iter()
             .filter(|vector| match vector.kind {
-                InventoryKind::Block => !node.contains_block(&vector.hash.into_inner()),
+                InventoryKind::Block => {
+                    allow_block_requests && !node.contains_block(&vector.hash.into_inner())
+                }
                 InventoryKind::Transaction => !node.mempool_contains(&vector.hash.into_inner()),
             })
             .take(network_params(self.network).limits.max_requests_per_peer)
@@ -1295,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnecting_last_ready_peer_resets_sync_target_to_local_height() {
+    fn disconnecting_last_ready_peer_preserves_observed_target_while_local_is_behind() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
         let miner = Miner::new(1);
@@ -1352,8 +1362,8 @@ mod tests {
             notice,
             SyncNotice::Disconnected { peer, .. } if peer == right.id
         ));
-        assert_eq!(left.sync.sync_state().best_height, left.node.height());
-        assert!(left.sync.sync_state().headers_synced);
+        assert_eq!(left.sync.sync_state().best_height, right.node.height());
+        assert!(!left.sync.sync_state().headers_synced);
     }
 
     #[test]
@@ -1378,6 +1388,78 @@ mod tests {
 
         assert_eq!(left.node.height(), right.node.height());
         assert_eq!(left.node.tip_hash(), right.node.tip_hash());
+    }
+
+    #[test]
+    fn block_inventory_does_not_trigger_body_requests_while_chain_sync_is_incomplete() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let miner = Miner::new(1);
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine first");
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine second");
+        right.sync.prime(&right.node);
+
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        collect_events(&mut queue, &mut notices, &left.id, events);
+
+        let left_version = queue.pop_front().expect("left version");
+        let (events, mut new_notices) = right
+            .sync
+            .receive(&left_version.from, left_version.message, &mut right.node)
+            .expect("right receives version");
+        collect_events(&mut queue, &mut notices, &right.id, events);
+        notices.append(&mut new_notices);
+
+        for _ in 0..2 {
+            let queued = queue.pop_front().expect("right handshake reply");
+            let (events, mut new_notices) = left
+                .sync
+                .receive(&queued.from, queued.message, &mut left.node)
+                .expect("left receives handshake reply");
+            collect_events(&mut queue, &mut notices, &left.id, events);
+            notices.append(&mut new_notices);
+        }
+
+        assert!(!left.sync.sync_state().headers_synced);
+        let block = right.node.blocks().last().cloned().expect("tip block");
+        let (events, _) = left
+            .sync
+            .receive(
+                &right.id,
+                right.sync.relay_block_message(&block),
+                &mut left.node,
+            )
+            .expect("left receives inv");
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ConnectionEvent::Send {
+                    message: NetworkMessage {
+                        payload: MessagePayload::GetData { .. },
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "block inventory should not bypass headers-first sync"
+        );
     }
 
     #[test]

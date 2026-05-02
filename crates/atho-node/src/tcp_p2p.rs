@@ -14,9 +14,10 @@ use atho_p2p::config::network_params;
 use atho_p2p::connection::ConnectionEvent;
 use atho_p2p::protocol::{Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage};
 use atho_storage::db::PeerHealthRecord;
+use get_if_addrs::get_if_addrs;
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -180,6 +181,7 @@ impl TcpP2pRuntime {
         };
         let discovery_thread = spawn_peer_discovery(
             runtime.network,
+            runtime.bind_addr,
             Arc::clone(&runtime.state),
             Arc::clone(&runtime.stop_requested),
             Arc::clone(&runtime.peer_threads),
@@ -227,11 +229,19 @@ impl TcpP2pRuntime {
 
     pub fn maintain_outbound(&self, remote_addr: impl Into<String>) {
         let remote_addr = remote_addr.into();
-        if !track_outbound_target(&self.outbound_targets, &remote_addr) {
+        if is_self_outbound_target(self.bind_addr, &remote_addr) {
+            let _ = dev::append_log(
+                "p2p",
+                &format!("ignoring self outbound bootstrap target peer={remote_addr}"),
+            );
             return;
         }
+        let Some(target_key) = track_outbound_target(&self.outbound_targets, &remote_addr) else {
+            return;
+        };
         let thread = spawn_outbound_maintainer(
             remote_addr,
+            target_key,
             Arc::clone(&self.state),
             Arc::clone(&self.stop_requested),
             Arc::clone(&self.peer_threads),
@@ -316,14 +326,14 @@ fn spawn_outbound_session(
 
 fn spawn_outbound_maintainer(
     remote_addr: String,
+    target_key: String,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     outbound_targets: Arc<Mutex<BTreeSet<String>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let _target_guard =
-            OutboundTargetGuard::new(Arc::clone(&outbound_targets), remote_addr.clone());
+        let _target_guard = OutboundTargetGuard::new(Arc::clone(&outbound_targets), target_key);
         let network = {
             let state = state.lock().expect("p2p runtime state poisoned");
             state.network()
@@ -447,6 +457,7 @@ fn resolve_outbound_target(remote_addr: &str) -> Result<Vec<SocketAddr>, TcpP2pE
 
 fn spawn_peer_discovery(
     network: Network,
+    bind_addr: SocketAddr,
     state: Arc<Mutex<NodeService>>,
     stop_requested: Arc<AtomicBool>,
     peer_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -464,11 +475,16 @@ fn spawn_peer_discovery(
                 state.p2p_bootstrap_peers(candidate_limit)
             };
             for remote_addr in candidates {
-                if !track_outbound_target(&outbound_targets, &remote_addr) {
+                if is_self_outbound_target(bind_addr, &remote_addr) {
                     continue;
                 }
+                let Some(target_key) = track_outbound_target(&outbound_targets, &remote_addr)
+                else {
+                    continue;
+                };
                 let thread = spawn_outbound_maintainer(
                     remote_addr,
+                    target_key,
                     Arc::clone(&state),
                     Arc::clone(&stop_requested),
                     Arc::clone(&peer_threads),
@@ -484,26 +500,58 @@ fn spawn_peer_discovery(
     })
 }
 
+pub(crate) fn outbound_target_dedup_key(remote_addr: &str) -> String {
+    match resolve_outbound_target(remote_addr) {
+        Ok(resolved) => format!("resolved:{}", resolved[0]),
+        Err(_) => remote_addr.trim().to_ascii_lowercase(),
+    }
+}
+
+fn is_self_outbound_target(bind_addr: SocketAddr, remote_addr: &str) -> bool {
+    let Ok(candidates) = resolve_outbound_target(remote_addr) else {
+        return false;
+    };
+    let local_ips = local_listener_ips(bind_addr);
+    if local_ips.is_empty() {
+        return false;
+    }
+    candidates.into_iter().any(|candidate| {
+        candidate.port() == bind_addr.port() && local_ips.contains(&candidate.ip())
+    })
+}
+
+fn local_listener_ips(bind_addr: SocketAddr) -> BTreeSet<IpAddr> {
+    if !bind_addr.ip().is_unspecified() {
+        return BTreeSet::from([bind_addr.ip()]);
+    }
+
+    get_if_addrs()
+        .map(|interfaces| interfaces.into_iter().map(|iface| iface.ip()).collect())
+        .unwrap_or_default()
+}
+
 fn track_outbound_target(
     outbound_targets: &Arc<Mutex<BTreeSet<String>>>,
     remote_addr: &str,
-) -> bool {
-    outbound_targets
+) -> Option<String> {
+    let target_key = outbound_target_dedup_key(remote_addr);
+    let inserted = outbound_targets
         .lock()
         .expect("outbound target registry poisoned")
-        .insert(remote_addr.to_string())
+        .insert(target_key.clone());
+    inserted.then_some(target_key)
 }
 
 struct OutboundTargetGuard {
     outbound_targets: Arc<Mutex<BTreeSet<String>>>,
-    remote_addr: String,
+    target_key: String,
 }
 
 impl OutboundTargetGuard {
-    fn new(outbound_targets: Arc<Mutex<BTreeSet<String>>>, remote_addr: String) -> Self {
+    fn new(outbound_targets: Arc<Mutex<BTreeSet<String>>>, target_key: String) -> Self {
         Self {
             outbound_targets,
-            remote_addr,
+            target_key,
         }
     }
 }
@@ -514,7 +562,7 @@ impl Drop for OutboundTargetGuard {
             .outbound_targets
             .lock()
             .expect("outbound target registry poisoned");
-        let _ = targets.remove(&self.remote_addr);
+        let _ = targets.remove(&self.target_key);
     }
 }
 
@@ -1088,6 +1136,31 @@ mod tests {
         wait_until("hostname peer handshake", Duration::from_secs(10), || {
             left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
         });
+    }
+
+    #[test]
+    fn outbound_target_dedup_key_collapses_hostname_and_ip_aliases() {
+        let hostname = outbound_target_dedup_key("localhost:9100");
+        let loopback = outbound_target_dedup_key("127.0.0.1:9100");
+        let other = outbound_target_dedup_key("127.0.0.1:9101");
+
+        assert_eq!(hostname, loopback);
+        assert_ne!(hostname, other);
+    }
+
+    #[test]
+    fn self_outbound_detection_matches_local_loopback_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let bind_addr = listener.local_addr().expect("local addr");
+
+        assert!(is_self_outbound_target(
+            bind_addr,
+            &format!("localhost:{}", bind_addr.port())
+        ));
+        assert!(!is_self_outbound_target(
+            bind_addr,
+            &format!("127.0.0.1:{}", bind_addr.port() + 1)
+        ));
     }
 
     #[test]

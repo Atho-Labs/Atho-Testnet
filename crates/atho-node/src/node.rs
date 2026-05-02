@@ -476,32 +476,9 @@ impl Node {
         stop_hash: [u8; 48],
         max_headers: usize,
     ) -> Vec<BlockHeader> {
-        let blocks = self.chainstate.blocks();
-        if blocks.is_empty() || max_headers == 0 {
-            return Vec::new();
-        }
-
-        let start_index = locator_hashes
-            .iter()
-            .find_map(|hash| {
-                blocks
-                    .iter()
-                    .position(|block| block.header.block_hash() == *hash)
-                    .map(|index| index.saturating_add(1))
-            })
-            .unwrap_or(0);
-
-        let mut headers = Vec::new();
-        for block in blocks.iter().skip(start_index) {
-            if headers.len() >= max_headers {
-                break;
-            }
-            headers.push(block.header.clone());
-            if stop_hash != [0; 48] && block.header.block_hash() == stop_hash {
-                break;
-            }
-        }
-        headers
+        self.chainstate
+            .headers_after_locator(locator_hashes, stop_hash, max_headers)
+            .unwrap_or_default()
     }
 }
 

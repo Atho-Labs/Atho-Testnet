@@ -10,7 +10,7 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
 use crate::system::AthoSystem;
-use crate::tcp_p2p::TcpP2pRuntime;
+use crate::tcp_p2p::{outbound_target_dedup_key, TcpP2pRuntime};
 use atho_core::network::Network;
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, LAUNCH_P2P_BIND_FAILED, LAUNCH_PUBLIC_RPC_DENIED,
@@ -308,7 +308,7 @@ fn initial_outbound_peers(
     configured_bootstrap_peers(network)
         .into_iter()
         .chain(discovered_bootstrap_peers)
-        .filter(|peer| seen.insert(peer.clone()))
+        .filter(|peer| seen.insert(outbound_target_dedup_key(peer)))
         .collect()
 }
 
@@ -378,24 +378,21 @@ mod tests {
     }
 
     #[test]
-    fn initial_outbound_peers_keep_operator_defaults_and_deduplicate_discovered_peers() {
+    fn initial_outbound_peers_deduplicate_targets_that_resolve_to_the_same_socket() {
         std::env::remove_var("ATHO_P2P_PEERS");
         std::env::remove_var("ATHO_MAINNET_PEER");
 
         let peers = initial_outbound_peers(
-            Network::Mainnet,
+            Network::Regnet,
             vec![
-                String::from("74.208.219.116:56000"),
-                String::from("203.0.113.10:56000"),
+                String::from("localhost:9200"),
+                String::from("127.0.0.1:9200"),
+                String::from("127.0.0.1:9201"),
             ],
         );
 
-        assert_eq!(
-            peers.first().map(String::as_str),
-            Some("mainnet-node1.atho.io:56000")
-        );
-        assert_eq!(peers.len(), 3);
-        assert!(peers.iter().any(|peer| peer == "74.208.219.116:56000"));
-        assert!(peers.iter().any(|peer| peer == "203.0.113.10:56000"));
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| peer == "localhost:9200"));
+        assert!(peers.iter().any(|peer| peer == "127.0.0.1:9201"));
     }
 }

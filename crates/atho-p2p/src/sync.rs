@@ -11,6 +11,7 @@ pub struct SyncState {
     pub best_tip: Option<Hash48>,
     pub inflight_headers_peer: Option<String>,
     pub locator_hashes: Vec<Hash48>,
+    pub(crate) requested_locator_hashes: Vec<Hash48>,
 }
 
 impl SyncState {
@@ -20,6 +21,7 @@ impl SyncState {
             .last()
             .map(|block| Hash48::from(block.header.block_hash()));
         self.locator_hashes = block_locator(blocks);
+        self.requested_locator_hashes.clear();
         self.headers_synced = true;
         crate::audit::append_log(
             "p2p",
@@ -38,6 +40,7 @@ impl SyncState {
     ) -> GetHeadersMessage {
         let peer = peer.into();
         self.inflight_headers_peer = Some(peer.clone());
+        self.requested_locator_hashes = self.locator_hashes.clone();
         crate::audit::append_log(
             "p2p",
             &format!(
@@ -59,6 +62,15 @@ impl SyncState {
     ) -> Result<(), ProtocolError> {
         if headers.len() > network_params(network).limits.max_headers_per_message {
             return Err(ProtocolError::TooManyHeaders);
+        }
+        if let Some(first) = headers.first() {
+            if !self.requested_locator_hashes.is_empty()
+                && !self
+                    .requested_locator_hashes
+                    .contains(&Hash48::from(first.previous_block_hash))
+            {
+                return Err(ProtocolError::InvalidHeadersSequence);
+            }
         }
         for window in headers.windows(2) {
             let [left, right] = window else {
@@ -85,6 +97,7 @@ impl SyncState {
                 .insert(0, Hash48::from(last.block_hash()));
             self.locator_hashes.truncate(32);
             self.inflight_headers_peer = None;
+            self.requested_locator_hashes.clear();
             crate::audit::append_log(
                 "p2p",
                 &format!(
@@ -97,6 +110,7 @@ impl SyncState {
         } else {
             self.headers_synced = true;
             self.inflight_headers_peer = None;
+            self.requested_locator_hashes.clear();
         }
         Ok(())
     }
@@ -190,6 +204,7 @@ mod tests {
             headers_synced: false,
             ..SyncState::default()
         };
+        state.requested_locator_hashes = vec![Hash48::from([0; 48])];
         let first = BlockHeader {
             version: 1,
             network_id: Network::Mainnet,
@@ -218,6 +233,28 @@ mod tests {
         assert_eq!(
             state.locator_hashes.first().copied(),
             Some(Hash48::from(third.block_hash()))
+        );
+    }
+
+    #[test]
+    fn headers_must_continue_from_requested_locator() {
+        let mut state = SyncState::default();
+        state.requested_locator_hashes = vec![Hash48::from([1; 48])];
+        let header = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 335,
+            previous_block_hash: [9; 48],
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            timestamp: 1_700_000_335,
+            difficulty_target_or_bits: [3; 48],
+            nonce: 335,
+        };
+
+        assert_eq!(
+            state.accept_headers(Network::Mainnet, &[header]),
+            Err(ProtocolError::InvalidHeadersSequence)
         );
     }
 }

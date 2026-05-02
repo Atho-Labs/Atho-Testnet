@@ -194,22 +194,35 @@ pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
 
 pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    wipe_root_locked(&dev_root())
+    wipe_root_locked(&dev_root(), true)
 }
 
 pub fn wipe_root(root: &Path) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    wipe_root_locked(root)
+    wipe_root_locked(root, false)
 }
 
-fn wipe_root_locked(root: &Path) -> std::io::Result<()> {
+fn wipe_root_locked(root: &Path, recreate_layout: bool) -> std::io::Result<()> {
     remove_tree(&root.join("chain"))?;
+    remove_tree(&root.join("dev"))?;
     remove_tree(&root.join("wallet"))?;
     remove_tree(&root.join("db"))?;
+    for network in [
+        Network::Mainnet,
+        Network::Testnet,
+        Network::Regnet,
+        Network::Prunetest,
+    ] {
+        remove_tree(&root.join(atho_storage::path::data_dir(network)))?;
+    }
     remove_tree(&root.join("audit"))?;
     remove_tree(&root.join("logs"))?;
     remove_tree(&root.join("quarantine"))?;
-    ensure_layout_for(root)
+    fs::create_dir_all(root)?;
+    if recreate_layout {
+        ensure_layout_for(root)?;
+    }
+    Ok(())
 }
 
 fn remove_tree(path: &Path) -> std::io::Result<()> {
@@ -715,12 +728,37 @@ mod tests {
 
         wipe_root(&root).expect("wipe");
 
-        assert!(root.join("logs").exists());
-        assert!(root.join("chain").exists());
-        assert!(root.join("wallet").exists());
-        assert!(root.join("db").exists());
-        assert!(root.join("audit").exists());
-        assert!(root.join("quarantine").exists());
+        assert!(root.exists());
+        assert!(!root.join("logs").exists());
+        assert!(!root.join("chain").exists());
+        assert!(!root.join("wallet").exists());
+        assert!(!root.join("db").exists());
+        assert!(!root.join("audit").exists());
+        assert!(!root.join("quarantine").exists());
         assert!(!root.join("logs").join("athod.log").exists());
+    }
+
+    #[test]
+    fn wipe_root_removes_direct_network_dirs_and_legacy_dev_layout() {
+        let _lock = acquire_global_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "atho-dev-direct-wipe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("testnet").join("blocks")).expect("testnet blocks");
+        fs::write(root.join("testnet").join("data.mdb"), "db").expect("testnet db");
+        fs::create_dir_all(root.join("dev").join("logs")).expect("legacy dev logs");
+        fs::write(root.join("dev").join("logs").join("p2p.log"), "log").expect("legacy log");
+
+        wipe_root(&root).expect("wipe");
+
+        assert!(!root.join("testnet").exists());
+        assert!(!root.join("dev").exists());
+        assert!(!root.join("logs").exists());
+        assert!(!root.join("wallet").exists());
     }
 }

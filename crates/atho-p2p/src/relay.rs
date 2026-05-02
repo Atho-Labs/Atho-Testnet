@@ -131,15 +131,25 @@ impl RelayLoop {
 
     pub fn refresh_sync_target(&mut self, blocks: &[Block], peer_best_height: Option<u64>) {
         let local_best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
-        self.sync.best_height = peer_best_height
-            .unwrap_or(local_best_height)
-            .max(local_best_height);
-        self.sync.headers_synced = self.sync.best_height <= local_best_height;
+        if let Some(peer_best_height) = peer_best_height {
+            self.sync.best_height = self
+                .sync
+                .best_height
+                .max(peer_best_height)
+                .max(local_best_height);
+            self.sync.headers_synced = self.sync.best_height <= local_best_height;
+        } else if local_best_height >= self.sync.best_height {
+            self.sync.best_height = local_best_height;
+            self.sync.headers_synced = true;
+        } else {
+            self.sync.headers_synced = false;
+        }
+        self.sync.inflight_headers_peer = None;
+        self.sync.requested_locator_hashes.clear();
         if self.sync.headers_synced {
             self.sync.best_tip = blocks
                 .last()
                 .map(|block| Hash48::from(block.header.block_hash()));
-            self.sync.inflight_headers_peer = None;
         }
     }
 
@@ -238,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_sync_target_drops_stale_remote_height_once_peers_are_gone() {
+    fn refresh_sync_target_keeps_observed_remote_height_when_local_is_still_behind() {
         let mut relay = RelayLoop::new(Network::Regnet);
         let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
 
@@ -246,7 +256,33 @@ mod tests {
         relay.sync.headers_synced = false;
         relay.refresh_sync_target(&local_blocks, None);
 
-        assert_eq!(relay.sync.best_height, 0);
+        assert_eq!(relay.sync.best_height, 128);
+        assert!(!relay.sync.headers_synced);
+    }
+
+    #[test]
+    fn refresh_sync_target_drops_stale_remote_height_once_local_tip_catches_up() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Regnet,
+                height: 128,
+                previous_block_hash: [7; 48],
+                merkle_root: [1; 48],
+                witness_root: [2; 48],
+                timestamp: 1_700_000_128,
+                difficulty_target_or_bits: [3; 48],
+                nonce: 128,
+            },
+            ..Block::default()
+        }];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = false;
+        relay.refresh_sync_target(&local_blocks, None);
+
+        assert_eq!(relay.sync.best_height, 128);
         assert!(relay.sync.headers_synced);
         assert_eq!(
             relay.sync.best_tip,

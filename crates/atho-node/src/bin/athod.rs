@@ -180,6 +180,10 @@ fn show_status(args: &[String]) -> Result<(), String> {
     println!("rpc_address={rpc_address}");
     println!("running={}", status.running);
     println!("headers_synced={}", status.headers_synced);
+    println!(
+        "chain_synced={}",
+        status.running && status.headers_synced && status.block_count >= status.sync_best_height
+    );
     println!("block_count={}", status.block_count);
     println!("mempool_count={}", status.mempool_count);
     println!("mempool_total_fee_atoms={}", status.mempool_total_fee_atoms);
@@ -321,25 +325,7 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
         .data_dir
         .ok_or_else(|| "wipe requires --data-dir PATH".to_string())?;
     let root = std::path::PathBuf::from(data_dir);
-    let _ = atho_node::dev::append_log(
-        "athod",
-        &format!(
-            "wipe requested network={} root={} all={} mainnet_override={}",
-            network.id(),
-            root.display(),
-            runtime.all,
-            runtime.dangerously_allow_mainnet
-        ),
-    );
     atho_node::dev::wipe_root(&root).map_err(|err| err.to_string())?;
-    let _ = atho_node::dev::append_log(
-        "athod",
-        &format!(
-            "wipe completed network={} root={}",
-            network.id(),
-            root.display()
-        ),
-    );
     println!("wiped {}", root.display());
     Ok(())
 }
