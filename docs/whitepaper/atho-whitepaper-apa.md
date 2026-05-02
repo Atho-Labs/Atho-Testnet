@@ -6,8 +6,8 @@ tagline: The Platinum Standard of the Quantum Age
 version: Draft v1.0
 date: April 30, 2026
 author: Atho Labs / Atho Project Team
-website: https://example.com/atho
-contact: contact@example.com
+website: https://atho.io
+contact: genull@proton.me
 ---
 
 # Atho: A Post-Quantum Proof-of-Work Payment Network for the Quantum Age
@@ -24,9 +24,9 @@ contact: contact@example.com
 
 **Author or Organization:** Atho Labs / Atho Project Team
 
-**Website:** https://example.com/atho
+**Website:** https://atho.io
 
-**Contact:** contact@example.com
+**Contact:** genull@proton.me
 
 \pagebreak
 
@@ -83,7 +83,7 @@ Atho is a post-quantum, proof-of-work, public UTXO payment blockchain designed f
 - Figure 8. Node Sync and Block Propagation Flow
 - Figure 9. Wallet-to-Node Interaction
 - Figure 10. Validation Pipeline and Parallel Work Distribution
-- Figure 11. Storage Commit Model
+- Figure 11. Hybrid Storage Commit Model
 
 # List of Tables
 
@@ -141,7 +141,7 @@ The Atho system is composed of users, wallets, transactions, mempool policy, min
 
 Miners ask the node for candidate block material. The miner selects validated mempool transactions, constructs a coinbase paying the current subsidy plus allowed miner fees, computes merkle and witness roots, and searches for a nonce that satisfies the current target. A solved block is not accepted merely because the local miner produced it. It must pass the same validation path as an externally received block. This prevents the mining implementation from becoming a shortcut around consensus.
 
-Full nodes persist accepted chain truth. Atho currently uses LMDB with named databases for metadata, blocks, transactions, UTXOs, peers, addresses, and peer health. The storage layer writes accepted block archives, transaction archives, chainstate snapshots, and UTXO data in one local transaction. APIs and explorer-like consumers can read from the node and storage products, but they do not become consensus authorities. Figure 1 summarizes the transaction-to-settlement path.
+Full nodes persist accepted chain truth through a hybrid storage model. Canonical raw block bytes are archived in Bitcoin-style flat block data files, while LMDB stores block metadata, block indexes, transaction archives, chainstate snapshots, UTXOs, peers, addresses, and peer health. The storage layer writes new raw blocks to network-specific `blkNNNNN.dat` files and commits the indexed state changes through LMDB so ordinary metadata queries do not need to reopen raw block files. APIs and explorer-like consumers can read from the node and storage products, but they do not become consensus authorities. Figure 1 summarizes the transaction-to-settlement path.
 
 ![Figure 1. Atho System Overview](assets/figure_01_system_overview.png)
 
@@ -332,7 +332,7 @@ Nodes verify monetary policy during block validation. They calculate the expecte
 
 Atho's mempool is a validated, in-memory staging area. It is not consensus truth. It holds candidate transactions that passed local policy and contextual validation against the current UTXO view. The mempool tracks entries by txid and tracks spent inputs in a set so it can reject local conflicts before mining. It orders candidates by fee rate, then absolute fee, then txid. That ordering gives miners a deterministic local selection policy without changing consensus rules.
 
-Admission runs through `validate_transaction_with_context` plus a standard-policy dust check. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, the 50-atom relay dust floor, minimum fee, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
+Admission runs through `validate_transaction_with_context`. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, minimum fee, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
 
 Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 50-atom relay dust floor, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
 
@@ -369,7 +369,7 @@ Chain selection uses accumulated chainwork rather than height alone. Reorg handl
 
 # 16. Network Layer
 
-Atho's network layer is implemented primarily in `crates/atho-p2p`. Network parameters define mainnet, testnet, and regnet with unique consensus IDs, wire magic values, default P2P ports, default RPC ports, visible address prefixes, and blank DNS seed lists. Current ports are 56000 for mainnet P2P and 9010 for mainnet RPC, 9100 and 9110 for testnet, and 9200 and 9210 for regnet. Wire magic values are `a7 54 48 01`, `a7 54 48 02`, and `a7 54 48 03` respectively.
+Atho's network layer is implemented primarily in `crates/atho-p2p`. Network parameters define mainnet, testnet, regnet, and prunetest with unique consensus IDs, wire magic values, default P2P ports, default RPC ports, visible address prefixes, and blank DNS seed lists. Current ports are 56000 for mainnet P2P and 9010 for mainnet RPC, 9100 and 9110 for testnet, 9200 and 9210 for regnet, and 9300 and 9310 for prunetest. Wire magic values are `a7 54 48 01`, `a7 54 48 02`, `a7 54 48 03`, and `a7 54 48 04` respectively.
 
 The peer protocol includes `version`, `verack`, `ping`, `pong`, `getaddr`, `addr`, `inv`, `getdata`, `notfound`, `getheaders`, `headers`, `block`, `tx`, `mempool`, compact block, get-block-transaction, and block-transaction messages. The handshake validates matching network, supported protocol version, matching genesis hash, matching active ruleset version, and the version/verack sequence. Hard limits include an 8 MiB maximum message size, 1,000 addresses per message, 50,000 inventory entries, 2,000 headers, 128 blocks in flight, 256 requests per peer, 32 inbound peers, 8 outbound peers, and a ban threshold of 100.
 
@@ -381,15 +381,15 @@ Headers-first sync begins with a block locator, requests headers, validates link
 
 # 17. Storage Layer
 
-Atho's storage layer owns durable local truth. It uses LMDB through `crates/atho-storage/src/db.rs` with one environment per network and named databases for metadata, blocks, transactions, UTXOs, peers, addresses, and peer health. LMDB is used here because one environment can commit multiple named datasets atomically. Atho relies on that property to prevent a local node from exposing a mixed-height state after a crash or partial write.
+Atho's storage layer owns durable local truth. It uses a hybrid model implemented primarily through `crates/atho-storage/src/block_files.rs` and `crates/atho-storage/src/db.rs`. Full raw block bytes are stored in Bitcoin-style flat block files with the wrapper `[network magic][payload length][canonical raw block]`, and those files rotate at 128 MiB. LMDB remains the indexed state engine and stores one environment per network with named databases for block metadata, height mappings, transaction archives, UTXOs, peers, addresses, and peer health. Atho relies on LMDB's atomic commit behavior to prevent a local node from exposing a mixed-height state after a crash or partial write.
 
-The canonical chainstate snapshot contains height, tip hash, and optional tip header. Block archive records store height, block hash, and the full block. Transaction archive records store height, block hash, transaction index, txid, and transaction. UTXOs are serialized by outpoint. When a new best-chain block is accepted, Atho writes the block archive, transaction archive records, chainstate snapshot, and full UTXO dataset in one LMDB write transaction. Figure 11 shows the commit model.
+The canonical chainstate snapshot contains height, tip hash, and an optional tip header. LMDB block archive records store height, block hash, parent hash, network identity, file number, offset, payload length, raw block size, weight and vsize metadata, timestamp, chainwork, validation flags, pruning state, and other header fields needed for indexed queries. Transaction archive records store height, block hash, transaction index, txid, and transaction. UTXOs are serialized by outpoint. When a new best-chain block is accepted, Atho appends the raw block bytes to the current network's flat block file, records the file pointer, and commits block metadata, transaction archive records, chainstate snapshot, and full UTXO dataset through LMDB. Figure 11 shows the commit model.
 
-Storage also participates in recovery. If persisted state is corrupt, incomplete, cross-network inconsistent, or schema mismatched, the storage layer can quarantine affected local files and rebuild from genesis. This fail-closed approach is safer than silent repair. However, the current project documentation identifies schema migration breadth, repair tooling, pruning lifecycle coverage, and peer-served snapshot sync as incomplete areas. Production readiness depends on hardening those paths because long-lived payment infrastructure must survive more than the common full-history happy path.
+Storage also participates in recovery. If persisted state is corrupt, incomplete, cross-network inconsistent, or schema mismatched, the storage layer can quarantine affected local files and rebuild from genesis. This fail-closed approach is safer than silent repair. The same per-network separation also applies to block archives: wrong-network flat block parsing fails when the wrapper magic or embedded block network identifier does not match the active network. Pruning removes old raw block archive data only after the configured retention depth, while LMDB keeps the indexed metadata and live chainstate needed for ongoing validation and restart. However, the current project documentation identifies schema migration breadth, repair tooling, pruning lifecycle coverage, and peer-served snapshot sync as incomplete areas. Production readiness depends on hardening those paths because long-lived payment infrastructure must survive more than the common full-history happy path.
 
-![Figure 11. Storage Commit Model](assets/figure_11_storage_commit.png)
+![Figure 11. Hybrid Storage Commit Model](assets/figure_11_storage_commit.png)
 
-*Figure 11. Accepted blocks, transaction archives, chainstate snapshots, and UTXO data are committed as one LMDB transaction to avoid mixed-height persistence.*
+*Figure 11. Accepted blocks are archived in Bitcoin-style flat block files while block metadata, transaction indexes, chainstate snapshots, and UTXO state are committed through LMDB to avoid mixed-height persistence.*
 
 # 18. Wallet Architecture
 
@@ -895,15 +895,20 @@ flowchart LR
     Apply --> Commit[Durable commit]
 ```
 
-## Figure 11. Storage Commit Model
+## Figure 11. Hybrid Storage Commit Model
 
 ```mermaid
 flowchart TD
-    Validated[Validated block] --> Apply[Apply UTXO changes in memory]
-    Apply --> Begin[Begin LMDB write transaction]
-    Begin --> Blocks[Write block archive]
-    Blocks --> Txs[Write transaction archive]
+    Validated[Validated block] --> Serialize[Serialize canonical block bytes]
+    Serialize --> Rotate{Current blk file has space?}
+    Rotate -->|Yes| Append[Append [magic][length][raw block] to blkNNNN.dat]
+    Rotate -->|No| NextFile[Rotate to next 128 MiB block file]
+    NextFile --> Append
+    Append --> Pointer[Record file number, offset, and payload length]
+    Pointer --> Begin[Begin LMDB write transaction]
+    Begin --> Meta[Write block metadata and height index]
+    Meta --> Txs[Write transaction archive and tx index]
     Txs --> Snapshot[Write chainstate snapshot]
     Snapshot --> UTXO[Rewrite UTXO dataset]
-    UTXO --> Commit[Commit transaction]
+    UTXO --> Commit[Commit LMDB transaction]
 ```

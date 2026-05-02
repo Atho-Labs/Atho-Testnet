@@ -346,18 +346,23 @@ FIGURES: Dict[str, FigureSpec] = {
     "fig11": FigureSpec(
         "fig11",
         11,
-        "Storage Commit Model",
-        "Accepted blocks, transaction archives, chainstate snapshots, and UTXO data are committed as one LMDB transaction to avoid mixed-height persistence.",
+        "Hybrid Storage Commit Model",
+        "Accepted blocks are archived in Bitcoin-style flat block files while block metadata, transaction indexes, chainstate snapshots, and UTXO state are committed through LMDB to avoid mixed-height persistence.",
         dedent(
             """
             flowchart TD
-                Validated[Validated block] --> Apply[Apply UTXO changes in memory]
-                Apply --> Begin[Begin LMDB write transaction]
-                Begin --> Blocks[Write block archive]
-                Blocks --> Txs[Write transaction archive]
+                Validated[Validated block] --> Serialize[Serialize canonical block bytes]
+                Serialize --> Rotate{Current blk file has space?}
+                Rotate -->|Yes| Append[Append [magic][length][raw block] to blkNNNN.dat]
+                Rotate -->|No| NextFile[Rotate to next 128 MiB block file]
+                NextFile --> Append
+                Append --> Pointer[Record file number, offset, and payload length]
+                Pointer --> Begin[Begin LMDB write transaction]
+                Begin --> Meta[Write block metadata and height index]
+                Meta --> Txs[Write transaction archive and tx index]
                 Txs --> Snapshot[Write chainstate snapshot]
                 Snapshot --> UTXO[Rewrite UTXO dataset]
-                UTXO --> Commit[Commit transaction]
+                UTXO --> Commit[Commit LMDB transaction]
             """
         ),
         "figure_11_storage_commit.png",
@@ -764,13 +769,16 @@ SECTIONS: List[Dict[str, object]] = [
         ),
         p(
             """
-            Full nodes persist accepted chain truth. Atho currently uses LMDB with
-            named databases for metadata, blocks, transactions, UTXOs, peers,
-            addresses, and peer health. The storage layer writes accepted block
-            archives, transaction archives, chainstate snapshots, and UTXO data in
-            one local transaction. APIs and explorer-like consumers can read from the
-            node and storage products, but they do not become consensus authorities.
-            Figure 1 summarizes the transaction-to-settlement path.
+            Full nodes persist accepted chain truth through a hybrid storage model.
+            Canonical raw block bytes are archived in Bitcoin-style flat block data
+            files, while LMDB stores block metadata, block indexes, transaction
+            archives, chainstate snapshots, UTXOs, peers, addresses, and peer
+            health. The storage layer writes new raw blocks to network-specific
+            `blkNNNNN.dat` files and commits the indexed state changes through LMDB
+            so ordinary metadata queries do not need to reopen raw block files.
+            APIs and explorer-like consumers can read from the node and storage
+            products, but they do not become consensus authorities. Figure 1
+            summarizes the transaction-to-settlement path.
             """
         ),
         fig("fig1"),
@@ -1256,12 +1264,13 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             Atho's network layer is implemented primarily in `crates/atho-p2p`.
-            Network parameters define mainnet, testnet, and regnet with unique
-            consensus IDs, wire magic values, default P2P ports, default RPC ports,
-            visible address prefixes, and blank DNS seed lists. Current ports are
-            56000 for mainnet P2P and 9010 for mainnet RPC, 9100 and 9110 for
-            testnet, and 9200 and 9210 for regnet. Wire magic values are `a7 54 48
-            01`, `a7 54 48 02`, and `a7 54 48 03` respectively.
+            Network parameters define mainnet, testnet, regnet, and prunetest with
+            unique consensus IDs, wire magic values, default P2P ports, default
+            RPC ports, visible address prefixes, and blank DNS seed lists. Current
+            ports are 56000 for mainnet P2P and 9010 for mainnet RPC, 9100 and
+            9110 for testnet, 9200 and 9210 for regnet, and 9300 and 9310 for
+            prunetest. Wire magic values are `a7 54 48 01`, `a7 54 48 02`,
+            `a7 54 48 03`, and `a7 54 48 04` respectively.
             """
         ),
         p(
@@ -1295,24 +1304,32 @@ SECTIONS: List[Dict[str, object]] = [
         "17. Storage Layer",
         p(
             """
-            Atho's storage layer owns durable local truth. It uses LMDB through
-            `crates/atho-storage/src/db.rs` with one environment per network and
-            named databases for metadata, blocks, transactions, UTXOs, peers,
-            addresses, and peer health. LMDB is used here because one environment
-            can commit multiple named datasets atomically. Atho relies on that
-            property to prevent a local node from exposing a mixed-height state after
-            a crash or partial write.
+            Atho's storage layer owns durable local truth. It uses a hybrid model
+            implemented primarily through `crates/atho-storage/src/block_files.rs`
+            and `crates/atho-storage/src/db.rs`. Full raw block bytes are stored in
+            Bitcoin-style flat block files with the wrapper
+            `[network magic][payload length][canonical raw block]`, and those files
+            rotate at 128 MiB. LMDB remains the indexed state engine and stores one
+            environment per network with named databases for block metadata, height
+            mappings, transaction archives, UTXOs, peers, addresses, and peer
+            health. Atho relies on LMDB's atomic commit behavior to prevent a local
+            node from exposing a mixed-height state after a crash or partial write.
             """
         ),
         p(
             """
-            The canonical chainstate snapshot contains height, tip hash, and optional
-            tip header. Block archive records store height, block hash, and the full
-            block. Transaction archive records store height, block hash, transaction
-            index, txid, and transaction. UTXOs are serialized by outpoint. When a
-            new best-chain block is accepted, Atho writes the block archive,
-            transaction archive records, chainstate snapshot, and full UTXO dataset
-            in one LMDB write transaction. Figure 11 shows the commit model.
+            The canonical chainstate snapshot contains height, tip hash, and an
+            optional tip header. LMDB block archive records store height, block
+            hash, parent hash, network identity, file number, offset, payload
+            length, raw block size, weight and vsize metadata, timestamp, chainwork,
+            validation flags, pruning state, and other header fields needed for
+            indexed queries. Transaction archive records store height, block hash,
+            transaction index, txid, and transaction. UTXOs are serialized by
+            outpoint. When a new best-chain block is accepted, Atho appends the raw
+            block bytes to the current network's flat block file, records the file
+            pointer, and commits block metadata, transaction archive records,
+            chainstate snapshot, and full UTXO dataset through LMDB. Figure 11 shows
+            the commit model.
             """
         ),
         p(
@@ -1320,12 +1337,18 @@ SECTIONS: List[Dict[str, object]] = [
             Storage also participates in recovery. If persisted state is corrupt,
             incomplete, cross-network inconsistent, or schema mismatched, the storage
             layer can quarantine affected local files and rebuild from genesis. This
-            fail-closed approach is safer than silent repair. However, the current
-            project documentation identifies schema migration breadth, repair
-            tooling, pruning lifecycle coverage, and peer-served snapshot sync as
-            incomplete areas. Production readiness depends on hardening those paths
-            because long-lived payment infrastructure must survive more than the
-            common full-history happy path.
+            fail-closed approach is safer than silent repair. The same per-network
+            separation also applies to block archives: wrong-network flat block
+            parsing fails when the wrapper magic or embedded block network
+            identifier does not match the active network. Pruning removes old raw
+            block archive data only after the configured retention depth, while LMDB
+            keeps the indexed metadata and live chainstate needed for ongoing
+            validation and restart. However, the current project documentation
+            identifies schema migration breadth, repair tooling, pruning lifecycle
+            coverage, and peer-served snapshot sync as incomplete areas. Production
+            readiness depends on hardening those paths because long-lived payment
+            infrastructure must survive more than the common full-history happy
+            path.
             """
         ),
         fig("fig11"),
@@ -2310,8 +2333,8 @@ def write_markdown() -> int:
         "version: Draft v1.0",
         f"date: {DATE}",
         "author: Atho Labs / Atho Project Team",
-        "website: https://example.com/atho",
-        "contact: contact@example.com",
+        "website: https://atho.io",
+        "contact: genull@proton.me",
         "---",
         "",
         f"# {TITLE}",
@@ -2328,9 +2351,9 @@ def write_markdown() -> int:
         "",
         "**Author or Organization:** Atho Labs / Atho Project Team",
         "",
-        "**Website:** https://example.com/atho",
+        "**Website:** https://atho.io",
         "",
-        "**Contact:** contact@example.com",
+        "**Contact:** genull@proton.me",
         "",
         "\\pagebreak",
         "",
@@ -2575,8 +2598,8 @@ def build_pdf():
         "Version: Draft v1.0",
         f"Date: {DATE}",
         "Author or Organization: Atho Labs / Atho Project Team",
-        "Website: https://example.com/atho",
-        "Contact: contact@example.com",
+        "Website: https://atho.io",
+        "Contact: genull@proton.me",
     ]:
         story.append(Paragraph(markup(line), styles["Meta"]))
     story.append(PageBreak())

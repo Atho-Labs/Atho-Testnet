@@ -1,8 +1,0 @@
-flowchart TD
-    Validated[Validated block] --> Apply[Apply UTXO changes in memory]
-    Apply --> Begin[Begin LMDB write transaction]
-    Begin --> Blocks[Write block archive]
-    Blocks --> Txs[Write transaction archive]
-    Txs --> Snapshot[Write chainstate snapshot]
-    Snapshot --> UTXO[Rewrite UTXO dataset]
-    UTXO --> Commit[Commit transaction]

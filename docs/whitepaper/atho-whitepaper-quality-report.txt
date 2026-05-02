@@ -1,8 +1,8 @@
-word_count=11310
+word_count=11535
 figure_count=11
 table_count=11
 pdf_path=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/atho-whitepaper-apa.pdf
-pdf_size_bytes=1019565
+pdf_size_bytes=1020856
 source_markdown=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/atho-whitepaper-apa.md
 diagram_dir=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/diagrams
 asset_dir=/Users/eyeanonymous/Desktop/Atho-Alpha /docs/whitepaper/assets
