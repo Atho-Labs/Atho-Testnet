@@ -12,6 +12,7 @@ pub(crate) const MUTED: egui::Color32 = egui::Color32::from_rgb(112, 116, 112);
 pub(crate) const TEXT: egui::Color32 = egui::Color32::from_rgb(50, 54, 50);
 pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(26, 112, 70);
 pub(crate) const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(226, 242, 232);
+pub(crate) const SYNC_PROGRESS_FILL: egui::Color32 = egui::Color32::from_rgb(36, 166, 83);
 
 pub(crate) fn shell_frame() -> egui::Frame {
     egui::Frame::none()

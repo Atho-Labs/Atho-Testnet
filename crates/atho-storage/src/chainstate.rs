@@ -1,5 +1,8 @@
 //! In-memory chainstate helpers layered on top of persisted storage.
-use crate::db::{ChainstateSnapshot, Database, PeerHealthRecord, PeerRecord};
+use crate::db::{
+    BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, PeerHealthRecord,
+    PeerRecord,
+};
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use crate::validation;
@@ -9,9 +12,8 @@ use atho_core::consensus::pow;
 use atho_core::constants::{GENESIS_COINBASE_ATOMS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
-use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,12 +30,6 @@ struct PersistedChainstate {
     tip_hash: [u8; 48],
     tip_header: Option<BlockHeader>,
     utxos: Vec<UtxoEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct BlockRecord {
-    height: u64,
-    block_hash: [u8; 48],
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +62,8 @@ pub struct Chainstate {
     utxos: UtxoSet,
     undo_stack: Vec<ChainUndo>,
     storage: Option<Database>,
+    last_prune_report: Option<BlockPruneReport>,
+    last_prune_error: Option<String>,
 }
 
 impl Chainstate {
@@ -103,6 +101,8 @@ impl Chainstate {
             utxos,
             undo_stack: Vec::new(),
             storage,
+            last_prune_report: None,
+            last_prune_error: None,
         }
     }
 
@@ -290,6 +290,66 @@ impl Chainstate {
         Ok(self.block_by_hash(block_hash)?.is_some())
     }
 
+    pub fn block_record_by_hash(
+        &self,
+        block_hash: [u8; 48],
+    ) -> Result<Option<BlockArchiveRecord>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(self
+                .blocks
+                .iter()
+                .position(|block| block.header.block_hash() == block_hash)
+                .map(|index| {
+                    let block = &self.blocks[index];
+                    BlockArchiveRecord {
+                        height: block.header.height,
+                        block_hash,
+                        previous_block_hash: block.header.previous_block_hash,
+                        network: block.header.network_id,
+                        version: block.header.version,
+                        merkle_root: block.header.merkle_root,
+                        witness_root: block.header.witness_root,
+                        timestamp: block.header.timestamp,
+                        difficulty_target_or_bits: block.header.difficulty_target_or_bits,
+                        nonce: block.header.nonce,
+                        file_number: 0,
+                        record_offset: 0,
+                        payload_length: 0,
+                        raw_block_size: block.canonical_bytes().len() as u32,
+                        weight_bytes: block.weight_bytes() as u32,
+                        vsize_bytes: block.vsize_bytes() as u32,
+                        tx_count: block.transactions.len() as u32,
+                        fees_total_atoms: block.fees_total_atoms,
+                        fees_miner_atoms: block.fees_miner_atoms,
+                        chainwork: pow::accumulated_chain_work(&self.blocks[..=index])
+                            .to_bytes_be(),
+                        fully_validated: true,
+                        main_chain: true,
+                        pruned: false,
+                        persisted_unix: 0,
+                    }
+                }));
+        };
+        storage.load_block_record(block_hash)
+    }
+
+    pub fn block_record_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<BlockArchiveRecord>, StorageError> {
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.height == height)
+        {
+            return self.block_record_by_hash(block.header.block_hash());
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_block_record_by_height(height)
+    }
+
     pub fn export_snapshot_bundle(&self) -> Result<ChainSnapshotBundle, StorageError> {
         Ok(ChainSnapshotBundle {
             snapshot: ChainstateSnapshot {
@@ -409,6 +469,43 @@ impl Chainstate {
         Ok(reversed)
     }
 
+    pub fn block_by_height(&self, height: u64) -> Result<Option<Block>, StorageError> {
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.height == height)
+            .cloned()
+        {
+            return Ok(Some(block));
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let Some(block_hash) = storage.load_block_hash_by_height(height)? else {
+            return Ok(None);
+        };
+        storage.load_block(block_hash)
+    }
+
+    pub fn prune_depth(&self) -> u64 {
+        effective_prune_depth(self.network)
+    }
+
+    pub fn last_prune_report(&self) -> Option<&BlockPruneReport> {
+        self.last_prune_report.as_ref()
+    }
+
+    pub fn last_prune_error(&self) -> Option<&str> {
+        self.last_prune_error.as_deref()
+    }
+
+    pub fn has_pruned_history(&self) -> Result<bool, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(false);
+        };
+        storage.has_pruned_blocks()
+    }
+
     pub fn disconnect_last_block(&mut self) -> Result<(), StorageError> {
         let undo = self
             .undo_stack
@@ -461,7 +558,20 @@ impl Chainstate {
     }
 
     fn prune_history(&mut self) {
-        self.prune_history_to_retain(PRUNE_DEPTH_BLOCKS as usize + 1);
+        let prune_depth = effective_prune_depth(self.network);
+        let retain = usize::try_from(prune_depth.saturating_add(1)).unwrap_or(usize::MAX);
+        self.prune_history_to_retain(retain);
+        if let Some(storage) = &self.storage {
+            match storage.prune_archived_blocks(self.height, prune_depth) {
+                Ok(report) => {
+                    self.last_prune_error = None;
+                    self.last_prune_report = Some(report);
+                }
+                Err(err) => {
+                    self.last_prune_error = Some(err.to_string());
+                }
+            }
+        }
     }
 
     fn prune_history_to_retain(&mut self, retain: usize) {
@@ -473,7 +583,8 @@ impl Chainstate {
             return;
         }
         self.blocks.drain(1..1 + prune_count);
-        self.undo_stack.drain(0..prune_count);
+        let undo_prune_count = prune_count.min(self.undo_stack.len());
+        self.undo_stack.drain(0..undo_prune_count);
     }
 
     fn save_persisted_chainstate(&self) -> Result<(), StorageError> {
@@ -577,6 +688,8 @@ impl PersistedChainstate {
             utxos,
             undo_stack: Vec::new(),
             storage,
+            last_prune_report: None,
+            last_prune_error: None,
         })
     }
 }
@@ -674,10 +787,6 @@ fn move_if_exists(source: PathBuf, destination: PathBuf) -> Result<(), StorageEr
     Ok(())
 }
 
-fn ensure_chain_dir() -> std::io::Result<()> {
-    fs::create_dir_all(chain_dir())
-}
-
 fn chainstate_snapshot_path(network: Network) -> PathBuf {
     chain_dir().join(format!("chainstate-{}.tsv", network.id()))
 }
@@ -716,10 +825,13 @@ fn load_persisted_chainstate(
         }));
     }
 
-    if let Some(persisted) = load_snapshot_files(network)? {
-        return Ok(Some(persisted));
+    // MIGRATION: legacy TSV snapshots and TSV chain exports are quarantine-only
+    // recovery inputs now. The production runtime only boots from the LMDB
+    // chainstate snapshot plus the flat raw-block archive.
+    if legacy_persisted_state_present(network) {
+        return Err(StorageError::LegacyStorageLayout);
     }
-    replay_legacy_chain_logs(network)
+    Ok(None)
 }
 
 fn load_recent_blocks_from_storage(
@@ -751,403 +863,31 @@ fn load_recent_blocks_from_storage(
     Ok(blocks)
 }
 
-fn load_snapshot_files(network: Network) -> Result<Option<PersistedChainstate>, StorageError> {
-    let state_path = chainstate_snapshot_path(network);
-    let utxo_path = utxo_snapshot_path(network);
-    let state_exists = state_path.exists();
-    let utxo_exists = utxo_path.exists();
-    if !state_exists && !utxo_exists {
-        return Ok(None);
-    }
-    if state_exists != utxo_exists {
-        return Err(StorageError::CorruptData);
-    }
-    let state_file = File::open(state_path)?;
-    let utxo_file = File::open(utxo_path)?;
-
-    let mut state_reader = BufReader::new(state_file);
-    let mut header_line = String::new();
-    if state_reader.read_line(&mut header_line)? == 0 {
-        return Err(StorageError::CorruptData);
-    }
-    if header_line.trim().is_empty() || !header_line.starts_with("height\t") {
-        return Err(StorageError::CorruptData);
-    }
-    let mut state_line = String::new();
-    if state_reader.read_line(&mut state_line)? == 0 {
-        return Err(StorageError::CorruptData);
-    }
-    let state_line = state_line.trim();
-    let mut fields = state_line.split('\t');
-    let height = fields
-        .next()
-        .ok_or(StorageError::CorruptData)?
-        .parse()
-        .map_err(|_| StorageError::CorruptData)?;
-    let tip_hash = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
-        .map_err(|_| StorageError::CorruptData)?
-        .try_into()
-        .map_err(|_| StorageError::CorruptData)?;
-
-    let mut utxos = Vec::new();
-    let reader = BufReader::new(utxo_file);
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("txid\t") || line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let txid: [u8; 48] = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
-            .map_err(|_| StorageError::CorruptData)?
-            .try_into()
-            .map_err(|_| StorageError::CorruptData)?;
-        let output_index = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let value_atoms = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let locking_script = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
-            .map_err(|_| StorageError::CorruptData)?;
-        let created_height = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let is_coinbase = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse::<u8>()
-            .map_err(|_| StorageError::CorruptData)?
-            != 0;
-        utxos.push(UtxoEntry::new(
-            network,
-            txid,
-            output_index,
-            value_atoms,
-            locking_script,
-            created_height,
-            is_coinbase,
-        ));
-    }
-
-    Ok(Some(PersistedChainstate {
-        height,
-        tip_hash,
-        tip_header: None,
-        utxos,
-    }))
-}
-
-fn replay_legacy_chain_logs(network: Network) -> Result<Option<PersistedChainstate>, StorageError> {
-    ensure_chain_dir()?;
-    let block_rows = load_block_rows()?;
-    if block_rows.is_empty() {
-        return Ok(None);
-    }
-
-    let tx_rows = load_tx_rows()?;
-    let mut input_rows = load_input_rows()?;
-    let mut output_rows = load_output_rows()?;
-    let mut utxo_set = UtxoSet::new(network);
-    let tip = block_rows.values().next_back().cloned();
-    for (height, canonical) in block_rows.into_iter() {
-        let tx_keys: Vec<_> = tx_rows
-            .keys()
-            .filter(|key| key.0 == height && key.1 == canonical.block_hash)
-            .copied()
-            .collect();
-        for key in tx_keys {
-            let tx = tx_rows.get(&key).expect("tx row exists");
-            let inputs = input_rows.remove(&key).unwrap_or_default();
-            let outputs = output_rows.remove(&key).unwrap_or_default();
-            for input in inputs {
-                let _ = utxo_set.remove(input.previous_txid, input.output_index);
-            }
-            for (output_index, output) in outputs.into_iter().enumerate() {
-                let entry = if tx.input_count == 0 && key.2 == 0 {
-                    UtxoEntry::coinbase(
-                        network,
-                        tx.txid,
-                        output_index as u32,
-                        output.value_atoms,
-                        output.locking_script,
-                        height,
-                    )
-                } else {
-                    UtxoEntry::new(
-                        network,
-                        tx.txid,
-                        output_index as u32,
-                        output.value_atoms,
-                        output.locking_script,
-                        height,
-                        false,
-                    )
-                };
-                let _ = utxo_set.insert(entry);
+fn effective_prune_depth(network: Network) -> u64 {
+    if network == Network::Prunetest {
+        if let Ok(raw) = std::env::var("ATHO_PRUNETEST_PRUNE_DEPTH") {
+            if let Ok(value) = raw.parse::<u64>() {
+                return value.max(1);
             }
         }
     }
-
-    let persisted = PersistedChainstate {
-        height: tip.as_ref().map(|record| record.height).unwrap_or(0),
-        tip_hash: tip
-            .as_ref()
-            .map(|record| record.block_hash)
-            .unwrap_or([0; 48]),
-        tip_header: None,
-        utxos: utxo_set.entries().cloned().collect(),
-    };
-    let _ = write_chainstate_snapshot(network, persisted.height, persisted.tip_hash);
-    let _ = write_utxo_snapshot(network, persisted.utxos.iter());
-    Ok(Some(persisted))
+    PRUNE_DEPTH_BLOCKS
 }
 
-fn load_block_rows() -> Result<BTreeMap<u64, BlockRecord>, StorageError> {
-    let path = blocks_ledger_path();
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut rows = BTreeMap::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("height\t") || line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let height = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let block_hash = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        rows.insert(height, BlockRecord { height, block_hash });
-    }
-    Ok(rows)
-}
-
-fn load_tx_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), TxRow>, StorageError> {
-    let path = transactions_ledger_path();
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut rows = BTreeMap::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("height\t") || line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let height = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let block_hash = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        let tx_index = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let txid = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        let _wtxid = fields.next();
-        let _version = fields.next();
-        let _lock_time = fields.next();
-        let input_count = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let _output_count = fields.next();
-        let _size_bytes = fields.next();
-        let _weight_bytes = fields.next();
-        let _vsize_bytes = fields.next();
-        let _witness_bytes = fields.next();
-        let _output_value_atoms = fields.next();
-        let _canonical_bytes_hex = fields.next();
-        rows.insert((height, block_hash, tx_index), TxRow { txid, input_count });
-    }
-    Ok(rows)
-}
-
-fn load_input_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), Vec<InputRow>>, StorageError> {
-    let path = transaction_inputs_ledger_path();
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut rows: BTreeMap<(u64, [u8; 48], u32), Vec<InputRow>> = BTreeMap::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("height\t") || line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let height = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let block_hash = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        let tx_index = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let _input_index = fields.next();
-        let previous_txid = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        let output_index = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let _unlocking_script_hex = fields.next();
-        rows.entry((height, block_hash, tx_index))
-            .or_default()
-            .push(InputRow {
-                previous_txid,
-                output_index,
-            });
-    }
-    Ok(rows)
-}
-
-fn load_output_rows() -> Result<BTreeMap<(u64, [u8; 48], u32), Vec<OutputRow>>, StorageError> {
-    let path = transaction_outputs_ledger_path();
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut rows: BTreeMap<(u64, [u8; 48], u32), Vec<OutputRow>> = BTreeMap::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("height\t") || line.trim().is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let height = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let block_hash = fields
-            .next()
-            .and_then(parse_hex::<48>)
-            .ok_or(StorageError::CorruptData)?;
-        let tx_index = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let _output_index = fields.next();
-        let value_atoms = fields
-            .next()
-            .ok_or(StorageError::CorruptData)?
-            .parse()
-            .map_err(|_| StorageError::CorruptData)?;
-        let locking_script = hex::decode(fields.next().ok_or(StorageError::CorruptData)?)
-            .map_err(|_| StorageError::CorruptData)?;
-        rows.entry((height, block_hash, tx_index))
-            .or_default()
-            .push(OutputRow {
-                value_atoms,
-                locking_script,
-            });
-    }
-    Ok(rows)
-}
-
-fn write_chainstate_snapshot(
-    network: Network,
-    height: u64,
-    tip_hash: [u8; 48],
-) -> std::io::Result<()> {
-    ensure_chain_dir()?;
-    let path = chainstate_snapshot_path(network);
-    let mut file = File::create(path)?;
-    writeln!(file, "height\ttip_hash")?;
-    writeln!(file, "{}\t{}", height, hex::encode(tip_hash))?;
-    Ok(())
-}
-
-fn write_utxo_snapshot<'a, I>(network: Network, utxos: I) -> std::io::Result<()>
-where
-    I: IntoIterator<Item = &'a UtxoEntry>,
-{
-    ensure_chain_dir()?;
-    let path = utxo_snapshot_path(network);
-    let mut file = File::create(path)?;
-    writeln!(
-        file,
-        "txid\toutput_index\tvalue_atoms\tlocking_script_hex\tcreated_height\tis_coinbase"
-    )?;
-    for utxo in utxos {
-        writeln!(
-            file,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            hex::encode(utxo.txid),
-            utxo.output_index,
-            utxo.value_atoms,
-            hex::encode(&utxo.locking_script),
-            utxo.created_height,
-            u8::from(utxo.is_coinbase)
-        )?;
-    }
-    Ok(())
-}
-
-fn parse_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
-    let bytes = hex::decode(value).ok()?;
-    bytes.as_slice().try_into().ok()
-}
-
-#[derive(Debug, Clone)]
-struct TxRow {
-    txid: [u8; 48],
-    input_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct InputRow {
-    previous_txid: [u8; 48],
-    output_index: u32,
-}
-
-#[derive(Debug, Clone)]
-struct OutputRow {
-    value_atoms: u64,
-    locking_script: Vec<u8>,
+fn legacy_persisted_state_present(network: Network) -> bool {
+    let snapshot_present =
+        chainstate_snapshot_path(network).exists() || utxo_snapshot_path(network).exists();
+    let audit_chain_present = blocks_ledger_path().exists()
+        || transactions_ledger_path().exists()
+        || transaction_inputs_ledger_path().exists()
+        || transaction_outputs_ledger_path().exists();
+    snapshot_present || audit_chain_present
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_files::BlockFileStore;
     use crate::db::{ChainstateSnapshot, CommitFaultPoint, Database};
     use crate::error::StorageError;
     use crate::test_support::acquire_global_test_lock;
@@ -1158,6 +898,8 @@ mod tests {
     use atho_core::genesis;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxOutput};
+    use lmdb::{Environment, Transaction as LmdbTransaction, WriteFlags};
+    use std::ffi::OsString;
     use std::fs;
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1196,6 +938,44 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct RotationOverrideGuard;
+
+    impl RotationOverrideGuard {
+        fn set(bytes: u64) -> Self {
+            BlockFileStore::set_rotation_override_for_test(Some(bytes));
+            Self
+        }
+    }
+
+    impl Drop for RotationOverrideGuard {
+        fn drop(&mut self) {
+            BlockFileStore::set_rotation_override_for_test(None);
+        }
+    }
+
     fn solve_block(mut block: Block) -> Block {
         let prefix = block.header.canonical_bytes_without_nonce();
         let target = block.header.difficulty_target_or_bits;
@@ -1210,6 +990,77 @@ mod tests {
             }
         }
         unreachable!("u64 nonce space exhausted");
+    }
+
+    fn build_coinbase_successor(state: &Chainstate) -> Block {
+        let height = state.height.saturating_add(1);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(height),
+                locking_script: vec![height as u8],
+            }],
+            lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+            witness: vec![],
+        };
+        let transactions = vec![coinbase];
+        let previous_timestamp = state
+            .tip
+            .as_ref()
+            .map(|header| header.timestamp)
+            .unwrap_or_else(|| genesis::genesis_state(state.network).block.header.timestamp);
+        solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: state.network,
+                height,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: previous_timestamp.saturating_add(1),
+                difficulty_target_or_bits: state.next_difficulty_target(),
+                nonce: 0,
+            },
+            transactions,
+        ))
+    }
+
+    fn fixture_utxo_key(txid: [u8; 48], output_index: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(52);
+        key.extend_from_slice(&txid);
+        key.extend_from_slice(&output_index.to_be_bytes());
+        key
+    }
+
+    fn inject_snapshot_fixture(
+        network: Network,
+        snapshot: &ChainstateSnapshot,
+        utxos: &[UtxoEntry],
+    ) {
+        let database = Database::open(network).expect("database");
+        let db_path = crate::path::database_dir(network);
+        drop(database);
+
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(128)
+            .set_max_dbs(10)
+            .set_map_size(1 << 30);
+        let env = builder.open(&db_path).expect("open env");
+        let meta = env.open_db(Some("meta")).expect("meta db");
+        let utxo_db = env.open_db(Some("utxos")).expect("utxos db");
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let snapshot_bytes = bincode::serialize(snapshot).expect("serialize snapshot");
+        txn.put(meta, b"chainstate", &snapshot_bytes, WriteFlags::empty())
+            .expect("put snapshot");
+        for utxo in utxos {
+            let key = fixture_utxo_key(utxo.txid, utxo.output_index);
+            let value = bincode::serialize(utxo).expect("serialize utxo");
+            txn.put(utxo_db, &key.as_slice(), &value, WriteFlags::empty())
+                .expect("put utxo");
+        }
+        txn.commit().expect("commit fixture");
     }
 
     #[test]
@@ -1463,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_snapshot_files_fail_closed() {
+    fn legacy_snapshot_files_are_rejected_as_legacy_layout() {
         let root = temp_workspace("files");
         fs::create_dir_all(root.join("dev/chain")).expect("chain dir");
         let _guard = CurrentDirGuard::switch_to(&root);
@@ -1480,7 +1331,7 @@ mod tests {
         .expect("utxos");
 
         let err = Chainstate::try_load_or_new(Network::Mainnet).unwrap_err();
-        assert!(matches!(err, StorageError::CorruptData));
+        assert!(matches!(err, StorageError::LegacyStorageLayout));
     }
 
     #[test]
@@ -1488,16 +1339,15 @@ mod tests {
         let root = temp_workspace("recover");
         fs::create_dir_all(&root).expect("root");
         let _guard = CurrentDirGuard::switch_to(&root);
-        let db = Database::open(Network::Mainnet).expect("database");
-        db.save_chainstate_snapshot(
+        inject_snapshot_fixture(
+            Network::Mainnet,
             &ChainstateSnapshot {
                 height: 1,
                 tip_hash: [9; 48],
                 tip_header: None,
             },
             &[],
-        )
-        .expect("snapshot");
+        );
 
         let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
         assert_eq!(recovered.height, 0);
@@ -1588,7 +1438,6 @@ mod tests {
         let _guard = CurrentDirGuard::switch_to(&root);
 
         {
-            let db = Database::open(Network::Mainnet).expect("database");
             let snapshot = ChainstateSnapshot {
                 height: 7,
                 tip_hash: [3; 48],
@@ -1598,8 +1447,7 @@ mod tests {
                 UtxoEntry::new(Network::Mainnet, [11; 48], 0, 100, vec![1], 1, false),
                 UtxoEntry::new(Network::Testnet, [12; 48], 1, 200, vec![2], 2, false),
             ];
-            db.save_chainstate_snapshot(&snapshot, &utxos)
-                .expect("snapshot");
+            inject_snapshot_fixture(Network::Mainnet, &snapshot, &utxos);
         }
 
         let err = Chainstate::try_load_or_new(Network::Mainnet).unwrap_err();
@@ -1759,6 +1607,147 @@ mod tests {
         let reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
         assert_eq!(reloaded.height, 1);
         assert_eq!(reloaded.tip_hash, tip_hash);
+    }
+
+    #[test]
+    fn prunetest_archive_prunes_raw_files_and_recovers_blocks_from_metadata() {
+        let root = temp_workspace("prunetest-prune-archive");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let _prune_guard = EnvVarGuard::set("ATHO_PRUNETEST_PRUNE_DEPTH", "2");
+        let rotation_bytes = build_coinbase_successor(&Chainstate::new(Network::Prunetest))
+            .canonical_bytes()
+            .len() as u64
+            + atho_core::constants::BLOCK_FILE_RECORD_OVERHEAD_BYTES;
+        let _rotation_guard = RotationOverrideGuard::set(rotation_bytes);
+
+        let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("state");
+        for _ in 0..4 {
+            let block = build_coinbase_successor(&state);
+            state.connect_block(&block).expect("connect block");
+        }
+
+        assert_eq!(state.height, 4);
+        assert_eq!(state.prune_depth(), 2);
+        assert!(state.last_prune_error().is_none());
+        assert!(state.has_pruned_history().expect("has pruned history"));
+
+        let prune_report = state
+            .last_prune_report()
+            .cloned()
+            .expect("last prune report");
+        assert_eq!(prune_report.tip_height, 4);
+        assert_eq!(prune_report.prune_depth, 2);
+        assert_eq!(prune_report.eligible_height, Some(2));
+        assert_eq!(prune_report.pruned_blocks, 1);
+
+        let genesis_record = state
+            .block_record_by_height(0)
+            .expect("genesis record")
+            .expect("genesis present");
+        let height_one_record = state
+            .block_record_by_height(1)
+            .expect("height one record")
+            .expect("height one present");
+        let height_two_record = state
+            .block_record_by_height(2)
+            .expect("height two record")
+            .expect("height two present");
+        let tip_record = state
+            .block_record_by_height(4)
+            .expect("tip record")
+            .expect("tip present");
+        assert!(genesis_record.pruned);
+        assert!(height_one_record.pruned);
+        assert!(height_two_record.pruned);
+        assert!(!tip_record.pruned);
+
+        let block_root = crate::path::block_storage_dir(Network::Prunetest);
+        assert!(!block_root
+            .join(format!("blk{:05}.dat", genesis_record.file_number))
+            .exists());
+        assert!(!block_root
+            .join(format!("blk{:05}.dat", height_one_record.file_number))
+            .exists());
+        assert!(!block_root
+            .join(format!("blk{:05}.dat", height_two_record.file_number))
+            .exists());
+        assert!(block_root
+            .join(format!("blk{:05}.dat", tip_record.file_number))
+            .exists());
+
+        let reconstructed = state
+            .block_by_height(1)
+            .expect("load pruned block")
+            .expect("block present");
+        assert_eq!(reconstructed.header.height, 1);
+
+        drop(state);
+        let mut reloaded = Chainstate::try_load_or_new(Network::Prunetest).expect("reload");
+        assert_eq!(reloaded.height, 4);
+        assert!(reloaded
+            .has_pruned_history()
+            .expect("reloaded prune marker"));
+        let reloaded_block = reloaded
+            .block_by_height(1)
+            .expect("reload pruned block")
+            .expect("reloaded block present");
+        assert_eq!(reloaded_block.header.height, 1);
+
+        let next = build_coinbase_successor(&reloaded);
+        reloaded
+            .connect_block(&next)
+            .expect("connect post-prune block");
+        assert_eq!(reloaded.height, 5);
+    }
+
+    #[test]
+    fn prunetest_pruning_threshold_is_exactly_inclusive() {
+        let root = temp_workspace("prunetest-prune-threshold");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let _prune_guard = EnvVarGuard::set("ATHO_PRUNETEST_PRUNE_DEPTH", "2");
+        let rotation_bytes = build_coinbase_successor(&Chainstate::new(Network::Prunetest))
+            .canonical_bytes()
+            .len() as u64
+            + atho_core::constants::BLOCK_FILE_RECORD_OVERHEAD_BYTES;
+        let _rotation_guard = RotationOverrideGuard::set(rotation_bytes);
+
+        let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("state");
+        let block_one = build_coinbase_successor(&state);
+        state.connect_block(&block_one).expect("connect height one");
+        let genesis_after_one = state
+            .block_record_by_height(0)
+            .expect("genesis after one")
+            .expect("genesis present");
+        assert!(!genesis_after_one.pruned);
+        assert_eq!(
+            state
+                .last_prune_report()
+                .and_then(|report| report.eligible_height),
+            None
+        );
+
+        let block_two = build_coinbase_successor(&state);
+        state.connect_block(&block_two).expect("connect height two");
+        let prune_report = state
+            .last_prune_report()
+            .cloned()
+            .expect("prune report at threshold");
+        assert_eq!(prune_report.tip_height, 2);
+        assert_eq!(prune_report.eligible_height, Some(0));
+        assert_eq!(prune_report.pruned_blocks, 1);
+
+        let genesis_after_two = state
+            .block_record_by_height(0)
+            .expect("genesis after two")
+            .expect("genesis present");
+        let height_one_after_two = state
+            .block_record_by_height(1)
+            .expect("height one after two")
+            .expect("height one present");
+        assert!(genesis_after_two.pruned);
+        assert!(!height_one_after_two.pruned);
     }
 
     #[test]

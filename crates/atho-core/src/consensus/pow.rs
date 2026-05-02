@@ -130,6 +130,15 @@ fn block_proof(target: &[u8; 48]) -> BigUint {
     (numerator / (&target + BigUint::from(1u8))) + BigUint::from(1u8)
 }
 
+/// Returns the canonical proof-of-work contribution for one difficulty target.
+///
+/// CONSENSUS: Branch selection accumulates this exact quantity when comparing
+/// competing histories. Any caller must use the same target bytes validators
+/// checked for the block header itself.
+pub fn block_proof_work(target: &[u8; 48]) -> BigUint {
+    block_proof(target)
+}
+
 fn median_u64(values: &[u64]) -> u64 {
     debug_assert!(!values.is_empty());
     let mut sorted = values.to_vec();

@@ -390,6 +390,107 @@ impl Transaction {
         }
         TxWitness::from_bytes(&self.witness)
     }
+
+    /// Parses the canonical full-transaction byte layout emitted by
+    /// [`Transaction::full_bytes`].
+    ///
+    /// CONSENSUS: Disk and recovery code must decode exactly the same bytes
+    /// that hashing and relay code produce. Diverging decoders would create
+    /// storage-only transaction shapes that the rest of the node cannot verify.
+    pub fn from_full_bytes(bytes: &[u8]) -> Option<Self> {
+        fn read_u16(bytes: &[u8], offset: &mut usize) -> Option<u16> {
+            let end = offset.checked_add(2)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 2];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u16::from_le_bytes(buf))
+        }
+
+        fn read_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+            let end = offset.checked_add(4)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u32::from_le_bytes(buf))
+        }
+
+        fn read_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+            let end = offset.checked_add(8)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u64::from_le_bytes(buf))
+        }
+
+        fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Option<[u8; N]> {
+            let end = offset.checked_add(N)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut out = [0u8; N];
+            out.copy_from_slice(slice);
+            *offset = end;
+            Some(out)
+        }
+
+        fn read_vec(bytes: &[u8], offset: &mut usize, len: usize) -> Option<Vec<u8>> {
+            let end = offset.checked_add(len)?;
+            let slice = bytes.get(*offset..end)?;
+            *offset = end;
+            Some(slice.to_vec())
+        }
+
+        let mut offset = 0usize;
+        let version = read_u16(bytes, &mut offset)?;
+        if bytes.get(offset..offset.checked_add(2)?)? != [0x00, 0x01] {
+            return None;
+        }
+        offset += 2;
+
+        let input_count = read_u32(bytes, &mut offset)? as usize;
+        let mut inputs = Vec::with_capacity(input_count);
+        for _ in 0..input_count {
+            let previous_txid = read_array::<48>(bytes, &mut offset)?;
+            let output_index = read_u32(bytes, &mut offset)?;
+            let unlocking_len = read_u32(bytes, &mut offset)? as usize;
+            let unlocking_script = read_vec(bytes, &mut offset, unlocking_len)?;
+            inputs.push(TxInput {
+                previous_txid,
+                output_index,
+                unlocking_script,
+            });
+        }
+
+        let output_count = read_u32(bytes, &mut offset)? as usize;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            let value_atoms = read_u64(bytes, &mut offset)?;
+            let locking_len = read_u32(bytes, &mut offset)? as usize;
+            let locking_script = read_vec(bytes, &mut offset, locking_len)?;
+            outputs.push(TxOutput {
+                value_atoms,
+                locking_script,
+            });
+        }
+
+        let witness_len = read_u32(bytes, &mut offset)? as usize;
+        let witness = read_vec(bytes, &mut offset, witness_len)?;
+        if !witness.is_empty() && TxWitness::from_bytes(&witness).is_none() {
+            return None;
+        }
+        let lock_time = read_u32(bytes, &mut offset)?;
+        if offset != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+            witness,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +639,40 @@ mod tests {
         encoded.extend_from_slice(&vec![4u8; FALCON_512_PUBLIC_KEY_BYTES]);
         encoded.extend_from_slice(&((MAX_WITNESS_INPUT_REFS + 1) as u32).to_le_bytes());
         assert!(TxWitness::from_bytes(&encoded).is_none());
+    }
+
+    #[test]
+    fn full_bytes_round_trip() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [9; 48],
+                output_index: 3,
+                unlocking_script: vec![1, 2, 3, 4],
+            }],
+            outputs: vec![
+                TxOutput {
+                    value_atoms: 500,
+                    locking_script: vec![5, 6],
+                },
+                TxOutput {
+                    value_atoms: 700,
+                    locking_script: vec![7, 8, 9],
+                },
+            ],
+            lock_time: 44,
+            witness: TxWitness {
+                signature: vec![1; FALCON_512_SIGNATURE_BYTES],
+                pubkey: vec![2; FALCON_512_PUBLIC_KEY_BYTES],
+                input_refs: vec![WitnessInputRef {
+                    sig_ref_short: [3, 4],
+                    witness_commit_ref: [5; 16],
+                }],
+            }
+            .canonical_bytes(),
+        };
+        let encoded = tx.full_bytes();
+        let decoded = Transaction::from_full_bytes(&encoded).expect("decode tx");
+        assert_eq!(decoded, tx);
     }
 }

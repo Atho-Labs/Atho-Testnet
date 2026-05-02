@@ -110,6 +110,63 @@ impl BlockHeader {
     pub fn block_hash(&self) -> [u8; 48] {
         sha3_384(&self.canonical_bytes())
     }
+
+    /// Parses the exact canonical header encoding emitted by
+    /// [`BlockHeader::canonical_bytes`].
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> {
+        fn read_u16(bytes: &[u8], offset: &mut usize) -> Option<u16> {
+            let end = offset.checked_add(2)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 2];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u16::from_le_bytes(buf))
+        }
+
+        fn read_u64(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+            let end = offset.checked_add(8)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u64::from_le_bytes(buf))
+        }
+
+        fn read_array<const N: usize>(bytes: &[u8], offset: &mut usize) -> Option<[u8; N]> {
+            let end = offset.checked_add(N)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut out = [0u8; N];
+            out.copy_from_slice(slice);
+            *offset = end;
+            Some(out)
+        }
+
+        let mut offset = 0usize;
+        let version = read_u16(bytes, &mut offset)?;
+        let network_id = crate::network::Network::from_consensus_id(*bytes.get(offset)?)?;
+        offset += 1;
+        let height = read_u64(bytes, &mut offset)?;
+        let previous_block_hash = read_array::<48>(bytes, &mut offset)?;
+        let merkle_root = read_array::<48>(bytes, &mut offset)?;
+        let witness_root = read_array::<48>(bytes, &mut offset)?;
+        let timestamp = read_u64(bytes, &mut offset)?;
+        let difficulty_target_or_bits = read_array::<48>(bytes, &mut offset)?;
+        let nonce = read_u64(bytes, &mut offset)?;
+        if offset != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            version,
+            network_id,
+            height,
+            previous_block_hash,
+            merkle_root,
+            witness_root,
+            timestamp,
+            difficulty_target_or_bits,
+            nonce,
+        })
+    }
 }
 
 impl Block {
@@ -239,6 +296,52 @@ impl Block {
     pub fn merkle_root(&self) -> [u8; 48] {
         merkle_root(&self.transactions)
     }
+
+    /// Parses the canonical block byte layout emitted by [`Block::full_bytes`].
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Option<Self> {
+        fn read_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+            let end = offset.checked_add(4)?;
+            let slice = bytes.get(*offset..end)?;
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(slice);
+            *offset = end;
+            Some(u32::from_le_bytes(buf))
+        }
+
+        fn read_vec(bytes: &[u8], offset: &mut usize, len: usize) -> Option<Vec<u8>> {
+            let end = offset.checked_add(len)?;
+            let slice = bytes.get(*offset..end)?;
+            *offset = end;
+            Some(slice.to_vec())
+        }
+
+        let header_len = BlockHeader {
+            version: 0,
+            network_id: crate::network::Network::Mainnet,
+            height: 0,
+            previous_block_hash: [0; 48],
+            merkle_root: [0; 48],
+            witness_root: [0; 48],
+            timestamp: 0,
+            difficulty_target_or_bits: [0; 48],
+            nonce: 0,
+        }
+        .canonical_size_bytes();
+        let header = BlockHeader::from_canonical_bytes(bytes.get(..header_len)?)?;
+        let mut offset = header_len;
+        let tx_count = read_u32(bytes, &mut offset)? as usize;
+        let mut transactions = Vec::with_capacity(tx_count);
+        for _ in 0..tx_count {
+            let tx_len = read_u32(bytes, &mut offset)? as usize;
+            let tx_bytes = read_vec(bytes, &mut offset, tx_len)?;
+            let tx = Transaction::from_full_bytes(&tx_bytes)?;
+            transactions.push(tx);
+        }
+        if offset != bytes.len() {
+            return None;
+        }
+        Some(Self::new(header, transactions))
+    }
 }
 
 /// Computes the transaction Merkle root for a block body.
@@ -363,5 +466,41 @@ mod tests {
         let block = Block::new(header, vec![tx]);
 
         assert!(block.compact_bytes().len() <= block.full_bytes().len());
+    }
+
+    #[test]
+    fn canonical_block_bytes_round_trip() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![crate::transaction::TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1],
+            }],
+            outputs: vec![crate::transaction::TxOutput {
+                value_atoms: 500,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let header = BlockHeader {
+            version: 1,
+            network_id: crate::network::Network::Mainnet,
+            height: 7,
+            previous_block_hash: [2; 48],
+            merkle_root: merkle_root(&[tx.clone()]),
+            witness_root: witness_root(&[tx.clone()]),
+            timestamp: 75,
+            difficulty_target_or_bits: [5; 48],
+            nonce: 42,
+        };
+        let mut block = Block::new(header, vec![tx]);
+        block.fees_total_atoms = 0;
+        block.fees_miner_atoms = 0;
+
+        let decoded = Block::from_canonical_bytes(&block.canonical_bytes()).expect("decode block");
+        assert_eq!(decoded.header, block.header);
+        assert_eq!(decoded.transactions, block.transactions);
     }
 }

@@ -5,7 +5,9 @@
 - the Rust workspace builds and tests cleanly
 - core protocol constants, genesis data, and consensus scaffolding are explicit
 - Falcon-512 is the only active signature path
-- chainstate persistence uses a single atomic LMDB environment per network
+- chainstate persistence uses a hybrid model:
+  - full raw blocks in network-specific flat files
+  - block metadata, indexes, UTXO state, and chainstate snapshots in one atomic LMDB environment per network
 - local recovery quarantines incomplete or corrupt state instead of crashing through it
 - node RPC exposes live status, block template, block submission, transaction submission, UTXO listing, and mempool information
 - the Qt client follows the real backend tip and supports managed local-node startup

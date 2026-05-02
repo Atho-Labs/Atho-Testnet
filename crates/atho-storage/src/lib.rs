@@ -7,6 +7,7 @@
 //! snapshot and the UTXO set or the node can restart into an inconsistent view.
 #![forbid(unsafe_code)]
 
+pub mod block_files;
 pub mod chainstate;
 pub mod config;
 pub mod db;

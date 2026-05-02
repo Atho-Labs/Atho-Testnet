@@ -73,6 +73,14 @@ impl ViewModel {
         (self.block_count as f32 / target as f32).clamp(0.0, 1.0)
     }
 
+    pub fn sync_progress_display(&self) -> f32 {
+        if self.chain_synced() {
+            return 1.0;
+        }
+        let progress = self.sync_progress();
+        progress.min(0.999)
+    }
+
     pub fn update_from_network(&mut self, response: RpcResponse) {
         match response {
             RpcResponse::BlockCount(count) => {
@@ -128,5 +136,18 @@ mod tests {
         view.block_count = 128;
         assert!(view.chain_synced());
         assert_eq!(view.sync_progress(), 1.0);
+    }
+
+    #[test]
+    fn sync_progress_display_stays_below_full_while_headers_are_unsynced() {
+        let mut view = ViewModel::default();
+        view.running = true;
+        view.headers_synced = false;
+        view.block_count = 128;
+        view.sync_best_height = 128;
+
+        assert!(!view.chain_synced());
+        assert_eq!(view.sync_progress(), 1.0);
+        assert!(view.sync_progress_display() < 1.0);
     }
 }

@@ -180,7 +180,8 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 .add_enabled(ready, egui::Button::new("Change Passphrase"))
                 .clicked()
             {
-                match app.change_wallet_passphrase(&app.wallet_management_form.backup_password) {
+                let password = app.wallet_management_form.backup_password.clone();
+                match app.change_wallet_passphrase(&password) {
                     Ok(()) => {
                         app.last_error = None;
                         app.send_status = String::from("Wallet passphrase updated");
@@ -225,6 +226,22 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 "No recovery phrase is loaded. Open or import a wallet to unlock it first.",
             );
         }
+    });
+
+    ui.add_space(14.0);
+    widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Storage & Paths");
+        ui.add_space(12.0);
+        widgets::muted_label(
+            ui,
+            "These paths are network-specific. Raw block files live under the block-storage root, while LMDB metadata, indexes, and chainstate live under the network data root.",
+        );
+        ui.add_space(12.0);
+        render_copyable_path_row(ui, "Operator root", &app.operator_root_label());
+        render_copyable_path_row(ui, "Network data root", &app.network_data_root_label());
+        render_copyable_path_row(ui, "Block storage root", &app.block_storage_root_label());
+        render_copyable_path_row(ui, "Chain recovery root", &app.chain_recovery_root_label());
+        render_copyable_path_row(ui, "Quarantine root", &app.quarantine_root_label());
     });
 
     ui.add_space(14.0);
@@ -542,6 +559,20 @@ fn format_quality(peer: &NetworkPeerDiagnostics) -> String {
         (Some(score), None) => score.to_string(),
         _ => String::from("-"),
     }
+}
+
+fn render_copyable_path_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(format!("{label}:"));
+        widgets::elided_label(ui, value, 44);
+        if ui
+            .button("Copy")
+            .on_hover_text("Copy this path to the clipboard.")
+            .clicked()
+        {
+            DesktopApp::copy_text(ui, value.to_string());
+        }
+    });
 }
 
 fn mining_backend_label(backend: MiningBackendKind) -> &'static str {

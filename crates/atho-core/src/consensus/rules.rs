@@ -17,7 +17,7 @@ pub struct ScheduledActivation {
 }
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const STORAGE_SCHEMA_VERSION: u32 = 3;
+pub const STORAGE_SCHEMA_VERSION: u32 = 4;
 
 pub const RULESET_VERSION_V1: u32 = 1;
 pub const BLOCK_VERSION_V1: u16 = 1;

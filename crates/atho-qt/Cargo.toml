@@ -30,3 +30,7 @@ thiserror = "1"
 [[bin]]
 name = "atho-qt"
 path = "src/bin/atho-qt.rs"
+
+[dev-dependencies]
+bincode = "1"
+lmdb = "0.8"

@@ -6,15 +6,21 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let summary = app.wallet_balance_summary().clone();
     let rows = app.wallet_activity_rows().to_vec();
     let stacked = ui.available_width() < 760.0;
+    let chain_synced = app.view_model.chain_synced();
 
     if stacked {
         render_balances_panel(app, ui, &summary);
         ui.add_space(8.0);
-        render_recent_transactions(ui, app.ui_state.connected, &rows);
+        render_recent_transactions(ui, app.ui_state.connected, chain_synced, &rows);
     } else {
         ui.columns(2, |columns| {
             render_balances_panel(app, &mut columns[0], &summary);
-            render_recent_transactions(&mut columns[1], app.ui_state.connected, &rows);
+            render_recent_transactions(
+                &mut columns[1],
+                app.ui_state.connected,
+                chain_synced,
+                &rows,
+            );
         });
     }
 }
@@ -26,9 +32,10 @@ fn render_balances_panel(
 ) {
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(252.0);
+        let chain_synced = app.view_model.chain_synced();
         ui.horizontal(|ui| {
             widgets::section_header(ui, "Balances");
-            if !app.ui_state.connected {
+            if !app.ui_state.connected || !chain_synced {
                 ui.add_space(8.0);
                 let _ = ui.add(resources::warning_icon(20.0));
             }
@@ -58,19 +65,34 @@ fn render_balances_panel(
                 });
                 ui.end_row();
             });
+
+        if !app.ui_state.connected {
+            ui.add_space(12.0);
+            widgets::muted_label(
+                ui,
+                "Wallet balances are unavailable until the local node reconnects.",
+            );
+        } else if !chain_synced {
+            ui.add_space(12.0);
+            widgets::muted_label(
+                ui,
+                "Wallet balances may still change while Atho is synchronizing to the network tip.",
+            );
+        }
     });
 }
 
 fn render_recent_transactions(
     ui: &mut egui::Ui,
     connected: bool,
+    chain_synced: bool,
     rows: &[crate::app::WalletActivityRow],
 ) {
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(252.0);
         ui.horizontal(|ui| {
             widgets::section_header(ui, "Recent transactions");
-            if !connected {
+            if !connected || !chain_synced {
                 ui.add_space(8.0);
                 let _ = ui.add(resources::warning_icon(20.0));
             }
@@ -91,11 +113,22 @@ fn render_recent_transactions(
         ui.add_space(8.0);
 
         if rows.is_empty() {
-            widgets::muted_label(ui, "No transactions to show");
-            widgets::muted_label(
-                ui,
-                "Mine, receive, or spend coins to populate wallet activity.",
-            );
+            if !connected {
+                widgets::muted_label(ui, "Wallet history is unavailable while the node is disconnected.");
+                widgets::muted_label(ui, "Reconnect to Atho Core to refresh recent activity.");
+            } else if !chain_synced {
+                widgets::muted_label(ui, "Wallet history is still synchronizing.");
+                widgets::muted_label(
+                    ui,
+                    "Recent transactions and balances may still change until Atho reaches the network tip.",
+                );
+            } else {
+                widgets::muted_label(ui, "No transactions to show");
+                widgets::muted_label(
+                    ui,
+                    "Mine, receive, or spend coins to populate wallet activity.",
+                );
+            }
             return;
         }
 

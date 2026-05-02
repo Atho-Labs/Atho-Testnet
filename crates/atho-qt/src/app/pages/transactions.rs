@@ -7,6 +7,7 @@ const TYPE_FILTERS: &[&str] = &["All", "Mined", "Received", "Sent"];
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(480.0);
+        let chain_synced = app.view_model.chain_synced();
 
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_source("tx_date_filter")
@@ -49,7 +50,17 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
         let rows = filtered_rows(app);
         if rows.is_empty() {
-            widgets::muted_label(ui, "No wallet transactions to display.");
+            if !app.ui_state.connected {
+                widgets::muted_label(ui, "Wallet transactions are unavailable while the node is disconnected.");
+            } else if !chain_synced {
+                widgets::muted_label(ui, "Wallet transactions are still synchronizing with the network tip.");
+                widgets::muted_label(
+                    ui,
+                    "Recent mined, received, and spent entries may appear once Atho finishes synchronizing.",
+                );
+            } else {
+                widgets::muted_label(ui, "No wallet transactions to display.");
+            }
         } else {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])

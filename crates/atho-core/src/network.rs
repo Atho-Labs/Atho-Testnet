@@ -98,6 +98,26 @@ impl Network {
         }
     }
 
+    /// Returns the 4-byte network magic used in framed disk and P2P records.
+    ///
+    /// INVARIANT: These values must remain unique per network so raw block
+    /// archives and P2P traffic cannot be parsed across network boundaries.
+    pub fn p2p_magic(self) -> [u8; 4] {
+        match self {
+            Self::Mainnet => [0xa7, 0x54, 0x48, 0x01],
+            Self::Testnet => [0xa7, 0x54, 0x48, 0x02],
+            Self::Regnet => [0xa7, 0x54, 0x48, 0x03],
+            Self::Prunetest => [0xa7, 0x54, 0x48, 0x04],
+        }
+    }
+
+    /// Decodes a 4-byte network magic into the corresponding network.
+    pub fn from_p2p_magic(magic: [u8; 4]) -> Option<Self> {
+        [Self::Mainnet, Self::Testnet, Self::Regnet, Self::Prunetest]
+            .into_iter()
+            .find(|network| network.p2p_magic() == magic)
+    }
+
     /// Returns the first visible character of a base56 user-facing address.
     pub fn visible_prefix(self) -> char {
         match self {
@@ -148,6 +168,11 @@ mod tests {
         assert_eq!(Network::Testnet.rpc_port(), 9_110);
         assert_eq!(Network::Regnet.visible_prefix(), 'R');
         assert_eq!(Network::Prunetest.visible_prefix(), 'P');
+        assert_eq!(Network::Mainnet.p2p_magic(), [0xa7, 0x54, 0x48, 0x01]);
+        assert_eq!(
+            Network::from_p2p_magic([0xa7, 0x54, 0x48, 0x04]),
+            Some(Network::Prunetest)
+        );
         assert_eq!(Network::Mainnet.utxo_flag(), "");
         assert_eq!(Network::Testnet.utxo_flag(), "TEST-UTXO");
         assert_eq!(Network::Regnet.utxo_flag(), "REG-UTXO");

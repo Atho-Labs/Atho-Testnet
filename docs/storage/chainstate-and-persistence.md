@@ -21,40 +21,52 @@ Implemented in:
 - `crates/atho-storage/src/chainstate.rs`
 - `crates/atho-storage/src/path.rs`
 
-Current durable storage uses one LMDB environment per network with named databases:
+Current durable storage is hybrid:
+
+- full raw blocks live in Bitcoin-style flat files under `<network>/blocks/`
+- LMDB stores chainstate snapshots, block metadata, block indexes, tx indexes, UTXOs, and peer/address metadata
+
+Why:
+
+- raw blocks are large append-only archival objects
+- indexed state and chain metadata need fast random access and atomic updates
+
+The LMDB environment per network still uses named databases:
 
 - `meta`
 - `blocks`
+- `block_heights`
+- `block_transactions`
 - `transactions`
 - `utxos`
 - `peers`
 - `addresses`
-
-Why:
-
-- a single environment supports atomic multi-dataset commits
-- named databases keep subsystem boundaries explicit without scattering state across independent stores
+- `peer_health`
 
 ## Atomic Commit Model
 
-When a new best-chain block is accepted, Atho commits:
+When a new best-chain block is accepted, Atho:
 
-1. block archive record
-2. transaction archive records
-3. chainstate snapshot
-4. full serialized UTXO snapshot
+1. appends the canonical raw block bytes to the active `blkNNNNN.dat`
+2. writes the block archive record to LMDB
+3. writes the transaction archive records to LMDB
+4. writes the chainstate snapshot to LMDB
+5. rewrites the canonical UTXO dataset in LMDB
 
-inside one LMDB write transaction.
+The LMDB portion is one write transaction. The flat-file append happens first, and
+the stored file number, offset, and payload length are committed with the rest of
+the block metadata.
 
 ```mermaid
 flowchart TD
-    A[Validated block] --> B[Apply UTXO changes in memory]
-    B --> C[Begin LMDB write transaction]
-    C --> D[Write block archive]
-    D --> E[Write transaction archive]
-    E --> F[Write chainstate snapshot]
-    F --> G[Rewrite UTXO dataset]
-    G --> H[Commit transaction]
+    A[Validated block] --> B[Append raw block to blkNNNNN.dat]
+    B --> C[Apply UTXO changes in memory]
+    C --> D[Begin LMDB write transaction]
+    D --> E[Write block archive record]
+    E --> F[Write transaction archive]
+    F --> G[Write chainstate snapshot]
+    G --> H[Rewrite UTXO dataset]
+    H --> I[Commit transaction]
 ```
 
 Why:
@@ -134,7 +146,8 @@ Default root by platform:
 
 Derived subpaths:
 
-- `db/`
+- `db/<network>/`
+- `db/<network>/blocks/`
 - `chain/`
 - `quarantine/`
 
@@ -145,16 +158,19 @@ Why:
 
 ## Chain Exports
 
-The `dev/chain/` area contains TSV exports for debugging and audit visibility.
+The `chain/` area contains legacy TSV snapshots and debug/audit exports only.
 
 Important:
 
-- those exports are operational aids
-- they are not the canonical persisted source of chain truth
+- those exports are quarantine/debug artifacts
+- they are not loaded by the production runtime
+- if the runtime sees them during startup, it treats them as legacy layout input
+  and quarantines them instead of replaying them live
 
 Why:
 
 - human-readable audit outputs are useful, but consensus must not depend on them
+- the active runtime path should be unambiguous after the storage migration
 
 ## Current Limitations
 

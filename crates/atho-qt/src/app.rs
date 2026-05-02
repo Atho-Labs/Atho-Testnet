@@ -76,6 +76,7 @@ pub struct DesktopApp {
     pub view_model: ViewModel,
     wallet: Option<Wallet>,
     wallet_path: Option<String>,
+    wallet_session_password: Option<String>,
     wallet_addresses_cache: Vec<WalletAddress>,
     wallet_address_index_cache: HashMap<[u8; 32], usize>,
     wallet_address_digests_cache: HashSet<[u8; 32]>,
@@ -197,6 +198,7 @@ enum WalletPreparationEvent {
 struct WalletPreparationOutcome {
     wallet: Wallet,
     wallet_path: String,
+    wallet_password: String,
 }
 
 #[derive(Debug)]
@@ -252,6 +254,7 @@ impl DesktopApp {
             view_model: ViewModel::default(),
             wallet: None,
             wallet_path: None,
+            wallet_session_password: None,
             wallet_addresses_cache: Vec::new(),
             wallet_address_index_cache: HashMap::new(),
             wallet_address_digests_cache: HashSet::new(),
@@ -441,6 +444,36 @@ impl DesktopApp {
             .unwrap_or_else(|| String::from("wallet.dat"))
     }
 
+    fn operator_root_label(&self) -> String {
+        atho_storage::path::sandbox_root()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn network_data_root_label(&self) -> String {
+        atho_storage::path::database_dir(self.connection.network())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn block_storage_root_label(&self) -> String {
+        atho_storage::path::block_storage_dir(self.connection.network())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn chain_recovery_root_label(&self) -> String {
+        atho_storage::path::chain_dir()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn quarantine_root_label(&self) -> String {
+        atho_storage::path::quarantine_dir()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn wallet_keypool_depths(&self) -> (usize, usize) {
         self.wallet_ref()
             .map(Wallet::keypool_depths)
@@ -511,6 +544,7 @@ impl DesktopApp {
         self.pending_mining_restart = None;
         self.wallet = None;
         self.wallet_path = None;
+        self.wallet_session_password = None;
         self.wallet_addresses_cache.clear();
         self.wallet_address_index_cache.clear();
         self.wallet_address_digests_cache.clear();
@@ -680,6 +714,9 @@ impl DesktopApp {
         } else {
             false
         };
+        if !continue_scanning {
+            self.wallet_readiness_gate_active = false;
+        }
         self.last_wallet_refresh_at = Instant::now();
         self.wallet_cache_dirty = continue_scanning;
     }
@@ -831,9 +868,6 @@ impl DesktopApp {
         scan_limit: usize,
     ) -> Result<WalletScanOutcome, String> {
         let status = connection.status();
-        if !status.connected || !status.running {
-            return Err(String::from("wallet scan deferred: node RPC is not ready"));
-        }
         let snapshot_token = Self::connection_snapshot_token(&status);
         let utxos = match connection.request(RpcRequest::ListUtxos) {
             RpcResponse::Utxos(utxos) => utxos,
@@ -859,7 +893,11 @@ impl DesktopApp {
             .iter()
             .map(|address| address.payment_digest)
             .collect::<HashSet<_>>();
-        let current_height = Self::wallet_scan_height(&status);
+        let current_height = match connection.request(RpcRequest::GetBlockCount) {
+            RpcResponse::BlockCount(count) => count,
+            RpcResponse::Error(err) => return Err(format!("block count lookup failed: {err}")),
+            other => return Err(format!("unexpected block count response: {other:?}")),
+        };
         let mut owned = utxos
             .into_par_iter()
             .filter_map(|utxo| {
@@ -1188,21 +1226,14 @@ impl DesktopApp {
     fn connection_snapshot_token(status: &ConnectionStatus) -> [u8; 32] {
         let mut preimage = Vec::with_capacity(
             status.network.id().len()
-                + core::mem::size_of::<u64>() * 4
+                + core::mem::size_of::<u64>()
                 + status.tip_hash.len()
-                + status.mempool_fingerprint.len()
-                + 4,
+                + status.mempool_fingerprint.len(),
         );
         preimage.extend_from_slice(status.network.id().as_bytes());
         preimage.extend_from_slice(&status.block_count.to_be_bytes());
         preimage.extend_from_slice(&status.tip_hash);
-        preimage.extend_from_slice(&status.mempool_count.to_be_bytes());
-        preimage.extend_from_slice(&status.mempool_total_fee_atoms.to_be_bytes());
         preimage.extend_from_slice(&status.mempool_fingerprint);
-        preimage.push(status.running as u8);
-        preimage.push(status.headers_synced as u8);
-        preimage.extend_from_slice(&status.sync_best_height.to_be_bytes());
-        preimage.push(status.connected as u8);
         sha3_256(&preimage)
     }
 
@@ -1288,7 +1319,11 @@ impl DesktopApp {
                 self.wallet_preparation_stage = String::from("Wallet ready");
                 self.wallet_preparation_progress = 1.0;
                 self.wallet_preparation_completed = self.wallet_preparation_total;
-                self.load_or_create_wallet(outcome.wallet, outcome.wallet_path);
+                self.load_or_create_wallet(
+                    outcome.wallet,
+                    outcome.wallet_path,
+                    outcome.wallet_password,
+                );
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     &format!("wallet preparation finished in {}ms", elapsed.as_millis()),
@@ -1357,11 +1392,14 @@ impl DesktopApp {
         }
 
         let current_scan_limit = self.wallet_discovery_scan_limit;
-        let wallet = self
-            .wallet_mut()
-            .ok_or_else(|| String::from("Load or create a wallet first"))?;
-        wallet.set_restore_gap_limit(limit);
+        {
+            let wallet = self
+                .wallet_mut()
+                .ok_or_else(|| String::from("Load or create a wallet first"))?;
+            wallet.set_restore_gap_limit(limit);
+        }
         self.sync_wallet_recovery_window_form();
+        self.persist_loaded_wallet_state()?;
 
         if self.queue_wallet_scan_to_limit(limit) {
             Ok(format!(
@@ -1375,18 +1413,17 @@ impl DesktopApp {
         }
     }
 
-    fn attach_wallet(&mut self, wallet: Wallet, wallet_path: String) {
+    fn attach_wallet(&mut self, mut wallet: Wallet, wallet_path: String) {
         let has_receive = wallet
             .address_book
             .snapshot()
             .iter()
             .any(|record| record.path.kind == AddressKind::Receive);
-
+        let mut generated_initial_receive = None;
         if !has_receive {
-            // Show the first deterministic receive preview without mutating persisted wallet
-            // state during startup. Real checkout still happens only when the user explicitly
-            // requests a new receive/change address.
-            self.current_receive_address = wallet.receive_addresses(1).into_iter().next();
+            let address = wallet.checkout_receive_address_with_label(None);
+            self.current_receive_address = Some(address.clone());
+            generated_initial_receive = Some(address);
         }
 
         let address_records = wallet.address_book.snapshot();
@@ -1410,6 +1447,9 @@ impl DesktopApp {
         self.wallet_management_form.backup_password_confirm.clear();
         self.wallet_path = Some(wallet_path);
         self.wallet = Some(wallet);
+        if self.wallet_session_password.is_none() {
+            self.wallet_session_password = Some(String::new());
+        }
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
         self.sync_wallet_recovery_window_form();
         self.wallet_readiness_gate_active = self.connection.has_local_node();
@@ -1419,6 +1459,18 @@ impl DesktopApp {
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
         self.sync_wallet_state();
+        if let Some(address) = generated_initial_receive {
+            self.append_generated_address(address);
+            if let Err(err) = self.persist_loaded_wallet_state() {
+                self.last_error = Some(format!(
+                    "Wallet loaded, but initial receive address save failed: {err}"
+                ));
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("persist initial receive address failed error={err}"),
+                );
+            }
+        }
         if self.wallet_scan_rpc_ready() {
             self.start_wallet_scan_job();
         }
@@ -1478,6 +1530,15 @@ impl DesktopApp {
                             self.current_receive_address = Some(address);
                             self.ui_state.wallet_snapshot = snapshot.clone();
                             self.view_model.ui_state.wallet_snapshot = snapshot;
+                            if let Err(err) = self.persist_loaded_wallet_state() {
+                                self.last_error = Some(format!(
+                                    "Coinbase rotation succeeded, but wallet save failed: {err}"
+                                ));
+                                let _ = atho_node::dev::append_log(
+                                    "atho-qt",
+                                    &format!("persist rotated coinbase address failed error={err}"),
+                                );
+                            }
                         }
                     }
                     self.wallet_cache_dirty = true;
@@ -1642,8 +1703,7 @@ impl DesktopApp {
             return Some(address.payment_digest.to_vec());
         }
 
-        let fallback = {
-            let wallet = self.wallet_ref()?;
+        let fallback = if let Some(wallet) = self.wallet_ref() {
             wallet
                 .address_book
                 .snapshot()
@@ -1651,7 +1711,8 @@ impl DesktopApp {
                 .rev()
                 .find(|record| record.path.kind == AddressKind::Receive)
                 .map(|record| wallet.address_for_path(record.path))
-                .or_else(|| wallet.receive_addresses(1).into_iter().next())
+        } else {
+            None
         };
 
         if let Some(address) = fallback {
@@ -1659,7 +1720,26 @@ impl DesktopApp {
             return Some(address.payment_digest.to_vec());
         }
 
-        None
+        let (address, snapshot) = {
+            let wallet = self.wallet_mut()?;
+            let address = wallet.checkout_receive_address_with_label(None);
+            let snapshot = wallet.snapshot.clone();
+            (address, snapshot)
+        };
+        self.current_receive_address = Some(address.clone());
+        self.ui_state.wallet_snapshot = snapshot.clone();
+        self.view_model.ui_state.wallet_snapshot = snapshot;
+        self.append_generated_address(address.clone());
+        if let Err(err) = self.persist_loaded_wallet_state() {
+            self.last_error = Some(format!(
+                "Generated mining reward address, but wallet save failed: {err}"
+            ));
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!("persist mining reward address failed error={err}"),
+            );
+        }
+        return Some(address.payment_digest.to_vec());
     }
 
     fn stop_mining_job(&mut self) {
@@ -1812,6 +1892,7 @@ impl DesktopApp {
             Ok(WalletPreparationOutcome {
                 wallet,
                 wallet_path: wallet_path_for_job,
+                wallet_password: wallet_password_for_job,
             })
         });
     }
@@ -1850,6 +1931,7 @@ impl DesktopApp {
             Ok(WalletPreparationOutcome {
                 wallet,
                 wallet_path: wallet_path_for_job,
+                wallet_password: wallet_password_for_job,
             })
         });
     }
@@ -1914,7 +1996,7 @@ impl DesktopApp {
         fs::write(metadata_path, metadata_bytes).map_err(|err| err.to_string())
     }
 
-    fn change_wallet_passphrase(&self, password: &str) -> Result<(), String> {
+    fn change_wallet_passphrase(&mut self, password: &str) -> Result<(), String> {
         let wallet_path = self
             .wallet_path
             .as_ref()
@@ -1922,7 +2004,9 @@ impl DesktopApp {
         let wallet = self
             .wallet_ref()
             .ok_or_else(|| String::from("Load or create a wallet first"))?;
-        Self::save_wallet_to_path(wallet, wallet_path, password)
+        Self::save_wallet_to_path(wallet, wallet_path, password)?;
+        self.wallet_session_password = Some(password.to_owned());
+        Ok(())
     }
 
     pub(crate) fn wallet_mnemonic_sentence(&self) -> Option<String> {
@@ -1961,11 +2045,29 @@ impl DesktopApp {
         }
     }
 
-    fn load_or_create_wallet(&mut self, wallet: Wallet, wallet_path: String) {
+    fn load_or_create_wallet(
+        &mut self,
+        wallet: Wallet,
+        wallet_path: String,
+        wallet_password: String,
+    ) {
         self.clear_wallet_state();
+        self.wallet_session_password = Some(wallet_password);
         self.attach_wallet(wallet, wallet_path);
         self.send_status = String::from("Wallet loaded");
         self.last_error = None;
+    }
+
+    fn persist_loaded_wallet_state(&mut self) -> Result<(), String> {
+        let wallet_path = self
+            .wallet_path
+            .clone()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let password = self.wallet_session_password.clone().unwrap_or_default();
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        Self::save_wallet_to_path(wallet, &wallet_path, &password)
     }
 
     fn generate_receive_address(&mut self) {
@@ -1988,7 +2090,21 @@ impl DesktopApp {
         self.current_receive_address = Some(address);
         self.ui_state.wallet_snapshot = snapshot.clone();
         self.view_model.ui_state.wallet_snapshot = snapshot;
-        self.send_status = String::from("Receive address generated");
+        match self.persist_loaded_wallet_state() {
+            Ok(()) => {
+                self.send_status = String::from("Receive address generated");
+                self.last_error = None;
+            }
+            Err(err) => {
+                self.send_status =
+                    format!("Receive address generated, but wallet save failed: {err}");
+                self.last_error = Some(err.clone());
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("persist receive address failed error={err}"),
+                );
+            }
+        }
         self.receive_label.clear();
     }
 
@@ -2052,12 +2168,51 @@ impl DesktopApp {
         self.ui_state.wallet_snapshot = snapshot.clone();
         self.view_model.ui_state.wallet_snapshot = snapshot;
         self.append_generated_address(address);
-        self.send_status = String::from("Change address generated");
+        match self.persist_loaded_wallet_state() {
+            Ok(()) => {
+                self.send_status = String::from("Change address generated");
+                self.last_error = None;
+            }
+            Err(err) => {
+                self.send_status =
+                    format!("Change address generated, but wallet save failed: {err}");
+                self.last_error = Some(err.clone());
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("persist change address failed error={err}"),
+                );
+            }
+        }
+    }
+
+    fn wallet_send_block_reason(&self) -> Option<String> {
+        if self.wallet.is_none() {
+            return Some(String::from("Load or create a wallet first"));
+        }
+        if !self.ui_state.connected || !self.view_model.running {
+            return Some(String::from(
+                "Cannot send while the local node is disconnected or still starting",
+            ));
+        }
+        if !self.view_model.chain_synced() {
+            return Some(String::from(
+                "Cannot send while Atho is still synchronizing to the network tip. Wallet balances and history may still change until sync completes.",
+            ));
+        }
+        if self.wallet_readiness_gate_active {
+            return Some(String::from(
+                "Cannot send until the wallet finishes its initial chain scan",
+            ));
+        }
+        None
     }
 
     fn submit_send_transaction(&mut self) -> Result<(), String> {
         if self.send_job.is_some() {
             return Err(String::from("A send submission is already in progress"));
+        }
+        if let Some(reason) = self.wallet_send_block_reason() {
+            return Err(reason);
         }
 
         let destination = self.send_to.trim();
@@ -2108,11 +2263,18 @@ impl DesktopApp {
         let output_count = selected_plan.output_count;
         let tx_lock_time = Self::transaction_lock_time_nonce();
         let change_address = if output_count == 2 {
-            let address = self
-                .wallet_mut()
-                .ok_or_else(|| String::from("Load or create a wallet first"))?
-                .checkout_change_address_with_label(None);
+            let (address, snapshot) = {
+                let wallet = self
+                    .wallet_mut()
+                    .ok_or_else(|| String::from("Load or create a wallet first"))?;
+                let address = wallet.checkout_change_address_with_label(None);
+                let snapshot = wallet.snapshot.clone();
+                (address, snapshot)
+            };
+            self.ui_state.wallet_snapshot = snapshot.clone();
+            self.view_model.ui_state.wallet_snapshot = snapshot;
             self.append_generated_address(address.clone());
+            self.persist_loaded_wallet_state()?;
             Some(address)
         } else {
             None
@@ -2761,7 +2923,7 @@ impl DesktopApp {
 
         let now = Instant::now();
         let target_height = self.view_model.sync_target_height();
-        let progress = self.view_model.sync_progress();
+        let progress = self.view_model.sync_progress_display();
         let latest = self.sync_progress_samples.last();
 
         if latest.is_some_and(|sample| {
@@ -4356,7 +4518,9 @@ mod tests {
     }
 
     #[test]
-    fn attach_wallet_uses_receive_preview_without_mutating_wallet_state() {
+    fn attach_wallet_generates_and_persists_initial_receive_address() {
+        let root = temp_sandbox_root("attach-wallet-persist");
+        fs::create_dir_all(&root).expect("root");
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -4364,16 +4528,30 @@ mod tests {
             "",
             Network::Regnet,
         );
+        let wallet_path = root.join("wallet.dat");
 
         assert_eq!(wallet.snapshot.receive_count, 0);
         assert!(wallet.address_book.snapshot().is_empty());
 
-        app.attach_wallet(wallet, String::from("wallet.dat"));
+        app.attach_wallet(wallet, wallet_path.to_string_lossy().into_owned());
 
         let attached = app.wallet_ref().expect("wallet attached");
-        assert_eq!(attached.snapshot.receive_count, 0);
-        assert!(attached.address_book.snapshot().is_empty());
-        assert!(app.current_receive_address.is_some());
+        assert!(!attached.address_book.snapshot().is_empty());
+        assert!(attached.snapshot.receive_count >= 1);
+        let current = app
+            .current_receive_address
+            .as_ref()
+            .expect("current receive address");
+        assert!(attached.address_book.snapshot().iter().any(|entry| {
+            entry.network == Network::Regnet
+                && entry.path.kind == current.path.kind
+                && entry.path.index == current.path.index
+        }));
+
+        let persisted =
+            Wallet::load_from_datafile(wallet_path.as_path(), "").expect("reload persisted wallet");
+        assert!(!persisted.address_book.snapshot().is_empty());
+        assert!(persisted.snapshot.receive_count >= 1);
     }
 
     #[test]

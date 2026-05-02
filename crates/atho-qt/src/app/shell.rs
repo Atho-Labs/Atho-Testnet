@@ -202,10 +202,10 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
             } else {
                 String::from("Disconnected")
             };
-            let progress = if app.ui_state.connected && app.view_model.running {
-                app.view_model.sync_progress()
-            } else if app.connection.has_local_node() {
-                0.0
+            let show_sync_bar =
+                app.ui_state.connected && app.view_model.running && !app.view_model.chain_synced();
+            let progress = if show_sync_bar {
+                app.view_model.sync_progress_display()
             } else {
                 0.0
             };
@@ -233,19 +233,27 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         if status_response.clicked() {
                             app.show_sync_status_dialog = true;
                         }
-                        let progress_width = (left_width * 0.32).clamp(90.0, 210.0);
-                        let progress_response = ui.add(
-                            egui::ProgressBar::new(progress)
-                                .desired_width(progress_width)
-                                .text(format!("{:.2}%", progress * 100.0)),
-                        );
-                        progress_response
-                            .clone()
-                            .on_hover_text(sync_tooltip.clone());
-                        if progress_response.clicked() {
-                            app.show_sync_status_dialog = true;
+                        if show_sync_bar {
+                            let progress_width = (left_width * 0.32).clamp(110.0, 220.0);
+                            let progress_text = if app.view_model.headers_synced {
+                                format!("{:.2}%", progress * 100.0)
+                            } else {
+                                String::from("Syncing headers")
+                            };
+                            let progress_response = ui.add(
+                                egui::ProgressBar::new(progress)
+                                    .desired_width(progress_width)
+                                    .fill(widgets::SYNC_PROGRESS_FILL)
+                                    .text(progress_text),
+                            );
+                            progress_response
+                                .clone()
+                                .on_hover_text(sync_tooltip.clone());
+                            if progress_response.clicked() {
+                                app.show_sync_status_dialog = true;
+                            }
+                            ui.separator();
                         }
-                        ui.separator();
                         widgets::muted_label(ui, &format!("Height {}", app.view_model.block_count))
                             .on_hover_text("Local canonical chain height.");
                         ui.separator();
@@ -308,13 +316,22 @@ fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
 
     let target = app.view_model.sync_target_height();
     let blocks_left = target.saturating_sub(app.view_model.block_count);
-    let progress = app.view_model.sync_progress();
+    let progress = app.view_model.sync_progress_display();
     let estimated_time_left = estimate_sync_time_left(app);
     let progress_per_hour = estimated_progress_per_hour(app);
     let last_block_time = if app.view_model.tip_timestamp == 0 {
         String::from("Unknown")
     } else {
         format!("{} ago", age_label(app.view_model.tip_timestamp))
+    };
+    let blocks_left_label = if app.view_model.headers_synced {
+        blocks_left.to_string()
+    } else {
+        format!(
+            "Unknown. Syncing headers ({}, {:.2}%)",
+            target,
+            progress * 100.0
+        )
     };
 
     let mut open = app.show_sync_status_dialog;
@@ -348,7 +365,7 @@ fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
                     .spacing([18.0, 8.0])
                     .show(ui, |ui| {
                         ui.strong("Number of blocks left");
-                        ui.label(blocks_left.to_string());
+                        ui.label(blocks_left_label);
                         ui.end_row();
 
                         ui.strong("Last local block time");
@@ -404,8 +421,21 @@ fn nav_tab_tooltip(tab: NavTab) -> &'static str {
 }
 
 fn sync_tooltip_text(app: &DesktopApp, blocks_left: u64, progress: f32) -> String {
+    if app.view_model.chain_synced() {
+        return format!(
+            "Local height: {}\nSync target: {}\nChain is synced to the known Atho network tip.",
+            app.view_model.block_count,
+            app.view_model.sync_target_height(),
+        );
+    }
+
+    let sync_mode = if app.view_model.headers_synced {
+        "Synchronizing blocks"
+    } else {
+        "Synchronizing headers"
+    };
     format!(
-        "Local height: {}\nSync target: {}\nBlocks left: {}\nProgress: {:.2}%\nClick for detailed Atho sync status.",
+        "{sync_mode}\nLocal height: {}\nSync target: {}\nBlocks left: {}\nProgress: {:.2}%\nClick for detailed Atho sync status.",
         app.view_model.block_count,
         app.view_model.sync_target_height(),
         blocks_left,

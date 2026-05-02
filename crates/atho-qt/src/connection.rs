@@ -5,7 +5,7 @@ use atho_rpc::command::command_requires_mutable_access;
 use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcResponse};
-use atho_rpc::transport::RpcClient;
+use atho_rpc::transport::{RpcClient, RpcTransportError};
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ const ATHO_QT_FORCE_RPC_ENV: &str = "ATHO_QT_FORCE_RPC";
 const DEFAULT_MAINNET_BOOTSTRAP_PEER: &str = "74.208.219.116:56000";
 const LOCAL_RPC_READY_RETRY_ATTEMPTS: usize = 20;
 const LOCAL_RPC_READY_RETRY_DELAY_MS: u64 = 100;
+const LOCAL_RPC_STATUS_ERROR_RETRY_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -467,39 +468,48 @@ fn collect_rpc_status(
         }
     }
 
-    if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
+    let managed_local = managed_node.is_some();
+
+    if let Ok(RpcResponse::NodeStatus(status)) =
+        call_status_rpc(client, &RpcRequest::GetNodeStatus, managed_local)
+    {
         let mut connection_status =
             connection_status_from_node_status(network, rpc_address.to_string(), status);
-        if managed_node.is_some() {
+        if managed_local {
             connection_status.running = true;
             connection_status.connected = connection_status.network == network;
         }
         return connection_status;
     }
 
-    let network_ok = match client.call(&RpcRequest::GetNetwork) {
-        Ok(RpcResponse::Network(label)) => label == network.id(),
-        _ => false,
+    let (network_replied, network_ok) =
+        match call_status_rpc(client, &RpcRequest::GetNetwork, managed_local) {
+            Ok(RpcResponse::Network(label)) => (true, label == network.id()),
+            _ => (false, false),
+        };
+    let block_count_reply = match call_status_rpc(client, &RpcRequest::GetBlockCount, managed_local)
+    {
+        Ok(RpcResponse::BlockCount(count)) => Some(count),
+        _ => None,
     };
-    let block_count = match client.call(&RpcRequest::GetBlockCount) {
-        Ok(RpcResponse::BlockCount(count)) => count,
-        _ => 0,
-    };
-    let (mempool_count, mempool_total_fee_atoms) = match client.call(&RpcRequest::GetMempoolInfo) {
+    let mempool_reply = match call_status_rpc(client, &RpcRequest::GetMempoolInfo, managed_local) {
         Ok(RpcResponse::MempoolInfo(MempoolInfo {
             transaction_count,
             total_fee_atoms,
-        })) => (transaction_count, total_fee_atoms),
-        _ => (0, 0),
+        })) => Some((transaction_count, total_fee_atoms)),
+        _ => None,
     };
-    if managed_node.is_some() || (network_ok && last_known.is_some()) {
+    let rpc_reachable = network_replied || block_count_reply.is_some() || mempool_reply.is_some();
+
+    if managed_node.is_some() || (rpc_reachable && last_known.is_some()) {
         return degrade_rpc_status(
             network,
             rpc_address,
-            block_count,
-            mempool_count,
-            mempool_total_fee_atoms,
+            block_count_reply,
+            mempool_reply,
             network_ok,
+            rpc_reachable,
+            managed_local,
             last_known,
         );
     }
@@ -507,11 +517,11 @@ fn collect_rpc_status(
     ConnectionStatus {
         network,
         rpc_address: rpc_address.to_string(),
-        block_count,
+        block_count: block_count_reply.unwrap_or(0),
         tip_hash: [0; 48],
         tip_timestamp: 0,
-        mempool_count,
-        mempool_total_fee_atoms,
+        mempool_count: mempool_reply.map(|reply| reply.0).unwrap_or(0),
+        mempool_total_fee_atoms: mempool_reply.map(|reply| reply.1).unwrap_or(0),
         mempool_fingerprint: [0; 32],
         peer_count: 0,
         inbound_peer_count: 0,
@@ -523,10 +533,46 @@ fn collect_rpc_status(
         connecting_peers: Vec::new(),
         running: false,
         headers_synced: false,
-        sync_best_height: block_count,
+        sync_best_height: block_count_reply.unwrap_or(0),
         connected: false,
         startup_error: None,
     }
+}
+
+fn call_status_rpc(
+    client: &RpcClient,
+    request: &RpcRequest,
+    managed_local: bool,
+) -> Result<RpcResponse, RpcTransportError> {
+    let transport_attempts = if managed_local {
+        LOCAL_RPC_READY_RETRY_ATTEMPTS
+    } else {
+        1
+    };
+    let status_error_attempts = if managed_local {
+        LOCAL_RPC_STATUS_ERROR_RETRY_ATTEMPTS
+    } else {
+        1
+    };
+
+    let mut status_error_retries = 0usize;
+    for attempt in 0..transport_attempts {
+        match client.call(request) {
+            Ok(RpcResponse::Error(_))
+                if managed_local && status_error_retries + 1 < status_error_attempts =>
+            {
+                status_error_retries += 1;
+                thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
+            }
+            Ok(response) => return Ok(response),
+            Err(_err) if managed_local && attempt + 1 < transport_attempts => {
+                thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("status RPC retry loop must return or error")
 }
 
 fn connection_status_from_node_status(
@@ -563,20 +609,21 @@ fn connection_status_from_node_status(
 fn degrade_rpc_status(
     network: Network,
     rpc_address: &str,
-    block_count: u64,
-    mempool_count: usize,
-    mempool_total_fee_atoms: u64,
+    block_count_reply: Option<u64>,
+    mempool_reply: Option<(usize, u64)>,
     network_ok: bool,
+    rpc_reachable: bool,
+    managed_local: bool,
     last_known: Option<&ConnectionStatus>,
 ) -> ConnectionStatus {
     let mut status = last_known.cloned().unwrap_or(ConnectionStatus {
         network,
         rpc_address: rpc_address.to_string(),
-        block_count,
+        block_count: block_count_reply.unwrap_or(0),
         tip_hash: [0; 48],
         tip_timestamp: 0,
-        mempool_count,
-        mempool_total_fee_atoms,
+        mempool_count: mempool_reply.map(|reply| reply.0).unwrap_or(0),
+        mempool_total_fee_atoms: mempool_reply.map(|reply| reply.1).unwrap_or(0),
         mempool_fingerprint: [0; 32],
         peer_count: 0,
         inbound_peer_count: 0,
@@ -588,19 +635,30 @@ fn degrade_rpc_status(
         connecting_peers: Vec::new(),
         running: false,
         headers_synced: false,
-        sync_best_height: block_count,
+        sync_best_height: block_count_reply.unwrap_or(0),
         connected: false,
         startup_error: None,
     });
 
     status.network = network;
     status.rpc_address = rpc_address.to_string();
-    status.block_count = block_count.max(status.block_count);
-    status.mempool_count = mempool_count;
-    status.mempool_total_fee_atoms = mempool_total_fee_atoms;
-    status.sync_best_height = status.sync_best_height.max(block_count);
-    status.connected = network_ok;
-    status.running = network_ok || status.running;
+    if let Some(block_count) = block_count_reply {
+        status.block_count = block_count;
+        status.sync_best_height = status.sync_best_height.max(block_count);
+    }
+    if let Some((mempool_count, mempool_total_fee_atoms)) = mempool_reply {
+        status.mempool_count = mempool_count;
+        status.mempool_total_fee_atoms = mempool_total_fee_atoms;
+    }
+    status.connected = if managed_local {
+        rpc_reachable
+    } else {
+        network_ok
+            || (rpc_reachable
+                && last_known
+                    .is_some_and(|previous| previous.connected && previous.network == network))
+    };
+    status.running = rpc_reachable || status.running;
     status.startup_error = None;
     status
 }
@@ -969,8 +1027,9 @@ mod tests {
     };
     use atho_rpc::transport::{read_message, write_message};
     use atho_storage::db::{ChainstateSnapshot, Database};
-    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use atho_storage::path::{database_dir, ATHO_DATA_DIR_ENV};
     use atho_storage::utxo::UtxoEntry;
+    use lmdb::{Environment, Transaction as LmdbTransaction, WriteFlags};
     use std::ffi::OsString;
     use std::fs;
     use std::io::BufReader;
@@ -1197,6 +1256,76 @@ mod tests {
         (address, handle)
     }
 
+    fn spawn_retryable_node_status_rpc_server(
+        network: Network,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            let mut fail_first_status = true;
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let clone = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(clone);
+                let request: RpcRequest = read_message(&mut reader).expect("request");
+                let response = match request {
+                    RpcRequest::GetNodeStatus if fail_first_status => {
+                        fail_first_status = false;
+                        RpcResponse::Error(atho_rpc::error::RpcError::method_not_found())
+                    }
+                    RpcRequest::GetNodeStatus => RpcResponse::NodeStatus(NodeStatus {
+                        network,
+                        block_count: 2,
+                        tip_hash: [0x55; 48],
+                        tip_timestamp: 1_777_416_555,
+                        mempool_count: 0,
+                        mempool_total_fee_atoms: 0,
+                        mempool_fingerprint: [0x77; 32],
+                        running: true,
+                        headers_synced: true,
+                        sync_best_height: 2,
+                        network_diagnostics: NetworkDiagnostics {
+                            peer_count: 1,
+                            inbound_peer_count: 0,
+                            outbound_peer_count: 1,
+                            connecting_peer_count: 0,
+                            bytes_sent: 512,
+                            bytes_received: 1_024,
+                            peers: vec![NetworkPeerDiagnostics {
+                                remote_addr: String::from("74.208.219.116:56000"),
+                                direction: NetworkPeerDirection::Outbound,
+                                handshake_ready: true,
+                                best_height: Some(2),
+                                protocol_version: Some(1),
+                                services: Some(9),
+                                user_agent: Some(String::from("/Atho:0.1.0/")),
+                                ruleset_version: Some(1),
+                                bytes_sent: 512,
+                                bytes_received: 1_024,
+                                last_send_unix: Some(1_777_416_555),
+                                last_receive_unix: Some(1_777_416_555),
+                                quality_score: Some(100),
+                                consecutive_failures: Some(0),
+                            }],
+                            connecting_peers: Vec::new(),
+                        },
+                    }),
+                    RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
+                    RpcRequest::GetBlockCount => RpcResponse::BlockCount(2),
+                    RpcRequest::GetMempoolInfo => RpcResponse::MempoolInfo(MempoolInfo {
+                        transaction_count: 0,
+                        total_fee_atoms: 0,
+                    }),
+                    other => RpcResponse::Error(RpcError::invalid_request(format!(
+                        "unexpected request in retryable mock rpc server: {other:?}"
+                    ))),
+                };
+                write_message(&mut stream, &response).expect("response");
+            }
+        });
+        (address, handle)
+    }
+
     fn wait_for_status(
         conn: &ReadOnlyNodeConnection,
         predicate: impl Fn(&ConnectionStatus) -> bool,
@@ -1238,15 +1367,26 @@ mod tests {
         let _local = EnvVarGuard::set_path(ATHO_QT_LOCAL_ENV, std::path::Path::new("1"));
 
         let db = Database::open(Network::Mainnet).expect("database");
-        db.save_chainstate_snapshot(
-            &ChainstateSnapshot {
-                height: 1,
-                tip_hash: [9; 48],
-                tip_header: None,
-            },
-            &[],
-        )
-        .expect("snapshot");
+        let db_path = database_dir(Network::Mainnet);
+        drop(db);
+
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(128)
+            .set_max_dbs(10)
+            .set_map_size(1 << 30);
+        let env = builder.open(&db_path).expect("open env");
+        let meta = env.open_db(Some("meta")).expect("meta db");
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let snapshot_bytes = bincode::serialize(&ChainstateSnapshot {
+            height: 1,
+            tip_hash: [9; 48],
+            tip_header: None,
+        })
+        .expect("serialize snapshot");
+        txn.put(meta, b"chainstate", &snapshot_bytes, WriteFlags::empty())
+            .expect("put snapshot");
+        txn.commit().expect("commit fixture");
 
         let conn = ReadOnlyNodeConnection::new(Network::Mainnet);
         let status = conn.status();
@@ -1341,6 +1481,37 @@ mod tests {
         assert_eq!(degraded.tip_timestamp, 1_777_416_445);
 
         handle.join().expect("flaky mock rpc server");
+    }
+
+    #[test]
+    fn managed_local_node_status_retries_transient_node_status_failures() {
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let (rpc_address, handle) = spawn_retryable_node_status_rpc_server(Network::Mainnet);
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2")
+            .spawn()
+            .expect("spawn managed child");
+        let managed = Arc::new(ManagedNodeState::new(child));
+        let client = RpcClient::new(rpc_address.clone());
+
+        let status = collect_rpc_status(
+            Network::Mainnet,
+            &rpc_address,
+            &client,
+            Some(&managed),
+            None,
+        );
+
+        assert!(status.connected);
+        assert!(status.running);
+        assert!(status.headers_synced);
+        assert_eq!(status.block_count, 2);
+        assert_eq!(status.sync_best_height, 2);
+        assert_eq!(status.tip_timestamp, 1_777_416_555);
+
+        handle.join().expect("retryable mock rpc server");
     }
 
     #[test]

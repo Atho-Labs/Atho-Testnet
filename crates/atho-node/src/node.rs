@@ -18,7 +18,7 @@ use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
-use atho_storage::db::{PeerHealthRecord, PeerRecord};
+use atho_storage::db::{BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord};
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -107,6 +107,40 @@ impl Node {
 
     pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Option<Block> {
         self.chainstate.block_by_hash(block_hash).ok().flatten()
+    }
+
+    pub fn block_by_height(&self, height: u64) -> Option<Block> {
+        self.chainstate.block_by_height(height).ok().flatten()
+    }
+
+    pub fn block_record_by_hash(&self, block_hash: [u8; 48]) -> Option<BlockArchiveRecord> {
+        self.chainstate
+            .block_record_by_hash(block_hash)
+            .ok()
+            .flatten()
+    }
+
+    pub fn block_record_by_height(&self, height: u64) -> Option<BlockArchiveRecord> {
+        self.chainstate
+            .block_record_by_height(height)
+            .ok()
+            .flatten()
+    }
+
+    pub fn prune_depth(&self) -> u64 {
+        self.chainstate.prune_depth()
+    }
+
+    pub fn last_prune_report(&self) -> Option<&BlockPruneReport> {
+        self.chainstate.last_prune_report()
+    }
+
+    pub fn last_prune_error(&self) -> Option<&str> {
+        self.chainstate.last_prune_error()
+    }
+
+    pub fn has_pruned_history(&self) -> bool {
+        self.chainstate.has_pruned_history().unwrap_or(false)
     }
 
     pub fn load_peer_health(

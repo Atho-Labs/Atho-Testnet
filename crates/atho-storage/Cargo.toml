@@ -11,6 +11,7 @@ atho-errors = { path = "../atho-errors" }
 bincode = "1"
 hex = "0.4"
 lmdb = "0.8"
+num-bigint = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"

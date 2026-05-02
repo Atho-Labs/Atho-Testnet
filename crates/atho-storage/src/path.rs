@@ -31,6 +31,10 @@ pub fn database_dir(network: Network) -> PathBuf {
     data_root().join(data_dir(network))
 }
 
+pub fn block_storage_dir(network: Network) -> PathBuf {
+    database_dir(network).join("blocks")
+}
+
 pub fn chain_dir() -> PathBuf {
     sandbox_root().join("chain")
 }

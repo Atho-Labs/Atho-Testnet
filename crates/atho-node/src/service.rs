@@ -484,9 +484,16 @@ impl NodeService {
             .orchestrator
             .runtime
             .node
-            .blocks()
-            .last()
-            .map(|block| block.header.timestamp)
+            .block_record_by_height(status.block_count)
+            .map(|record| record.timestamp)
+            .or_else(|| {
+                self.orchestrator
+                    .runtime
+                    .node
+                    .blocks()
+                    .last()
+                    .map(|block| block.header.timestamp)
+            })
             .unwrap_or_default();
         NodeStatus {
             network: status.network,
@@ -1055,12 +1062,12 @@ impl NodeService {
 
     fn command_getblockhash(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         let height = self.parse_single_u64_arg("getblockhash", args, "height")?;
-        let block = self.canonical_block_by_height(height)?.ok_or_else(|| {
+        let block = self.block_record_by_height(height)?.ok_or_else(|| {
             atho_rpc::error::RpcError::invalid_request(format!("unknown block height {height}"))
         })?;
         Ok(json!({
             "height": height,
-            "block_hash": hex::encode(block.header.block_hash()),
+            "block_hash": hex::encode(block.block_hash),
         }))
     }
 
@@ -1080,17 +1087,9 @@ impl NodeService {
     ) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getblockchaininfo", args)?;
         let status = self.node_status();
-        let blocks = self
-            .orchestrator
-            .runtime
-            .node
-            .canonical_blocks()
-            .map_err(rpc_error_from_node)?;
-        let chainwork = pow::accumulated_chain_work(&blocks).to_str_radix(16);
-        let tip = blocks
-            .last()
-            .map(|block| block.header.clone())
-            .ok_or_else(|| atho_rpc::error::RpcError::internal())?;
+        let tip = self
+            .block_record_by_height(status.block_count)?
+            .ok_or_else(atho_rpc::error::RpcError::internal)?;
         let ruleset = rules::rules_at_height(status.block_count);
         let verification_progress =
             if status.sync_best_height == 0 || status.block_count >= status.sync_best_height {
@@ -1105,11 +1104,13 @@ impl NodeService {
             "best_block_time": tip.timestamp,
             "difficulty_target": hex::encode(tip.difficulty_target_or_bits),
             "next_target": hex::encode(self.orchestrator.runtime.node.difficulty_target_for_next_block()),
-            "chainwork": chainwork,
+            "chainwork": render_chainwork_hex(&tip.chainwork),
             "ruleset_id": format!("atho-ruleset-v{}", ruleset.ruleset_version),
             "ruleset_version": ruleset.ruleset_version,
             "genesis_hash": hex::encode(genesis::genesis_hash(status.network)),
-            "pruned": false,
+            "pruned": self.orchestrator.runtime.node.has_pruned_history(),
+            "prune_depth_blocks": self.orchestrator.runtime.node.prune_depth(),
+            "tip_raw_block_pruned": tip.pruned,
             "verification_progress": verification_progress,
         }))
     }
@@ -1149,11 +1150,11 @@ impl NodeService {
     fn command_getchaintips(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getchaintips", args)?;
         let block = self
-            .canonical_block_by_height(self.orchestrator.runtime.node.height())?
+            .block_record_by_height(self.orchestrator.runtime.node.height())?
             .ok_or_else(atho_rpc::error::RpcError::internal)?;
         Ok(json!([{
-            "height": block.header.height,
-            "hash": hex::encode(block.header.block_hash()),
+            "height": block.height,
+            "hash": hex::encode(block.block_hash),
             "branchlen": 0,
             "status": "active",
         }]))
@@ -1230,14 +1231,13 @@ impl NodeService {
     fn command_getdifficulty(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getdifficulty", args)?;
         let tip = self
-            .canonical_block_by_height(self.orchestrator.runtime.node.height())?
+            .block_record_by_height(self.orchestrator.runtime.node.height())?
             .ok_or_else(atho_rpc::error::RpcError::internal)?;
-        let scaled =
-            pow::difficulty_ratio_scaled(&tip.header.difficulty_target_or_bits, 100_000_000);
+        let scaled = pow::difficulty_ratio_scaled(&tip.difficulty_target_or_bits, 100_000_000);
         Ok(json!({
             "network": self.network().id(),
-            "height": tip.header.height,
-            "target": hex::encode(tip.header.difficulty_target_or_bits),
+            "height": tip.height,
+            "target": hex::encode(tip.difficulty_target_or_bits),
             "next_target": hex::encode(self.orchestrator.runtime.node.difficulty_target_for_next_block()),
             "difficulty": format_scaled_decimal(scaled, 8),
         }))
@@ -1327,15 +1327,12 @@ impl NodeService {
 
     fn command_getchainwork(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getchainwork", args)?;
-        let blocks = self
-            .orchestrator
-            .runtime
-            .node
-            .canonical_blocks()
-            .map_err(rpc_error_from_node)?;
+        let tip = self
+            .block_record_by_height(self.orchestrator.runtime.node.height())?
+            .ok_or_else(atho_rpc::error::RpcError::internal)?;
         Ok(json!({
             "height": self.orchestrator.runtime.node.height(),
-            "chainwork": pow::accumulated_chain_work(&blocks).to_str_radix(16),
+            "chainwork": render_chainwork_hex(&tip.chainwork),
         }))
     }
 
@@ -1961,15 +1958,18 @@ impl NodeService {
         &self,
         height: u64,
     ) -> Result<Option<Block>, atho_rpc::error::RpcError> {
-        let blocks = self
+        Ok(self.orchestrator.runtime.node.block_by_height(height))
+    }
+
+    fn block_record_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<atho_storage::db::BlockArchiveRecord>, atho_rpc::error::RpcError> {
+        Ok(self
             .orchestrator
             .runtime
             .node
-            .canonical_blocks()
-            .map_err(rpc_error_from_node)?;
-        Ok(blocks
-            .into_iter()
-            .find(|block| block.header.height == height))
+            .block_record_by_height(height))
     }
 }
 
@@ -2021,6 +2021,16 @@ fn render_block_template_value(template: &BlockTemplate) -> Value {
         "nonce_offset_bytes": template.nonce_offset_bytes(),
         "block": render_block_value(&template.block),
     })
+}
+
+fn render_chainwork_hex(bytes: &[u8]) -> String {
+    let rendered = hex::encode(bytes);
+    let trimmed = rendered.trim_start_matches('0');
+    if trimmed.is_empty() {
+        String::from("0")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn render_block_value(block: &Block) -> Value {

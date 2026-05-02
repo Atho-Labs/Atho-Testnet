@@ -27,12 +27,26 @@ Why:
 
 When `ATHO_DATA_DIR` points at `./dev`, Atho uses:
 
-- `dev/db/`
+- `dev/<network>/`
+- `dev/<network>/blocks/`
 - `dev/logs/`
 - `dev/wallet/`
 - `dev/chain/`
 - `dev/audit/`
 - `dev/quarantine/`
+
+Examples:
+
+- `dev/regnet/`
+- `dev/regnet/blocks/blk00000.dat`
+- `dev/prunetest/`
+- `dev/prunetest/blocks/`
+
+Why:
+
+- the hybrid storage model keeps raw blocks in per-network flat files
+- LMDB state stays isolated inside the same per-network runtime root
+- `dev/chain/` remains a debug/quarantine area, not the live chainstate root
 
 ## Wipe And Reset
 

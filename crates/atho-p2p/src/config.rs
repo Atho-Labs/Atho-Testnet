@@ -65,7 +65,7 @@ pub fn network_params(network: Network) -> NetworkParams {
     match network {
         Network::Mainnet => NetworkParams {
             network,
-            magic: [0xa7, 0x54, 0x48, 0x01],
+            magic: network.p2p_magic(),
             default_port: network.p2p_port(),
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -74,7 +74,7 @@ pub fn network_params(network: Network) -> NetworkParams {
         },
         Network::Testnet => NetworkParams {
             network,
-            magic: [0xa7, 0x54, 0x48, 0x02],
+            magic: network.p2p_magic(),
             default_port: network.p2p_port(),
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -83,7 +83,7 @@ pub fn network_params(network: Network) -> NetworkParams {
         },
         Network::Regnet => NetworkParams {
             network,
-            magic: [0xa7, 0x54, 0x48, 0x03],
+            magic: network.p2p_magic(),
             default_port: network.p2p_port(),
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -92,7 +92,7 @@ pub fn network_params(network: Network) -> NetworkParams {
         },
         Network::Prunetest => NetworkParams {
             network,
-            magic: [0xa7, 0x54, 0x48, 0x04],
+            magic: network.p2p_magic(),
             default_port: network.p2p_port(),
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
@@ -103,14 +103,7 @@ pub fn network_params(network: Network) -> NetworkParams {
 }
 
 pub fn network_from_magic(magic: [u8; 4]) -> Option<Network> {
-    [
-        Network::Mainnet,
-        Network::Testnet,
-        Network::Regnet,
-        Network::Prunetest,
-    ]
-    .into_iter()
-    .find(|network| network_params(*network).magic == magic)
+    Network::from_p2p_magic(magic)
 }
 
 #[cfg(test)]

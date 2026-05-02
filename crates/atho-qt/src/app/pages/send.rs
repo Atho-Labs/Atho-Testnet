@@ -5,16 +5,31 @@ use eframe::egui;
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let available_balance = app.wallet_balance_atoms();
+    let send_block_reason = app.wallet_send_block_reason();
 
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(430.0);
         render_send_form(app, ui, available_balance);
         ui.add_space(6.0);
+        if let Some(reason) = send_block_reason.as_deref() {
+            widgets::panel_frame().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(resources::warning_icon(18.0));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(reason)
+                            .size(12.5)
+                            .color(egui::Color32::from_rgb(136, 86, 32)),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+        }
         render_fee_panel(app, ui);
         ui.add_space(6.0);
         widgets::muted_label(ui, &app.send_status);
         ui.add_space(6.0);
-        render_send_actions(app, ui, available_balance);
+        render_send_actions(app, ui, available_balance, send_block_reason.as_deref());
     });
 }
 
@@ -146,22 +161,33 @@ fn render_fee_panel(app: &DesktopApp, ui: &mut egui::Ui) {
         });
 }
 
-fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, available_balance: u64) {
+fn render_send_actions(
+    app: &mut DesktopApp,
+    ui: &mut egui::Ui,
+    available_balance: u64,
+    send_block_reason: Option<&str>,
+) {
+    let send_enabled = send_block_reason.is_none();
     let compact = ui.available_width() < 760.0;
     if compact {
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_sized(
-                        [104.0, 28.0],
-                        egui::Button::image_and_text(resources::send_icon(13.0), "Send"),
-                    )
-                    .clicked()
-                {
+                let send_response = ui
+                    .add_enabled_ui(send_enabled, |ui| {
+                        ui.add_sized(
+                            [104.0, 28.0],
+                            egui::Button::image_and_text(resources::send_icon(13.0), "Send"),
+                        )
+                    })
+                    .inner;
+                if send_response.clicked() {
                     if let Err(err) = app.submit_send_transaction() {
                         app.last_error = Some(err.clone());
                         app.send_status = err;
                     }
+                }
+                if let Some(reason) = send_block_reason {
+                    send_response.on_hover_text(reason);
                 }
                 if ui
                     .add_sized(
@@ -199,17 +225,22 @@ fn render_send_actions(app: &mut DesktopApp, ui: &mut egui::Ui, available_balanc
     }
 
     ui.horizontal(|ui| {
-        if ui
-            .add_sized(
-                [104.0, 28.0],
-                egui::Button::image_and_text(resources::send_icon(13.0), "Send"),
-            )
-            .clicked()
-        {
+        let send_response = ui
+            .add_enabled_ui(send_enabled, |ui| {
+                ui.add_sized(
+                    [104.0, 28.0],
+                    egui::Button::image_and_text(resources::send_icon(13.0), "Send"),
+                )
+            })
+            .inner;
+        if send_response.clicked() {
             if let Err(err) = app.submit_send_transaction() {
                 app.last_error = Some(err.clone());
                 app.send_status = err;
             }
+        }
+        if let Some(reason) = send_block_reason {
+            send_response.on_hover_text(reason);
         }
         if ui
             .add_sized(
