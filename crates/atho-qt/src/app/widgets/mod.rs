@@ -117,8 +117,8 @@ pub(crate) fn row_value_signed(ui: &mut egui::Ui, atoms: i128) {
     );
 }
 
-pub(crate) fn muted_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(11.0).color(MUTED));
+pub(crate) fn muted_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.label(egui::RichText::new(text).size(11.0).color(MUTED))
 }
 
 pub(crate) fn elided_label(ui: &mut egui::Ui, text: &str, max_chars: usize) -> egui::Response {

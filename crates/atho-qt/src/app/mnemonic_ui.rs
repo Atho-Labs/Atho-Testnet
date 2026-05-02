@@ -1,3 +1,4 @@
+//! Shared mnemonic and recovery-phrase UI widgets.
 use super::widgets;
 use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
 use eframe::egui;
@@ -76,9 +77,9 @@ pub(crate) fn render_word_grid(
     id_source: &str,
     auto_resize_on_paste: bool,
 ) {
-    let columns = if words.len() > 24 { 6 } else { 4 };
-    let card_width =
-        ((ui.available_width() - (columns as f32 - 1.0) * 8.0) / columns as f32).max(118.0);
+    let columns = mnemonic_grid_columns(ui.available_width(), words.len());
+    let spacing = (columns.saturating_sub(1)) as f32 * 8.0;
+    let card_width = ((ui.available_width() - spacing) / columns as f32).clamp(92.0, 160.0);
 
     egui::Grid::new(id_source)
         .num_columns(columns)
@@ -159,6 +160,20 @@ fn normalize_word(word: &str) -> String {
     word.trim().to_lowercase()
 }
 
+fn mnemonic_grid_columns(available_width: f32, word_count: usize) -> usize {
+    let preferred = if word_count > 24 { 6 } else { 4 }.min(word_count.max(1));
+    let mut columns = preferred.max(1);
+    while columns > 1 {
+        let spacing = (columns.saturating_sub(1)) as f32 * 8.0;
+        let per_column = (available_width - spacing) / columns as f32;
+        if per_column >= 118.0 {
+            break;
+        }
+        columns -= 1;
+    }
+    columns.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +192,13 @@ mod tests {
     fn words_from_sentence_normalizes_spacing() {
         let words = words_from_sentence("  Alpha   beta\nGAMMA  ");
         assert_eq!(words, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn mnemonic_grid_columns_collapse_on_narrow_widths() {
+        assert_eq!(mnemonic_grid_columns(720.0, 12), 4);
+        assert_eq!(mnemonic_grid_columns(360.0, 12), 2);
+        assert_eq!(mnemonic_grid_columns(220.0, 12), 1);
+        assert_eq!(mnemonic_grid_columns(900.0, 48), 6);
     }
 }

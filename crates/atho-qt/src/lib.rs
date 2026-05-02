@@ -1,3 +1,11 @@
+//! Atho Qt-style desktop client built on `eframe`/`egui`.
+//!
+//! The GUI crate provides the wallet operator experience, node diagnostics,
+//! debug console, and local RPC integration while keeping node validation in
+//! the backend crates.
+//!
+//! SECURITY: GUI actions may display or copy sensitive wallet data. The UI
+//! layer must keep those flows explicit and avoid accidental leakage in logs.
 #![forbid(unsafe_code)]
 
 pub mod app;

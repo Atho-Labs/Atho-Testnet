@@ -1,3 +1,4 @@
+//! Reference CPU nonce-search implementation.
 use crate::dev;
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;

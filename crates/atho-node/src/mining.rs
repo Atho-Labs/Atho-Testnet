@@ -1,3 +1,8 @@
+//! Block template construction for solo mining.
+//!
+//! This module assembles candidate blocks from the current mempool and tip
+//! state. It keeps the node authoritative: miners search nonce space, but the
+//! node defines the canonical template contents and validates solved blocks.
 use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
@@ -14,6 +19,7 @@ use atho_crypto::falcon;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Builds a candidate block from the current tip and mempool contents.
 pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let utxos = node.utxo_snapshot();
     let height = node.height().saturating_add(1);
@@ -97,6 +103,9 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
             .saturating_mul(3)
             .saturating_add(next_full_bytes);
         let next_vbytes = (next_weight.saturating_add(3)) / 4;
+        // PERFORMANCE: Skip oversize candidates incrementally so block assembly
+        // does not have to rebuild the block from scratch when one transaction
+        // would exceed raw-size, vsize, or weight limits.
         if next_full_bytes > MAX_BLOCK_RAW_BYTES
             || next_vbytes > MAX_BLOCK_VBYTES
             || next_weight > MAX_BLOCK_WEIGHT
@@ -158,6 +167,7 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     Ok(block)
 }
 
+/// Returns a timestamp that respects median-time-past constraints.
 fn candidate_block_timestamp(previous_blocks: &[Block]) -> u64 {
     let now = current_unix_timestamp_seconds();
     pow::minimum_next_block_timestamp(previous_blocks).map_or(now, |minimum| now.max(minimum))
@@ -170,6 +180,10 @@ fn current_unix_timestamp_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// Selects the deterministic reward target for the next mined height.
+///
+/// Mining rewards are sent to a synthetic per-height key derived from the
+/// network tag and height so tests and solo mining runs stay reproducible.
 fn reward_target_for_height(network: Network, height: u64) -> (String, Vec<u8>) {
     let mut seed = Vec::with_capacity(network.id().len() + 8);
     seed.extend_from_slice(network.domain_tag().as_bytes());

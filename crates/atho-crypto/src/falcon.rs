@@ -1,3 +1,10 @@
+//! Falcon-512 key generation and signature verification for Atho.
+//!
+//! This module wraps the `fn-dsa` Falcon implementation with Atho-specific
+//! domain separation and secret-handling helpers.
+//!
+//! CONSENSUS: Signature verification must stay on the CPU canonical path. Any
+//! accelerated backend must produce identical accept/reject results.
 use crate::error::CryptoError;
 use crate::secret::SecretBytes;
 use atho_core::consensus::signatures::AthoSignatureDomain;
@@ -16,6 +23,7 @@ pub const FALCON_512_PUBLIC_KEY_BYTES: usize = vrfy_key_size(FALCON_512_LOGN);
 pub const FALCON_512_SECRET_KEY_BYTES: usize = sign_key_size(FALCON_512_LOGN);
 pub const FALCON_512_SIGNATURE_BYTES: usize = signature_size(FALCON_512_LOGN);
 
+/// Falcon-512 public verification key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconPublicKey(pub Vec<u8>);
 
@@ -25,6 +33,7 @@ impl FalconPublicKey {
     }
 }
 
+/// Falcon-512 secret signing key stored in zeroizing memory.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FalconSecretKey(pub SecretBytes);
 
@@ -34,6 +43,7 @@ impl FalconSecretKey {
     }
 }
 
+/// Falcon-512 signature bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconSignature(pub Vec<u8>);
 
@@ -43,6 +53,7 @@ impl FalconSignature {
     }
 }
 
+/// Public/secret Falcon keypair used by wallet code and tests.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FalconKeypair {
     pub public_key: FalconPublicKey,
@@ -135,22 +146,27 @@ impl RngCore for SeededRng {
     }
 }
 
+/// Returns whether the Falcon backend is available in this build.
 pub fn available() -> bool {
     true
 }
 
+/// Validates a Falcon public key length.
 pub fn public_key_len_ok(len: usize) -> bool {
     len == FALCON_512_PUBLIC_KEY_BYTES
 }
 
+/// Validates a Falcon secret key length.
 pub fn secret_key_len_ok(len: usize) -> bool {
     len == FALCON_512_SECRET_KEY_BYTES
 }
 
+/// Validates a Falcon signature length.
 pub fn signature_len_ok(len: usize) -> bool {
     len == FALCON_512_SIGNATURE_BYTES
 }
 
+/// Verifies that the provided raw key lengths match the Falcon-512 profile.
 pub fn validate_key_lengths(public_key: &[u8], secret_key: &[u8]) -> Result<(), CryptoError> {
     if !public_key_len_ok(public_key.len()) || !secret_key_len_ok(secret_key.len()) {
         Err(CryptoError::InvalidKeyLength)
@@ -173,6 +189,7 @@ fn init_rng(seed: &[u8]) -> SeededRng {
     SeededRng::new(seed)
 }
 
+/// Deterministically generates a Falcon keypair from a seed.
 pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
     if seed.is_empty() {
         return Err(CryptoError::InvalidKeyLength);
@@ -196,6 +213,7 @@ pub fn generate_from_seed(seed: &[u8]) -> Result<FalconKeypair, CryptoError> {
     })
 }
 
+/// Generates a Falcon keypair from OS randomness.
 pub fn generate() -> Result<FalconKeypair, CryptoError> {
     let mut seed = [0u8; 48];
     getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
@@ -204,6 +222,10 @@ pub fn generate() -> Result<FalconKeypair, CryptoError> {
     keypair
 }
 
+/// Signs an Atho message under the selected signature domain.
+///
+/// SECURITY: Domain separation prevents signatures for one protocol context from
+/// being replayed as if they were valid in another.
 pub fn sign(
     domain: AthoSignatureDomain,
     secret_key: &FalconSecretKey,
@@ -231,6 +253,7 @@ pub fn sign(
     Ok(FalconSignature(signature))
 }
 
+/// Verifies an Atho Falcon signature under the selected signature domain.
 pub fn verify(
     domain: AthoSignatureDomain,
     public_key: &FalconPublicKey,

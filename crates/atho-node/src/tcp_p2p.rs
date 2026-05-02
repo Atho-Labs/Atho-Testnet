@@ -1,3 +1,4 @@
+//! TCP-backed P2P runtime integration for the Atho node.
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;

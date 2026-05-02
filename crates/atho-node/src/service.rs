@@ -1,3 +1,10 @@
+//! Node service layer for RPC, CLI, and GUI command execution.
+//!
+//! This module converts high-level operator requests into validated node
+//! actions, gathers diagnostics, and formats human-readable command results.
+//!
+//! SECURITY: External callers never mutate chainstate directly. Every write path
+//! still flows through the node's validated transaction or block submission APIs.
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::rpc_error_from_node;
@@ -34,6 +41,7 @@ use atho_wallet::snapshot::WalletSnapshot;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Snapshot of the local node state used by operator interfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemStatus {
     pub network: Network,
@@ -62,6 +70,7 @@ struct NetworkRuntimeView {
     peers: BTreeMap<String, PeerTrafficStats>,
 }
 
+/// Mutable service façade around a running [`NodeOrchestrator`].
 #[derive(Debug)]
 pub struct NodeService {
     orchestrator: NodeOrchestrator,
@@ -71,6 +80,7 @@ pub struct NodeService {
 }
 
 impl NodeService {
+    /// Creates a new service with a fresh orchestrator.
     pub fn new(config: NodeConfig) -> Self {
         Self {
             orchestrator: NodeOrchestrator::new(config),
@@ -80,6 +90,7 @@ impl NodeService {
         }
     }
 
+    /// Creates an ephemeral service for tests and local tooling.
     pub fn new_ephemeral(config: NodeConfig) -> Self {
         let network = config.network;
         Self {
@@ -103,6 +114,7 @@ impl NodeService {
         })
     }
 
+    /// Starts the orchestrator and seeds the initial peer graph view.
     pub fn start(&mut self) {
         self.orchestrator.start();
         self.seed_peer_graph();
@@ -117,6 +129,7 @@ impl NodeService {
         self.orchestrator.runtime.node.config.network
     }
 
+    /// Handles read-only RPC requests.
     pub fn handle(&self, request: RpcRequest) -> RpcResponse {
         match request {
             RpcRequest::GetNetwork => RpcResponse::Network(self.network().id().to_string()),
@@ -168,6 +181,7 @@ impl NodeService {
         }
     }
 
+    /// Handles mutable RPC requests that may update node state.
     pub fn handle_mut(&mut self, request: RpcRequest) -> RpcResponse {
         match request {
             RpcRequest::ExecuteCommand(invocation) => self.execute_command_mut(invocation),
@@ -466,10 +480,19 @@ impl NodeService {
 
     pub fn node_status(&self) -> NodeStatus {
         let status = self.status();
+        let tip_timestamp = self
+            .orchestrator
+            .runtime
+            .node
+            .blocks()
+            .last()
+            .map(|block| block.header.timestamp)
+            .unwrap_or_default();
         NodeStatus {
             network: status.network,
             block_count: status.block_count,
             tip_hash: status.tip_hash,
+            tip_timestamp,
             mempool_count: status.mempool_count,
             mempool_total_fee_atoms: status.mempool_total_fee_atoms,
             mempool_fingerprint: self.orchestrator.runtime.node.mempool_fingerprint(),
@@ -480,9 +503,51 @@ impl NodeService {
         }
     }
 
+    fn chain_synced(status: &NodeStatus) -> bool {
+        status.running && status.headers_synced && status.block_count >= status.sync_best_height
+    }
+
+    fn render_status_value(status: &NodeStatus) -> Value {
+        json!({
+            "network": status.network.id(),
+            "running": status.running,
+            "local_height": status.block_count,
+            "block_count": status.block_count,
+            "sync_target_height": status.sync_best_height,
+            "sync_best_height": status.sync_best_height,
+            "headers_synced": status.headers_synced,
+            "chain_synced": Self::chain_synced(status),
+            "tip_hash": hex::encode(status.tip_hash),
+            "tip_timestamp": status.tip_timestamp,
+            "peer_count": status.network_diagnostics.peer_count,
+            "connecting_peer_count": status.network_diagnostics.connecting_peer_count,
+            "mempool_count": status.mempool_count,
+            "mempool_total_fee_atoms": status.mempool_total_fee_atoms,
+        })
+    }
+
+    fn health_warnings(status: &NodeStatus) -> Vec<&'static str> {
+        let mut warnings = Vec::new();
+        let chain_synced = Self::chain_synced(status);
+        if !status.running {
+            warnings.push("node runtime is not running");
+        }
+        if !status.headers_synced {
+            warnings.push("headers are not fully synced");
+        } else if !chain_synced {
+            warnings.push("local chain tip is behind the advertised network target");
+        }
+        if status.network_diagnostics.peer_count == 0
+            && !matches!(status.network, Network::Regnet | Network::Prunetest)
+        {
+            warnings.push("no peers are connected");
+        }
+        warnings
+    }
+
     pub fn network_diagnostics(&self) -> NetworkDiagnostics {
         let connections = self.orchestrator.sync.connections();
-        let peers = connections
+        let (peers, connecting_peers): (Vec<_>, Vec<_>) = connections
             .peer_snapshots()
             .into_iter()
             .map(|peer| {
@@ -513,15 +578,27 @@ impl NodeService {
                     consecutive_failures: health.map(|record| record.consecutive_failures),
                 }
             })
-            .collect();
+            .partition(|peer| peer.handshake_ready);
+
+        let peer_count = peers.len();
+        let inbound_peer_count = peers
+            .iter()
+            .filter(|peer| peer.direction == NetworkPeerDirection::Inbound)
+            .count();
+        let outbound_peer_count = peers
+            .iter()
+            .filter(|peer| peer.direction == NetworkPeerDirection::Outbound)
+            .count();
 
         NetworkDiagnostics {
-            peer_count: connections.peer_count(),
-            inbound_peer_count: connections.inbound_count(),
-            outbound_peer_count: connections.outbound_count(),
+            peer_count,
+            inbound_peer_count,
+            outbound_peer_count,
+            connecting_peer_count: connecting_peers.len(),
             bytes_sent: self.network_runtime.bytes_sent,
             bytes_received: self.network_runtime.bytes_received,
             peers,
+            connecting_peers,
         }
     }
 
@@ -851,30 +928,23 @@ impl NodeService {
 
     fn command_getstatus(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getstatus", args)?;
-        Ok(serde_json::to_value(self.node_status()).expect("node status serializes"))
+        Ok(Self::render_status_value(&self.node_status()))
     }
 
     fn command_gethealth(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("gethealth", args)?;
         let status = self.node_status();
-        let mut warnings = Vec::new();
-        if !status.running {
-            warnings.push("node runtime is not running");
-        }
-        if !status.headers_synced {
-            warnings.push("headers are not fully synced");
-        }
-        if status.network_diagnostics.peer_count == 0
-            && !matches!(status.network, Network::Regnet | Network::Prunetest)
-        {
-            warnings.push("no peers are connected");
-        }
+        let chain_synced = Self::chain_synced(&status);
+        let warnings = Self::health_warnings(&status);
         Ok(json!({
             "network": status.network.id(),
             "running": status.running,
-            "synced": status.headers_synced,
+            "synced": chain_synced,
+            "headers_synced": status.headers_synced,
             "height": status.block_count,
+            "sync_target_height": status.sync_best_height,
             "best_block_hash": hex::encode(status.tip_hash),
+            "best_block_time": status.tip_timestamp,
             "peer_count": status.network_diagnostics.peer_count,
             "mempool_count": status.mempool_count,
             "pruned": false,
@@ -1336,6 +1406,7 @@ impl NodeService {
             "peer_count": status.network_diagnostics.peer_count,
             "inbound_peer_count": status.network_diagnostics.inbound_peer_count,
             "outbound_peer_count": status.network_diagnostics.outbound_peer_count,
+            "connecting_peer_count": status.network_diagnostics.connecting_peer_count,
             "bytes_sent": status.network_diagnostics.bytes_sent,
             "bytes_received": status.network_diagnostics.bytes_received,
             "dns_seeds": params.dns_seeds,
@@ -1427,8 +1498,12 @@ impl NodeService {
 
     fn command_getpeerinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getpeerinfo", args)?;
-        serde_json::to_value(self.network_diagnostics().peers)
-            .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
+        let diagnostics = self.network_diagnostics();
+        serde_json::to_value(json!({
+            "connected_peers": diagnostics.peers,
+            "connecting_peers": diagnostics.connecting_peers,
+        }))
+        .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))
     }
 
     fn command_getmempoolinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
@@ -2418,6 +2493,81 @@ mod tests {
         assert_eq!(command.data["is_valid"], true);
         assert_eq!(command.data["address"], address);
         assert_eq!(command.data["matches_active_network"], true);
+    }
+
+    #[test]
+    fn rendered_status_marks_peer_target_above_local_height_as_not_synced() {
+        let status = NodeStatus {
+            network: Network::Mainnet,
+            block_count: 0,
+            tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x22; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 128,
+            network_diagnostics: NetworkDiagnostics::default(),
+        };
+
+        let rendered = NodeService::render_status_value(&status);
+        assert_eq!(rendered["local_height"], 0);
+        assert_eq!(rendered["sync_target_height"], 128);
+        assert_eq!(rendered["chain_synced"], false);
+        assert_eq!(rendered["headers_synced"], true);
+    }
+
+    #[test]
+    fn gethealth_warns_when_local_tip_is_behind_sync_target() {
+        let status = NodeStatus {
+            network: Network::Mainnet,
+            block_count: 0,
+            tip_hash: [0x33; 48],
+            tip_timestamp: 1_777_416_445,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x44; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 128,
+            network_diagnostics: NetworkDiagnostics::default(),
+        };
+        assert!(!NodeService::chain_synced(&status));
+        let warnings = NodeService::health_warnings(&status);
+        assert_eq!(
+            warnings,
+            vec![
+                "local chain tip is behind the advertised network target",
+                "no peers are connected",
+            ]
+        );
+    }
+
+    #[test]
+    fn network_diagnostics_excludes_pending_outbound_sessions_from_connected_peer_counts() {
+        let root = temp_data_dir("pending-peer-diagnostics");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service
+            .p2p_open_outbound("8.8.8.8:9200")
+            .expect("open pending outbound");
+
+        let diagnostics = service.network_diagnostics();
+        assert_eq!(diagnostics.peer_count, 0);
+        assert_eq!(diagnostics.inbound_peer_count, 0);
+        assert_eq!(diagnostics.outbound_peer_count, 0);
+        assert_eq!(diagnostics.connecting_peer_count, 1);
+        assert!(diagnostics.peers.is_empty());
+        assert_eq!(diagnostics.connecting_peers.len(), 1);
+        assert_eq!(diagnostics.connecting_peers[0].remote_addr, "8.8.8.8:9200");
+        assert_eq!(
+            diagnostics.connecting_peers[0].direction,
+            NetworkPeerDirection::Outbound
+        );
+        assert!(!diagnostics.connecting_peers[0].handshake_ready);
     }
 
     #[test]

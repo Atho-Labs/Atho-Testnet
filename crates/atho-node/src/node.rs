@@ -1,3 +1,4 @@
+//! Core in-process full-node state machine.
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;

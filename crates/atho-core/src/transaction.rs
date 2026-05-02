@@ -1,3 +1,10 @@
+//! Canonical Atho transaction and witness encoding.
+//!
+//! This module defines the transaction body, the attached witness payload, and
+//! the byte serialization routines used for txids, wtxids, relay, and wallet
+//! signing.
+//!
+//! CONSENSUS: Transaction hashing must only use canonical byte layouts.
 use crate::constants::{
     FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES, MAX_WITNESS_INPUT_REFS,
 };
@@ -5,6 +12,7 @@ use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
 
+/// Compact witness reference that binds an input to the shared witness payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessInputRef {
     #[serde(with = "serde_big_array::BigArray")]
@@ -13,6 +21,11 @@ pub struct WitnessInputRef {
     pub witness_commit_ref: [u8; 16],
 }
 
+/// Shared witness payload carried by an Atho transaction.
+///
+/// Atho groups the Falcon signature, Falcon public key, and per-input witness
+/// references into one canonical witness blob to keep transaction hashing and
+/// relay deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TxWitness {
     pub signature: Vec<u8>,
@@ -21,10 +34,12 @@ pub struct TxWitness {
 }
 
 impl TxWitness {
+    /// Returns `true` when no witness fields are populated.
     pub fn is_empty(&self) -> bool {
         self.signature.is_empty() && self.pubkey.is_empty() && self.input_refs.is_empty()
     }
 
+    /// Serializes the witness in the canonical full-transaction form.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
@@ -39,6 +54,7 @@ impl TxWitness {
         out
     }
 
+    /// Serializes the witness using compact-size prefixes for relay paths.
     pub fn compact_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             compact_size_len(self.signature.len())
@@ -60,6 +76,7 @@ impl TxWitness {
         out
     }
 
+    /// Returns the subset of witness bytes committed by the witness tree.
     pub fn commitment_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
@@ -69,6 +86,10 @@ impl TxWitness {
         out
     }
 
+    /// Parses a canonical witness blob.
+    ///
+    /// SECURITY: Length checks reject malformed Falcon material before higher
+    /// layers attempt signature verification.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut offset = 0usize;
         let read_u32 = |bytes: &[u8], offset: &mut usize| -> Option<u32> {
@@ -136,6 +157,7 @@ impl TxWitness {
     }
 }
 
+/// Reference to one previously created output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxInput {
     #[serde(with = "serde_big_array::BigArray")]
@@ -144,12 +166,17 @@ pub struct TxInput {
     pub unlocking_script: Vec<u8>,
 }
 
+/// Spendable output created by a transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxOutput {
     pub value_atoms: u64,
     pub locking_script: Vec<u8>,
 }
 
+/// Canonical Atho transaction body.
+///
+/// The `witness` field stores the canonical serialized [`TxWitness`] bytes so
+/// the transaction can move through storage and the network as a single object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub version: u16,
@@ -160,14 +187,17 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Returns `true` when the transaction is a coinbase.
     pub fn is_coinbase(&self) -> bool {
         self.inputs.is_empty()
     }
 
+    /// Returns the sum of all output values in atoms.
     pub fn output_value_atoms(&self) -> u64 {
         self.outputs.iter().map(|output| output.value_atoms).sum()
     }
 
+    /// Returns the canonical bytes used for txid calculation.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         self.base_bytes()
     }
@@ -231,6 +261,7 @@ impl Transaction {
             + self.witness.len()
     }
 
+    /// Serializes the full transaction including witness bytes.
     pub fn full_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.full_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -255,6 +286,7 @@ impl Transaction {
         out
     }
 
+    /// Serializes the transaction using compact-size prefixes for relay paths.
     pub fn compact_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.compact_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -277,6 +309,7 @@ impl Transaction {
         out
     }
 
+    /// Serializes the base transaction form used for txid hashing.
     pub fn base_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.base_size_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -297,6 +330,7 @@ impl Transaction {
         out
     }
 
+    /// Returns the witness byte count carried by the transaction.
     pub fn witness_bytes(&self) -> usize {
         self.witness.len()
     }
@@ -311,11 +345,16 @@ impl Transaction {
         (self.weight_bytes().saturating_add(3)) / 4
     }
 
+    /// Returns the effective feerate for the provided absolute fee.
     pub fn feerate_atoms_per_vbyte(&self, fee_atoms: u64) -> (u64, usize) {
         let vsize = self.vsize_bytes().max(1);
         (fee_atoms / vsize as u64, vsize)
     }
 
+    /// Computes the canonical transaction identifier.
+    ///
+    /// CONSENSUS: Atho txids exclude witness bytes, matching the canonical base
+    /// serialization used in UTXO references and Merkle roots.
     pub fn txid(&self) -> [u8; 48] {
         sha3_384(&self.base_bytes())
     }

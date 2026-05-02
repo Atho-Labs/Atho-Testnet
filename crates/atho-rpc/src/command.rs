@@ -1,7 +1,15 @@
+//! Shared Atho RPC command registry and permission model.
+//!
+//! The registry in this module is the single source of truth for the CLI, GUI
+//! debug console, help output, and RPC command routing.
+//!
+//! RPC SECURITY: Each command advertises whether it is read-only, wallet-
+//! sensitive, test-only, or blocked on mainnet.
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+/// Permission class enforced before a command is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandPermission {
@@ -44,6 +52,7 @@ impl CommandPermission {
     }
 }
 
+/// High-level command group shown in help and GUI tooling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandGroup {
@@ -82,6 +91,7 @@ impl CommandGroup {
     }
 }
 
+/// Static registry entry describing one Atho command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDefinition {
     pub name: &'static str,
@@ -100,6 +110,7 @@ pub struct CommandDefinition {
     pub examples: &'static [&'static str],
 }
 
+/// Serializable help metadata returned to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandHelpEntry {
     pub name: String,
@@ -143,6 +154,7 @@ impl From<&'static CommandDefinition> for CommandHelpEntry {
     }
 }
 
+/// Parsed command invocation supplied by the CLI, GUI, or RPC client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandInvocation {
     pub name: String,
@@ -160,6 +172,7 @@ impl CommandInvocation {
     }
 }
 
+/// Structured result returned by the command execution layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandResponse {
     pub command: String,

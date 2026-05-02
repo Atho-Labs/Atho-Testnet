@@ -156,6 +156,14 @@ pub(crate) struct NetworkTrafficSample {
     pub(crate) total_bytes_received: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncProgressSample {
+    pub(crate) recorded_at: Instant,
+    pub(crate) local_height: u64,
+    pub(crate) target_height: u64,
+    pub(crate) progress: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchPage {
     Welcome,

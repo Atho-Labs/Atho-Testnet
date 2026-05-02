@@ -1,3 +1,4 @@
+//! Node configuration defaults and runtime selection helpers.
 use atho_core::network::Network;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

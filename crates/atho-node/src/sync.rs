@@ -1,3 +1,4 @@
+//! Node sync notices and background synchronization bookkeeping.
 use crate::error::NodeError;
 use crate::node::Node;
 use crate::validation::{finalize_witness_commit_refs, ValidationError};

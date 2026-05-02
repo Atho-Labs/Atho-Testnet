@@ -1,3 +1,4 @@
+//! Block and header download coordination primitives.
 use crate::protocol::{Hash48, InventoryKind, InventoryVector};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

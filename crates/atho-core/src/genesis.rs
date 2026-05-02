@@ -1,3 +1,10 @@
+//! Network-specific genesis block definitions.
+//!
+//! This module hard-codes the genesis profile for each supported Atho network
+//! and exposes helpers used by startup, storage, and P2P identity checks.
+//!
+//! CONSENSUS: Genesis constants anchor the network identity. Changing them
+//! creates a new network and invalidates all existing chain data.
 use crate::block::{merkle_root, witness_root, Block, BlockHeader};
 use crate::consensus::pow;
 use crate::consensus::rules::{BLOCK_VERSION_V1, TRANSACTION_VERSION_V1};
@@ -64,6 +71,7 @@ const PRUNETEST_GENESIS_LOCK_TIME: u32 = 0;
 const PRUNETEST_GENESIS_TIMESTAMP: u64 = 1_773_360_490;
 const PRUNETEST_GENESIS_TARGET: [u8; 48] = pow::PRUNETEST_INITIAL_TARGET;
 
+/// Fully materialized genesis state for one Atho network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenesisState {
     pub network: Network,
@@ -74,6 +82,7 @@ pub struct GenesisState {
     pub utxo_flag: &'static str,
 }
 
+/// Regenerated genesis profile including the solved nonce and block hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenesisProfile {
     pub network: Network,
@@ -91,6 +100,7 @@ pub struct GenesisProfile {
     pub block_hash: [u8; 48],
 }
 
+/// Returns the hard-coded genesis state for the selected network.
 pub fn genesis_state(network: Network) -> GenesisState {
     match network {
         Network::Mainnet => mainnet(),
@@ -100,31 +110,41 @@ pub fn genesis_state(network: Network) -> GenesisState {
     }
 }
 
+/// Returns the canonical genesis block for the selected network.
 pub fn genesis_block(network: Network) -> Block {
     genesis_state(network).block
 }
 
+/// Returns the canonical genesis block hash for the selected network.
 pub fn genesis_hash(network: Network) -> [u8; 48] {
     genesis_state(network).block_hash
 }
 
+/// Returns the genesis coinbase txid for the selected network.
 pub fn genesis_coinbase_txid(network: Network) -> [u8; 48] {
     genesis_state(network).coinbase_txid
 }
 
+/// Returns the genesis reward address encoded for the selected network.
 pub fn genesis_reward_address(network: Network) -> String {
     genesis_state(network).reward_address
 }
 
+/// Returns the network-specific UTXO tag seeded by genesis.
 pub fn genesis_utxo_flag(network: Network) -> &'static str {
     genesis_state(network).utxo_flag
 }
 
+/// Returns the genesis coinbase value in atoms.
 pub fn genesis_utxo_value(network: Network) -> u64 {
     let _ = network;
     GENESIS_COINBASE_ATOMS
 }
 
+/// Re-solves the genesis profile from the static parameters.
+///
+/// This helper is for development tooling and verification. Production nodes
+/// use the fixed constants above and do not mine genesis at startup.
 pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
     let (reward_address, reward_script, block_version, tx_version, lock_time, timestamp, target) =
         match network {

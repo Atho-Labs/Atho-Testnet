@@ -1,3 +1,4 @@
+//! Structured RPC errors and safe user-facing serialization.
 use atho_errors::{
     AthoError, AthoErrorDescriptor, AthoSeverity, RPC_INTERNAL, RPC_INVALID_REQUEST,
     RPC_METHOD_NOT_FOUND, RPC_VALIDATION,

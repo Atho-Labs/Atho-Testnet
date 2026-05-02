@@ -1,3 +1,8 @@
+//! Desktop installer entry point for packaged Atho releases.
+//!
+//! The installer unpacks a signed release bundle, chooses the platform-specific
+//! install script, and presents a minimal GUI so end users do not have to
+//! manage shell commands directly.
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};

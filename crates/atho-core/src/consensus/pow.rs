@@ -1,3 +1,10 @@
+//! Atho proof-of-work difficulty and chainwork utilities.
+//!
+//! This module implements the deterministic target retargeting rules, target
+//! comparison helpers, and chainwork ordering used for branch selection.
+//!
+//! CONSENSUS: Every function here must produce identical results across nodes
+//! for the same ordered block history.
 use crate::block::{Block, BlockHeader};
 use crate::constants::{
     POW_AVERAGING_WINDOW_BLOCKS, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
@@ -10,6 +17,7 @@ use num_bigint::BigUint;
 use num_traits::Zero;
 use std::cmp::Ordering;
 
+/// Static proof-of-work tuning knobs shared across all networks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProofOfWork {
     pub target_block_time_seconds: u64,
@@ -21,6 +29,7 @@ pub struct ProofOfWork {
     pub max_adjust_down_percent: u64,
 }
 
+/// Network-specific difficulty target bounds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DifficultyTargetProfile {
     pub genesis_target: [u8; 48],
@@ -54,6 +63,7 @@ pub const TESTNET_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.genesis_target;
 pub const REGNET_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.genesis_target;
 pub const PRUNETEST_INITIAL_TARGET: [u8; 48] = DIFFICULTY_PROFILE.min_difficulty_target;
 
+/// Returns the expected retarget timespan for the configured averaging window.
 pub fn expected_timespan_seconds() -> u64 {
     expected_timespan_seconds_for_window(POW_PROFILE.averaging_window_blocks as usize)
 }
@@ -64,6 +74,7 @@ fn expected_timespan_seconds_for_window(window_blocks: usize) -> u64 {
         .saturating_mul(window_blocks.saturating_sub(1) as u64)
 }
 
+/// Clamps a signed difficulty delta to a configured absolute limit.
 pub fn clamp_difficulty_delta(current: i64, change: i64, limit: i64) -> i64 {
     let next = current.saturating_add(change);
     if next > limit {
@@ -75,6 +86,7 @@ pub fn clamp_difficulty_delta(current: i64, change: i64, limit: i64) -> i64 {
     }
 }
 
+/// Returns the initial target for the selected network.
 pub fn initial_target_for_network(network: Network) -> [u8; 48] {
     match network {
         Network::Mainnet => MAINNET_INITIAL_TARGET,
@@ -84,6 +96,7 @@ pub fn initial_target_for_network(network: Network) -> [u8; 48] {
     }
 }
 
+/// Returns the target committed by a block at the given height.
 pub fn target_for_height(network: Network, height: u64) -> [u8; 48] {
     if height == 0 {
         DIFFICULTY_PROFILE.genesis_target
@@ -190,6 +203,7 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
     clamp_target(biguint_to_target(&threshold))
 }
 
+/// Computes the next required target from historical block headers.
 pub fn target_for_next_block(network: Network, previous_blocks: &[Block]) -> [u8; 48] {
     let headers: Vec<BlockHeader> = previous_blocks
         .iter()
@@ -198,6 +212,7 @@ pub fn target_for_next_block(network: Network, previous_blocks: &[Block]) -> [u8
     next_target_from_headers(network, &headers)
 }
 
+/// Computes cumulative chainwork for a block sequence.
 pub fn accumulated_chain_work(blocks: &[Block]) -> BigUint {
     let mut total = BigUint::zero();
     for block in blocks {
@@ -206,6 +221,7 @@ pub fn accumulated_chain_work(blocks: &[Block]) -> BigUint {
     total
 }
 
+/// Converts a target into a user-facing scaled difficulty ratio.
 pub fn difficulty_ratio_scaled(target: &[u8; 48], scale: u64) -> u64 {
     let target = target_to_biguint(target);
     if target.is_zero() {
@@ -217,6 +233,7 @@ pub fn difficulty_ratio_scaled(target: &[u8; 48], scale: u64) -> u64 {
     u64::try_from(ratio).unwrap_or(u64::MAX)
 }
 
+/// Estimates average network hash rate from an ordered block history.
 pub fn estimated_hashes_per_second(blocks: &[Block]) -> u64 {
     if blocks.len() < 2 {
         return 0;
@@ -238,6 +255,7 @@ pub fn estimated_hashes_per_second(blocks: &[Block]) -> u64 {
     u64::try_from(work).unwrap_or(u64::MAX)
 }
 
+/// Compares two branches using chainwork, then deterministic tie-breakers.
 pub fn compare_branch_work(candidate: &[Block], current: &[Block]) -> Ordering {
     let candidate_work = accumulated_chain_work(candidate);
     let current_work = accumulated_chain_work(current);
@@ -257,10 +275,12 @@ pub fn compare_branch_work(candidate: &[Block], current: &[Block]) -> Ordering {
         })
 }
 
+/// Returns `true` when the candidate branch should replace the current tip.
 pub fn branch_is_preferred(candidate: &[Block], current: &[Block]) -> bool {
     compare_branch_work(candidate, current).is_gt()
 }
 
+/// Returns the median time past of the current tip, if any history exists.
 pub fn median_time_past_from_blocks(previous_blocks: &[Block]) -> Option<u64> {
     if previous_blocks.is_empty() {
         return None;
@@ -272,19 +292,25 @@ pub fn median_time_past_from_blocks(previous_blocks: &[Block]) -> Option<u64> {
     Some(median_time_past(&headers, headers.len() - 1))
 }
 
+/// Returns the minimum valid timestamp for the next block.
 pub fn minimum_next_block_timestamp(previous_blocks: &[Block]) -> Option<u64> {
     median_time_past_from_blocks(previous_blocks).map(|timestamp| timestamp.saturating_add(1))
 }
 
+/// Returns `true` when the target respects the configured difficulty bounds.
 pub fn target_within_bounds(target: &[u8; 48]) -> bool {
     target >= &DIFFICULTY_PROFILE.max_difficulty_target
         && target <= &DIFFICULTY_PROFILE.min_difficulty_target
 }
 
+/// Returns `true` when the block hash meets the required target.
+///
+/// CONSENSUS: Atho accepts hashes that are exactly equal to the target.
 pub fn meets_target(hash: &[u8; 48], target: &[u8; 48]) -> bool {
     hash <= target
 }
 
+/// Clamps an arbitrary target into the network-wide difficulty bounds.
 pub fn clamp_target(target: [u8; 48]) -> [u8; 48] {
     if target < DIFFICULTY_PROFILE.max_difficulty_target {
         DIFFICULTY_PROFILE.max_difficulty_target

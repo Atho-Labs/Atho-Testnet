@@ -1,5 +1,4 @@
 use crate::app::{widgets, DesktopApp, WalletActivityKind, WalletActivityRow};
-use crate::resources;
 use eframe::egui;
 
 const DATE_FILTERS: &[&str] = &["All", "Confirmed"];
@@ -77,30 +76,6 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                     }
                 });
         }
-
-        ui.add_space(10.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_sized(
-                    [90.0, 30.0],
-                    egui::Button::image_and_text(resources::export_icon(14.0), "Export"),
-                )
-                .clicked()
-            {
-                let mut export = String::from("date\ttype\tlabel\tamount_atoms\treference\n");
-                for row in rows {
-                    export.push_str(&format!(
-                        "{}\t{}\t{}\t{}\t{}\n",
-                        row.when,
-                        row.kind.label(),
-                        row.label,
-                        row.amount_atoms,
-                        row.reference
-                    ));
-                }
-                DesktopApp::copy_text(ui, export);
-            }
-        });
     });
 }
 

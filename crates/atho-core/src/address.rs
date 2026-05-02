@@ -1,3 +1,11 @@
+//! Atho address encoding, decoding, and hashed-public-key helpers.
+//!
+//! Atho addresses are user-facing base56 strings derived from a 32-byte payment
+//! digest plus a visible network prefix and checksum. Internal hashed public
+//! keys use a separate network-tagged string form.
+//!
+//! SECURITY: Network-specific prefixes prevent users and wallets from confusing
+//! mainnet, testnet, regnet, and prunetest destinations.
 use crate::{constants::*, crypto::hash::sha3_256, network::Network};
 
 fn base56_value(c: char) -> Option<u8> {
@@ -83,6 +91,7 @@ fn base56_decode_to_bytes(
     Ok(bytes)
 }
 
+/// Computes the visible-address checksum for a base56 body.
 pub fn address_checksum(prefix: char, body: &str) -> [u8; ADDRESS_CHECKSUM_BYTES] {
     let mut data = Vec::with_capacity(1 + body.len());
     data.push(prefix as u8);
@@ -93,6 +102,10 @@ pub fn address_checksum(prefix: char, body: &str) -> [u8; ADDRESS_CHECKSUM_BYTES
         .expect("fixed length")
 }
 
+/// Derives a role-separated digest from a public key.
+///
+/// SECURITY: The `role` domain separator prevents the same public key bytes
+/// from being reused across incompatible address-like namespaces.
 pub fn role_digest_from_pubkey(
     network: Network,
     public_key: &[u8],
@@ -109,10 +122,12 @@ pub fn role_digest_from_pubkey(
     sha3_256(&preimage)
 }
 
+/// Returns the 32-byte payment digest used in Atho locking scripts.
 pub fn public_key_digest(network: Network, public_key: &[u8]) -> [u8; ADDRESS_DIGEST_BYTES] {
     role_digest_from_pubkey(network, public_key, ADDRESS_ROLE_DOMAIN)
 }
 
+/// Formats an internal hashed-public-key string from a payment digest.
 pub fn hashed_public_key_from_digest(
     network: Network,
     digest: &[u8; ADDRESS_DIGEST_BYTES],
@@ -120,6 +135,7 @@ pub fn hashed_public_key_from_digest(
     format!("{}{}", network.internal_hpk_prefix(), hex::encode(digest))
 }
 
+/// Parsed address components derived from a wallet or public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressParts {
     pub network: Network,
@@ -130,6 +146,7 @@ pub struct AddressParts {
     pub checksum: [u8; ADDRESS_CHECKSUM_BYTES],
 }
 
+/// Builds both visible and internal Atho address forms from a public key.
 pub fn address_parts_from_public_key(network: Network, public_key: &[u8]) -> AddressParts {
     let payment_digest = public_key_digest(network, public_key);
     let visible_prefix = network.visible_prefix();
@@ -150,6 +167,7 @@ pub fn address_parts_from_public_key(network: Network, public_key: &[u8]) -> Add
     }
 }
 
+/// Decodes an internal hashed-public-key string into raw digest bytes.
 pub fn internal_hpk_bytes(network: Network, internal_hpk: &str) -> Option<Vec<u8>> {
     let prefix = network.internal_hpk_prefix();
     let body = internal_hpk.strip_prefix(prefix)?;
@@ -159,18 +177,22 @@ pub fn internal_hpk_bytes(network: Network, internal_hpk: &str) -> Option<Vec<u8
     hex::decode(body).ok()
 }
 
+/// Builds the visible base56 address for a public key.
 pub fn address_from_public_key(network: Network, public_key: &[u8]) -> String {
     address_parts_from_public_key(network, public_key).base56_address
 }
 
+/// Returns `true` when the character is valid in Atho base56 strings.
 pub fn is_base56_char(c: char) -> bool {
     BASE56_ALPHABET.contains(c)
 }
 
+/// Returns `true` when the character can begin a visible Atho address.
 pub fn is_visible_prefix(c: char) -> bool {
     matches!(c, 'A' | 'T' | 'R' | 'P')
 }
 
+/// Encodes a payment digest into a visible Atho base56 address.
 pub fn encode_base56_address(network: Network, digest: &[u8; ADDRESS_DIGEST_BYTES]) -> String {
     let prefix = network.visible_prefix();
     let body = base56_encode_bytes(digest);
@@ -183,6 +205,10 @@ pub fn encode_base56_address(network: Network, digest: &[u8; ADDRESS_DIGEST_BYTE
     out
 }
 
+/// Decodes and validates a visible Atho address.
+///
+/// SECURITY: The checksum and visible prefix checks reject wrong-network or
+/// malformed addresses before wallet or RPC code accepts them.
 pub fn decode_base56_address(
     address: &str,
 ) -> Result<([u8; ADDRESS_DIGEST_BYTES], Network), crate::error::AddressError> {

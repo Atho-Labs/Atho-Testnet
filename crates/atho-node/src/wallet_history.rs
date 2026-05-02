@@ -1,3 +1,4 @@
+//! Wallet activity extraction from on-chain and mempool data.
 use atho_core::block::Block;
 use atho_rpc::request::WalletHistoryAddress;
 use atho_rpc::response::{WalletActivityEntry, WalletActivityKind};

@@ -1,3 +1,4 @@
+//! Atho P2P message definitions and protocol validation.
 use crate::config::{network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::rules;

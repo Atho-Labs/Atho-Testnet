@@ -1,3 +1,4 @@
+//! Wallet address-book records and label tracking.
 use crate::hd::{AddressKind, DerivationPath};
 use atho_core::network::Network;
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,4 @@
+//! Receive/change keypool reservation and recycling.
 use crate::hd::{AddressKind, DerivationPath, HdWallet};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

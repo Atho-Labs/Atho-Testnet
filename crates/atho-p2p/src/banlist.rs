@@ -1,3 +1,4 @@
+//! Peer banlist and temporary network isolation state.
 use crate::config::network_params;
 use atho_core::network::Network;
 use std::collections::BTreeMap;

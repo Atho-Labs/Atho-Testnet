@@ -1,3 +1,4 @@
+//! UTXO entry types and the in-memory UTXO set representation.
 use crate::error::StorageError;
 use atho_core::block::Block;
 use atho_core::constants::{COINBASE_MATURITY_BLOCKS, STANDARD_TX_CONFIRMATIONS};

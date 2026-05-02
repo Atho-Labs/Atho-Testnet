@@ -1,3 +1,10 @@
+//! Core Atho protocol types and consensus-facing helpers.
+//!
+//! This crate defines the canonical block, transaction, address, network, and
+//! consensus primitives shared by every higher-level Atho component.
+//!
+//! CONSENSUS: Any serialization, hashing, or validation helper in this crate
+//! must remain deterministic across all nodes for the same input data.
 #![forbid(unsafe_code)]
 
 pub mod address;

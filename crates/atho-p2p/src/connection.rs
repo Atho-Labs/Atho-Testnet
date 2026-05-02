@@ -1,3 +1,4 @@
+//! Live peer connection state and event reporting.
 use crate::address_manager::{format_remote_addr, AddressManager};
 use crate::banlist::BanList;
 use crate::config::network_params;

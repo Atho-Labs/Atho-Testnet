@@ -1,6 +1,7 @@
 use crate::app::{widgets, AddressPoolFilter, DesktopApp, ReceivePageTab};
 use crate::resources;
 use eframe::egui;
+use qrcodegen::{QrCode, QrCodeEcc};
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
@@ -36,118 +37,33 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
 }
 
 fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
+    let selected_request = app.selected_receive_request().cloned();
+    let current_address = app.current_receive_address_text();
+    let detail_address = selected_request
+        .as_ref()
+        .map(|request| request.address.clone())
+        .or_else(|| (!current_address.is_empty()).then_some(current_address.clone()));
+
     widgets::panel_frame().show(ui, |ui| {
-        ui.set_min_height(280.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new("Use this form to request payments. All fields are optional.")
-                    .size(13.0),
-            );
-        });
-        ui.add_space(10.0);
-
-        egui::Grid::new("receive_form")
-            .num_columns(2)
-            .spacing([12.0, 9.0])
-            .min_col_width(120.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Label:").size(13.0).strong());
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut app.receive_label),
+        ui.set_min_height(300.0);
+        if ui.available_width() > 820.0 {
+            ui.columns(2, |columns| {
+                render_request_form(app, &mut columns[0]);
+                render_receive_detail_card(
+                    app,
+                    &mut columns[1],
+                    selected_request.as_ref(),
+                    detail_address.as_deref(),
                 );
-                ui.end_row();
-
-                ui.label(egui::RichText::new("Amount:").size(13.0).strong());
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [160.0, 30.0],
-                        egui::TextEdit::singleline(&mut app.receive_amount),
-                    );
-                    let mut receive_unit = 0usize;
-                    egui::ComboBox::from_id_source("receive_unit")
-                        .width(120.0)
-                        .selected_text("atoms")
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut receive_unit, 0, "atoms");
-                        });
-                    widgets::muted_label(ui, "Base56");
-                });
-                ui.end_row();
-
-                ui.label(egui::RichText::new("Message:").size(13.0).strong());
-                ui.add_sized(
-                    [ui.available_width(), 30.0],
-                    egui::TextEdit::singleline(&mut app.receive_message),
-                );
-                ui.end_row();
             });
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    [190.0, 30.0],
-                    egui::Button::image_and_text(
-                        resources::receive_icon(14.0),
-                        "Create new receiving address",
-                    ),
-                )
-                .clicked()
-            {
-                app.create_receive_request();
-            }
-            if ui
-                .add_sized(
-                    [84.0, 30.0],
-                    egui::Button::image_and_text(resources::clear_icon(14.0), "Clear"),
-                )
-                .clicked()
-            {
-                app.receive_label.clear();
-                app.receive_amount.clear();
-                app.receive_message.clear();
-            }
-            if !app.current_receive_address_text().is_empty()
-                && widgets::icon_button(ui, resources::copy_icon(15.0), "Copy current address")
-                    .clicked()
-            {
-                DesktopApp::copy_text(ui, app.current_receive_address_text());
-            }
-        });
-        if !app.current_receive_address_text().is_empty() {
+        } else {
+            render_request_form(app, ui);
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                widgets::muted_label(ui, "Current receiving address");
-                if let Some(index) = app.wallet_current_receive_index() {
-                    ui.label(
-                        egui::RichText::new(format!("Wallet index R{index:04}"))
-                            .monospace()
-                            .color(widgets::ACCENT),
-                    );
-                }
-                if let Some(row) = app.current_receive_address_row() {
-                    let status = if row.used {
-                        let suffix = if row.utxo_count == 1 { "UTXO" } else { "UTXOs" };
-                        format!("Used - {} {}", row.utxo_count, suffix)
-                    } else {
-                        String::from("Unused")
-                    };
-                    ui.colored_label(
-                        if row.used {
-                            widgets::ACCENT
-                        } else {
-                            widgets::MUTED
-                        },
-                        status,
-                    );
-                }
-            });
-            let mut address_text = app.current_receive_address_text();
-            ui.add(
-                egui::TextEdit::singleline(&mut address_text)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false),
+            render_receive_detail_card(
+                app,
+                ui,
+                selected_request.as_ref(),
+                detail_address.as_deref(),
             );
         }
     });
@@ -220,7 +136,6 @@ fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             }
         }
 
-        let selected_request = app.selected_receive_request().cloned();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
@@ -245,13 +160,254 @@ fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             widgets::muted_label(ui, "Selected base56 receiving address");
             let mut selected_address = request.address;
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut selected_address)
                     .desired_width(f32::INFINITY)
                     .interactive(false),
             );
+            response.context_menu(|ui| {
+                if ui.button("Copy address").clicked() {
+                    DesktopApp::copy_text(ui, selected_address.clone());
+                    ui.close_menu();
+                }
+            });
         }
     });
+}
+
+fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new("Use this form to request Atho payments. All fields are optional.")
+                .size(13.0),
+        );
+        ui.add_space(10.0);
+
+        egui::Grid::new("receive_form")
+            .num_columns(2)
+            .spacing([12.0, 9.0])
+            .min_col_width(120.0)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Label:").size(13.0).strong());
+                ui.add_sized(
+                    [ui.available_width(), 30.0],
+                    egui::TextEdit::singleline(&mut app.receive_label)
+                        .hint_text("Optional internal label")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Amount:").size(13.0).strong());
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [180.0, 30.0],
+                        egui::TextEdit::singleline(&mut app.receive_amount)
+                            .hint_text("Atom amount, for example 50000000"),
+                    );
+                    widgets::muted_label(ui, "atoms");
+                });
+                ui.end_row();
+
+                ui.label(egui::RichText::new("Message:").size(13.0).strong());
+                ui.add_sized(
+                    [ui.available_width(), 30.0],
+                    egui::TextEdit::singleline(&mut app.receive_message)
+                        .hint_text("Optional payment note")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            });
+
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_sized(
+                    [190.0, 30.0],
+                    egui::Button::image_and_text(
+                        resources::receive_icon(14.0),
+                        "Create new receiving address",
+                    ),
+                )
+                .clicked()
+            {
+                app.create_receive_request();
+            }
+            if ui
+                .add_sized(
+                    [84.0, 30.0],
+                    egui::Button::image_and_text(resources::clear_icon(14.0), "Clear"),
+                )
+                .clicked()
+            {
+                app.receive_label.clear();
+                app.receive_amount.clear();
+                app.receive_message.clear();
+            }
+            if !app.current_receive_address_text().is_empty()
+                && widgets::icon_button(ui, resources::copy_icon(15.0), "Copy current address")
+                    .clicked()
+            {
+                DesktopApp::copy_text(ui, app.current_receive_address_text());
+            }
+        });
+        if !app.current_receive_address_text().is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                widgets::muted_label(ui, "Current receiving address");
+                if let Some(index) = app.wallet_current_receive_index() {
+                    ui.label(
+                        egui::RichText::new(format!("Wallet index R{index:04}"))
+                            .monospace()
+                            .color(widgets::ACCENT),
+                    );
+                }
+                if let Some(row) = app.current_receive_address_row() {
+                    let status = if row.used {
+                        let suffix = if row.utxo_count == 1 { "UTXO" } else { "UTXOs" };
+                        format!("Used - {} {}", row.utxo_count, suffix)
+                    } else {
+                        String::from("Unused")
+                    };
+                    ui.colored_label(
+                        if row.used {
+                            widgets::ACCENT
+                        } else {
+                            widgets::MUTED
+                        },
+                        status,
+                    );
+                }
+            });
+            let mut address_text = app.current_receive_address_text();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut address_text)
+                    .desired_width(f32::INFINITY)
+                    .interactive(false),
+            );
+            response.context_menu(|ui| {
+                if ui.button("Copy address").clicked() {
+                    DesktopApp::copy_text(ui, address_text.clone());
+                    ui.close_menu();
+                }
+            });
+        }
+    });
+}
+
+fn render_receive_detail_card(
+    app: &mut DesktopApp,
+    ui: &mut egui::Ui,
+    selected_request: Option<&crate::app::ReceiveRequestRecord>,
+    detail_address: Option<&str>,
+) {
+    widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Address request");
+        ui.add_space(10.0);
+
+        let Some(address) = detail_address else {
+            widgets::muted_label(
+                ui,
+                "Create a receiving address or select a requested payment to show the address and QR code here.",
+            );
+            return;
+        };
+
+        let title = if selected_request.is_some() {
+            "Selected request"
+        } else {
+            "Current receiving address"
+        };
+        ui.label(egui::RichText::new(title).strong().color(widgets::ACCENT));
+        ui.add_space(8.0);
+
+        ui.horizontal_wrapped(|ui| {
+            if let Some(request) = selected_request {
+                ui.label(
+                    egui::RichText::new(format!("#{}", request.sequence))
+                        .monospace()
+                        .color(widgets::TEXT),
+                );
+                if !request.label.is_empty() {
+                    ui.separator();
+                    widgets::muted_label(ui, &request.label);
+                }
+                if let Some(amount_atoms) = request.amount_atoms {
+                    ui.separator();
+                    widgets::muted_label(ui, &format!("{amount_atoms} atoms"));
+                }
+            } else if let Some(index) = app.wallet_current_receive_index() {
+                ui.label(
+                    egui::RichText::new(format!("Wallet index R{index:04}"))
+                        .monospace()
+                        .color(widgets::TEXT),
+                );
+            }
+        });
+        if let Some(request) = selected_request {
+            if !request.message.is_empty() {
+                ui.add_space(4.0);
+                widgets::muted_label(ui, &request.message);
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            paint_qr_code(ui, address, 176.0);
+            ui.add_space(8.0);
+            let response = ui.label(
+                egui::RichText::new(widgets::elide_text(address, 42))
+                    .monospace()
+                    .color(widgets::TEXT),
+            );
+            response.on_hover_text(address);
+        });
+        ui.add_space(10.0);
+
+        ui.horizontal_wrapped(|ui| {
+            if widgets::icon_button(ui, resources::copy_icon(15.0), "Copy address").clicked() {
+                DesktopApp::copy_text(ui, address.to_owned());
+            }
+            widgets::muted_label(ui, "The QR encodes the same base56 Atho address shown below it.");
+        });
+    });
+}
+
+fn paint_qr_code(ui: &mut egui::Ui, payload: &str, size: f32) {
+    let Ok(code) = QrCode::encode_text(payload, QrCodeEcc::Medium) else {
+        widgets::muted_label(ui, "QR unavailable");
+        return;
+    };
+    let module_count = code.size();
+    if module_count <= 0 {
+        widgets::muted_label(ui, "QR unavailable");
+        return;
+    }
+
+    let quiet_zone = 2;
+    let total_modules = module_count + quiet_zone * 2;
+    let (response, painter) = ui.allocate_painter(egui::vec2(size, size), egui::Sense::hover());
+    painter.rect_filled(response.rect, 4.0, egui::Color32::WHITE);
+    let module_size = response.rect.width() / total_modules as f32;
+
+    for y in 0..module_count {
+        for x in 0..module_count {
+            if !code.get_module(x, y) {
+                continue;
+            }
+            let left = response.rect.left() + (x + quiet_zone) as f32 * module_size;
+            let top = response.rect.top() + (y + quiet_zone) as f32 * module_size;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(left, top),
+                egui::vec2(module_size, module_size),
+            );
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 31, 28));
+        }
+    }
+    painter.rect_stroke(
+        response.rect,
+        4.0,
+        egui::Stroke::new(1.0, widgets::PANEL_STROKE),
+    );
 }
 
 fn render_address_pool_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {

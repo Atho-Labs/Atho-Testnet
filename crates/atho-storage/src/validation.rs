@@ -1,3 +1,12 @@
+//! Transaction and block validation against chainstate context.
+//!
+//! This module bridges the pure protocol types in `atho-core` with the live
+//! UTXO set so the node can validate transactions for mempool admission and
+//! blocks for chain acceptance.
+//!
+//! SECURITY: Duplicate inputs, missing UTXOs, immature coinbase spends, wrong
+//! witness references, and wrong-network blocks are rejected here before the
+//! chainstate mutates.
 use crate::utxo::{UtxoEntry, UtxoSet};
 use atho_core::address::public_key_digest;
 use atho_core::block::Block;
@@ -28,6 +37,7 @@ use rayon::prelude::*;
 use std::collections::BTreeSet;
 use thiserror::Error;
 
+/// Validation failures raised while checking transactions or blocks.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum ValidationError {
     #[error("transaction has no inputs")]
@@ -136,6 +146,10 @@ impl AthoErrorMeta for ValidationError {
     }
 }
 
+/// Derives the short witness reference committed per input.
+///
+/// CONSENSUS: Both signers and validators must derive the same two-byte tag for
+/// the same txid, signature, and input index.
 pub fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
     let mut preimage = Vec::with_capacity(
         b"ATHO_SIG_REF_SHORT_V1".len() + txid.len() + signature.len() + core::mem::size_of::<u32>(),
@@ -148,6 +162,7 @@ pub fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32)
     [digest[0], digest[1]]
 }
 
+/// Derives the witness-commitment reference that binds an input to a block.
 pub fn derive_witness_commit_ref(
     txid: &[u8; 48],
     block_witness_root: &[u8; 48],
@@ -169,6 +184,7 @@ pub fn derive_witness_commit_ref(
     out
 }
 
+/// Rebuilds the transaction witness references against the selected block root.
 pub fn finalize_witness_commit_refs(tx: &Transaction, block_witness_root: [u8; 48]) -> Transaction {
     let Some(witness) = tx.witness_payload() else {
         return tx.clone();
@@ -200,6 +216,11 @@ pub fn finalize_witness_commit_refs(tx: &Transaction, block_witness_root: [u8; 4
     }
 }
 
+/// Verifies the Falcon witness signature carried by a transaction.
+///
+/// CONSENSUS: This check validates the canonical Atho signing digest. If wallet
+/// signing and validator verification ever disagree on the digest bytes, spends
+/// will fail network-wide.
 pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationError> {
     if tx.is_coinbase() {
         return Err(ValidationError::NoInputs);
@@ -242,16 +263,22 @@ fn locking_script_matches_public_key(
     }
 }
 
+/// Performs context-free transaction validation with a caller-supplied fee.
 pub fn validate_transaction(tx: &Transaction, fee_atoms: u64) -> Result<(), ValidationError> {
     validate_transaction_for_height(tx, fee_atoms, 0)
 }
 
+/// Returns `true` when a transaction contains relay-policy dust outputs.
 pub fn transaction_contains_dust_outputs(tx: &Transaction) -> bool {
     tx.outputs
         .iter()
         .any(|output| output.value_atoms > 0 && output.value_atoms < DUST_RELAY_VALUE_ATOMS)
 }
 
+/// Enforces standard relay policy that is stricter than bare consensus.
+///
+/// POLICY: Dust output rejection is applied for mempool admission and wallet
+/// construction, not by itself as a historical block-validity rule.
 pub fn validate_transaction_standard_policy(tx: &Transaction) -> Result<(), ValidationError> {
     if transaction_contains_dust_outputs(tx) {
         return Err(ValidationError::DustOutput);
@@ -259,6 +286,7 @@ pub fn validate_transaction_standard_policy(tx: &Transaction) -> Result<(), Vali
     Ok(())
 }
 
+/// Validates transaction structure against the active rule schedule.
 pub fn validate_transaction_for_height(
     tx: &Transaction,
     fee_atoms: u64,
@@ -272,6 +300,7 @@ pub fn validate_transaction_for_height(
     )
 }
 
+/// Performs context-free structural checks before UTXO lookup.
 pub fn validate_transaction_structure_for_height_with_schedule(
     tx: &Transaction,
     fee_atoms: u64,
@@ -295,12 +324,15 @@ pub fn validate_transaction_structure_for_height_with_schedule(
     if tx.outputs.iter().any(|output| output.value_atoms == 0) {
         return Err(ValidationError::ZeroValueOutput);
     }
+    // SECURITY: Reject duplicate inputs before fee or ownership accounting so
+    // one transaction cannot attempt an intra-transaction double spend.
     let mut seen = BTreeSet::new();
     for input in &tx.inputs {
         if !seen.insert((input.previous_txid, input.output_index)) {
             return Err(ValidationError::DuplicateInput);
         }
     }
+    // POLICY: Standard relay requires at least one atom per vbyte.
     let minimum_fee = vsize_bytes as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
     if fee_atoms < minimum_fee {
         return Err(ValidationError::FeeBelowMinimum);
@@ -324,6 +356,7 @@ pub fn validate_transaction_structure_for_height_with_schedule(
     Ok(())
 }
 
+/// Performs context-free validation and Falcon signature verification.
 pub fn validate_transaction_for_height_with_schedule(
     tx: &Transaction,
     fee_atoms: u64,
@@ -335,6 +368,7 @@ pub fn validate_transaction_for_height_with_schedule(
     Ok(())
 }
 
+/// Validates a transaction against UTXO context and checks fee exactness.
 pub fn validate_transaction_with_context_structure_and_schedule<F>(
     tx: &Transaction,
     fee_atoms: u64,
@@ -354,6 +388,7 @@ where
     Ok(actual_fee)
 }
 
+/// Validates a transaction against UTXO context with a minimum fee floor.
 pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
     tx: &Transaction,
     minimum_fee_atoms: u64,
@@ -398,6 +433,8 @@ where
         if !seen.insert((input.previous_txid, input.output_index)) {
             return Err(ValidationError::DuplicateInput);
         }
+        // SECURITY: A missing UTXO or mismatched locking script indicates an
+        // attempt to spend coins the witness does not control.
         let utxo =
             lookup(&input.previous_txid, input.output_index).ok_or(ValidationError::MissingUtxo)?;
         if utxo.locking_script != input.unlocking_script {
@@ -419,12 +456,15 @@ where
     }
 
     let output_total = tx.output_value_atoms();
+    // The fee is the remaining value after all outputs are funded. Checked
+    // arithmetic prevents underflow from turning overspends into huge fees.
     let actual_fee = input_total
         .checked_sub(output_total)
         .ok_or(ValidationError::FeeMismatch)?;
     Ok(actual_fee)
 }
 
+/// Validates a transaction against chainstate and an exact fee value.
 pub fn validate_transaction_with_context<F>(
     tx: &Transaction,
     fee_atoms: u64,
@@ -443,6 +483,7 @@ where
     )
 }
 
+/// Applies mempool policy before full chainstate validation.
 pub fn validate_transaction_with_context_for_mempool<F>(
     tx: &Transaction,
     fee_atoms: u64,
@@ -456,6 +497,7 @@ where
     validate_transaction_with_context(tx, fee_atoms, spend_height, lookup)
 }
 
+/// Validates a transaction against chainstate and the active rule schedule.
 pub fn validate_transaction_with_context_and_schedule<F>(
     tx: &Transaction,
     fee_atoms: u64,
@@ -477,6 +519,7 @@ where
     Ok(actual_fee)
 }
 
+/// Validates a coinbase transaction against the expected reward.
 pub fn validate_coinbase_transaction(
     tx: &Transaction,
     expected_reward_atoms: u64,
@@ -490,6 +533,7 @@ pub fn validate_coinbase_transaction(
     )
 }
 
+/// Validates a coinbase transaction under a caller-supplied rule schedule.
 pub fn validate_coinbase_transaction_with_schedule(
     tx: &Transaction,
     expected_reward_atoms: u64,
@@ -637,10 +681,15 @@ fn block_inputs_are_unique(transactions: &[Transaction]) -> bool {
     true
 }
 
+/// Validates a block under the current rule schedule and performs PoW checks.
 pub fn validate_block(block: &Block, height: u64, network: Network) -> Result<(), ValidationError> {
     validate_block_impl(block, height, network, false)
 }
 
+/// Validates a block while skipping PoW checks for internal tooling.
+///
+/// WARNING(consensus): This helper is for diagnostics and tests. Network
+/// acceptance must always validate proof of work.
 pub fn validate_block_without_pow(
     block: &Block,
     height: u64,
@@ -649,6 +698,7 @@ pub fn validate_block_without_pow(
     validate_block_impl(block, height, network, true)
 }
 
+/// Validates a block against the expected parent, target, and live UTXO set.
 pub fn validate_block_with_context(
     block: &Block,
     height: u64,
@@ -670,6 +720,7 @@ pub fn validate_block_with_context(
     )
 }
 
+/// Validates a block against chain context and an explicit activation schedule.
 pub fn validate_block_with_context_and_schedule(
     block: &Block,
     height: u64,
@@ -681,6 +732,7 @@ pub fn validate_block_with_context_and_schedule(
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
     validate_block_impl_with_schedule(block, height, network, false, schedule)?;
+    // CONSENSUS: The parent hash check binds this block to one exact chain tip.
     if block.header.previous_block_hash != expected_previous_hash {
         return Err(ValidationError::BlockParentHashMismatch);
     }
@@ -699,6 +751,7 @@ pub fn validate_block_with_context_and_schedule(
     }
 
     let block_witness_root = block.header.witness_root;
+    // INVARIANT: No input may be spent twice within one block.
     let mut seen_inputs = BTreeSet::new();
     let mut sum_fees = 0u64;
 

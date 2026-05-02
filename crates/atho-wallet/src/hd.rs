@@ -1,3 +1,4 @@
+//! Deterministic HD derivation for Atho wallet seeds.
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 

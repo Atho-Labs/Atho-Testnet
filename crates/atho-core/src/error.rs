@@ -1,3 +1,8 @@
+//! Core protocol error types and their `ATHO-*` registry mappings.
+//!
+//! The errors in this module stay close to the protocol primitives so higher
+//! layers can distinguish address parsing failures from transaction, block, and
+//! consensus failures without relying on string matching.
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, ADDR_INVALID_ALPHABET, ADDR_INVALID_CHECKSUM,
     ADDR_INVALID_PREFIX, BLK_BLOCK_TOO_LARGE, BLK_EMPTY_BLOCK, BLK_MERKLE_ROOT_MISMATCH,
@@ -6,6 +11,7 @@ use atho_errors::{
 };
 use thiserror::Error;
 
+/// Address-decoding failures in the core protocol layer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AddressError {
     #[error("invalid base56 alphabet")]
@@ -16,6 +22,7 @@ pub enum AddressError {
     InvalidChecksum,
 }
 
+/// Proof-of-work and subsidy schedule failures raised by the core layer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConsensusError {
     #[error("invalid subsidy schedule")]
@@ -24,6 +31,7 @@ pub enum ConsensusError {
     InvalidProofOfWorkTarget,
 }
 
+/// Canonical transaction structure failures detected without chain context.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransactionError {
     #[error("transaction has no inputs")]
@@ -38,6 +46,7 @@ pub enum TransactionError {
     TooLarge,
 }
 
+/// Canonical block-structure failures detected without chain context.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlockError {
     #[error("block has no transactions")]
@@ -48,6 +57,7 @@ pub enum BlockError {
     MerkleRootMismatch,
 }
 
+/// Top-level wrapper for core-protocol failures.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CoreError {
     #[error(transparent)]

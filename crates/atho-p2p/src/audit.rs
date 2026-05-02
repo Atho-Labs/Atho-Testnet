@@ -1,3 +1,4 @@
+//! Structured P2P audit logging used by diagnostics and tests.
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;

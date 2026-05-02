@@ -1,3 +1,4 @@
+//! In-memory chainstate helpers layered on top of persisted storage.
 use crate::db::{ChainstateSnapshot, Database, PeerHealthRecord, PeerRecord};
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};

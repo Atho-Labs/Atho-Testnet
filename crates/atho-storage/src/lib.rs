@@ -1,3 +1,10 @@
+//! Persistent chainstate, block archive, and UTXO storage for Atho.
+//!
+//! The storage crate wraps LMDB-backed persistence and exposes the canonical
+//! on-disk view of blocks, transactions, UTXOs, metadata, and peer health.
+//!
+//! STORAGE: Changes here must preserve atomic updates between the chain tip
+//! snapshot and the UTXO set or the node can restart into an inconsistent view.
 #![forbid(unsafe_code)]
 
 pub mod chainstate;

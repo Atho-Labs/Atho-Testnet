@@ -94,11 +94,11 @@ fn render_information_tab(app: &DesktopApp, ui: &mut egui::Ui) {
                 "Stopped"
             },
         );
-        info_row(ui, "Height", &app.view_model.block_count.to_string());
+        info_row(ui, "Local Height", &app.view_model.block_count.to_string());
         info_row(
             ui,
-            "Best Height",
-            &app.view_model.sync_best_height.to_string(),
+            "Sync Target",
+            &app.view_model.sync_target_height().to_string(),
         );
         info_row(
             ui,
@@ -109,7 +109,21 @@ fn render_information_tab(app: &DesktopApp, ui: &mut egui::Ui) {
                 "Syncing"
             },
         );
+        info_row(
+            ui,
+            "Chain Sync",
+            if app.view_model.chain_synced() {
+                "Caught up"
+            } else {
+                "Behind target"
+            },
+        );
         info_row(ui, "Peers", &app.view_model.peer_count.to_string());
+        info_row(
+            ui,
+            "Connecting Peers",
+            &app.view_model.connecting_peer_count.to_string(),
+        );
         info_row(
             ui,
             "Inbound Peers",
@@ -171,6 +185,13 @@ fn render_console_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.label(format!("Network: {}", app.view_model.network_label));
             ui.separator();
             ui.label(format!("Peers: {}", app.view_model.peer_count));
+            if app.view_model.connecting_peer_count > 0 {
+                ui.separator();
+                ui.label(format!(
+                    "Connecting: {}",
+                    app.view_model.connecting_peer_count
+                ));
+            }
             ui.separator();
             ui.label(format!(
                 "Node: {}",
@@ -240,6 +261,18 @@ fn render_console_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                     .font(egui::TextStyle::Monospace)
                     .hint_text("Type help for grouped commands"),
             );
+            response.context_menu(|ui| {
+                if ui.button("Paste").clicked() {
+                    if let Some(text) = DesktopApp::read_clipboard_text() {
+                        app.debug_console_input.push_str(&text);
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Clear input").clicked() {
+                    app.debug_console_input.clear();
+                    ui.close_menu();
+                }
+            });
 
             if response.has_focus() {
                 let up = ui.input(|input| input.key_pressed(egui::Key::ArrowUp));
@@ -349,7 +382,7 @@ fn render_console_entry(
             } else {
                 egui::Color32::from_rgb(170, 77, 50)
             };
-            ui.add(
+            let output_response = ui.add(
                 egui::Label::new(
                     egui::RichText::new(&entry.output)
                         .monospace()
@@ -358,6 +391,16 @@ fn render_console_entry(
                 )
                 .wrap(true),
             );
+            output_response.context_menu(|ui| {
+                if ui.button("Copy output").clicked() {
+                    DesktopApp::copy_text(ui, entry.output.clone());
+                    ui.close_menu();
+                }
+                if ui.button("Copy command").clicked() {
+                    DesktopApp::copy_text(ui, entry.command_line.clone());
+                    ui.close_menu();
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 widgets::muted_label(
                     ui,
@@ -435,6 +478,16 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::panel_frame().show(&mut columns[0], |ui| {
             widgets::section_header(ui, "Peers");
             ui.add_space(10.0);
+            if app.view_model.connecting_peer_count > 0 {
+                widgets::muted_label(
+                    ui,
+                    &format!(
+                        "{} outbound connection attempt(s) in progress. Pending handshakes are shown below the connected peer list and no longer count as established peers.",
+                        app.view_model.connecting_peer_count
+                    ),
+                );
+                ui.add_space(10.0);
+            }
             ui.horizontal(|ui| {
                 ui.add_sized(
                     [48.0, 0.0],
@@ -458,6 +511,10 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 .id_source("node_window_peers_list")
                 .auto_shrink([false, false])
                 .show(ui, |ui: &mut egui::Ui| {
+                    if app.view_model.peers.is_empty() {
+                        widgets::muted_label(ui, "No connected peers.");
+                        ui.add_space(8.0);
+                    }
                     for (index, peer) in app.view_model.peers.iter().enumerate() {
                         let selected = app
                             .debug_selected_peer
@@ -503,6 +560,32 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                 );
                             });
                         });
+                    }
+                    if !app.view_model.connecting_peers.is_empty() {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        widgets::muted_label(ui, "Connecting");
+                        ui.add_space(6.0);
+                        for peer in &app.view_model.connecting_peers {
+                            widgets::panel_frame().show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [220.0, 0.0],
+                                        egui::Label::new(widgets::elide_text(
+                                            &peer.remote_addr,
+                                            28,
+                                        )),
+                                    );
+                                    ui.add_sized(
+                                        [90.0, 0.0],
+                                        egui::Label::new(connection_type_label(peer.direction)),
+                                    );
+                                    widgets::muted_label(ui, "Handshake pending");
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
                     }
                 });
         });
@@ -568,7 +651,7 @@ fn render_peer_details(ui: &mut egui::Ui, peer: &NetworkPeerDiagnostics) {
     );
     info_row(
         ui,
-        "Best Height",
+        "Peer Best Height",
         &peer
             .best_height
             .map(|height| height.to_string())

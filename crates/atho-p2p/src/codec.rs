@@ -1,3 +1,4 @@
+//! Wire framing and checksum validation for Atho P2P messages.
 use crate::config::{network_from_magic, network_params};
 use crate::protocol::{MessageCommand, NetworkMessage, ProtocolError};
 use atho_core::crypto::hash::sha3_256;

@@ -1,3 +1,4 @@
+//! RPC response payloads returned by the Atho node service.
 use crate::command::CommandResponse;
 use crate::error::RpcError;
 use atho_core::block::Block;
@@ -87,9 +88,11 @@ pub struct NetworkDiagnostics {
     pub peer_count: usize,
     pub inbound_peer_count: usize,
     pub outbound_peer_count: usize,
+    pub connecting_peer_count: usize,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub peers: Vec<NetworkPeerDiagnostics>,
+    pub connecting_peers: Vec<NetworkPeerDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +101,7 @@ pub struct NodeStatus {
     pub block_count: u64,
     #[serde(with = "serde_big_array::BigArray")]
     pub tip_hash: [u8; 48],
+    pub tip_timestamp: u64,
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     #[serde(with = "serde_big_array::BigArray")]

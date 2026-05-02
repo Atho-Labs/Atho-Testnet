@@ -1,3 +1,12 @@
+//! Atho full-node runtime, orchestration, and operator-facing services.
+//!
+//! This crate owns the production node lifecycle: startup, mempool handling,
+//! block template construction, RPC command execution, local diagnostics, and
+//! the boundary to the P2P runtime.
+//!
+//! SECURITY: The node crate sits on multiple trust boundaries. RPC requests,
+//! peer traffic, wallet activity views, and mining results must all be
+//! validated before they mutate chainstate.
 #![forbid(unsafe_code)]
 
 pub mod chainstate;

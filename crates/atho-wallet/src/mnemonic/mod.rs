@@ -1,3 +1,4 @@
+//! Mnemonic phrase parsing, validation, and seed derivation.
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, WALLET_INVALID_ENTROPY_LENGTH,
     WALLET_INVALID_MNEMONIC_CHECKSUM, WALLET_INVALID_MNEMONIC_WORD,

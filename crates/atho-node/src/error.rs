@@ -1,3 +1,4 @@
+//! Node-layer errors that wrap runtime, storage, validation, and RPC failures.
 use crate::runtime::RuntimeError;
 use crate::validation::ValidationError;
 use atho_errors::{AthoErrorDescriptor, AthoErrorMeta};

@@ -1,3 +1,11 @@
+//! High-level Atho wallet model.
+//!
+//! The wallet combines deterministic seed derivation, HD address generation,
+//! keypool reservation, address-book tracking, and encrypted datafile
+//! persistence into one operator-facing model.
+//!
+//! WALLET SECURITY: Mnemonics and seeds remain optional so imported seed-only
+//! wallets never fabricate phrase material they do not actually own.
 use crate::address_book::AddressBook;
 use crate::hd::{AddressKind, DerivationPath, HdWallet, WalletSeed};
 use crate::keypool::Keypool;
@@ -18,6 +26,7 @@ pub const WALLET_DATAFILE_NAME: &str = ".datafile";
 pub mod datafile;
 pub use datafile::WalletDatafileMetadata;
 
+/// One derived Atho address tracked by the wallet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletAddress {
     pub network: Network,
@@ -30,6 +39,7 @@ pub struct WalletAddress {
     pub checksum: [u8; 4],
 }
 
+/// User wallet state including key material, address bookkeeping, and snapshot data.
 #[derive(Debug, Clone)]
 pub struct Wallet {
     pub network: Network,
@@ -42,6 +52,7 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    /// Builds a wallet from a mnemonic phrase and optional passphrase.
     pub fn from_mnemonic(mnemonic: MnemonicPhrase, passphrase: &str, network: Network) -> Self {
         Self::from_mnemonic_with_progress(mnemonic, passphrase, network, |_, _| {})
     }
@@ -70,6 +81,7 @@ impl Wallet {
         wallet
     }
 
+    /// Restores a wallet from a mnemonic string.
     pub fn restore_from_phrase(
         phrase: &str,
         passphrase: &str,
@@ -84,6 +96,7 @@ impl Wallet {
         ))
     }
 
+    /// Builds a wallet from a raw seed instead of a mnemonic phrase.
     pub fn from_seed(seed: WalletSeed, network: Network) -> Self {
         Self::from_seed_with_progress(seed, network, |_, _| {})
     }
@@ -113,6 +126,7 @@ impl Wallet {
         self.restore_gap_limit = limit.max(1);
     }
 
+    /// Persists the wallet into an encrypted `.datafile`.
     pub fn save_to_datafile(
         &self,
         path: &Path,
@@ -131,6 +145,7 @@ impl Wallet {
         datafile::WalletDataFile::save_with_iterations(self, password, path, iterations)
     }
 
+    /// Loads a wallet from an encrypted `.datafile`.
     pub fn load_from_datafile(
         path: &Path,
         password: &str,
@@ -168,18 +183,22 @@ impl Wallet {
         WALLET_DATAFILE_NAME
     }
 
+    /// Returns the mnemonic phrase when this wallet was created from one.
     pub fn mnemonic_phrase(&self) -> Option<&MnemonicPhrase> {
         self.mnemonic.as_ref()
     }
 
+    /// Returns the mnemonic as a sentence for explicit wallet export flows.
     pub fn mnemonic_sentence(&self) -> Option<String> {
         self.mnemonic.as_ref().map(MnemonicPhrase::as_sentence)
     }
 
+    /// Reserves the next receive address from the keypool.
     pub fn checkout_receive_address(&mut self) -> WalletAddress {
         self.checkout(AddressKind::Receive, None)
     }
 
+    /// Reserves the next change address from the keypool.
     pub fn checkout_change_address(&mut self) -> WalletAddress {
         self.checkout(AddressKind::Change, None)
     }
@@ -196,6 +215,10 @@ impl Wallet {
         self.derive_address(path)
     }
 
+    /// Derives the deterministic Falcon keypair for one wallet path.
+    ///
+    /// WALLET SECURITY: The derivation mixes the network tag and path so keys
+    /// are not silently reused across networks or address roles.
     pub fn keypair_for_path(&self, path: DerivationPath) -> FalconKeypair {
         let mut bytes = Vec::with_capacity(32 + 4 + 1 + 4 + 1 + self.network.id().len());
         bytes.extend_from_slice(self.hd_wallet.seed());

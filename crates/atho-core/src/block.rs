@@ -1,9 +1,21 @@
+//! Canonical Atho block and block-header encoding.
+//!
+//! This module defines the consensus-visible block container, the exact header
+//! byte layout used for hashing, and the Merkle/witness commitment trees used
+//! during block validation.
+//!
+//! CONSENSUS: Header hashing and transaction commitment construction must remain
+//! byte-for-byte deterministic across all nodes.
 use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use crate::transaction::{Transaction, TxWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Canonical Atho block header.
+///
+/// The header contains the minimal data needed to identify a block, validate
+/// its proof of work, and bind the block body through Merkle and witness roots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub version: u16,
@@ -21,6 +33,11 @@ pub struct BlockHeader {
     pub nonce: u64,
 }
 
+/// Full Atho block payload as stored and relayed by full nodes.
+///
+/// The header is the consensus commitment. Transactions are the canonical block
+/// body, while `witnesses` is a convenience cache reconstructed from the
+/// transaction witness payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
@@ -54,14 +71,17 @@ impl Default for Block {
 }
 
 impl BlockHeader {
+    /// Returns the number of canonical header bytes before the nonce field.
     pub fn canonical_size_bytes_without_nonce(&self) -> usize {
         2 + 1 + 8 + 48 + 48 + 48 + 8 + 48
     }
 
+    /// Returns the exact canonical header size used for PoW hashing.
     pub fn canonical_size_bytes(&self) -> usize {
         self.canonical_size_bytes_without_nonce() + 8
     }
 
+    /// Serializes the header fields that are stable while miners search nonce space.
     pub fn canonical_bytes_without_nonce(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.canonical_size_bytes_without_nonce());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -75,6 +95,7 @@ impl BlockHeader {
         out
     }
 
+    /// Serializes the full canonical header in consensus order.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.canonical_size_bytes());
         out.extend_from_slice(&self.canonical_bytes_without_nonce());
@@ -82,12 +103,17 @@ impl BlockHeader {
         out
     }
 
+    /// Computes the Atho block hash from canonical header bytes only.
+    ///
+    /// CONSENSUS: Any change to this byte layout invalidates historical block
+    /// hashes and will split the network.
     pub fn block_hash(&self) -> [u8; 48] {
         sha3_384(&self.canonical_bytes())
     }
 }
 
 impl Block {
+    /// Builds a block and repopulates the witness cache from the transaction list.
     pub fn new(header: BlockHeader, transactions: Vec<Transaction>) -> Self {
         let mut block = Self {
             header,
@@ -102,6 +128,7 @@ impl Block {
         block
     }
 
+    /// Serializes the block without witness bytes.
     pub fn base_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.base_size_bytes());
         out.extend_from_slice(&self.header.canonical_bytes());
@@ -114,6 +141,7 @@ impl Block {
         out
     }
 
+    /// Serializes the full block including embedded transaction witness data.
     pub fn full_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.full_size_bytes());
         out.extend_from_slice(&self.header.canonical_bytes());
@@ -126,6 +154,7 @@ impl Block {
         out
     }
 
+    /// Serializes the block using compact-size prefixes for relay-oriented uses.
     pub fn compact_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.compact_size_bytes());
         out.extend_from_slice(&self.header.canonical_bytes());
@@ -138,6 +167,7 @@ impl Block {
         out
     }
 
+    /// Returns the canonical full-block bytes used by disk and wire encoders.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         self.full_bytes()
     }
@@ -166,6 +196,7 @@ impl Block {
         self.full_size_bytes()
     }
 
+    /// Returns the total witness bytes cached for the block.
     pub fn witness_bytes(&self) -> usize {
         self.witnesses
             .values()
@@ -173,10 +204,12 @@ impl Block {
             .sum()
     }
 
+    /// Recomputes the witness commitment root from the block transactions.
     pub fn compute_witness_root(&self) -> [u8; 48] {
         witness_root(&self.transactions)
     }
 
+    /// Returns the commitment written into the block header for witness data.
     pub fn compute_witness_commitment(&self) -> [u8; 48] {
         self.compute_witness_root()
     }
@@ -202,11 +235,16 @@ impl Block {
         total
     }
 
+    /// Returns the block's transaction Merkle root.
     pub fn merkle_root(&self) -> [u8; 48] {
         merkle_root(&self.transactions)
     }
 }
 
+/// Computes the transaction Merkle root for a block body.
+///
+/// CONSENSUS: The last hash in an odd-length layer is duplicated to match the
+/// consensus tree construction used everywhere else in Atho.
 pub fn merkle_root(transactions: &[Transaction]) -> [u8; 48] {
     if transactions.is_empty() {
         return [0; 48];
@@ -226,6 +264,7 @@ pub fn merkle_root(transactions: &[Transaction]) -> [u8; 48] {
     layer[0]
 }
 
+/// Computes the witness commitment tree root for the block body.
 pub fn witness_root(transactions: &[Transaction]) -> [u8; 48] {
     if transactions.is_empty() {
         return [0; 48];

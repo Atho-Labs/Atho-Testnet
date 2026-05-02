@@ -1,14 +1,27 @@
+//! Atho network identity and isolation parameters.
+//!
+//! This module keeps the runtime names, consensus ids, ports, and address
+//! prefixes for the supported Atho networks in one place.
+//!
+//! INVARIANT: Mainnet, testnet, regnet, and prunetest must never share the same
+//! consensus id, port set, or visible address prefix.
 use serde::{Deserialize, Serialize};
 
+/// Network mode selected for the running node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Network {
+    /// Production network with real economic value.
     Mainnet,
+    /// Public test network.
     Testnet,
+    /// Local deterministic developer network.
     Regnet,
+    /// Low-difficulty storage and pruning test network.
     Prunetest,
 }
 
 impl Network {
+    /// Parses a CLI or RPC network selector into a canonical [`Network`].
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "mainnet" | "atho-mainnet" => Some(Self::Mainnet),
@@ -19,6 +32,7 @@ impl Network {
         }
     }
 
+    /// Returns the one-byte network id committed into block headers.
     pub fn consensus_id(self) -> u8 {
         match self {
             Self::Mainnet => 1,
@@ -28,6 +42,7 @@ impl Network {
         }
     }
 
+    /// Decodes the consensus network id found in canonical block bytes.
     pub fn from_consensus_id(id: u8) -> Option<Self> {
         match id {
             1 => Some(Self::Mainnet),
@@ -38,6 +53,7 @@ impl Network {
         }
     }
 
+    /// Returns the stable human-readable network identifier.
     pub fn id(self) -> &'static str {
         match self {
             Self::Mainnet => "atho-mainnet",
@@ -47,6 +63,7 @@ impl Network {
         }
     }
 
+    /// Returns the network tag mixed into domain-separated hashes.
     pub fn domain_tag(self) -> &'static str {
         match self {
             Self::Mainnet => "mainnet",
@@ -56,10 +73,12 @@ impl Network {
         }
     }
 
+    /// Returns the canonical CLI selector.
     pub fn cli_arg(self) -> &'static str {
         self.domain_tag()
     }
 
+    /// Returns the default TCP P2P port for the network.
     pub fn p2p_port(self) -> u16 {
         match self {
             Self::Mainnet => 56_000,
@@ -69,6 +88,7 @@ impl Network {
         }
     }
 
+    /// Returns the default loopback RPC port for the network.
     pub fn rpc_port(self) -> u16 {
         match self {
             Self::Mainnet => 9_010,
@@ -78,6 +98,7 @@ impl Network {
         }
     }
 
+    /// Returns the first visible character of a base56 user-facing address.
     pub fn visible_prefix(self) -> char {
         match self {
             Self::Mainnet => 'A',
@@ -87,6 +108,7 @@ impl Network {
         }
     }
 
+    /// Returns the internal hashed-public-key prefix for the network.
     pub fn internal_hpk_prefix(self) -> &'static str {
         match self {
             Self::Mainnet => "ATHO",
@@ -95,6 +117,7 @@ impl Network {
         }
     }
 
+    /// Returns the storage flag embedded into genesis-derived UTXO state.
     pub fn utxo_flag(self) -> &'static str {
         match self {
             Self::Mainnet => "",

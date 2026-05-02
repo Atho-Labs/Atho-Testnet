@@ -1,3 +1,4 @@
+//! Derived Qt view state computed from node status snapshots.
 use crate::state::UiState;
 use atho_rpc::response::{NetworkPeerDiagnostics, RpcResponse};
 
@@ -6,15 +7,18 @@ pub struct ViewModel {
     pub network_label: String,
     pub block_count: u64,
     pub tip_hash: [u8; 48],
+    pub tip_timestamp: u64,
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     pub mempool_fingerprint: [u8; 32],
     pub peer_count: usize,
     pub inbound_peer_count: usize,
     pub outbound_peer_count: usize,
+    pub connecting_peer_count: usize,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub peers: Vec<NetworkPeerDiagnostics>,
+    pub connecting_peers: Vec<NetworkPeerDiagnostics>,
     pub sync_best_height: u64,
     pub running: bool,
     pub headers_synced: bool,
@@ -28,15 +32,18 @@ impl Default for ViewModel {
             network_label: String::new(),
             block_count: 0,
             tip_hash: [0; 48],
+            tip_timestamp: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0; 32],
             peer_count: 0,
             inbound_peer_count: 0,
             outbound_peer_count: 0,
+            connecting_peer_count: 0,
             bytes_sent: 0,
             bytes_received: 0,
             peers: Vec::new(),
+            connecting_peers: Vec::new(),
             sync_best_height: 0,
             running: false,
             headers_synced: false,
@@ -47,6 +54,25 @@ impl Default for ViewModel {
 }
 
 impl ViewModel {
+    pub fn sync_target_height(&self) -> u64 {
+        self.sync_best_height.max(self.block_count)
+    }
+
+    pub fn chain_synced(&self) -> bool {
+        self.running && self.headers_synced && self.block_count >= self.sync_target_height()
+    }
+
+    pub fn sync_progress(&self) -> f32 {
+        if self.chain_synced() {
+            return 1.0;
+        }
+        let target = self.sync_target_height();
+        if target == 0 {
+            return 0.0;
+        }
+        (self.block_count as f32 / target as f32).clamp(0.0, 1.0)
+    }
+
     pub fn update_from_network(&mut self, response: RpcResponse) {
         match response {
             RpcResponse::BlockCount(count) => {
@@ -86,5 +112,21 @@ mod tests {
         assert_eq!(view.network_label, "atho-mainnet");
         assert_eq!(view.block_count, 7);
         assert_eq!(view.sync_stage, "Synced");
+    }
+
+    #[test]
+    fn chain_synced_requires_local_height_to_reach_sync_target() {
+        let mut view = ViewModel::default();
+        view.running = true;
+        view.headers_synced = true;
+        view.block_count = 0;
+        view.sync_best_height = 128;
+        assert!(!view.chain_synced());
+        assert_eq!(view.sync_target_height(), 128);
+        assert_eq!(view.sync_progress(), 0.0);
+
+        view.block_count = 128;
+        assert!(view.chain_synced());
+        assert_eq!(view.sync_progress(), 1.0);
     }
 }

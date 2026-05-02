@@ -1,3 +1,4 @@
+//! Network-specific P2P configuration defaults.
 use atho_core::consensus::rules::PROTOCOL_VERSION;
 use atho_core::network::Network;
 

@@ -1,3 +1,4 @@
+//! RPC request types accepted by the Atho node service.
 use crate::command::CommandInvocation;
 use atho_core::block::Block;
 use atho_core::transaction::Transaction;

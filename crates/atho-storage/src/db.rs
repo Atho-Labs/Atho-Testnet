@@ -1,3 +1,10 @@
+//! LMDB-backed Atho storage primitives.
+//!
+//! This module owns the database environment, named databases, archive records,
+//! and the atomic commit paths that keep chainstate and block history aligned.
+//!
+//! STORAGE: Changes to key names, record serialization, or transaction grouping
+//! can invalidate existing databases or create unrecoverable mixed-height state.
 use crate::error::StorageError;
 use crate::path;
 use crate::utxo::UtxoEntry;
@@ -42,6 +49,7 @@ const SCHEMA_MIGRATION_LOG_KEY: &[u8; 20] = b"schema_migration_log";
 #[cfg(test)]
 static COMMIT_FAULT: OnceLock<Mutex<Option<CommitFault>>> = OnceLock::new();
 
+/// Canonical persisted chain tip snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainstateSnapshot {
     pub height: u64,
@@ -50,6 +58,7 @@ pub struct ChainstateSnapshot {
     pub tip_header: Option<BlockHeader>,
 }
 
+/// Block archive record stored in the block database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockArchiveRecord {
     pub height: u64,
@@ -58,6 +67,7 @@ pub struct BlockArchiveRecord {
     pub block: Block,
 }
 
+/// Transaction archive record stored in the transaction index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionArchiveRecord {
     pub height: u64,
@@ -69,6 +79,7 @@ pub struct TransactionArchiveRecord {
     pub transaction: CoreTransaction,
 }
 
+/// Persisted peer-discovery record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub network: Network,
@@ -78,6 +89,7 @@ pub struct PeerRecord {
     pub last_seen_unix: u64,
 }
 
+/// Persisted address-book discovery record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressRecord {
     pub network: Network,
@@ -87,6 +99,7 @@ pub struct AddressRecord {
     pub last_seen_height: u64,
 }
 
+/// Persisted peer health and backoff state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerHealthRecord {
     pub network: Network,
@@ -122,6 +135,7 @@ enum Dataset {
     PeerHealth,
 }
 
+/// LMDB-backed Atho storage handle.
 #[derive(Debug)]
 pub struct Database {
     network: Network,
@@ -143,6 +157,10 @@ struct DatabaseState {
 }
 
 impl Database {
+    /// Opens or initializes the database for the selected network.
+    ///
+    /// INVARIANT: Database roots are network-specific so one network never
+    /// reuses another network's block archive or chainstate.
     pub fn open(network: Network) -> Result<Self, StorageError> {
         let root = path::database_dir(network);
         fs::create_dir_all(&root)?;
@@ -159,10 +177,12 @@ impl Database {
         Ok(database)
     }
 
+    /// Returns the network this database was opened for.
     pub fn network(&self) -> Network {
         self.network
     }
 
+    /// Loads the current chainstate tip snapshot, if any.
     pub fn load_chainstate_snapshot(&self) -> Result<Option<ChainstateSnapshot>, StorageError> {
         let snapshot_bytes = match self.get(Dataset::Meta, SNAPSHOT_KEY)? {
             Some(bytes) => bytes,
@@ -173,6 +193,7 @@ impl Database {
         Ok(Some(snapshot))
     }
 
+    /// Loads one archived block by block hash.
     pub fn load_block(&self, block_hash: [u8; 48]) -> Result<Option<Block>, StorageError> {
         match self.get(Dataset::Blocks, &block_hash)? {
             Some(bytes) => {
@@ -184,6 +205,7 @@ impl Database {
         }
     }
 
+    /// Loads one indexed transaction archive record by txid.
     pub fn load_transaction(
         &self,
         txid: [u8; 48],
@@ -198,6 +220,7 @@ impl Database {
         }
     }
 
+    /// Loads the entire UTXO set snapshot from storage.
     pub fn load_utxos(&self) -> Result<Vec<UtxoEntry>, StorageError> {
         let entries = self.entries(Dataset::Utxos)?;
         let mut utxos = Vec::with_capacity(entries.len());
@@ -209,6 +232,7 @@ impl Database {
         Ok(utxos)
     }
 
+    /// Commits a new tip snapshot and complete UTXO image atomically.
     pub fn save_chainstate_snapshot(
         &self,
         snapshot: &ChainstateSnapshot,
@@ -217,6 +241,7 @@ impl Database {
         self.commit_chainstate(snapshot, utxos, None)
     }
 
+    /// Appends a block archive record without rewriting the UTXO set.
     pub fn append_block(&self, height: u64, block: &Block) -> Result<(), StorageError> {
         self.write_with_retry(|state| {
             let mut txn = state.env.begin_rw_txn()?;
@@ -226,6 +251,10 @@ impl Database {
         })
     }
 
+    /// Commits the tip snapshot, UTXO set, and optional appended block together.
+    ///
+    /// STORAGE: This transaction must remain atomic. Writing the tip without the
+    /// matching UTXO image would let the node restart into a corrupt state.
     pub fn commit_chainstate(
         &self,
         snapshot: &ChainstateSnapshot,

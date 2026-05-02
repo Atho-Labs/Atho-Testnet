@@ -1,3 +1,4 @@
+//! Serializable wallet balance and activity snapshot types.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

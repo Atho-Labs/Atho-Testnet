@@ -1,9 +1,17 @@
+//! In-memory mempool admission and conflict tracking.
+//!
+//! The mempool keeps policy-accepted transactions that are not yet mined and
+//! tracks spent inputs so unconfirmed double spends are rejected locally.
+//!
+//! POLICY: Relay policy is intentionally stricter than bare consensus. Dust and
+//! fee-floor checks happen here before transactions are mined into templates.
 use crate::dev;
 use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Cached mempool entry with precomputed sizes and identifiers.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
     pub transaction: Transaction,
@@ -16,6 +24,7 @@ pub struct MempoolEntry {
 }
 
 impl MempoolEntry {
+    /// Builds a mempool entry and caches the transaction identifiers and sizes.
     pub fn new(transaction: Transaction, fee_atoms: u64) -> Self {
         let txid = transaction.txid();
         let wtxid = transaction.wtxid();
@@ -33,14 +42,17 @@ impl MempoolEntry {
         }
     }
 
+    /// Returns the canonical txid.
     pub fn txid(&self) -> [u8; 48] {
         self.txid
     }
 
+    /// Returns the witness transaction identifier.
     pub fn wtxid(&self) -> [u8; 48] {
         self.wtxid
     }
 
+    /// Returns the raw serialized transaction size.
     pub fn raw_size_bytes(&self) -> usize {
         self.raw_size_bytes
     }
@@ -57,11 +69,13 @@ impl MempoolEntry {
         self.vsize_bytes
     }
 
+    /// Returns the feerate in atoms per vbyte.
     pub fn feerate_atoms_per_vbyte(&self) -> u64 {
         self.fee_atoms / self.vsize_bytes as u64
     }
 }
 
+/// In-memory transaction pool for standard-policy transactions.
 #[derive(Debug, Default)]
 pub struct Mempool {
     entries: BTreeMap<[u8; 48], MempoolEntry>,
@@ -79,6 +93,7 @@ impl Mempool {
             .map(|input| (input.previous_txid, input.output_index))
     }
 
+    /// Reserves all inputs for a transaction, rejecting mempool double spends.
     fn reserve_inputs(&mut self, tx: &Transaction) -> Result<(), ValidationError> {
         let mut inserted = Vec::new();
         for key in Self::input_keys(tx) {
@@ -120,6 +135,7 @@ impl Mempool {
         Ok(fee)
     }
 
+    /// Admits one transaction after policy and chainstate validation.
     pub fn admit<F>(
         &mut self,
         entry: MempoolEntry,
@@ -162,6 +178,10 @@ impl Mempool {
         Ok(txids)
     }
 
+    /// Revalidates the mempool after the chain tip changes.
+    ///
+    /// PERFORMANCE: Revalidation is bulk work triggered on tip changes, so it
+    /// avoids repeated logging and reuses the caller's UTXO lookup closure.
     pub fn revalidate<F>(&mut self, spend_height: u64, mut lookup: F)
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,

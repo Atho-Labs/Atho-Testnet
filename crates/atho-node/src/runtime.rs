@@ -1,3 +1,10 @@
+//! Process-level node runtime and RPC/P2P bind orchestration.
+//!
+//! The runtime owns the running `Node`, binds loopback RPC and public P2P
+//! listeners, and forwards incoming RPC requests into the validated node path.
+//!
+//! SECURITY: RPC remains loopback-only by default. Public binding requires an
+//! explicit override because wallet and admin commands assume local trust.
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;
@@ -22,6 +29,7 @@ use thiserror::Error;
 
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Runtime-level launch failures before the node can serve traffic.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RuntimeError {
     #[error("invalid network")]
@@ -58,6 +66,7 @@ impl AthoErrorMeta for RuntimeError {
     }
 }
 
+/// Running node process state.
 #[derive(Debug)]
 pub struct NodeRuntime {
     pub node: Node,
@@ -66,6 +75,7 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
+    /// Creates a new runtime around a fresh node instance.
     pub fn new(config: NodeConfig) -> Self {
         Self {
             node: Node::new(config),
@@ -74,6 +84,7 @@ impl NodeRuntime {
         }
     }
 
+    /// Loads persisted state when available and otherwise creates a fresh node.
     pub fn load_or_new(config: NodeConfig) -> Self {
         Self {
             node: Node::load_or_new(config),
@@ -98,6 +109,7 @@ impl NodeRuntime {
         })
     }
 
+    /// Starts the runtime and records the process start time.
     pub fn start(&mut self) {
         self.running = true;
         self.started_at_unix = Some(
@@ -116,6 +128,7 @@ impl NodeRuntime {
         );
     }
 
+    /// Stops the runtime without mutating persisted state.
     pub fn stop(&mut self) {
         self.running = false;
         let _ = dev::append_log(
@@ -129,6 +142,7 @@ impl NodeRuntime {
     }
 }
 
+/// Loads the node configuration from environment variables.
 pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
     let raw = std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet"));
     let network = Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?;
@@ -136,6 +150,7 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
     Ok(NodeConfig::new(network))
 }
 
+/// Runs the full Atho node with live RPC and P2P listeners.
 pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
@@ -212,6 +227,8 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                         continue;
                     }
                 };
+                // RPC requests are always executed through the validated node
+                // service path; there is no direct mutation of chainstate here.
                 let response: RpcResponse = {
                     let mut guard = system.lock().expect("node runtime mutex poisoned");
                     guard.handle_mut(request)
@@ -229,6 +246,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Returns the effective RPC bind address for the selected network.
 pub fn rpc_bind_address(network: Network) -> String {
     if let Ok(address) = std::env::var("ATHO_RPC_ADDR") {
         return address;

@@ -1,3 +1,4 @@
+//! Coordination layer joining runtime, sync, and RPC services.
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;

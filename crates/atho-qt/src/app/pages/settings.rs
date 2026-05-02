@@ -381,11 +381,12 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.label(format!("Connected: {}", app.ui_state.connected));
         ui.label(format!("Node running: {}", app.view_model.running));
         ui.label(format!("Headers synced: {}", app.view_model.headers_synced));
+        ui.label(format!("Chain synced: {}", app.view_model.chain_synced()));
         ui.label(format!("Sync stage: {}", app.view_model.sync_stage));
         ui.label(format!("Block height: {}", app.view_model.block_count));
         ui.label(format!(
-            "Sync best height: {}",
-            app.view_model.sync_best_height
+            "Sync target height: {}",
+            app.view_model.sync_target_height()
         ));
         ui.label(format!("Mempool entries: {}", app.view_model.mempool_count));
         ui.label(format!(
@@ -397,6 +398,10 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             app.view_model.peer_count,
             app.view_model.inbound_peer_count,
             app.view_model.outbound_peer_count
+        ));
+        ui.label(format!(
+            "Connecting peers: {}",
+            app.view_model.connecting_peer_count
         ));
         ui.label(format!(
             "Network traffic: sent {} / received {}",
@@ -416,7 +421,9 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         if app.view_model.peers.is_empty() {
             widgets::muted_label(ui, "No connected peers.");
-            return;
+            if app.view_model.connecting_peers.is_empty() {
+                return;
+            }
         }
 
         egui::ScrollArea::vertical()
@@ -471,6 +478,22 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                             ui.end_row();
                         }
                     });
+
+                if !app.view_model.connecting_peers.is_empty() {
+                    ui.add_space(12.0);
+                    widgets::muted_label(
+                        ui,
+                        "Pending outbound connection attempts",
+                    );
+                    ui.add_space(6.0);
+                    for peer in &app.view_model.connecting_peers {
+                        ui.horizontal(|ui| {
+                            ui.label(peer_direction_label(peer.direction));
+                            widgets::elided_label(ui, &peer.remote_addr, 28);
+                            ui.label("Handshake pending");
+                        });
+                    }
+                }
             });
     });
 }

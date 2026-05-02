@@ -1,3 +1,4 @@
+//! Peer address discovery, scoring, and outbound candidate selection.
 use crate::config::network_params;
 use crate::peer::{PeerBook, PeerState};
 use crate::protocol::{PeerAddress, ProtocolError, VersionMessage};

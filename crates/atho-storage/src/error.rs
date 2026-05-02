@@ -1,3 +1,4 @@
+//! Storage-layer errors and their `ATHO-*` registry mappings.
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, DB_BRANCH_NOT_PREFERRED, DB_CORRUPT_DATA,
     DB_CROSS_NETWORK_REPLAY, DB_EMPTY_BRANCH, DB_FORK_POINT_UNAVAILABLE,

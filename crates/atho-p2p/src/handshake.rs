@@ -1,18 +1,28 @@
+//! Peer handshake state machine.
+//!
+//! This module validates the Atho version/verack exchange and only marks a peer
+//! as ready after both sides have agreed on network identity and protocol
+//! compatibility.
+//!
+//! P2P SECURITY: Peers that fail this handshake never reach relay or sync code.
 use crate::protocol::{MessagePayload, NetworkMessage, ProtocolError, VersionMessage};
 use atho_core::network::Network;
 
+/// Direction of the in-progress handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeDirection {
     Inbound,
     Outbound,
 }
 
+/// Action requested by the handshake state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeAction {
     Send(NetworkMessage),
     Ready { best_height: u64 },
 }
 
+/// Stateful tracker for one Atho peer handshake.
 #[derive(Debug, Clone)]
 pub struct HandshakeState {
     network: Network,
@@ -25,6 +35,7 @@ pub struct HandshakeState {
 }
 
 impl HandshakeState {
+    /// Creates a new inbound handshake state.
     pub fn inbound(network: Network) -> Self {
         Self {
             network,
@@ -37,6 +48,7 @@ impl HandshakeState {
         }
     }
 
+    /// Starts an outbound handshake and emits the initial version message.
     pub fn outbound(
         network: Network,
         local_version: NetworkMessage,
@@ -58,14 +70,20 @@ impl HandshakeState {
         ))
     }
 
+    /// Returns the remote peer's validated version message, if one was seen.
     pub fn remote_version(&self) -> Option<&VersionMessage> {
         self.remote_version.as_ref()
     }
 
+    /// Returns `true` once the handshake is fully complete.
     pub fn is_ready(&self) -> bool {
         self.ready
     }
 
+    /// Processes one inbound handshake message.
+    ///
+    /// SECURITY: Only `version` and `verack` are legal before the handshake is
+    /// marked ready. Other payloads are rejected at the protocol boundary.
     pub fn receive(
         &mut self,
         message: &NetworkMessage,

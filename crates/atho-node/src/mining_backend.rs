@@ -1,3 +1,4 @@
+//! Mining backend selection and CPU/GPU fallback policy.
 use crate::miner::{Miner, MiningInterrupted};
 use atho_core::block::Block;
 #[cfg(not(feature = "gpu-native"))]

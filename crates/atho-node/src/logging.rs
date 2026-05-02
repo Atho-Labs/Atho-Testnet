@@ -1,3 +1,4 @@
+//! Lightweight logging configuration for node processes and local tooling.
 use atho_core::network::Network;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

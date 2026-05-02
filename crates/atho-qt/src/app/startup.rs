@@ -1,4 +1,6 @@
+//! Startup and first-run screens for the desktop client.
 use super::{dialogs, widgets, DesktopApp, LaunchPage};
+use crate::resources;
 use eframe::egui;
 
 pub(crate) fn render_startup_screen(app: &mut DesktopApp, ctx: &egui::Context) {
@@ -6,22 +8,27 @@ pub(crate) fn render_startup_screen(app: &mut DesktopApp, ctx: &egui::Context) {
         .frame(egui::Frame::none().fill(widgets::SHELL_BG))
         .show(ctx, |ui| {
             widgets::shell_frame()
-                .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 12.0))
                 .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(14.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(8.0);
 
-                        if !matches!(app.launch_page, LaunchPage::Welcome) {
-                            dialogs::render(app, ui);
-                        } else {
-                            render_welcome_actions(app, ui);
-                        }
+                                if !matches!(app.launch_page, LaunchPage::Welcome) {
+                                    dialogs::render(app, ui);
+                                } else {
+                                    render_welcome_actions(app, ui);
+                                }
 
-                        if let Some(error) = &app.last_error {
-                            ui.add_space(8.0);
-                            ui.colored_label(egui::Color32::from_rgb(170, 77, 50), error);
-                        }
-                    });
+                                if let Some(error) = &app.last_error {
+                                    ui.add_space(10.0);
+                                    ui.colored_label(egui::Color32::from_rgb(170, 77, 50), error);
+                                }
+                                ui.add_space(10.0);
+                            });
+                        });
                 });
         });
 }
@@ -127,58 +134,250 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
 }
 
 fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Welcome to Atho Core")
-            .size(20.0)
-            .strong(),
-    );
-    ui.add_space(6.0);
-    ui.horizontal_centered(|ui| {
-        if ui
-            .add_sized([142.0, 28.0], egui::Button::new("Create Wallet"))
-            .clicked()
+    let content_width = ui.available_width().min(1080.0);
+    let compact = content_width < 860.0;
+    let card_width = (content_width * if compact { 0.98 } else { 0.94 }).min(1000.0);
+    let action_width = if compact {
+        (card_width - 32.0).max(260.0)
+    } else {
+        ((card_width - 56.0) / 3.0).max(180.0)
+    };
+
+    ui.add_space(10.0);
+    egui::Frame::none()
+        .fill(widgets::ACCENT_SOFT)
+        .stroke(egui::Stroke::new(1.0, widgets::ACCENT))
+        .inner_margin(egui::Margin::symmetric(24.0, 24.0))
+        .show(ui, |ui| {
+            ui.set_width(card_width);
+            if compact {
+                ui.vertical_centered(|ui| {
+                    let _ = ui.add(resources::logo_mark(74.0));
+                    ui.add_space(10.0);
+                    render_welcome_copy(app, ui, true);
+                    ui.add_space(18.0);
+                    render_action_buttons(app, ui, action_width, true);
+                });
+            } else {
+                ui.columns(2, |columns| {
+                    columns[0].vertical(|ui| {
+                        let _ = ui.add(resources::logo_mark(92.0));
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Atho Core")
+                                .size(15.0)
+                                .strong()
+                                .color(widgets::ACCENT),
+                        );
+                    });
+                    columns[1].vertical(|ui| {
+                        render_welcome_copy(app, ui, false);
+                        ui.add_space(18.0);
+                        render_action_buttons(app, ui, action_width, false);
+                    });
+                });
+            }
+        });
+
+    ui.add_space(16.0);
+    ui.set_width(card_width);
+    if compact {
+        render_info_card(
+            ui,
+            "First Run",
+            &[
+                "Create or open a wallet.",
+                "Use regnet or testnet first to keep the workflow local.",
+                "Open Settings to confirm the active mining backend.",
+            ],
+            "The Mining panel shows the effective backend and any fallback reason before you leave the app running.",
+        );
+        ui.add_space(10.0);
+        render_info_card(
+            ui,
+            "Safety",
+            &[
+                "Write down the recovery phrase when it is shown.",
+                "Do not paste secrets into the debug console.",
+                "Wallet encryption is optional but recommended.",
+            ],
+            "The launch screens now scroll on smaller windows, including recovery-phrase workflows.",
+        );
+    } else {
+        ui.columns(2, |columns| {
+            render_info_card(
+                &mut columns[0],
+                "First Run",
+                &[
+                    "Create or open a wallet.",
+                    "Use regnet or testnet first to keep the workflow local.",
+                    "Open Settings to confirm the active mining backend.",
+                ],
+                "The Mining panel shows the effective backend and any fallback reason before you leave the app running.",
+            );
+            render_info_card(
+                &mut columns[1],
+                "Safety",
+                &[
+                    "Write down the recovery phrase when it is shown.",
+                    "Do not paste secrets into the debug console.",
+                    "Wallet encryption is optional but recommended.",
+                ],
+                "The launch screens now scroll on smaller windows, including recovery-phrase workflows.",
+            );
+        });
+    }
+}
+
+fn render_welcome_copy(app: &DesktopApp, ui: &mut egui::Ui, centered: bool) {
+    let network = app.connection.network().id();
+    if centered {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("Welcome to Atho Core")
+                    .size(34.0)
+                    .strong()
+                    .color(widgets::ACCENT),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("A production-focused Atho node, wallet, and miner client.")
+                    .size(17.0)
+                    .color(widgets::TEXT),
+            );
+            ui.add_space(10.0);
+            widgets::muted_label(
+                ui,
+                &format!(
+                    "Current network target: {}. You can create, open, or restore a wallet below and move straight into the full desktop client.",
+                    network
+                ),
+            );
+        });
+    } else {
+        ui.label(
+            egui::RichText::new("Welcome to Atho Core")
+                .size(34.0)
+                .strong()
+                .color(widgets::ACCENT),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("A production-focused Atho node, wallet, and miner client.")
+                .size(17.0)
+                .color(widgets::TEXT),
+        );
+        ui.add_space(10.0);
+        widgets::muted_label(
+            ui,
+            &format!(
+                "Current network target: {}. Create a new HD wallet, open an existing one, or restore from a recovery phrase.",
+                network
+            ),
+        );
+    }
+}
+
+fn render_action_buttons(app: &mut DesktopApp, ui: &mut egui::Ui, width: f32, compact: bool) {
+    let render_button = |ui: &mut egui::Ui, label: &str, hint: &str| {
+        ui.vertical(|ui| {
+            ui.add_sized(
+                [width, 36.0],
+                egui::Button::new(egui::RichText::new(label).size(16.0).strong()),
+            )
+            .on_hover_text(hint)
+        })
+        .inner
+    };
+
+    if compact {
+        if render_button(
+            ui,
+            "Create Wallet",
+            "Create a new Atho HD wallet and show the recovery phrase once.",
+        )
+        .clicked()
         {
             app.create_form = super::CreateWalletForm::new(app.connection.network());
             let _ = app.generate_create_mnemonic();
             app.launch_page = LaunchPage::CreateWallet;
         }
-        if ui
-            .add_sized([138.0, 28.0], egui::Button::new("Open Wallet"))
-            .clicked()
+        ui.add_space(8.0);
+        if render_button(
+            ui,
+            "Open Wallet",
+            "Open an existing wallet file and unlock it if required.",
+        )
+        .clicked()
         {
             app.open_form = super::OpenWalletForm::new(app.connection.network());
             app.launch_page = LaunchPage::OpenWallet;
         }
-        if ui
-            .add_sized([138.0, 28.0], egui::Button::new("Import Wallet"))
-            .clicked()
+        ui.add_space(8.0);
+        if render_button(
+            ui,
+            "Import Wallet",
+            "Restore a wallet from an existing recovery phrase.",
+        )
+        .clicked()
         {
             app.import_form = super::ImportWalletForm::new(app.connection.network());
             app.launch_page = LaunchPage::ImportWallet;
         }
-    });
-    ui.add_space(6.0);
-    widgets::muted_label(
-        ui,
-        "Open an existing wallet or create a new wallet to continue.",
-    );
-    ui.add_space(14.0);
+    } else {
+        ui.horizontal(|ui| {
+            if render_button(
+                ui,
+                "Create Wallet",
+                "Create a new Atho HD wallet and show the recovery phrase once.",
+            )
+            .clicked()
+            {
+                app.create_form = super::CreateWalletForm::new(app.connection.network());
+                let _ = app.generate_create_mnemonic();
+                app.launch_page = LaunchPage::CreateWallet;
+            }
+            if render_button(
+                ui,
+                "Open Wallet",
+                "Open an existing wallet file and unlock it if required.",
+            )
+            .clicked()
+            {
+                app.open_form = super::OpenWalletForm::new(app.connection.network());
+                app.launch_page = LaunchPage::OpenWallet;
+            }
+            if render_button(
+                ui,
+                "Import Wallet",
+                "Restore a wallet from an existing recovery phrase.",
+            )
+            .clicked()
+            {
+                app.import_form = super::ImportWalletForm::new(app.connection.network());
+                app.launch_page = LaunchPage::ImportWallet;
+            }
+        });
+    }
+}
+
+fn render_info_card(ui: &mut egui::Ui, title: &str, lines: &[&str], footer: &str) {
     egui::Frame::none()
         .fill(widgets::PANEL_BG)
         .stroke(egui::Stroke::new(1.0, widgets::PANEL_STROKE))
-        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+        .inner_margin(egui::Margin::symmetric(18.0, 16.0))
         .show(ui, |ui| {
-            widgets::section_header(ui, "First Run");
+            widgets::section_header(ui, title);
             ui.add_space(8.0);
-            ui.label("1. Create or open a wallet.");
-            ui.label("2. Use regnet or testnet first to keep the workflow local.");
-            ui.label("3. Open Settings to see whether mining is using GPU or CPU.");
-            ui.label("4. If GPU is unavailable or fails, Atho falls back to CPU automatically.");
-            ui.add_space(8.0);
-            widgets::muted_label(
-                ui,
-                "The Mining panel shows the effective backend and any fallback reason so you can confirm the runtime path before leaving the app running.",
-            );
+            for line in lines {
+                ui.label(
+                    egui::RichText::new(format!("• {line}"))
+                        .size(14.0)
+                        .color(widgets::TEXT),
+                );
+                ui.add_space(4.0);
+            }
+            ui.add_space(6.0);
+            widgets::muted_label(ui, footer);
         });
 }

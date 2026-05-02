@@ -1,3 +1,4 @@
+//! P2P synchronization state and request planning.
 use crate::config::network_params;
 use crate::protocol::{GetHeadersMessage, Hash48, ProtocolError};
 use atho_core::block::{Block, BlockHeader};

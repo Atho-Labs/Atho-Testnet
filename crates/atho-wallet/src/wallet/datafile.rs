@@ -1,3 +1,4 @@
+//! Encrypted wallet `.datafile` persistence.
 use super::{PersistedWalletState, Wallet};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};

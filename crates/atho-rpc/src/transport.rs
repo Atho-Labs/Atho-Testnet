@@ -1,3 +1,4 @@
+//! Length-delimited RPC transport framing.
 use crate::request::RpcRequest;
 use crate::response::RpcResponse;
 use atho_errors::{

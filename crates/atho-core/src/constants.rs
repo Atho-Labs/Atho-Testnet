@@ -1,3 +1,10 @@
+//! Consensus and policy constants shared across Atho crates.
+//!
+//! These values define monetary units, relay policy defaults, witness sizing,
+//! and network-independent protocol limits.
+//!
+//! CONSENSUS: Supply, block, and witness constants here feed directly into block
+//! and transaction validation. Changes require explicit protocol coordination.
 pub const ATOMS_PER_ATHO: u64 = 100_000_000;
 pub const MAX_SUPPLY_ATHO: u64 = 168_000_000;
 pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ATHO * ATOMS_PER_ATHO;

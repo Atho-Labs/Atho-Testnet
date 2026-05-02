@@ -1,3 +1,4 @@
+//! Wallet creation, import, and recovery dialogs.
 use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage};
 use atho_wallet::mnemonic::MnemonicPhrase;
 use eframe::egui;
@@ -7,7 +8,9 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut cancel_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        ui.set_width(700.0);
+        let card_width = ui.available_width().min(700.0).max(320.0);
+        ui.set_width(card_width);
+        ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Create Wallet").size(22.0).strong());
         ui.add_space(6.0);
         widgets::muted_label(ui, "Create a new Atho HD wallet. Encryption is optional.");
@@ -76,7 +79,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         }
 
         ui.add_space(18.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let ready = create_mnemonic_sentence.is_some()
                 && app.create_form.acknowledged_backup
                 && (!app.create_form.encrypt_wallet
@@ -146,7 +149,9 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut cancel_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        ui.set_width(700.0);
+        let card_width = ui.available_width().min(700.0).max(320.0);
+        ui.set_width(card_width);
+        ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Import Wallet").size(22.0).strong());
         ui.add_space(8.0);
         widgets::muted_label(
@@ -202,7 +207,7 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         }
         ui.checkbox(&mut app.import_form.show_passwords, "Show passphrases");
         ui.add_space(18.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let import_mnemonic_ready =
                 mnemonic_ui::mnemonic_sentence_from_words(&app.import_form.mnemonic_words).is_ok();
             let ready = (!app.import_form.encrypt_wallet
@@ -271,7 +276,9 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut cancel_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        ui.set_width(580.0);
+        let card_width = ui.available_width().min(580.0).max(320.0);
+        ui.set_width(card_width);
+        ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Open Wallet").size(22.0).strong());
         ui.add_space(8.0);
         widgets::muted_label(
@@ -292,7 +299,7 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.open_form.show_password, "Show passphrase");
         ui.add_space(18.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Open").clicked() {
                 open_clicked = true;
             }

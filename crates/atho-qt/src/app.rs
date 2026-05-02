@@ -1,3 +1,4 @@
+//! Top-level desktop application state and event handling.
 use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection, StatusMonitor};
 use crate::error::QtError;
 use crate::state::UiState;
@@ -58,8 +59,8 @@ pub(crate) use models::{
     AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode, DebugWindowTab,
     ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, NavTab,
     NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord,
-    SendJob, SendOutcome, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
-    WalletManagementForm,
+    SendJob, SendOutcome, SyncProgressSample, WalletActivityKind, WalletActivityRow,
+    WalletBalanceSummary, WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
@@ -132,6 +133,7 @@ pub struct DesktopApp {
     debug_console_font_size: f32,
     debug_selected_peer: Option<String>,
     network_traffic_samples: Vec<NetworkTrafficSample>,
+    sync_progress_samples: Vec<SyncProgressSample>,
     last_network_traffic_snapshot: Option<(Instant, u64, u64)>,
     wallet_utxos_cache: Vec<UtxoEntry>,
     wallet_activity_cache: Vec<WalletActivityRow>,
@@ -144,6 +146,7 @@ pub struct DesktopApp {
     wallet_balance_cache: u64,
     theme_initialized: bool,
     compact_viewport: bool,
+    show_sync_status_dialog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +309,7 @@ impl DesktopApp {
             debug_console_font_size: 13.0,
             debug_selected_peer: None,
             network_traffic_samples: Vec::new(),
+            sync_progress_samples: Vec::new(),
             last_network_traffic_snapshot: None,
             wallet_utxos_cache: Vec::new(),
             wallet_activity_cache: Vec::new(),
@@ -320,6 +324,7 @@ impl DesktopApp {
             wallet_balance_cache: 0,
             theme_initialized: false,
             compact_viewport: false,
+            show_sync_status_dialog: false,
         };
 
         app.view_model.network_label = app.connection.network().id().to_string();
@@ -353,27 +358,41 @@ impl DesktopApp {
         self.view_model.network_label = status.network.id().to_string();
         self.view_model.block_count = status.block_count;
         self.view_model.tip_hash = status.tip_hash;
+        self.view_model.tip_timestamp = status.tip_timestamp;
         self.view_model.mempool_count = status.mempool_count;
         self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
         self.view_model.mempool_fingerprint = status.mempool_fingerprint;
         self.view_model.peer_count = status.peer_count;
         self.view_model.inbound_peer_count = status.inbound_peer_count;
         self.view_model.outbound_peer_count = status.outbound_peer_count;
+        self.view_model.connecting_peer_count = status.connecting_peer_count;
         self.view_model.bytes_sent = status.bytes_sent;
         self.view_model.bytes_received = status.bytes_received;
         self.view_model.peers = status.peers.clone();
+        self.view_model.connecting_peers = status.connecting_peers.clone();
         self.view_model.running = status.running;
         self.view_model.headers_synced = status.headers_synced;
         self.view_model.sync_best_height = status.sync_best_height.max(status.block_count);
         self.record_network_traffic_sample(&status);
+        self.record_sync_progress_sample();
         self.ensure_debug_peer_selection();
         self.view_model.sync_stage = if let Some(error) = startup_error.as_ref() {
             format!("Startup error: {error}")
         } else if status.connected {
-            if status.running && status.headers_synced {
+            if self.view_model.chain_synced() {
                 String::from("Synced")
+            } else if status.running
+                && self.view_model.sync_target_height() > self.view_model.block_count
+            {
+                format!(
+                    "Syncing {}/{}",
+                    self.view_model.block_count,
+                    self.view_model.sync_target_height()
+                )
+            } else if status.running && !status.headers_synced {
+                String::from("Syncing headers")
             } else if status.running {
-                format!("Running at height {}", self.view_model.sync_best_height)
+                format!("Running at local height {}", self.view_model.block_count)
             } else {
                 String::from("Connected")
             }
@@ -2735,6 +2754,41 @@ impl DesktopApp {
         self.last_network_traffic_snapshot = Some((now, status.bytes_sent, status.bytes_received));
     }
 
+    fn record_sync_progress_sample(&mut self) {
+        if !self.view_model.running {
+            return;
+        }
+
+        let now = Instant::now();
+        let target_height = self.view_model.sync_target_height();
+        let progress = self.view_model.sync_progress();
+        let latest = self.sync_progress_samples.last();
+
+        if latest.is_some_and(|sample| {
+            sample.local_height == self.view_model.block_count
+                && sample.target_height == target_height
+                && sample.recorded_at.elapsed() < Duration::from_secs(20)
+        }) {
+            return;
+        }
+
+        self.sync_progress_samples.push(SyncProgressSample {
+            recorded_at: now,
+            local_height: self.view_model.block_count,
+            target_height,
+            progress,
+        });
+
+        if self.sync_progress_samples.len() > 360 {
+            let drop_count = self.sync_progress_samples.len() - 360;
+            self.sync_progress_samples.drain(0..drop_count);
+        }
+
+        let retention = Duration::from_secs(6 * 60 * 60);
+        self.sync_progress_samples
+            .retain(|sample| now.saturating_duration_since(sample.recorded_at) <= retention);
+    }
+
     pub(crate) fn clear_network_traffic_samples(&mut self) {
         self.network_traffic_samples.clear();
         self.last_network_traffic_snapshot = Some((
@@ -3885,12 +3939,14 @@ mod tests {
             rpc_address: String::from("127.0.0.1:18445"),
             block_count: 12,
             tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
             mempool_count: 1,
             mempool_total_fee_atoms: 44,
             mempool_fingerprint: [0x22; 32],
             peer_count: 2,
             inbound_peer_count: 1,
             outbound_peer_count: 1,
+            connecting_peer_count: 1,
             bytes_sent: 8_192,
             bytes_received: 16_384,
             peers: vec![NetworkPeerDiagnostics {
@@ -3909,6 +3965,22 @@ mod tests {
                 quality_score: Some(100),
                 consecutive_failures: Some(0),
             }],
+            connecting_peers: vec![NetworkPeerDiagnostics {
+                remote_addr: String::from("9.9.9.9:9200"),
+                direction: NetworkPeerDirection::Outbound,
+                handshake_ready: false,
+                best_height: None,
+                protocol_version: None,
+                services: None,
+                user_agent: None,
+                ruleset_version: None,
+                bytes_sent: 96,
+                bytes_received: 0,
+                last_send_unix: Some(1_777_416_445),
+                last_receive_unix: None,
+                quality_score: Some(85),
+                consecutive_failures: Some(1),
+            }],
             running: true,
             headers_synced: true,
             sync_best_height: 12,
@@ -3918,10 +3990,48 @@ mod tests {
         assert_eq!(app.view_model.peer_count, 2);
         assert_eq!(app.view_model.inbound_peer_count, 1);
         assert_eq!(app.view_model.outbound_peer_count, 1);
+        assert_eq!(app.view_model.connecting_peer_count, 1);
         assert_eq!(app.view_model.bytes_sent, 8_192);
         assert_eq!(app.view_model.bytes_received, 16_384);
         assert_eq!(app.view_model.peers.len(), 1);
         assert_eq!(app.view_model.peers[0].remote_addr, "74.208.219.116:56000");
+        assert_eq!(app.view_model.connecting_peers.len(), 1);
+        assert_eq!(
+            app.view_model.connecting_peers[0].remote_addr,
+            "9.9.9.9:9200"
+        );
+    }
+
+    #[test]
+    fn desktop_app_does_not_report_synced_when_local_height_is_behind_target() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.apply_connection_status(ConnectionStatus {
+            network: Network::Mainnet,
+            rpc_address: String::from("127.0.0.1:9210"),
+            block_count: 0,
+            tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x22; 32],
+            peer_count: 1,
+            inbound_peer_count: 0,
+            outbound_peer_count: 1,
+            connecting_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            connecting_peers: Vec::new(),
+            running: true,
+            headers_synced: true,
+            sync_best_height: 128,
+            connected: true,
+            startup_error: None,
+        });
+        assert_eq!(app.view_model.sync_target_height(), 128);
+        assert!(!app.view_model.chain_synced());
+        assert_eq!(app.view_model.sync_stage, "Syncing 0/128");
     }
 
     #[test]
@@ -4479,15 +4589,18 @@ mod tests {
             rpc_address: String::from("127.0.0.1:18444"),
             block_count: 12,
             tip_hash: [0; 48],
+            tip_timestamp: 1_777_416_445,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0; 32],
             peer_count: 0,
             inbound_peer_count: 0,
             outbound_peer_count: 0,
+            connecting_peer_count: 0,
             bytes_sent: 0,
             bytes_received: 0,
             peers: Vec::new(),
+            connecting_peers: Vec::new(),
             running: true,
             headers_synced: false,
             sync_best_height: 1_000,
@@ -4513,15 +4626,18 @@ mod tests {
             rpc_address: String::from("127.0.0.1:18444"),
             block_count: 12,
             tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
             mempool_count: 3,
             mempool_total_fee_atoms: 44,
             mempool_fingerprint: [0x22; 32],
             peer_count: 0,
             inbound_peer_count: 0,
             outbound_peer_count: 0,
+            connecting_peer_count: 0,
             bytes_sent: 0,
             bytes_received: 0,
             peers: Vec::new(),
+            connecting_peers: Vec::new(),
             running: true,
             headers_synced: true,
             sync_best_height: 12,

@@ -1,3 +1,4 @@
+//! Inventory, block, and transaction relay helpers.
 use crate::config::{network_params, NetworkParams};
 use crate::peer::PeerBook;
 use crate::protocol::{

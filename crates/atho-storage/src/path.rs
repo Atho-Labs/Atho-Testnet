@@ -1,3 +1,4 @@
+//! Network-specific data-directory and database-path resolution.
 use atho_core::network::Network;
 use std::path::PathBuf;
 

@@ -9,6 +9,7 @@ pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
     render_menu_bar(app, ctx);
     render_toolbar(app, ctx);
     render_status_bar(app, ctx);
+    render_sync_status_window(app, ctx);
     render_about_window(app, ctx);
     pages::console::render_window(app, ctx);
 
@@ -163,6 +164,7 @@ fn render_toolbar(app: &mut DesktopApp, ctx: &egui::Context) {
                         NavTab::DebugConsole => continue,
                         NavTab::Settings => continue,
                     };
+                    let response = response.on_hover_text(nav_tab_tooltip(tab));
                     if response.clicked() {
                         app.active_tab = tab;
                     }
@@ -171,6 +173,9 @@ fn render_toolbar(app: &mut DesktopApp, ctx: &egui::Context) {
                 ui.add_space(4.0);
                 if ui
                     .add_sized([90.0, 28.0], egui::Button::new("Console"))
+                    .on_hover_text(
+                        "Open the Atho node window with console, peers, and network diagnostics.",
+                    )
                     .clicked()
                 {
                     app.open_debug_window(DebugWindowTab::Console);
@@ -188,20 +193,27 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, widgets::PANEL_STROKE)),
         )
         .show(ctx, |ui| {
-            let status_text = if app.ui_state.connected {
-                String::from("Up to date")
+            let status_text = if app.ui_state.connected && app.view_model.chain_synced() {
+                String::from("Synced")
+            } else if app.ui_state.connected && app.view_model.running {
+                String::from("Synchronizing with network...")
             } else if app.connection.has_local_node() {
                 String::from("Synchronizing with network...")
             } else {
                 String::from("Disconnected")
             };
-            let progress = if app.ui_state.connected {
-                1.0
+            let progress = if app.ui_state.connected && app.view_model.running {
+                app.view_model.sync_progress()
             } else if app.connection.has_local_node() {
                 0.0
             } else {
                 0.0
             };
+            let blocks_left = app
+                .view_model
+                .sync_target_height()
+                .saturating_sub(app.view_model.block_count);
+            let sync_tooltip = sync_tooltip_text(app, blocks_left, progress);
 
             ui.horizontal(|ui| {
                 let available = ui.available_width();
@@ -213,21 +225,43 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(egui::RichText::new(status_text).color(widgets::TEXT));
+                        let status_response = ui.add(
+                            egui::Label::new(egui::RichText::new(status_text).color(widgets::TEXT))
+                                .sense(egui::Sense::click()),
+                        );
+                        status_response.clone().on_hover_text(sync_tooltip.clone());
+                        if status_response.clicked() {
+                            app.show_sync_status_dialog = true;
+                        }
                         let progress_width = (left_width * 0.32).clamp(90.0, 210.0);
-                        ui.add(egui::ProgressBar::new(progress).desired_width(progress_width));
+                        let progress_response = ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(progress_width)
+                                .text(format!("{:.2}%", progress * 100.0)),
+                        );
+                        progress_response
+                            .clone()
+                            .on_hover_text(sync_tooltip.clone());
+                        if progress_response.clicked() {
+                            app.show_sync_status_dialog = true;
+                        }
                         ui.separator();
-                        widgets::muted_label(ui, &format!("Height {}", app.view_model.block_count));
+                        widgets::muted_label(ui, &format!("Height {}", app.view_model.block_count))
+                            .on_hover_text("Local canonical chain height.");
                         ui.separator();
                         widgets::muted_label(
                             ui,
-                            &format!("Best {}", app.view_model.sync_best_height),
+                            &format!("Target {}", app.view_model.sync_target_height()),
+                        )
+                        .on_hover_text(
+                            "Best known sync target advertised by the current peer set.",
                         );
                         ui.separator();
                         widgets::muted_label(
                             ui,
                             &format!("Mempool {}", app.view_model.mempool_count),
-                        );
+                        )
+                        .on_hover_text("Current local mempool transaction count.");
                         if let Some(error) = &app.last_error {
                             ui.separator();
                             ui.colored_label(egui::Color32::from_rgb(170, 77, 50), "!")
@@ -242,10 +276,17 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let _ = ui.add(resources::sync_icon(16.0, app.ui_state.connected));
-                        let _ = ui.add(resources::network_icon(16.0, app.ui_state.connected));
+                        ui.add(resources::sync_icon(16.0, app.view_model.chain_synced()))
+                            .on_hover_text(sync_tooltip);
+                        ui.add(resources::network_icon(16.0, app.ui_state.connected))
+                            .on_hover_text(if app.ui_state.connected {
+                                "RPC connected to the expected Atho network."
+                            } else {
+                                "RPC is disconnected or the managed local node is still starting."
+                            });
                         ui.separator();
-                        let _ = ui.add(resources::hd_enabled_icon(16.0));
+                        ui.add(resources::hd_enabled_icon(16.0))
+                            .on_hover_text("HD wallet mode is enabled.");
                         ui.label(
                             egui::RichText::new("ATHO")
                                 .size(13.0)
@@ -258,6 +299,186 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                 );
             });
         });
+}
+
+fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
+    if !app.show_sync_status_dialog {
+        return;
+    }
+
+    let target = app.view_model.sync_target_height();
+    let blocks_left = target.saturating_sub(app.view_model.block_count);
+    let progress = app.view_model.sync_progress();
+    let estimated_time_left = estimate_sync_time_left(app);
+    let progress_per_hour = estimated_progress_per_hour(app);
+    let last_block_time = if app.view_model.tip_timestamp == 0 {
+        String::from("Unknown")
+    } else {
+        format!("{} ago", age_label(app.view_model.tip_timestamp))
+    };
+
+    let mut open = app.show_sync_status_dialog;
+    let mut hide_requested = false;
+
+    egui::Window::new("Synchronization status")
+        .collapsible(false)
+        .resizable(false)
+        .default_size(egui::vec2(520.0, 280.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            widgets::dialog_frame().show(ui, |ui| {
+                let warning = if app.view_model.chain_synced() {
+                    "The local Atho chain is caught up with the advertised network target."
+                } else {
+                    "Recent wallet transactions and balances may still change while the local Atho chain is synchronizing. Transactions that depend on not-yet-synced history may be rejected."
+                };
+                ui.horizontal_top(|ui| {
+                    ui.add(resources::warning_icon(22.0));
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(warning)
+                            .size(13.0)
+                            .color(widgets::TEXT),
+                    );
+                });
+                ui.add_space(14.0);
+
+                egui::Grid::new("sync_status_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.strong("Number of blocks left");
+                        ui.label(blocks_left.to_string());
+                        ui.end_row();
+
+                        ui.strong("Last local block time");
+                        ui.label(last_block_time);
+                        ui.end_row();
+
+                        ui.strong("Progress");
+                        ui.label(format!("{:.2}%", progress * 100.0));
+                        ui.end_row();
+
+                        ui.strong("Progress increase per hour");
+                        ui.label(progress_per_hour.unwrap_or_else(|| String::from("Unknown")));
+                        ui.end_row();
+
+                        ui.strong("Estimated time left");
+                        ui.label(
+                            estimated_time_left
+                                .map(format_duration_human)
+                                .unwrap_or_else(|| String::from("Unknown")),
+                        );
+                        ui.end_row();
+
+                        ui.strong("Connected peers");
+                        ui.label(app.view_model.peer_count.to_string());
+                        ui.end_row();
+
+                        ui.strong("Connecting peers");
+                        ui.label(app.view_model.connecting_peer_count.to_string());
+                        ui.end_row();
+                    });
+
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Hide").clicked() {
+                        hide_requested = true;
+                    }
+                });
+            });
+        });
+
+    app.show_sync_status_dialog = open && !hide_requested;
+}
+
+fn nav_tab_tooltip(tab: NavTab) -> &'static str {
+    match tab {
+        NavTab::Overview => "Wallet balances, recent activity, and high-level node status.",
+        NavTab::Send => "Create and submit outgoing Atho transactions.",
+        NavTab::Receive => "Generate receiving addresses, payment requests, and QR codes.",
+        NavTab::Transactions => "Review wallet transaction history and filters.",
+        NavTab::DebugConsole => "Open the Atho node window.",
+        NavTab::Settings => "Wallet, mining, and diagnostics settings.",
+    }
+}
+
+fn sync_tooltip_text(app: &DesktopApp, blocks_left: u64, progress: f32) -> String {
+    format!(
+        "Local height: {}\nSync target: {}\nBlocks left: {}\nProgress: {:.2}%\nClick for detailed Atho sync status.",
+        app.view_model.block_count,
+        app.view_model.sync_target_height(),
+        blocks_left,
+        progress * 100.0
+    )
+}
+
+fn estimated_progress_per_hour(app: &DesktopApp) -> Option<String> {
+    let first = app.sync_progress_samples.first()?;
+    let last = app.sync_progress_samples.last()?;
+    let elapsed_secs = last
+        .recorded_at
+        .saturating_duration_since(first.recorded_at)
+        .as_secs_f64();
+    if elapsed_secs <= f64::EPSILON || last.progress < first.progress {
+        return None;
+    }
+    let delta_percent = (last.progress - first.progress) as f64 * 100.0;
+    let per_hour = delta_percent * (3600.0 / elapsed_secs);
+    Some(format!("{per_hour:.2}%"))
+}
+
+fn estimate_sync_time_left(app: &DesktopApp) -> Option<u64> {
+    let first = app.sync_progress_samples.first()?;
+    let last = app.sync_progress_samples.last()?;
+    let elapsed_secs = last
+        .recorded_at
+        .saturating_duration_since(first.recorded_at)
+        .as_secs_f64();
+    let height_delta = last.local_height.saturating_sub(first.local_height) as f64;
+    if elapsed_secs <= f64::EPSILON || height_delta <= f64::EPSILON {
+        return None;
+    }
+    let blocks_per_second = height_delta / elapsed_secs;
+    if blocks_per_second <= f64::EPSILON {
+        return None;
+    }
+    let remaining = app
+        .view_model
+        .sync_target_height()
+        .saturating_sub(app.view_model.block_count) as f64;
+    Some((remaining / blocks_per_second).max(0.0) as u64)
+}
+
+fn age_label(unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(unix);
+    if now <= unix {
+        return String::from("just now");
+    }
+    format_duration_human(now - unix)
+}
+
+fn format_duration_human(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{}h {}m", hours, minutes % 60);
+    }
+    let days = hours / 24;
+    if days < 21 {
+        return format!("{}d {}h", days, hours % 24);
+    }
+    let weeks = days / 7;
+    format!("{}w {}d", weeks, days % 7)
 }
 
 fn render_about_window(app: &mut DesktopApp, ctx: &egui::Context) {
