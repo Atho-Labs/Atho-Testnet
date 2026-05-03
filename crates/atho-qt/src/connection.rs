@@ -1,11 +1,12 @@
 //! Client-side RPC and managed local-node connection handling.
 use atho_core::network::Network;
 use atho_node::system::AthoSystem;
-use atho_rpc::command::command_requires_mutable_access;
+use atho_rpc::command::{command_requires_mutable_access, CommandInvocation};
 use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcResponse};
 use atho_rpc::transport::{RpcClient, RpcTransportError};
+use atho_storage::db::Database;
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,14 @@ const ATHO_QT_FORCE_RPC_ENV: &str = "ATHO_QT_FORCE_RPC";
 const LOCAL_RPC_READY_RETRY_ATTEMPTS: usize = 20;
 const LOCAL_RPC_READY_RETRY_DELAY_MS: u64 = 100;
 const LOCAL_RPC_STATUS_ERROR_RETRY_ATTEMPTS: usize = 2;
+const LOCAL_RPC_STOP_RETRY_ATTEMPTS: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedChainTipStatus {
+    height: u64,
+    tip_hash: [u8; 48],
+    tip_timestamp: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionStatus {
@@ -639,6 +648,36 @@ fn degrade_rpc_status(
         startup_error: None,
     });
 
+    if managed_local && !rpc_reachable {
+        let persisted = load_persisted_chain_tip_status(network);
+        status.network = network;
+        status.rpc_address = rpc_address.to_string();
+        status.block_count = persisted.map(|snapshot| snapshot.height).unwrap_or(0);
+        status.tip_hash = persisted
+            .map(|snapshot| snapshot.tip_hash)
+            .unwrap_or([0; 48]);
+        status.tip_timestamp = persisted
+            .map(|snapshot| snapshot.tip_timestamp)
+            .unwrap_or(0);
+        status.mempool_count = 0;
+        status.mempool_total_fee_atoms = 0;
+        status.mempool_fingerprint = [0; 32];
+        status.peer_count = 0;
+        status.inbound_peer_count = 0;
+        status.outbound_peer_count = 0;
+        status.connecting_peer_count = 0;
+        status.bytes_sent = 0;
+        status.bytes_received = 0;
+        status.peers.clear();
+        status.connecting_peers.clear();
+        status.running = false;
+        status.headers_synced = false;
+        status.connected = false;
+        status.startup_error = None;
+        status.sync_best_height = status.sync_best_height.max(status.block_count);
+        return status;
+    }
+
     status.network = network;
     status.rpc_address = rpc_address.to_string();
     if let Some(block_count) = block_count_reply {
@@ -692,12 +731,26 @@ fn start_local_node_if_needed(
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "rpc already available at {} for {}",
+                "managed local node requested with existing rpc endpoint network={} rpc={}; stopping previous node before restart",
+                network.id(),
+                rpc_address,
+            ),
+        );
+        stop_existing_local_node(rpc_address, network)?;
+    }
+    if probe_rpc(rpc_address) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "rpc still active after managed restart preflight at {} for {}",
                 rpc_address,
                 network.id()
             ),
         );
-        return Ok(None);
+        return Err(format!(
+            "managed local node rpc remained active at {rpc_address} for {}",
+            network.id()
+        ));
     }
 
     let mut command = if let Some(binary) = node_binary_path() {
@@ -828,6 +881,79 @@ fn probe_rpc(rpc_address: &str) -> bool {
         client.call(&RpcRequest::GetNetwork),
         Ok(RpcResponse::Network(_))
     )
+}
+
+fn load_persisted_chain_tip_status(network: Network) -> Option<PersistedChainTipStatus> {
+    let database = Database::open(network).ok()?;
+    let snapshot = database.load_chainstate_snapshot().ok().flatten()?;
+    let tip_timestamp = snapshot
+        .tip_header
+        .as_ref()
+        .map(|header| header.timestamp)
+        .or_else(|| {
+            database
+                .load_block_record_by_height(snapshot.height)
+                .ok()
+                .flatten()
+                .map(|record| record.timestamp)
+        })
+        .unwrap_or_default();
+    Some(PersistedChainTipStatus {
+        height: snapshot.height,
+        tip_hash: snapshot.tip_hash,
+        tip_timestamp,
+    })
+}
+
+fn stop_existing_local_node(rpc_address: &str, network: Network) -> Result<(), String> {
+    let client = RpcClient::new(rpc_address.to_string());
+    let mut invocation = CommandInvocation::new("stop", Vec::new());
+    invocation.confirmed = true;
+    match client.call(&RpcRequest::ExecuteCommand(invocation)) {
+        Ok(RpcResponse::Command(_)) => {}
+        Ok(RpcResponse::Error(err)) => {
+            return Err(format!(
+                "existing local node at {rpc_address} refused managed restart for {}: {err}",
+                network.id()
+            ));
+        }
+        Ok(other) => {
+            return Err(format!(
+                "existing local node at {rpc_address} returned unexpected stop response for {}: {other:?}",
+                network.id()
+            ));
+        }
+        Err(err) => {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!(
+                    "stop command transport error before managed restart network={} rpc={} error={err}",
+                    network.id(),
+                    rpc_address
+                ),
+            );
+        }
+    }
+
+    for _ in 0..LOCAL_RPC_STOP_RETRY_ATTEMPTS {
+        if !probe_rpc(rpc_address) {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!(
+                    "existing local node stopped before managed restart network={} rpc={}",
+                    network.id(),
+                    rpc_address
+                ),
+            );
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
+    }
+
+    Err(format!(
+        "existing local node at {rpc_address} did not stop for {}; stop the conflicting athod process or use external RPC mode instead of --local-node",
+        network.id()
+    ))
 }
 
 fn local_node_stdio_log_path(network: Network) -> PathBuf {
@@ -985,6 +1111,7 @@ mod tests {
     use super::*;
     use crate::test_support::acquire_global_test_lock;
     use atho_node::miner::Miner;
+    use atho_rpc::command::{CommandGroup, CommandPermission, CommandResponse};
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::{
         MempoolInfo, NetworkDiagnostics, NetworkPeerDiagnostics, NetworkPeerDirection, NodeStatus,
@@ -1061,7 +1188,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc");
         let address = listener.local_addr().expect("local addr").to_string();
         let handle = std::thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let clone = stream.try_clone().expect("clone");
                 let mut reader = BufReader::new(clone);
@@ -1221,6 +1348,53 @@ mod tests {
         (address, handle)
     }
 
+    fn spawn_stoppable_rpc_server(network: Network) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stoppable rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept getnetwork");
+            let clone = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(clone);
+            let request: RpcRequest = read_message(&mut reader).expect("request");
+            match request {
+                RpcRequest::GetNetwork => {
+                    write_message(&mut stream, &RpcResponse::Network(network.id().to_string()))
+                        .expect("getnetwork response")
+                }
+                other => panic!("unexpected initial request: {other:?}"),
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept stop");
+            let clone = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(clone);
+            let request: RpcRequest = read_message(&mut reader).expect("request");
+            match request {
+                RpcRequest::ExecuteCommand(invocation) => {
+                    assert_eq!(invocation.name, "stop");
+                    assert!(invocation.confirmed);
+                    write_message(
+                        &mut stream,
+                        &RpcResponse::Command(CommandResponse {
+                            command: String::from("stop"),
+                            group: CommandGroup::Control,
+                            permission: CommandPermission::NodeAdmin,
+                            dangerous: true,
+                            network: network.id().to_string(),
+                            data: serde_json::json!({
+                                "stopping": true,
+                                "network": network.id(),
+                                "height": 0,
+                            }),
+                        }),
+                    )
+                    .expect("stop response");
+                }
+                other => panic!("unexpected stop request: {other:?}"),
+            }
+        });
+        (address, handle)
+    }
+
     fn spawn_retryable_node_status_rpc_server(
         network: Network,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -1362,9 +1536,9 @@ mod tests {
     }
 
     #[test]
-    fn local_flag_uses_rpc_status_path_when_rpc_is_available() {
+    fn rpc_status_path_uses_available_rpc_server_without_local_node_mode() {
         let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
-        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "0");
         let (rpc_address, handle) = spawn_mock_rpc_server(Network::Mainnet, 42, 3, 55);
 
         let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Mainnet, rpc_address);
@@ -1410,6 +1584,9 @@ mod tests {
 
     #[test]
     fn managed_local_node_status_degrades_without_zeroing_last_known_sync_target() {
+        let root = temp_data_dir("managed-degrade");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
         let (rpc_address, handle) = spawn_flaky_node_status_rpc_server(Network::Mainnet);
@@ -1446,6 +1623,91 @@ mod tests {
         assert_eq!(degraded.tip_timestamp, 1_777_416_445);
 
         handle.join().expect("flaky mock rpc server");
+    }
+
+    #[test]
+    fn managed_local_degraded_status_uses_persisted_chainstate_height() {
+        let root = temp_data_dir("managed-persisted-height");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let db = Database::open(Network::Mainnet).expect("database");
+        let db_path = database_dir(Network::Mainnet);
+        drop(db);
+
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(128)
+            .set_max_dbs(10)
+            .set_map_size(1 << 30);
+        let env = builder.open(&db_path).expect("open env");
+        let meta = env.open_db(Some("meta")).expect("meta db");
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let snapshot_bytes = bincode::serialize(&ChainstateSnapshot {
+            height: 7,
+            tip_hash: [9; 48],
+            tip_header: None,
+        })
+        .expect("serialize snapshot");
+        txn.put(meta, b"chainstate", &snapshot_bytes, WriteFlags::empty())
+            .expect("put snapshot");
+        txn.commit().expect("commit fixture");
+
+        let degraded = degrade_rpc_status(
+            Network::Mainnet,
+            "127.0.0.1:9010",
+            None,
+            None,
+            false,
+            false,
+            true,
+            Some(&ConnectionStatus {
+                network: Network::Mainnet,
+                rpc_address: String::from("127.0.0.1:9010"),
+                block_count: 42,
+                tip_hash: [4; 48],
+                tip_timestamp: 1_777_416_445,
+                mempool_count: 3,
+                mempool_total_fee_atoms: 55,
+                mempool_fingerprint: [8; 32],
+                peer_count: 1,
+                inbound_peer_count: 0,
+                outbound_peer_count: 1,
+                connecting_peer_count: 0,
+                bytes_sent: 2_048,
+                bytes_received: 4_096,
+                peers: Vec::new(),
+                connecting_peers: Vec::new(),
+                running: true,
+                headers_synced: true,
+                sync_best_height: 128,
+                connected: true,
+                startup_error: None,
+            }),
+        );
+
+        assert_eq!(degraded.block_count, 7);
+        assert_eq!(degraded.tip_hash, [9; 48]);
+        assert_eq!(degraded.tip_timestamp, 0);
+        assert_eq!(degraded.sync_best_height, 128);
+        assert!(!degraded.running);
+        assert!(!degraded.connected);
+        assert!(!degraded.headers_synced);
+        assert_eq!(degraded.mempool_count, 0);
+        assert_eq!(degraded.peer_count, 0);
+    }
+
+    #[test]
+    fn managed_local_stop_command_reclaims_existing_rpc_endpoint() {
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let (rpc_address, handle) = spawn_stoppable_rpc_server(Network::Mainnet);
+
+        assert!(probe_rpc(&rpc_address));
+        stop_existing_local_node(&rpc_address, Network::Mainnet).expect("stop existing node");
+        assert!(!probe_rpc(&rpc_address));
+
+        handle.join().expect("stoppable mock rpc server");
     }
 
     #[test]
