@@ -7,6 +7,7 @@ use atho_errors::{
     RPC_SERIALIZATION, RPC_TRANSPORT_IO,
 };
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -80,7 +81,7 @@ where
     W: Write,
     T: Serialize,
 {
-    let encoded = bincode::serialize(message)
+    let encoded = serde_json::to_vec(message)
         .map_err(|err| RpcTransportError::Serialization(err.to_string()))?;
     if encoded.len() > MAX_RPC_MESSAGE_BYTES {
         return Err(RpcTransportError::MessageTooLarge);
@@ -115,7 +116,8 @@ where
     }
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload)?;
-    bincode::deserialize(&payload).map_err(|err| RpcTransportError::Serialization(err.to_string()))
+    serde_json::from_slice(&payload)
+        .map_err(|err| RpcTransportError::Serialization(err.to_string()))
 }
 
 fn connect_stream(address: &str) -> Result<TcpStream, RpcTransportError> {
@@ -154,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn read_message_parses_bincode_frames() {
+    fn read_message_parses_length_prefixed_json_frames() {
         let mut payload = Vec::new();
         write_message(
             &mut payload,
@@ -183,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn read_message_rejects_invalid_bincode_payloads() {
+    fn read_message_rejects_invalid_json_payloads() {
         let payload = [4u8, 0, 0, 0, 1, 2, 3, 4];
         let mut reader = BufReader::new(&payload[..]);
         let err = read_message::<_, TestMessage>(&mut reader).unwrap_err();

@@ -105,6 +105,10 @@ impl Node {
         self.chainstate.contains_block(*block_hash).unwrap_or(false)
     }
 
+    pub fn known_block_height(&self, block_hash: &[u8; 48]) -> Option<u64> {
+        self.chainstate.known_block_height(*block_hash)
+    }
+
     pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Option<Block> {
         self.chainstate.block_by_hash(block_hash).ok().flatten()
     }

@@ -498,7 +498,7 @@ impl Chainstate {
         }
 
         let start_height = match locator_hashes.iter().find_map(|hash| {
-            self.height_for_known_block(*hash)
+            self.known_block_height(*hash)
                 .map(|height| height.saturating_add(1))
         }) {
             Some(height) => height,
@@ -690,7 +690,7 @@ impl Chainstate {
         self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
     }
 
-    fn height_for_known_block(&self, block_hash: [u8; 48]) -> Option<u64> {
+    pub fn known_block_height(&self, block_hash: [u8; 48]) -> Option<u64> {
         if let Some(block) = self
             .blocks
             .iter()

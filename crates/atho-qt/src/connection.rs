@@ -8,7 +8,8 @@ use atho_rpc::response::{MempoolInfo, NetworkPeerDiagnostics, NodeStatus, RpcRes
 use atho_rpc::transport::{RpcClient, RpcTransportError};
 use atho_storage::db::Database;
 use std::fs::OpenOptions;
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -21,6 +22,9 @@ const LOCAL_RPC_READY_RETRY_ATTEMPTS: usize = 20;
 const LOCAL_RPC_READY_RETRY_DELAY_MS: u64 = 100;
 const LOCAL_RPC_STATUS_ERROR_RETRY_ATTEMPTS: usize = 2;
 const LOCAL_RPC_STOP_RETRY_ATTEMPTS: usize = 50;
+const LEGACY_RPC_COMPAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const LEGACY_RPC_COMPAT_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistedChainTipStatus {
@@ -101,13 +105,6 @@ impl LocalNodeStartup {
         }
     }
 
-    fn attached_existing() -> Self {
-        Self {
-            node: None,
-            local_node: true,
-        }
-    }
-
     fn managed(node: Arc<ManagedNodeState>) -> Self {
         Self {
             node: Some(node),
@@ -135,6 +132,12 @@ impl StatusMonitor {
 struct ManagedNodeState {
     child: Mutex<Option<Child>>,
     startup_error: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortOwnerProcess {
+    pid: u32,
+    command: String,
 }
 
 impl ManagedNodeState {
@@ -792,6 +795,7 @@ enum ExistingRpcEndpoint {
     SameNetworkRunning,
     SameNetworkStopped,
     SameNetworkIncomplete,
+    SameNetworkLegacy,
     WrongNetwork(String),
     OccupiedByNonAtho,
 }
@@ -807,21 +811,34 @@ fn start_local_node_if_needed(
     match inspect_existing_rpc_endpoint(network, rpc_address) {
         ExistingRpcEndpoint::None => {}
         ExistingRpcEndpoint::SameNetworkRunning => {
+            // Managed local-node mode owns the local athod lifecycle. Reusing an already-running
+            // node here risks attaching to an older binary or stale runtime root after rebuilds.
             let _ = atho_node::dev::append_log(
                 "atho-qt",
                 &format!(
-                    "managed local node requested; attaching to existing healthy local node network={} rpc={}",
+                    "managed local node requested with existing healthy same-network rpc endpoint network={} rpc={}; stopping before restart so managed local-node mode owns the process lifecycle",
                     network.id(),
                     rpc_address
                 ),
             );
-            return Ok(LocalNodeStartup::attached_existing());
+            stop_existing_local_node(rpc_address, network)?;
         }
         ExistingRpcEndpoint::SameNetworkStopped | ExistingRpcEndpoint::SameNetworkIncomplete => {
             let _ = atho_node::dev::append_log(
                 "atho-qt",
                 &format!(
                     "managed local node requested with stale same-network rpc endpoint network={} rpc={}; stopping before restart",
+                    network.id(),
+                    rpc_address,
+                ),
+            );
+            stop_existing_local_node(rpc_address, network)?;
+        }
+        ExistingRpcEndpoint::SameNetworkLegacy => {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!(
+                    "managed local node requested with legacy same-network rpc endpoint network={} rpc={}; stopping before restart",
                     network.id(),
                     rpc_address,
                 ),
@@ -951,10 +968,84 @@ fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> Existin
         };
     }
 
+    if let Some(endpoint) = inspect_legacy_rpc_endpoint(network, rpc_address) {
+        return endpoint;
+    }
+
     if rpc_bind_available(rpc_address) {
         ExistingRpcEndpoint::None
     } else {
         ExistingRpcEndpoint::OccupiedByNonAtho
+    }
+}
+
+fn inspect_legacy_rpc_endpoint(network: Network, rpc_address: &str) -> Option<ExistingRpcEndpoint> {
+    if let Ok(RpcResponse::NodeStatus(status)) =
+        legacy_rpc_call(rpc_address, &RpcRequest::GetNodeStatus)
+    {
+        return Some(if status.network == network {
+            ExistingRpcEndpoint::SameNetworkLegacy
+        } else {
+            ExistingRpcEndpoint::WrongNetwork(status.network.id().to_string())
+        });
+    }
+
+    if let Ok(RpcResponse::Network(label)) = legacy_rpc_call(rpc_address, &RpcRequest::GetNetwork) {
+        return Some(if label == network.id() {
+            ExistingRpcEndpoint::SameNetworkLegacy
+        } else {
+            ExistingRpcEndpoint::WrongNetwork(label)
+        });
+    }
+
+    None
+}
+
+fn legacy_rpc_call(rpc_address: &str, request: &RpcRequest) -> Result<RpcResponse, String> {
+    let mut stream = legacy_connect_stream(rpc_address).map_err(|err| err.to_string())?;
+    let encoded = serde_json::to_string(request).map_err(|err| err.to_string())?;
+    stream
+        .write_all(encoded.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .map_err(|err| err.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    let bytes = reader
+        .read_until(b'\n', &mut line)
+        .map_err(|err| err.to_string())?;
+    if bytes == 0 {
+        return Err(String::from("legacy rpc returned an empty response"));
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    serde_json::from_slice(&line).map_err(|err| err.to_string())
+}
+
+fn legacy_connect_stream(rpc_address: &str) -> Result<TcpStream, std::io::Error> {
+    let mut last_error = None;
+    for socket_addr in rpc_address.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&socket_addr, LEGACY_RPC_COMPAT_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(LEGACY_RPC_COMPAT_IO_TIMEOUT))?;
+                stream.set_write_timeout(Some(LEGACY_RPC_COMPAT_IO_TIMEOUT))?;
+                return Ok(stream);
+            }
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    match last_error {
+        Some(err) => Err(err),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rpc address did not resolve to any socket address",
+        )),
     }
 }
 
@@ -998,6 +1089,7 @@ fn spawn_bootstrap_watcher(
     });
 }
 
+#[cfg(test)]
 fn probe_rpc(rpc_address: &str) -> bool {
     let client = RpcClient::new(rpc_address.to_string());
     matches!(
@@ -1033,11 +1125,14 @@ fn load_persisted_chain_tip_status(network: Network) -> Option<PersistedChainTip
 }
 
 fn stop_existing_local_node(rpc_address: &str, network: Network) -> Result<(), String> {
-    let client = RpcClient::new(rpc_address.to_string());
     let mut invocation = CommandInvocation::new("stop", Vec::new());
     invocation.confirmed = true;
-    match client.call(&RpcRequest::ExecuteCommand(invocation)) {
-        Ok(RpcResponse::Command(_)) => {}
+    let stop_request = RpcRequest::ExecuteCommand(invocation);
+    let client = RpcClient::new(rpc_address.to_string());
+
+    let current_stop_result = client.call(&stop_request);
+    let current_stop = match &current_stop_result {
+        Ok(RpcResponse::Command(_)) => true,
         Ok(RpcResponse::Error(err)) => {
             return Err(format!(
                 "existing local node at {rpc_address} refused managed restart for {}: {err}",
@@ -1059,28 +1154,240 @@ fn stop_existing_local_node(rpc_address: &str, network: Network) -> Result<(), S
                     rpc_address
                 ),
             );
+            false
         }
-    }
+    };
 
-    for _ in 0..LOCAL_RPC_STOP_RETRY_ATTEMPTS {
-        if !probe_rpc(rpc_address) {
-            let _ = atho_node::dev::append_log(
-                "atho-qt",
-                &format!(
-                    "existing local node stopped before managed restart network={} rpc={}",
-                    network.id(),
-                    rpc_address
-                ),
-            );
+    let legacy_stop = if current_stop {
+        false
+    } else {
+        match legacy_rpc_call(rpc_address, &stop_request) {
+            Ok(RpcResponse::Command(_)) => true,
+            Ok(RpcResponse::Error(err)) => {
+                return Err(format!(
+                    "existing legacy local node at {rpc_address} refused managed restart for {}: {err}",
+                    network.id()
+                ));
+            }
+            Ok(other) => {
+                return Err(format!(
+                    "existing legacy local node at {rpc_address} returned unexpected stop response for {}: {other:?}",
+                    network.id()
+                ));
+            }
+            Err(err) => {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "legacy stop command transport error before managed restart network={} rpc={} error={err}",
+                        network.id(),
+                        rpc_address
+                    ),
+                );
+                false
+            }
+        }
+    };
+
+    if !current_stop && !legacy_stop {
+        if force_stop_owned_local_athod(rpc_address, network)? {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
+        return Err(format!(
+            "rpc address {rpc_address} is occupied but did not respond to Atho stop commands for {}; stop the conflicting process or choose a different RPC port.",
+            network.id()
+        ));
+    }
+
+    if wait_for_rpc_bind_release(rpc_address, LOCAL_RPC_STOP_RETRY_ATTEMPTS) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "existing local node stopped before managed restart network={} rpc={}",
+                network.id(),
+                rpc_address
+            ),
+        );
+        return Ok(());
+    }
+
+    if force_stop_owned_local_athod(rpc_address, network)? {
+        return Ok(());
     }
 
     Err(format!(
         "existing local node at {rpc_address} did not stop for {}; stop the conflicting athod process or use external RPC mode instead of --local-node",
         network.id()
     ))
+}
+
+fn wait_for_rpc_bind_release(rpc_address: &str, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if rpc_bind_available(rpc_address) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
+    }
+    false
+}
+
+fn force_stop_owned_local_athod(rpc_address: &str, network: Network) -> Result<bool, String> {
+    let Some(owner) = listening_process_on_rpc_address(rpc_address) else {
+        return Ok(false);
+    };
+    if !command_matches_managed_local_athod(&owner.command, network, rpc_address) {
+        return Ok(false);
+    }
+
+    let _ = atho_node::dev::append_log(
+        "atho-qt",
+        &format!(
+            "graceful stop did not release rpc address {}; force-stopping managed athod pid={} command={}",
+            rpc_address, owner.pid, owner.command
+        ),
+    );
+
+    terminate_process(owner.pid, false)?;
+    if wait_for_rpc_bind_release(rpc_address, LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS) {
+        return Ok(true);
+    }
+
+    terminate_process(owner.pid, true)?;
+    if wait_for_rpc_bind_release(rpc_address, LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS) {
+        return Ok(true);
+    }
+
+    Err(format!(
+        "existing local athod pid {} kept rpc address {} after termination attempts for {}",
+        owner.pid,
+        rpc_address,
+        network.id()
+    ))
+}
+
+fn command_matches_managed_local_athod(
+    command: &str,
+    network: Network,
+    _rpc_address: &str,
+) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let explicit_network = lower.contains(&format!("--network {}", network.cli_arg()));
+    let implicit_mainnet = network == Network::Mainnet && !lower.contains("--network");
+    let same_network = explicit_network || implicit_mainnet;
+    lower.contains("athod") && same_network
+}
+
+fn listening_process_on_rpc_address(rpc_address: &str) -> Option<PortOwnerProcess> {
+    let port = rpc_address.to_socket_addrs().ok()?.next()?.port();
+    listening_process_on_port(port)
+}
+
+#[cfg(unix)]
+fn listening_process_on_port(port: u16) -> Option<PortOwnerProcess> {
+    let pid_output = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .ok()?;
+    if !pid_output.status.success() {
+        return None;
+    }
+    let pid = String::from_utf8_lossy(&pid_output.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())?;
+    let command_output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !command_output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&command_output.stdout)
+        .trim()
+        .to_string();
+    if command.is_empty() {
+        return None;
+    }
+    Some(PortOwnerProcess { pid, command })
+}
+
+#[cfg(windows)]
+fn listening_process_on_port(port: u16) -> Option<PortOwnerProcess> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let suffix = format!(":{port}");
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            if columns.len() < 5 {
+                return None;
+            }
+            let local_addr = columns[1];
+            let state = columns[3];
+            if state.eq_ignore_ascii_case("LISTENING") && local_addr.ends_with(&suffix) {
+                columns[4].parse::<u32>().ok()
+            } else {
+                None
+            }
+        })?;
+    let command_output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    if !command_output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&command_output.stdout)
+        .trim()
+        .to_string();
+    if command.is_empty() {
+        return None;
+    }
+    Some(PortOwnerProcess { pid, command })
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32, force: bool) -> Result<(), String> {
+    let signal = if force { "-KILL" } else { "-TERM" };
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill {} {} failed with status {}",
+            signal, pid, status
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32, force: bool) -> Result<(), String> {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    let status = command.status().map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "taskkill pid {} failed with status {}",
+            pid, status
+        ))
+    }
 }
 
 fn local_node_stdio_log_path(network: Network) -> PathBuf {
@@ -1455,6 +1762,167 @@ mod tests {
         (address, handle)
     }
 
+    fn spawn_stoppable_running_rpc_server(
+        network: Network,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stoppable running rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status");
+            let clone = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(clone);
+            let request: RpcRequest = read_message(&mut reader).expect("request");
+            match request {
+                RpcRequest::GetNodeStatus => write_message(
+                    &mut stream,
+                    &RpcResponse::NodeStatus(NodeStatus {
+                        network,
+                        block_count: 3,
+                        tip_hash: [0x33; 48],
+                        tip_timestamp: 1_777_416_777,
+                        mempool_count: 0,
+                        mempool_total_fee_atoms: 0,
+                        mempool_fingerprint: [0; 32],
+                        running: true,
+                        headers_synced: true,
+                        sync_best_height: 3,
+                        network_diagnostics: NetworkDiagnostics::default(),
+                    }),
+                )
+                .expect("status response"),
+                other => panic!("unexpected status request: {other:?}"),
+            }
+
+            let (mut stream, _) = listener.accept().expect("accept stop");
+            let clone = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(clone);
+            let request: RpcRequest = read_message(&mut reader).expect("request");
+            match request {
+                RpcRequest::ExecuteCommand(invocation) => {
+                    assert_eq!(invocation.name, "stop");
+                    assert!(invocation.confirmed);
+                    write_message(
+                        &mut stream,
+                        &RpcResponse::Command(CommandResponse {
+                            command: String::from("stop"),
+                            group: CommandGroup::Control,
+                            permission: CommandPermission::NodeAdmin,
+                            dangerous: true,
+                            network: network.id().to_string(),
+                            data: serde_json::json!({
+                                "stopping": true,
+                                "network": network.id(),
+                                "height": 3,
+                            }),
+                        }),
+                    )
+                    .expect("stop response");
+                }
+                other => panic!("unexpected stop request: {other:?}"),
+            }
+        });
+        (address, handle)
+    }
+
+    fn write_legacy_message(
+        stream: &mut std::net::TcpStream,
+        message: &RpcResponse,
+    ) -> Result<(), String> {
+        let encoded = serde_json::to_string(message).map_err(|err| err.to_string())?;
+        stream
+            .write_all(encoded.as_bytes())
+            .and_then(|_| stream.write_all(b"\n"))
+            .and_then(|_| stream.flush())
+            .map_err(|err| err.to_string())
+    }
+
+    fn read_legacy_request(
+        reader: &mut BufReader<std::net::TcpStream>,
+    ) -> Result<RpcRequest, String> {
+        let mut line = Vec::new();
+        let bytes = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|err| err.to_string())?;
+        if bytes == 0 {
+            return Err(String::from("legacy rpc empty request"));
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        serde_json::from_slice(&line).map_err(|err| err.to_string())
+    }
+
+    fn spawn_stoppable_legacy_rpc_server(
+        network: Network,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy stoppable rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().expect("accept legacy rpc");
+                let clone = stream.try_clone().expect("clone");
+                let mut reader = BufReader::new(clone);
+                let Ok(request) = read_legacy_request(&mut reader) else {
+                    continue;
+                };
+                match request {
+                    RpcRequest::GetNodeStatus => {
+                        write_legacy_message(
+                            &mut stream,
+                            &RpcResponse::NodeStatus(NodeStatus {
+                                network,
+                                block_count: 0,
+                                tip_hash: [0; 48],
+                                tip_timestamp: 1_777_416_445,
+                                mempool_count: 0,
+                                mempool_total_fee_atoms: 0,
+                                mempool_fingerprint: [0; 32],
+                                running: true,
+                                headers_synced: true,
+                                sync_best_height: 0,
+                                network_diagnostics: NetworkDiagnostics::default(),
+                            }),
+                        )
+                        .expect("legacy status response");
+                    }
+                    RpcRequest::GetNetwork => {
+                        write_legacy_message(
+                            &mut stream,
+                            &RpcResponse::Network(network.id().to_string()),
+                        )
+                        .expect("legacy getnetwork response");
+                    }
+                    RpcRequest::ExecuteCommand(invocation) => {
+                        assert_eq!(invocation.name, "stop");
+                        assert!(invocation.confirmed);
+                        write_legacy_message(
+                            &mut stream,
+                            &RpcResponse::Command(CommandResponse {
+                                command: String::from("stop"),
+                                group: CommandGroup::Control,
+                                permission: CommandPermission::NodeAdmin,
+                                dangerous: true,
+                                network: network.id().to_string(),
+                                data: serde_json::json!({
+                                    "stopping": true,
+                                    "network": network.id(),
+                                    "height": 0,
+                                }),
+                            }),
+                        )
+                        .expect("legacy stop response");
+                        break;
+                    }
+                    other => panic!("unexpected legacy request: {other:?}"),
+                }
+            }
+        });
+        (address, handle)
+    }
+
     fn spawn_retryable_node_status_rpc_server(
         network: Network,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -1803,16 +2271,64 @@ mod tests {
     }
 
     #[test]
-    fn managed_local_start_attaches_to_running_same_network_endpoint() {
+    fn managed_local_stop_command_reclaims_legacy_rpc_endpoint() {
+        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
-        let (rpc_address, handle) = spawn_single_node_status_rpc_server(Network::Testnet, true);
+        let (rpc_address, handle) = spawn_stoppable_legacy_rpc_server(Network::Mainnet);
+
+        assert!(matches!(
+            inspect_existing_rpc_endpoint(Network::Mainnet, &rpc_address),
+            ExistingRpcEndpoint::SameNetworkLegacy
+        ));
+        stop_existing_local_node(&rpc_address, Network::Mainnet).expect("stop legacy node");
+        assert!(rpc_bind_available(&rpc_address));
+
+        handle.join().expect("stoppable legacy mock rpc server");
+    }
+
+    #[test]
+    fn managed_local_athod_matcher_accepts_same_network_commands() {
+        assert!(command_matches_managed_local_athod(
+            "target/debug/athod --network testnet --rpc-addr 127.0.0.1:9110",
+            Network::Testnet,
+            "127.0.0.1:9110"
+        ));
+        assert!(command_matches_managed_local_athod(
+            "/opt/atho/bin/athod --rpc-addr 127.0.0.1:9010",
+            Network::Mainnet,
+            "127.0.0.1:9010"
+        ));
+    }
+
+    #[test]
+    fn managed_local_athod_matcher_rejects_wrong_process_or_network() {
+        assert!(!command_matches_managed_local_athod(
+            "python some_server.py --network testnet",
+            Network::Testnet,
+            "127.0.0.1:9110"
+        ));
+        assert!(!command_matches_managed_local_athod(
+            "target/debug/athod --network regnet --rpc-addr 127.0.0.1:9110",
+            Network::Testnet,
+            "127.0.0.1:9110"
+        ));
+    }
+
+    #[test]
+    fn managed_local_start_reclaims_running_same_network_endpoint_before_restart() {
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let _node_bin = EnvVarGuard::set_value(
+            "ATHO_NODE_BIN",
+            &std::env::var("CARGO").unwrap_or_else(|_| String::from("cargo")),
+        );
+        let (rpc_address, handle) = spawn_stoppable_running_rpc_server(Network::Testnet);
 
         let startup =
-            start_local_node_if_needed(Network::Testnet, &rpc_address).expect("attach existing");
+            start_local_node_if_needed(Network::Testnet, &rpc_address).expect("restart managed");
 
         assert!(startup.local_node);
-        assert!(startup.node.is_none());
-        handle.join().expect("status mock rpc server");
+        assert!(startup.node.is_some());
+        handle.join().expect("running stoppable mock rpc server");
     }
 
     #[test]

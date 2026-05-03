@@ -13,7 +13,7 @@ pub struct DownloadAssignment {
 pub struct BlockDownloadScheduler {
     ready_peers: BTreeSet<String>,
     pending: VecDeque<Hash48>,
-    inflight_by_peer: BTreeMap<String, BTreeSet<Hash48>>,
+    inflight_by_peer: BTreeMap<String, VecDeque<Hash48>>,
     inflight_owner: BTreeMap<Hash48, String>,
     inflight_started: BTreeMap<Hash48, Instant>,
     peer_hints: BTreeMap<Hash48, BTreeSet<String>>,
@@ -75,7 +75,7 @@ impl BlockDownloadScheduler {
         self.pending.retain(|candidate| *candidate != hash);
         if let Some(owner) = self.inflight_owner.remove(&hash) {
             if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
-                inflight.remove(&hash);
+                inflight.retain(|candidate| *candidate != hash);
             }
         }
         self.inflight_started.remove(&hash);
@@ -91,7 +91,7 @@ impl BlockDownloadScheduler {
             self.inflight_owner.remove(&hash);
             self.inflight_started.remove(&hash);
             if let Some(inflight) = self.inflight_by_peer.get_mut(peer) {
-                inflight.remove(&hash);
+                inflight.retain(|candidate| *candidate != hash);
             }
             if let Some(hints) = self.peer_hints.get_mut(&hash) {
                 hints.remove(peer);
@@ -114,7 +114,7 @@ impl BlockDownloadScheduler {
         let mut total_inflight = self
             .inflight_by_peer
             .values()
-            .map(BTreeSet::len)
+            .map(VecDeque::len)
             .sum::<usize>();
         if total_inflight >= max_blocks_in_flight {
             return Vec::new();
@@ -145,7 +145,7 @@ impl BlockDownloadScheduler {
             self.inflight_by_peer
                 .entry(peer.clone())
                 .or_default()
-                .insert(hash);
+                .push_back(hash);
             self.inflight_owner.insert(hash, peer.clone());
             self.inflight_started.insert(hash, Instant::now());
             staged.entry(peer).or_default().push(InventoryVector {
@@ -181,7 +181,7 @@ impl BlockDownloadScheduler {
                 let inflight = self
                     .inflight_by_peer
                     .get(peer)
-                    .map(BTreeSet::len)
+                    .map(VecDeque::len)
                     .unwrap_or(0);
                 (inflight < max_requests_per_peer).then_some((
                     inflight,
@@ -210,7 +210,7 @@ impl BlockDownloadScheduler {
         let mut total_inflight = self
             .inflight_by_peer
             .values()
-            .map(BTreeSet::len)
+            .map(VecDeque::len)
             .sum::<usize>();
         if total_inflight >= max_blocks_in_flight {
             return None;
@@ -218,7 +218,7 @@ impl BlockDownloadScheduler {
         let peer_inflight = self
             .inflight_by_peer
             .get(peer)
-            .map(BTreeSet::len)
+            .map(VecDeque::len)
             .unwrap_or(0);
         let peer_capacity = max_requests_per_peer.saturating_sub(peer_inflight);
         if peer_capacity == 0 {
@@ -247,7 +247,7 @@ impl BlockDownloadScheduler {
             self.inflight_by_peer
                 .entry(peer.to_string())
                 .or_default()
-                .insert(hash);
+                .push_back(hash);
             self.inflight_owner.insert(hash, peer.to_string());
             self.inflight_started.insert(hash, Instant::now());
             inventory.push(InventoryVector {
@@ -280,7 +280,7 @@ impl BlockDownloadScheduler {
             self.inflight_started.remove(&hash);
             if let Some(owner) = self.inflight_owner.remove(&hash) {
                 if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
-                    inflight.remove(&hash);
+                    inflight.retain(|candidate| *candidate != hash);
                 }
             }
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
@@ -367,5 +367,39 @@ mod tests {
             .expect("retry assignment");
         assert_eq!(retry.peer, "left");
         assert_eq!(retry.inventory[0].hash, Hash48::from([7; 48]));
+    }
+
+    #[test]
+    fn disconnect_requeues_inflight_blocks_in_original_chain_order() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_headers("left", [[1; 48], [2; 48], [3; 48]]);
+
+        let assignments = scheduler.assignments(3, 3);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0]
+                .inventory
+                .iter()
+                .map(|item| item.hash.into_inner())
+                .collect::<Vec<_>>(),
+            vec![[1; 48], [2; 48], [3; 48]]
+        );
+
+        scheduler.note_peer_disconnected("left");
+        scheduler.note_peer_ready("right");
+        scheduler.note_headers("right", [[1; 48], [2; 48], [3; 48]]);
+
+        let retry = scheduler.assignments(3, 3);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].peer, "right");
+        assert_eq!(
+            retry[0]
+                .inventory
+                .iter()
+                .map(|item| item.hash.into_inner())
+                .collect::<Vec<_>>(),
+            vec![[1; 48], [2; 48], [3; 48]]
+        );
     }
 }

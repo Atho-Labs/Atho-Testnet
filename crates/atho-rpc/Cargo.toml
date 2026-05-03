@@ -8,7 +8,6 @@ license = "Proprietary"
 atho-core = { path = "../atho-core" }
 atho-errors = { path = "../atho-errors" }
 atho-storage = { path = "../atho-storage" }
-bincode = "1"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
 serde_json = "1"

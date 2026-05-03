@@ -40,7 +40,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -3707,15 +3707,30 @@ fn default_wallet_path(network: Network) -> PathBuf {
         .join(Wallet::datafile_name())
 }
 
+fn legacy_wallet_root() -> PathBuf {
+    atho_storage::path::sandbox_root().join("wallet")
+}
+
+fn legacy_default_wallet_path(network: Network) -> PathBuf {
+    legacy_wallet_root()
+        .join(network.id())
+        .join(Wallet::datafile_name())
+}
+
 fn startup_wallet_metadata_path(network: Network) -> PathBuf {
     atho_node::dev::wallet_dir()
         .join(network.id())
         .join("last-wallet.json")
 }
 
-fn startup_wallet_path(network: Network) -> Option<PathBuf> {
-    let metadata_path = startup_wallet_metadata_path(network);
-    if let Ok(bytes) = fs::read(&metadata_path) {
+fn legacy_startup_wallet_metadata_path(network: Network) -> PathBuf {
+    legacy_wallet_root()
+        .join(network.id())
+        .join("last-wallet.json")
+}
+
+fn startup_wallet_path_from_metadata(metadata_path: &Path) -> Option<PathBuf> {
+    if let Ok(bytes) = fs::read(metadata_path) {
         if let Ok(metadata) = serde_json::from_slice::<WalletStartupMetadata>(&bytes) {
             let candidate = PathBuf::from(metadata.wallet_path);
             if candidate.exists() {
@@ -3723,9 +3738,33 @@ fn startup_wallet_path(network: Network) -> Option<PathBuf> {
             }
         }
     }
+    None
+}
+
+fn startup_wallet_path(network: Network) -> Option<PathBuf> {
+    let metadata_path = startup_wallet_metadata_path(network);
+    if let Some(candidate) = startup_wallet_path_from_metadata(&metadata_path) {
+        return Some(candidate);
+    }
+
+    let legacy_metadata_path = legacy_startup_wallet_metadata_path(network);
+    if legacy_metadata_path != metadata_path {
+        if let Some(candidate) = startup_wallet_path_from_metadata(&legacy_metadata_path) {
+            return Some(candidate);
+        }
+    }
 
     let default = default_wallet_path(network);
-    default.exists().then_some(default)
+    if default.exists() {
+        return Some(default);
+    }
+
+    let legacy_default = legacy_default_wallet_path(network);
+    if legacy_default != default && legacy_default.exists() {
+        return Some(legacy_default);
+    }
+
+    None
 }
 
 fn alternate_wallet_path(network: Network) -> PathBuf {
@@ -3873,7 +3912,7 @@ mod tests {
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
     use atho_node::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
-    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use atho_storage::path::{ATHO_DATA_DIR_ENV, ATHO_WALLET_DIR_ENV};
     use std::ffi::OsString;
     use std::fs;
     use std::thread;
@@ -4159,6 +4198,9 @@ mod tests {
 
     #[test]
     fn desktop_app_refreshes_view_state() {
+        let root = temp_sandbox_root("refresh-view");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
         wait_until(
@@ -4704,6 +4746,47 @@ mod tests {
         );
         wait_until(
             "remembered wallet auto-open completes",
+            &mut app,
+            Duration::from_secs(10),
+            |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),
+        );
+        assert_eq!(
+            app.wallet_path.as_deref(),
+            Some(wallet_path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn startup_auto_open_falls_back_to_legacy_runtime_wallet_location() {
+        let root = temp_sandbox_root("startup-legacy-wallet");
+        let home = root.join("home");
+        let data = root.join("data");
+        let wallet_root = root.join("wallet-home");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        fs::create_dir_all(&wallet_root).expect("wallet root");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _wallet = EnvVarGuard::set_path(ATHO_WALLET_DIR_ENV, &wallet_root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
+
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x41u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let wallet_path = legacy_default_wallet_path(Network::Regnet);
+        DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
+            .expect("save legacy wallet");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        assert_eq!(
+            app.open_form.wallet_path,
+            wallet_path.to_string_lossy().into_owned()
+        );
+        wait_until(
+            "legacy wallet auto-open completes",
             &mut app,
             Duration::from_secs(10),
             |app| app.wallet.is_some() && app.wallet_preparation_job.is_none(),

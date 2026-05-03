@@ -14,6 +14,7 @@ struct RuntimeCli {
     peers: Vec<String>,
     public_rpc: bool,
     all: bool,
+    include_wallets: bool,
     dangerously_allow_mainnet: bool,
 }
 
@@ -325,7 +326,11 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
         .data_dir
         .ok_or_else(|| "wipe requires --data-dir PATH".to_string())?;
     let root = std::path::PathBuf::from(data_dir);
-    atho_node::dev::wipe_root(&root).map_err(|err| err.to_string())?;
+    if runtime.include_wallets {
+        atho_node::dev::wipe_root_including_wallets(&root).map_err(|err| err.to_string())?;
+    } else {
+        atho_node::dev::wipe_root(&root).map_err(|err| err.to_string())?;
+    }
     println!("wiped {}", root.display());
     Ok(())
 }
@@ -387,6 +392,10 @@ fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
             }
             "--all" => {
                 runtime.all = true;
+                i += 1;
+            }
+            "--include-wallets" => {
+                runtime.include_wallets = true;
                 i += 1;
             }
             "--dangerously-allow-mainnet" => {
@@ -451,7 +460,7 @@ fn parse_network(value: &str) -> Option<Network> {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc]");
-    eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--dangerously-allow-mainnet]");
+    eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets] [--dangerously-allow-mainnet]");
     eprintln!("  athod status [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
     eprintln!("  athod verify [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine> [options]");
@@ -499,12 +508,14 @@ mod tests {
             String::from("--data-dir"),
             String::from("/tmp/atho-dev"),
             String::from("--all"),
+            String::from("--include-wallets"),
             String::from("--dangerously-allow-mainnet"),
         ];
         let parsed = parse_runtime_cli(&args[1..]).expect("parse");
         assert_eq!(parsed.network, Some(Network::Regnet));
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho-dev"));
         assert!(parsed.all);
+        assert!(parsed.include_wallets);
         assert!(parsed.dangerously_allow_mainnet);
     }
 

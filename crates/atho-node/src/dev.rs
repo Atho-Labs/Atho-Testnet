@@ -48,7 +48,7 @@ pub fn chain_dir() -> PathBuf {
 }
 
 pub fn wallet_dir() -> PathBuf {
-    dev_root().join("wallet")
+    atho_storage::path::wallet_root()
 }
 
 pub fn db_dir() -> PathBuf {
@@ -194,18 +194,26 @@ pub fn record_block(height: u64, block: &Block) -> std::io::Result<()> {
 
 pub fn wipe_chain_and_keys() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    wipe_root_locked(&dev_root(), true)
+    wipe_root_locked(&dev_root(), true, true)
 }
 
 pub fn wipe_root(root: &Path) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
-    wipe_root_locked(root, false)
+    wipe_root_locked(root, false, false)
 }
 
-fn wipe_root_locked(root: &Path, recreate_layout: bool) -> std::io::Result<()> {
+pub fn wipe_root_including_wallets(root: &Path) -> std::io::Result<()> {
+    let _guard = dev_lock().lock().expect("dev lock poisoned");
+    wipe_root_locked(root, false, true)
+}
+
+fn wipe_root_locked(
+    root: &Path,
+    recreate_layout: bool,
+    include_wallets: bool,
+) -> std::io::Result<()> {
     remove_tree(&root.join("chain"))?;
     remove_tree(&root.join("dev"))?;
-    remove_tree(&root.join("wallet"))?;
     remove_tree(&root.join("db"))?;
     for network in [
         Network::Mainnet,
@@ -218,6 +226,14 @@ fn wipe_root_locked(root: &Path, recreate_layout: bool) -> std::io::Result<()> {
     remove_tree(&root.join("audit"))?;
     remove_tree(&root.join("logs"))?;
     remove_tree(&root.join("quarantine"))?;
+    if include_wallets {
+        let root_wallet_dir = root.join("wallet");
+        remove_tree(&root_wallet_dir)?;
+        let configured_wallet_dir = wallet_dir();
+        if configured_wallet_dir != root_wallet_dir {
+            remove_tree(&configured_wallet_dir)?;
+        }
+    }
     fs::create_dir_all(root)?;
     if recreate_layout {
         ensure_layout_for(root)?;
@@ -725,13 +741,15 @@ mod tests {
         fs::create_dir_all(root.join("logs")).expect("logs");
         fs::write(root.join("logs").join("athod.log"), "temp").expect("log");
         fs::create_dir_all(root.join("db").join("nested")).expect("db");
+        fs::create_dir_all(root.join("wallet")).expect("wallet");
+        fs::write(root.join("wallet").join("wallet.dat"), "wallet").expect("wallet data");
 
         wipe_root(&root).expect("wipe");
 
         assert!(root.exists());
         assert!(!root.join("logs").exists());
         assert!(!root.join("chain").exists());
-        assert!(!root.join("wallet").exists());
+        assert!(root.join("wallet").exists());
         assert!(!root.join("db").exists());
         assert!(!root.join("audit").exists());
         assert!(!root.join("quarantine").exists());
@@ -753,12 +771,33 @@ mod tests {
         fs::write(root.join("testnet").join("data.mdb"), "db").expect("testnet db");
         fs::create_dir_all(root.join("dev").join("logs")).expect("legacy dev logs");
         fs::write(root.join("dev").join("logs").join("p2p.log"), "log").expect("legacy log");
+        fs::create_dir_all(root.join("wallet")).expect("wallet dir");
+        fs::write(root.join("wallet").join("wallet.dat"), "wallet").expect("wallet data");
 
         wipe_root(&root).expect("wipe");
 
         assert!(!root.join("testnet").exists());
         assert!(!root.join("dev").exists());
         assert!(!root.join("logs").exists());
+        assert!(root.join("wallet").exists());
+    }
+
+    #[test]
+    fn wipe_root_including_wallets_removes_wallet_data_when_explicitly_requested() {
+        let _lock = acquire_global_test_lock();
+        let root = std::env::temp_dir().join(format!(
+            "atho-dev-wallet-wipe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("wallet")).expect("wallet dir");
+        fs::write(root.join("wallet").join("wallet.dat"), "wallet").expect("wallet");
+
+        wipe_root_including_wallets(&root).expect("wipe including wallets");
+
         assert!(!root.join("wallet").exists());
     }
 }

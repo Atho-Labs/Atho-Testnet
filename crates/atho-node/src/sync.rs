@@ -18,7 +18,7 @@ use atho_p2p::relay::RelayLoop;
 use atho_p2p::sync::SyncState;
 use atho_storage::chainstate::ChainSelectionOutcome;
 use atho_storage::error::StorageError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -46,6 +46,7 @@ pub struct NodeSync {
     relay: RelayLoop,
     connections: ConnectionManager,
     downloader: BlockDownloadScheduler,
+    mempool_snapshot_peers: BTreeSet<String>,
     branch_buffers: BTreeMap<String, BufferedBranch>,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
 }
@@ -68,6 +69,7 @@ impl NodeSync {
             relay: RelayLoop::new(network),
             connections: ConnectionManager::new(network),
             downloader: BlockDownloadScheduler::default(),
+            mempool_snapshot_peers: BTreeSet::new(),
             branch_buffers: BTreeMap::new(),
             pending_compact_blocks: BTreeMap::new(),
         }
@@ -130,6 +132,7 @@ impl NodeSync {
         {
             Ok(events) => events,
             Err(atho_p2p::connection::ConnectionError::Protocol(error)) => {
+                self.mempool_snapshot_peers.remove(remote_addr);
                 self.refresh_sync_target_from_live_peers(node);
                 return Ok((
                     Vec::new(),
@@ -263,6 +266,7 @@ impl NodeSync {
             }
         }
 
+        self.maybe_request_mempool_snapshots(node, &mut outbound);
         Ok((outbound, notices))
     }
 
@@ -280,6 +284,7 @@ impl NodeSync {
 
     fn note_peer_disconnected(&mut self, peer: &str, node: &Node) {
         self.downloader.note_peer_disconnected(peer);
+        self.mempool_snapshot_peers.remove(peer);
         // Buffered blocks are already marked received by the downloader. Keep
         // them across disconnects so a reconnect or another peer can still
         // complete the branch instead of leaving an unrecoverable gap.
@@ -307,14 +312,13 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         match message.payload {
             MessagePayload::Inv { inventory } => {
+                let chain_synced = self.chain_synced(node);
                 for vector in &inventory {
                     if vector.kind == InventoryKind::Block {
                         self.downloader
                             .note_inventory(peer, vector.hash.into_inner());
                     }
                 }
-                let chain_synced = self.sync_state().headers_synced
-                    && node.height() >= self.sync_state().best_height;
                 let requests = self.missing_inventory_requests(node, &inventory, chain_synced);
                 if !requests.is_empty() {
                     outbound.push(ConnectionEvent::Send {
@@ -364,6 +368,28 @@ impl NodeSync {
                 let first_height = headers.first().map(|header| header.height);
                 let last_height = headers.last().map(|header| header.height);
                 let header_count = headers.len();
+                if let Some(first) = headers.first() {
+                    if let Some(parent_height) = node.known_block_height(&first.previous_block_hash)
+                    {
+                        let expected_height = parent_height.saturating_add(1);
+                        if first.height != expected_height {
+                            let _ = dev::append_log(
+                                "p2p",
+                                &format!(
+                                    "rejecting headers peer={} first_height={} expected_height={} prev={} target_height={}",
+                                    peer,
+                                    first.height,
+                                    expected_height,
+                                    short_hash(&first.previous_block_hash),
+                                    self.relay.sync_state().best_height
+                                ),
+                            );
+                            return Err(NodeSyncError::Protocol(
+                                ProtocolError::InvalidHeadersSequence,
+                            ));
+                        }
+                    }
+                }
                 self.relay.accept_headers(&headers)?;
                 if let Some(last_header) = headers.last() {
                     self.note_observed_peer_tip(peer, last_header, node);
@@ -414,6 +440,19 @@ impl NodeSync {
                 self.handle_blocktxn(peer, response, node, outbound)?;
             }
             MessagePayload::Tx(transaction) => {
+                if !self.chain_synced(node) {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "ignoring relayed tx during catch-up peer={} txid={} local_height={} target_height={}",
+                            peer,
+                            short_hash(&transaction.txid()),
+                            node.height(),
+                            self.sync_state().best_height
+                        ),
+                    );
+                    return Ok(());
+                }
                 let txid = transaction.txid();
                 if !node.mempool_contains(&txid) {
                     match node.accept_relayed_transaction(transaction) {
@@ -1037,19 +1076,63 @@ impl NodeSync {
         &self,
         node: &Node,
         inventory: &[InventoryVector],
-        allow_block_requests: bool,
+        chain_synced: bool,
     ) -> Vec<InventoryVector> {
         inventory
             .iter()
             .filter(|vector| match vector.kind {
                 InventoryKind::Block => {
-                    allow_block_requests && !node.contains_block(&vector.hash.into_inner())
+                    chain_synced && !node.contains_block(&vector.hash.into_inner())
                 }
-                InventoryKind::Transaction => !node.mempool_contains(&vector.hash.into_inner()),
+                // During initial catch-up, ignore mempool relay entirely so a policy-only
+                // transaction error cannot disconnect the sync peer or starve block download.
+                InventoryKind::Transaction => {
+                    chain_synced && !node.mempool_contains(&vector.hash.into_inner())
+                }
             })
             .take(network_params(self.network).limits.max_requests_per_peer)
             .cloned()
             .collect()
+    }
+
+    fn chain_synced(&self, node: &Node) -> bool {
+        self.sync_state().headers_synced && node.height() >= self.sync_state().best_height
+    }
+
+    fn maybe_request_mempool_snapshots(
+        &mut self,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        if !self.chain_synced(node) {
+            self.mempool_snapshot_peers.clear();
+            return;
+        }
+
+        for peer in self
+            .connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.handshake_ready)
+            .map(|snapshot| snapshot.remote_addr)
+        {
+            if !self.mempool_snapshot_peers.insert(peer.clone()) {
+                continue;
+            }
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "requesting mempool snapshot peer={} local_height={} target_height={}",
+                    peer,
+                    node.height(),
+                    self.sync_state().best_height
+                ),
+            );
+            outbound.push(ConnectionEvent::Send {
+                peer,
+                message: NetworkMessage::new(self.network, MessagePayload::MemPool),
+            });
+        }
     }
 
     fn serve_getdata(
@@ -1552,6 +1635,45 @@ mod tests {
     }
 
     #[test]
+    fn headers_batch_must_start_at_the_next_known_height() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        let _ = sync
+            .expand_events(
+                vec![ConnectionEvent::Ready {
+                    peer: String::from("right"),
+                    best_height: 10,
+                }],
+                &mut node,
+            )
+            .expect("expand ready");
+
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let jumped = coinbase_block(Network::Regnet, 5, node.tip_hash(), target, 1_700_000_005);
+        let mut outbound = Vec::new();
+
+        let err = sync
+            .handle_message(
+                "right",
+                NetworkMessage::new(
+                    Network::Regnet,
+                    MessagePayload::Headers {
+                        headers: vec![jumped.header.clone()],
+                    },
+                ),
+                &mut node,
+                &mut outbound,
+            )
+            .expect_err("jumped headers must be rejected");
+
+        assert!(matches!(
+            err,
+            NodeSyncError::Protocol(ProtocolError::InvalidHeadersSequence)
+        ));
+    }
+
+    #[test]
     fn buffered_out_of_order_block_frees_download_slot() {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
@@ -1899,6 +2021,193 @@ mod tests {
             )),
             "block inventory should not bypass headers-first sync"
         );
+    }
+
+    #[test]
+    fn synced_nodes_pull_peer_mempool_snapshots_after_handshake() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+
+        let seed_txid = [7; 48];
+        let seed_value = 2_000u64;
+        let seed_script = vec![1];
+        for peer in [&mut left, &mut right] {
+            peer.node
+                .dev_seed_chainstate(
+                    6,
+                    peer.node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Regnet,
+                        seed_txid,
+                        0,
+                        seed_value,
+                        seed_script.clone(),
+                        0,
+                        false,
+                    )],
+                )
+                .expect("seed utxo");
+            peer.sync.prime(&peer.node);
+        }
+
+        let template = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: seed_txid,
+                output_index: 0,
+                unlocking_script: seed_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let provisional = Transaction {
+            witness: witness_bytes_for_tx(&template),
+            ..template
+        };
+        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let signed = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: seed_value.saturating_sub(fee_atoms),
+                locking_script: vec![2],
+            }],
+            ..Transaction {
+                witness: vec![],
+                ..provisional
+            }
+        };
+        let signed = Transaction {
+            witness: witness_bytes_for_tx(&signed),
+            ..signed
+        };
+        let txid = right
+            .node
+            .submit_transaction(MempoolEntry::new(signed, fee_atoms))
+            .expect("submit tx");
+
+        let _ = connect(&mut left, &mut right);
+
+        assert!(left.node.mempool_contains(&txid));
+    }
+
+    #[test]
+    fn relayed_transactions_are_ignored_while_chain_sync_is_incomplete() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let miner = Miner::new(1);
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine first");
+        right
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine second");
+        right.sync.prime(&right.node);
+
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        collect_events(&mut queue, &mut notices, &left.id, events);
+
+        let left_version = queue.pop_front().expect("left version");
+        let (events, mut new_notices) = right
+            .sync
+            .receive(&left_version.from, left_version.message, &mut right.node)
+            .expect("right receives version");
+        collect_events(&mut queue, &mut notices, &right.id, events);
+        notices.append(&mut new_notices);
+
+        for _ in 0..2 {
+            let queued = queue.pop_front().expect("right handshake reply");
+            let (events, mut new_notices) = left
+                .sync
+                .receive(&queued.from, queued.message, &mut left.node)
+                .expect("left receives handshake reply");
+            collect_events(&mut queue, &mut notices, &left.id, events);
+            notices.append(&mut new_notices);
+        }
+
+        assert!(!left.sync.sync_state().headers_synced);
+
+        let seed_txid = [7; 48];
+        let seed_value = 2_000u64;
+        let seed_script = vec![1];
+        right
+            .node
+            .dev_seed_chainstate(
+                6,
+                right.node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    seed_script.clone(),
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed utxo");
+
+        let template = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: seed_txid,
+                output_index: 0,
+                unlocking_script: seed_script.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                locking_script: vec![2],
+            }],
+            lock_time: 0,
+            witness: vec![],
+        };
+        let provisional = Transaction {
+            witness: witness_bytes_for_tx(&template),
+            ..template
+        };
+        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let signed = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: seed_value.saturating_sub(fee_atoms),
+                locking_script: vec![2],
+            }],
+            ..Transaction {
+                witness: vec![],
+                ..provisional
+            }
+        };
+        let signed = Transaction {
+            witness: witness_bytes_for_tx(&signed),
+            ..signed
+        };
+        let txid = signed.txid();
+
+        let (events, new_notices) = left
+            .sync
+            .receive(
+                &right.id,
+                NetworkMessage::new(Network::Regnet, MessagePayload::Tx(signed)),
+                &mut left.node,
+            )
+            .expect("ignore relayed tx while behind");
+
+        assert!(events.is_empty());
+        assert!(new_notices.is_empty());
+        assert!(!left.node.mempool_contains(&txid));
     }
 
     #[test]

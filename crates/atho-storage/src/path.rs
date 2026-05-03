@@ -3,6 +3,7 @@ use atho_core::network::Network;
 use std::path::PathBuf;
 
 pub const ATHO_DATA_DIR_ENV: &str = "ATHO_DATA_DIR";
+pub const ATHO_WALLET_DIR_ENV: &str = "ATHO_WALLET_DIR";
 
 pub fn data_dir(network: Network) -> &'static str {
     match network {
@@ -41,6 +42,24 @@ pub fn chain_dir() -> PathBuf {
 
 pub fn quarantine_dir() -> PathBuf {
     sandbox_root().join("quarantine")
+}
+
+pub fn wallet_root() -> PathBuf {
+    if let Some(path) = std::env::var_os(ATHO_WALLET_DIR_ENV) {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(test)]
+    {
+        return sandbox_root().join("wallet");
+    }
+
+    #[cfg(not(test))]
+    {
+        // Wallet persistence must survive ordinary chainstate wipes and custom data-dir changes
+        // unless the operator explicitly points wallets elsewhere.
+        default_operator_root().join("wallet")
+    }
 }
 
 fn default_operator_root() -> PathBuf {
