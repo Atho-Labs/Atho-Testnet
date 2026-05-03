@@ -217,10 +217,6 @@ impl NodeSync {
                         peer: peer.clone(),
                         message: self.relay.build_getheaders(peer.clone()),
                     });
-                    outbound.push(ConnectionEvent::Send {
-                        peer,
-                        message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
-                    });
                 }
                 ConnectionEvent::Message { peer, message } => {
                     self.handle_message(&peer, message, node, &mut outbound)?;
@@ -299,13 +295,42 @@ impl NodeSync {
                     request.stop_hash.into_inner(),
                     network_params(self.network).limits.max_headers_per_message,
                 );
+                let first_height = headers.first().map(|header| header.height);
+                let last_height = headers.last().map(|header| header.height);
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "serving headers peer={} locator_len={} count={} first_height={:?} last_height={:?}",
+                        peer,
+                        request.locator_hashes.len(),
+                        headers.len(),
+                        first_height,
+                        last_height
+                    ),
+                );
                 outbound.push(ConnectionEvent::Send {
                     peer: peer.to_string(),
                     message: NetworkMessage::new(self.network, MessagePayload::Headers { headers }),
                 });
             }
             MessagePayload::Headers { headers } => {
+                let first_height = headers.first().map(|header| header.height);
+                let last_height = headers.last().map(|header| header.height);
+                let header_count = headers.len();
                 self.relay.accept_headers(&headers)?;
+                let headers_synced = self.relay.sync_state().headers_synced;
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "received headers peer={} count={} first_height={:?} last_height={:?} headers_synced={} target_height={}",
+                        peer,
+                        header_count,
+                        first_height,
+                        last_height,
+                        headers_synced,
+                        self.relay.sync_state().best_height
+                    ),
+                );
                 self.downloader.note_headers(
                     peer,
                     headers
@@ -318,6 +343,11 @@ impl NodeSync {
                     outbound.push(ConnectionEvent::Send {
                         peer: peer.to_string(),
                         message: self.relay.build_getheaders(peer.to_string()),
+                    });
+                } else {
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
                     });
                 }
             }
@@ -533,6 +563,9 @@ impl NodeSync {
             ),
         );
         self.buffer_peer_block(peer, block);
+        self.downloader.note_block_received(block_hash);
+        self.pending_compact_blocks.remove(&block_hash);
+        self.push_scheduled_block_requests(outbound);
         self.process_buffered_branches(node, outbound)?;
 
         Ok(())
@@ -1231,6 +1264,147 @@ mod tests {
             .address_manager()
             .advertisable_addresses(8);
         assert!(addresses.iter().any(|address| address.host == "8.8.8.8"));
+    }
+
+    #[test]
+    fn ready_peer_requests_headers_before_addr_gossip() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+
+        let (events, notices) = sync
+            .expand_events(
+                vec![ConnectionEvent::Ready {
+                    peer: String::from("right"),
+                    best_height: 2,
+                }],
+                &mut node,
+            )
+            .expect("expand ready");
+
+        assert_eq!(
+            notices,
+            vec![SyncNotice::Ready {
+                peer: String::from("right"),
+                best_height: 2
+            }]
+        );
+        let payloads = events
+            .into_iter()
+            .map(|event| match event {
+                ConnectionEvent::Send { message, .. } => message.payload,
+                _ => panic!("unexpected event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(payloads.len(), 1);
+        assert!(matches!(payloads[0], MessagePayload::GetHeaders(_)));
+    }
+
+    #[test]
+    fn addr_gossip_waits_until_headers_response() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        let _ = sync
+            .expand_events(
+                vec![ConnectionEvent::Ready {
+                    peer: String::from("right"),
+                    best_height: 0,
+                }],
+                &mut node,
+            )
+            .expect("expand ready");
+
+        let mut outbound = Vec::new();
+        sync.handle_message(
+            "right",
+            NetworkMessage::new(
+                Network::Regnet,
+                MessagePayload::Headers {
+                    headers: Vec::new(),
+                },
+            ),
+            &mut node,
+            &mut outbound,
+        )
+        .expect("headers response");
+
+        assert!(outbound.into_iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message: NetworkMessage {
+                    payload: MessagePayload::GetAddr,
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn buffered_out_of_order_block_frees_download_slot() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("right");
+
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let mut previous_hash = node.tip_hash();
+        let mut blocks = Vec::new();
+        for height in 1..=129 {
+            let block = coinbase_block(
+                Network::Regnet,
+                height,
+                previous_hash,
+                target,
+                1_700_000_000 + height,
+            );
+            previous_hash = block.header.block_hash();
+            blocks.push(block);
+        }
+        sync.downloader.note_headers(
+            "right",
+            blocks.iter().map(|block| block.header.block_hash()),
+        );
+
+        let mut outbound = Vec::new();
+        sync.push_scheduled_block_requests(&mut outbound);
+        let requested_before = outbound
+            .iter()
+            .map(|event| match event {
+                ConnectionEvent::Send {
+                    message:
+                        NetworkMessage {
+                            payload: MessagePayload::GetData { inventory },
+                            ..
+                        },
+                    ..
+                } => inventory.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(requested_before, 128);
+
+        outbound.clear();
+        sync.handle_received_block("right", blocks[127].clone(), &mut node, &mut outbound)
+            .expect("buffer future block");
+
+        assert_eq!(node.height(), 0);
+        let requested_after = outbound
+            .iter()
+            .map(|event| match event {
+                ConnectionEvent::Send {
+                    message:
+                        NetworkMessage {
+                            payload: MessagePayload::GetData { inventory },
+                            ..
+                        },
+                    ..
+                } => inventory.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(requested_after, 1);
     }
 
     #[test]

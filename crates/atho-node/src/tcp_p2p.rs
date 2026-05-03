@@ -32,7 +32,6 @@ const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
-const PEER_QUALITY_SUCCESS_RECOVERY: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum TcpP2pError {
@@ -338,9 +337,9 @@ fn spawn_outbound_maintainer(
             let state = state.lock().expect("p2p runtime state poisoned");
             state.network()
         };
-        let mut health = load_peer_health_snapshot(&state, network, &remote_addr);
         let mut last_failure = None::<String>;
         while !stop_requested.load(Ordering::Acquire) {
+            let mut health = load_peer_health_snapshot(&state, network, &remote_addr);
             let now_unix = unix_timestamp();
             if health.backoff_until_unix > now_unix {
                 let remaining = health.backoff_until_unix.saturating_sub(now_unix).max(1);
@@ -367,23 +366,6 @@ fn spawn_outbound_maintainer(
                 Arc::clone(&peer_threads),
             ) {
                 Ok(()) => {
-                    health.quality_score = health
-                        .quality_score
-                        .saturating_add(PEER_QUALITY_SUCCESS_RECOVERY)
-                        .min(PEER_QUALITY_MAX_SCORE);
-                    health.consecutive_failures = 0;
-                    health.backoff_until_unix = 0;
-                    health.last_success_unix = Some(now_unix);
-                    persist_peer_health(&state, &health);
-                    if last_failure.take().is_some() {
-                        let _ = dev::append_log(
-                            "p2p",
-                            &format!(
-                                "outbound connect recovered peer={remote_addr} quality={} backoff_cleared=true",
-                                health.quality_score
-                            ),
-                        );
-                    }
                     sleep_with_stop(&stop_requested, Duration::from_millis(250));
                 }
                 Err(err) => {
@@ -646,6 +628,7 @@ fn spawn_peer_thread(
                             state.p2p_note_bytes_received(&peer_id, bytes_received);
                             last_activity = SystemTime::now();
                         }
+                        log_peer_message("rx", &peer_id, &message, bytes_received);
                         message
                     }
                     Ok(None) => {
@@ -854,11 +837,80 @@ fn flush_send_events(
     for event in events {
         if let ConnectionEvent::Send { peer, message } = event {
             if peer == peer_id {
-                bytes_sent = bytes_sent.saturating_add(write_message(stream, &message)?);
+                let sent = write_message(stream, &message)?;
+                log_peer_message("tx", peer_id, &message, sent);
+                bytes_sent = bytes_sent.saturating_add(sent);
             }
         }
     }
     Ok(bytes_sent)
+}
+
+fn log_peer_message(direction: &str, peer_id: &str, message: &NetworkMessage, bytes: usize) {
+    let _ = dev::append_log(
+        "p2p",
+        &format!(
+            "peer {direction} peer={} command={} bytes={} {}",
+            peer_id,
+            message.command().as_str(),
+            bytes,
+            message_payload_summary(&message.payload)
+        ),
+    );
+}
+
+fn message_payload_summary(payload: &MessagePayload) -> String {
+    match payload {
+        MessagePayload::Version(version) => {
+            format!(
+                "height={} protocol={} user_agent={}",
+                version.best_height, version.protocol_version, version.user_agent
+            )
+        }
+        MessagePayload::Verack => String::from("handshake=verack"),
+        MessagePayload::Ping { nonce } | MessagePayload::Pong { nonce } => {
+            format!("nonce={nonce}")
+        }
+        MessagePayload::GetAddr => String::from("request=addresses"),
+        MessagePayload::Addr { addresses } => format!("count={}", addresses.len()),
+        MessagePayload::Inv { inventory }
+        | MessagePayload::GetData { inventory }
+        | MessagePayload::NotFound { inventory } => format!("count={}", inventory.len()),
+        MessagePayload::GetHeaders(message) => {
+            format!("locator_len={}", message.locator_hashes.len())
+        }
+        MessagePayload::Headers { headers } => {
+            let first_height = headers.first().map(|header| header.height);
+            let last_height = headers.last().map(|header| header.height);
+            format!(
+                "count={} first_height={first_height:?} last_height={last_height:?}",
+                headers.len()
+            )
+        }
+        MessagePayload::Block(block) => format!("height={}", block.header.height),
+        MessagePayload::Tx(transaction) => {
+            format!(
+                "inputs={} outputs={}",
+                transaction.inputs.len(),
+                transaction.outputs.len()
+            )
+        }
+        MessagePayload::MemPool => String::from("request=mempool"),
+        MessagePayload::CompactBlock(message) => {
+            format!(
+                "height={} tx_count={}",
+                message.header.height, message.tx_count
+            )
+        }
+        MessagePayload::GetBlockTxn(message) => format!("indexes={}", message.indexes.len()),
+        MessagePayload::BlockTxn(message) => {
+            format!(
+                "indexes={} txs={}",
+                message.indexes.len(),
+                message.transactions.len()
+            )
+        }
+    }
 }
 
 fn write_message(stream: &mut TcpStream, message: &NetworkMessage) -> Result<usize, TcpP2pError> {
@@ -1054,7 +1106,11 @@ fn sleep_with_stop(stop_requested: &Arc<AtomicBool>, duration: Duration) {
 mod tests {
     use super::*;
     use crate::test_support::acquire_global_test_lock;
+    use atho_core::consensus::rules;
     use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::genesis;
+    use atho_p2p::config::MIN_SUPPORTED_PROTOCOL_VERSION;
+    use atho_p2p::protocol::{VersionMessage, LOCAL_NODE_SERVICES};
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::RpcResponse;
     use atho_storage::path::ATHO_DATA_DIR_ENV;
@@ -1102,6 +1158,63 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         panic!("timed out waiting for tcp p2p condition: {label}");
+    }
+
+    fn test_version_message(network: Network, best_height: u64) -> NetworkMessage {
+        NetworkMessage::new(
+            network,
+            MessagePayload::Version(VersionMessage {
+                protocol_version: rules::PROTOCOL_VERSION,
+                min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                services: LOCAL_NODE_SERVICES,
+                timestamp_unix: unix_timestamp() as i64,
+                network,
+                user_agent: String::from("/Atho-Test:0.1.0/"),
+                best_height,
+                ruleset_version: rules::RULESET_VERSION_V1,
+                relay: true,
+                genesis_hash: Hash48::from(genesis::genesis_hash(network)),
+                tip_hash: Hash48::ZERO,
+                chainwork: Hash48::ZERO,
+            }),
+        )
+    }
+
+    fn spawn_ready_then_drop_peer(
+        network: Network,
+        best_height: u64,
+    ) -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ready-drop listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("ready-drop addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = configure_stream(&stream);
+                        if read_message(&mut stream, network).is_ok() {
+                            let _ = write_message(
+                                &mut stream,
+                                &test_version_message(network, best_height),
+                            );
+                            let _ = write_message(
+                                &mut stream,
+                                &NetworkMessage::new(network, MessagePayload::Verack),
+                            );
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (address, stop, handle)
     }
 
     #[test]
@@ -1371,6 +1484,110 @@ mod tests {
                     })
             },
         );
+    }
+
+    #[test]
+    fn tcp_runtime_backoff_grows_when_peer_accepts_tcp_then_drops_handshake() {
+        let root = std::env::temp_dir().join(format!(
+            "atho-p2p-drop-health-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("dropping listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let dropping_addr = listener.local_addr().expect("dropping addr");
+        let stop_dropping_peer = Arc::new(AtomicBool::new(false));
+        let dropping_peer_stop = Arc::clone(&stop_dropping_peer);
+        let dropping_peer = thread::spawn(move || {
+            while !dropping_peer_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let runtime = TcpP2pRuntime::bind_service(
+            Network::Regnet,
+            NodeService::try_new(NodeConfig::new(Network::Regnet)).expect("service"),
+            "127.0.0.1:0",
+        )
+        .expect("runtime");
+        runtime.maintain_outbound(dropping_addr.to_string());
+
+        wait_until(
+            "peer health backoff grows after protocol-level drops",
+            Duration::from_secs(10),
+            || {
+                let mut state = runtime.state.lock().expect("state");
+                state
+                    .p2p_peer_health(&dropping_addr.to_string())
+                    .is_some_and(|record| {
+                        record.consecutive_failures >= 2
+                            && record.quality_score
+                                <= PEER_QUALITY_MAX_SCORE
+                                    .saturating_sub(PEER_QUALITY_FAILURE_PENALTY * 2)
+                            && record.backoff_until_unix >= unix_timestamp()
+                    })
+            },
+        );
+
+        drop(runtime);
+        stop_dropping_peer.store(true, Ordering::Release);
+        let _ = TcpStream::connect(dropping_addr);
+        dropping_peer.join().expect("dropping peer join");
+    }
+
+    #[test]
+    fn tcp_runtime_backoff_grows_when_ready_peer_repeatedly_resets() {
+        let root = std::env::temp_dir().join(format!(
+            "atho-p2p-ready-reset-health-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let (peer_addr, stop_peer, peer_thread) = spawn_ready_then_drop_peer(Network::Regnet, 42);
+        let runtime = TcpP2pRuntime::bind_service(
+            Network::Regnet,
+            NodeService::try_new(NodeConfig::new(Network::Regnet)).expect("service"),
+            "127.0.0.1:0",
+        )
+        .expect("runtime");
+        runtime.maintain_outbound(peer_addr.to_string());
+
+        wait_until(
+            "peer health backoff grows after ready peer resets",
+            Duration::from_secs(10),
+            || {
+                let mut state = runtime.state.lock().expect("state");
+                state
+                    .p2p_peer_health(&peer_addr.to_string())
+                    .is_some_and(|record| {
+                        record.consecutive_failures >= 2
+                            && record.quality_score
+                                <= PEER_QUALITY_MAX_SCORE
+                                    .saturating_sub(PEER_QUALITY_FAILURE_PENALTY * 2)
+                            && record.backoff_until_unix >= unix_timestamp()
+                    })
+            },
+        );
+
+        drop(runtime);
+        stop_peer.store(true, Ordering::Release);
+        let _ = TcpStream::connect(peer_addr);
+        peer_thread.join().expect("ready-drop peer join");
     }
 
     #[test]

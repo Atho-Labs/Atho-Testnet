@@ -170,6 +170,7 @@ impl BlockDownloadScheduler {
         peers
             .iter()
             .enumerate()
+            .filter(|(_, peer)| hinted.is_none_or(|hints| hints.contains(*peer)))
             .filter_map(|(index, peer)| {
                 let inflight = self
                     .inflight_by_peer
@@ -178,15 +179,12 @@ impl BlockDownloadScheduler {
                     .unwrap_or(0);
                 (inflight < max_requests_per_peer).then_some((
                     inflight,
-                    hinted.is_none_or(|hints| hints.contains(peer)),
                     (index + peers.len() - (start_index % peers.len())) % peers.len(),
                     peer,
                 ))
             })
-            .min_by_key(|(inflight, hinted_peer, rotation, _)| {
-                (*inflight, !*hinted_peer, *rotation)
-            })
-            .map(|(_, _, _, peer)| peer.clone())
+            .min_by_key(|(inflight, rotation, _)| (*inflight, *rotation))
+            .map(|(_, _, peer)| peer.clone())
     }
 }
 
@@ -226,14 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn hinted_peer_does_not_monopolize_when_another_ready_peer_is_idle() {
+    fn hinted_hashes_stay_on_peers_that_advertised_them() {
         let mut scheduler = BlockDownloadScheduler::default();
         scheduler.note_peer_ready("left");
         scheduler.note_peer_ready("right");
         scheduler.note_headers("left", [[1; 48], [2; 48], [3; 48], [4; 48]]);
 
         let assignments = scheduler.assignments(4, 4);
-        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].peer, "left");
         assert_eq!(
             assignments
                 .iter()

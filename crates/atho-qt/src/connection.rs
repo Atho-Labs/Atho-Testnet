@@ -63,6 +63,7 @@ enum ConnectionBackend {
     Rpc {
         client: RpcClient,
         node: Option<Arc<ManagedNodeState>>,
+        local_node: bool,
     },
 }
 
@@ -73,10 +74,44 @@ impl Clone for ConnectionBackend {
             ConnectionBackend::Unavailable { startup_error } => ConnectionBackend::Unavailable {
                 startup_error: startup_error.clone(),
             },
-            ConnectionBackend::Rpc { client, node } => ConnectionBackend::Rpc {
+            ConnectionBackend::Rpc {
+                client,
+                node,
+                local_node,
+            } => ConnectionBackend::Rpc {
                 client: client.clone(),
                 node: node.clone(),
+                local_node: *local_node,
             },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalNodeStartup {
+    node: Option<Arc<ManagedNodeState>>,
+    local_node: bool,
+}
+
+impl LocalNodeStartup {
+    fn external_rpc() -> Self {
+        Self {
+            node: None,
+            local_node: false,
+        }
+    }
+
+    fn attached_existing() -> Self {
+        Self {
+            node: None,
+            local_node: true,
+        }
+    }
+
+    fn managed(node: Arc<ManagedNodeState>) -> Self {
+        Self {
+            node: Some(node),
+            local_node: true,
         }
     }
 }
@@ -216,9 +251,10 @@ impl ReadOnlyNodeConnection {
             }
         } else {
             match start_local_node_if_needed(network, &rpc_address) {
-                Ok(node) => ConnectionBackend::Rpc {
+                Ok(startup) => ConnectionBackend::Rpc {
                     client: RpcClient::new(rpc_address.clone()),
-                    node,
+                    node: startup.node,
+                    local_node: startup.local_node,
                 },
                 Err(startup_error) => ConnectionBackend::Unavailable { startup_error },
             }
@@ -244,7 +280,10 @@ impl ReadOnlyNodeConnection {
             &self.backend,
             ConnectionBackend::Local(_)
                 | ConnectionBackend::Unavailable { .. }
-                | ConnectionBackend::Rpc { node: Some(_), .. }
+                | ConnectionBackend::Rpc {
+                    local_node: true,
+                    ..
+                }
         )
     }
 
@@ -265,7 +304,11 @@ impl ReadOnlyNodeConnection {
                     system.handle(request)
                 }
             }
-            ConnectionBackend::Rpc { client, node } => {
+            ConnectionBackend::Rpc {
+                client,
+                node,
+                local_node,
+            } => {
                 if let Some(node) = node {
                     if let Some(error) = node.observe_exit(self.network) {
                         return RpcResponse::Error(RpcError::invalid_request(error));
@@ -275,9 +318,13 @@ impl ReadOnlyNodeConnection {
                     match client.call(&request) {
                         Ok(response) => return response,
                         Err(err) => {
-                            if let Some(node) = node {
-                                if let Some(error) = node.observe_exit(self.network) {
-                                    return RpcResponse::Error(RpcError::invalid_request(error));
+                            if *local_node {
+                                if let Some(node) = node {
+                                    if let Some(error) = node.observe_exit(self.network) {
+                                        return RpcResponse::Error(RpcError::invalid_request(
+                                            error,
+                                        ));
+                                    }
                                 }
                                 if attempt + 1 < LOCAL_RPC_READY_RETRY_ATTEMPTS {
                                     thread::sleep(Duration::from_millis(
@@ -288,6 +335,11 @@ impl ReadOnlyNodeConnection {
                                 return RpcResponse::Error(RpcError::invalid_request(format!(
                                     "local node RPC is not ready yet: {err}"
                                 )));
+                            }
+                            if let Some(node) = node {
+                                if let Some(error) = node.observe_exit(self.network) {
+                                    return RpcResponse::Error(RpcError::invalid_request(error));
+                                }
                             }
                             let _ =
                                 atho_node::dev::append_log("atho-qt", &format!("rpc error: {err}"));
@@ -336,9 +388,18 @@ impl ReadOnlyNodeConnection {
                 connected: false,
                 startup_error: Some(startup_error.clone()),
             },
-            ConnectionBackend::Rpc { client, node } => {
-                collect_rpc_status(self.network, &self.rpc_address, client, node.as_ref(), None)
-            }
+            ConnectionBackend::Rpc {
+                client,
+                node,
+                local_node,
+            } => collect_rpc_status(
+                self.network,
+                &self.rpc_address,
+                client,
+                node.as_ref(),
+                *local_node,
+                None,
+            ),
         }
     }
 
@@ -364,9 +425,12 @@ impl ReadOnlyNodeConnection {
                     thread::sleep(interval);
                 });
             }
-            ConnectionBackend::Rpc { node, .. } => {
+            ConnectionBackend::Rpc {
+                node, local_node, ..
+            } => {
                 let network = self.network;
                 let node = node.clone();
+                let local_node = *local_node;
                 thread::spawn(move || {
                     let client = RpcClient::new(rpc_address.clone());
                     let mut last_status: Option<ConnectionStatus> = None;
@@ -376,6 +440,7 @@ impl ReadOnlyNodeConnection {
                             &rpc_address,
                             &client,
                             node.as_ref(),
+                            local_node,
                             last_status.as_ref(),
                         );
                         last_status = Some(status.clone());
@@ -446,6 +511,7 @@ fn collect_rpc_status(
     rpc_address: &str,
     client: &RpcClient,
     managed_node: Option<&Arc<ManagedNodeState>>,
+    local_node: bool,
     last_known: Option<&ConnectionStatus>,
 ) -> ConnectionStatus {
     if let Some(node) = managed_node {
@@ -476,7 +542,7 @@ fn collect_rpc_status(
         }
     }
 
-    let managed_local = managed_node.is_some();
+    let managed_local = local_node;
 
     if let Ok(RpcResponse::NodeStatus(status)) =
         call_status_rpc(client, &RpcRequest::GetNodeStatus, managed_local)
@@ -720,35 +786,64 @@ fn manage_local_node_requested() -> bool {
     std::env::var(ATHO_QT_LOCAL_ENV).ok().as_deref() == Some("1")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExistingRpcEndpoint {
+    None,
+    SameNetworkRunning,
+    SameNetworkStopped,
+    SameNetworkIncomplete,
+    WrongNetwork(String),
+    OccupiedByNonAtho,
+}
+
 fn start_local_node_if_needed(
     network: Network,
     rpc_address: &str,
-) -> Result<Option<Arc<ManagedNodeState>>, String> {
+) -> Result<LocalNodeStartup, String> {
     if !manage_local_node_requested() {
-        return Ok(None);
+        return Ok(LocalNodeStartup::external_rpc());
     }
-    if probe_rpc(rpc_address) {
-        let _ = atho_node::dev::append_log(
-            "atho-qt",
-            &format!(
-                "managed local node requested with existing rpc endpoint network={} rpc={}; stopping previous node before restart",
-                network.id(),
-                rpc_address,
-            ),
-        );
-        stop_existing_local_node(rpc_address, network)?;
-    }
-    if probe_rpc(rpc_address) {
-        let _ = atho_node::dev::append_log(
-            "atho-qt",
-            &format!(
-                "rpc still active after managed restart preflight at {} for {}",
-                rpc_address,
+
+    match inspect_existing_rpc_endpoint(network, rpc_address) {
+        ExistingRpcEndpoint::None => {}
+        ExistingRpcEndpoint::SameNetworkRunning => {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!(
+                    "managed local node requested; attaching to existing healthy local node network={} rpc={}",
+                    network.id(),
+                    rpc_address
+                ),
+            );
+            return Ok(LocalNodeStartup::attached_existing());
+        }
+        ExistingRpcEndpoint::SameNetworkStopped | ExistingRpcEndpoint::SameNetworkIncomplete => {
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!(
+                    "managed local node requested with stale same-network rpc endpoint network={} rpc={}; stopping before restart",
+                    network.id(),
+                    rpc_address,
+                ),
+            );
+            stop_existing_local_node(rpc_address, network)?;
+        }
+        ExistingRpcEndpoint::WrongNetwork(actual) => {
+            return Err(format!(
+                "rpc address {rpc_address} is already serving {actual}; expected {}. Use the matching network, choose a different RPC port, or stop the conflicting athod process.",
                 network.id()
-            ),
-        );
+            ));
+        }
+        ExistingRpcEndpoint::OccupiedByNonAtho => {
+            return Err(format!(
+                "rpc address {rpc_address} is already occupied by a non-Atho service or an incompatible node; choose a different RPC port or stop the conflicting process."
+            ));
+        }
+    }
+
+    if !rpc_bind_available(rpc_address) {
         return Err(format!(
-            "managed local node rpc remained active at {rpc_address} for {}",
+            "rpc address {rpc_address} is still occupied after managed-node preflight for {}; choose a different RPC port or stop the conflicting process.",
             network.id()
         ));
     }
@@ -825,13 +920,41 @@ fn start_local_node_if_needed(
                 ),
             );
             spawn_bootstrap_watcher(network, rpc_address.to_string(), Arc::clone(&node));
-            Ok(Some(node))
+            Ok(LocalNodeStartup::managed(node))
         }
         Err(err) => {
             let startup_error = format!("failed to spawn local node: {err}");
             let _ = atho_node::dev::append_log("atho-qt", &startup_error);
             Err(startup_error)
         }
+    }
+}
+
+fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> ExistingRpcEndpoint {
+    let client = RpcClient::new(rpc_address.to_string());
+    if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
+        if status.network != network {
+            return ExistingRpcEndpoint::WrongNetwork(status.network.id().to_string());
+        }
+        return if status.running {
+            ExistingRpcEndpoint::SameNetworkRunning
+        } else {
+            ExistingRpcEndpoint::SameNetworkStopped
+        };
+    }
+
+    if let Ok(RpcResponse::Network(label)) = client.call(&RpcRequest::GetNetwork) {
+        return if label == network.id() {
+            ExistingRpcEndpoint::SameNetworkIncomplete
+        } else {
+            ExistingRpcEndpoint::WrongNetwork(label)
+        };
+    }
+
+    if rpc_bind_available(rpc_address) {
+        ExistingRpcEndpoint::None
+    } else {
+        ExistingRpcEndpoint::OccupiedByNonAtho
     }
 }
 
@@ -881,6 +1004,10 @@ fn probe_rpc(rpc_address: &str) -> bool {
         client.call(&RpcRequest::GetNetwork),
         Ok(RpcResponse::Network(_))
     )
+}
+
+fn rpc_bind_available(rpc_address: &str) -> bool {
+    TcpListener::bind(rpc_address).is_ok()
 }
 
 fn load_persisted_chain_tip_status(network: Network) -> Option<PersistedChainTipStatus> {
@@ -1010,7 +1137,12 @@ fn prefer_workspace_cargo_runner(exe: &Path) -> bool {
         return false;
     };
     let target_root = workspace_root.join("target");
-    exe.starts_with(&target_root)
+    let Ok(relative_exe) = exe.strip_prefix(&target_root) else {
+        return false;
+    };
+    !relative_exe
+        .components()
+        .any(|component| component.as_os_str() == "release")
 }
 
 fn node_binary_candidates_from_exe(exe: &Path) -> Vec<PathBuf> {
@@ -1465,6 +1597,40 @@ mod tests {
         (address, handle)
     }
 
+    fn spawn_single_node_status_rpc_server(
+        network: Network,
+        running: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc");
+        let address = listener.local_addr().expect("local addr").to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept status");
+            let clone = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(clone);
+            let request: RpcRequest = read_message(&mut reader).expect("request");
+            let response = match request {
+                RpcRequest::GetNodeStatus => RpcResponse::NodeStatus(NodeStatus {
+                    network,
+                    block_count: 3,
+                    tip_hash: [0x33; 48],
+                    tip_timestamp: 1_777_416_777,
+                    mempool_count: 0,
+                    mempool_total_fee_atoms: 0,
+                    mempool_fingerprint: [0; 32],
+                    running,
+                    headers_synced: true,
+                    sync_best_height: 3,
+                    network_diagnostics: NetworkDiagnostics::default(),
+                }),
+                other => RpcResponse::Error(RpcError::invalid_request(format!(
+                    "unexpected request in single status server: {other:?}"
+                ))),
+            };
+            write_message(&mut stream, &response).expect("response");
+        });
+        (address, handle)
+    }
+
     fn wait_for_status(
         conn: &ReadOnlyNodeConnection,
         predicate: impl Fn(&ConnectionStatus) -> bool,
@@ -1603,6 +1769,7 @@ mod tests {
             &rpc_address,
             &client,
             Some(&managed),
+            true,
             None,
         );
         assert!(first.connected);
@@ -1614,6 +1781,7 @@ mod tests {
             &rpc_address,
             &client,
             Some(&managed),
+            true,
             Some(&first),
         );
         assert!(degraded.connected);
@@ -1711,6 +1879,32 @@ mod tests {
     }
 
     #[test]
+    fn managed_local_start_attaches_to_running_same_network_endpoint() {
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let (rpc_address, handle) = spawn_single_node_status_rpc_server(Network::Testnet, true);
+
+        let startup =
+            start_local_node_if_needed(Network::Testnet, &rpc_address).expect("attach existing");
+
+        assert!(startup.local_node);
+        assert!(startup.node.is_none());
+        handle.join().expect("status mock rpc server");
+    }
+
+    #[test]
+    fn managed_local_start_rejects_wrong_network_endpoint_without_stopping_it() {
+        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
+        let (rpc_address, handle) = spawn_single_node_status_rpc_server(Network::Mainnet, true);
+
+        let err = start_local_node_if_needed(Network::Testnet, &rpc_address)
+            .expect_err("wrong network should be rejected");
+
+        assert!(err.contains("already serving atho-mainnet"));
+        assert!(err.contains("expected atho-testnet"));
+        handle.join().expect("status mock rpc server");
+    }
+
+    #[test]
     fn managed_local_node_status_retries_transient_node_status_failures() {
         let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
@@ -1728,6 +1922,7 @@ mod tests {
             &rpc_address,
             &client,
             Some(&managed),
+            true,
             None,
         );
 
@@ -1863,6 +2058,17 @@ mod tests {
             .join("debug")
             .join("atho-qt");
         assert!(prefer_workspace_cargo_runner(&exe));
+    }
+
+    #[test]
+    fn workspace_release_executables_use_sibling_node_binary() {
+        let exe = workspace_manifest_path()
+            .parent()
+            .expect("workspace root")
+            .join("target")
+            .join("release")
+            .join("atho-qt");
+        assert!(!prefer_workspace_cargo_runner(&exe));
     }
 
     #[test]

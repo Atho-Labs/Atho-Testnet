@@ -497,28 +497,30 @@ impl Chainstate {
             return Ok(Vec::new());
         }
 
-        let start_height = locator_hashes
-            .iter()
-            .find_map(|hash| {
-                self.height_for_known_block(*hash)
-                    .map(|height| height.saturating_add(1))
-            })
-            .unwrap_or(0);
+        let start_height = match locator_hashes.iter().find_map(|hash| {
+            self.height_for_known_block(*hash)
+                .map(|height| height.saturating_add(1))
+        }) {
+            Some(height) => height,
+            None if locator_hashes.is_empty() => 0,
+            None => return Ok(Vec::new()),
+        };
 
         let Some(storage) = &self.storage else {
             let blocks = &self.blocks;
             if blocks.is_empty() {
                 return Ok(Vec::new());
             }
-            let start_index = locator_hashes
-                .iter()
-                .find_map(|hash| {
-                    blocks
-                        .iter()
-                        .position(|block| block.header.block_hash() == *hash)
-                        .map(|index| index.saturating_add(1))
-                })
-                .unwrap_or(0);
+            let start_index = match locator_hashes.iter().find_map(|hash| {
+                blocks
+                    .iter()
+                    .position(|block| block.header.block_hash() == *hash)
+                    .map(|index| index.saturating_add(1))
+            }) {
+                Some(index) => index,
+                None if locator_hashes.is_empty() => 0,
+                None => return Ok(Vec::new()),
+            };
 
             let mut headers = Vec::new();
             for block in blocks.iter().skip(start_index) {
@@ -1744,6 +1746,28 @@ mod tests {
         assert!(!headers.is_empty());
         assert_eq!(headers.first().map(|header| header.height), Some(1));
         assert_eq!(headers.last().map(|header| header.height), Some(40));
+
+        let unknown_locator_headers = reloaded
+            .headers_after_locator(&[[9; 48]], [0; 48], 64)
+            .expect("unknown locator headers");
+        assert!(unknown_locator_headers.is_empty());
+    }
+
+    #[test]
+    fn in_memory_chainstate_does_not_serve_genesis_for_unknown_nonempty_locator() {
+        let chainstate = Chainstate::new(Network::Regnet);
+        let unknown_locator_headers = chainstate
+            .headers_after_locator(&[[9; 48]], [0; 48], 64)
+            .expect("unknown locator headers");
+        assert!(unknown_locator_headers.is_empty());
+
+        let empty_locator_headers = chainstate
+            .headers_after_locator(&[], [0; 48], 64)
+            .expect("empty locator headers");
+        assert_eq!(
+            empty_locator_headers.first().map(|header| header.height),
+            Some(0)
+        );
     }
 
     #[test]

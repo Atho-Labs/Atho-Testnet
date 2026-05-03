@@ -235,8 +235,19 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                     let mut guard = system.lock().expect("node runtime mutex poisoned");
                     guard.handle_mut(request)
                 };
+                let shutdown_requested = response_requests_runtime_shutdown(&response);
                 if let Err(err) = write_message(&mut stream, &response) {
                     let _ = dev::append_log("athod", &format!("rpc write error: {err}"));
+                }
+                if shutdown_requested {
+                    let _ = dev::append_log(
+                        "athod",
+                        &format!(
+                            "runtime shutdown requested over rpc network={}",
+                            config.network.id()
+                        ),
+                    );
+                    break;
                 }
             }
             Err(err) => {
@@ -246,6 +257,17 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     }
     let _ = dev::append_log("athod", "runtime stopped");
     Ok(())
+}
+
+fn response_requests_runtime_shutdown(response: &RpcResponse) -> bool {
+    match response {
+        RpcResponse::Command(command) if command.command == "stop" => command
+            .data
+            .get("stopping")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Returns the effective RPC bind address for the selected network.
@@ -394,5 +416,26 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert!(peers.iter().any(|peer| peer == "localhost:9200"));
         assert!(peers.iter().any(|peer| peer == "127.0.0.1:9201"));
+    }
+
+    #[test]
+    fn stop_command_response_requests_runtime_shutdown() {
+        let response = RpcResponse::Command(atho_rpc::command::CommandResponse {
+            command: String::from("stop"),
+            group: atho_rpc::command::CommandGroup::Control,
+            permission: atho_rpc::command::CommandPermission::NodeAdmin,
+            dangerous: true,
+            network: String::from("atho-testnet"),
+            data: serde_json::json!({
+                "stopping": true,
+                "network": "atho-testnet",
+                "height": 0,
+            }),
+        });
+
+        assert!(response_requests_runtime_shutdown(&response));
+        assert!(!response_requests_runtime_shutdown(&RpcResponse::Network(
+            String::from("atho-testnet")
+        )));
     }
 }
