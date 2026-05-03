@@ -638,6 +638,7 @@ dependencies = [
  "atho-core",
  "atho-errors",
  "atho-storage",
+ "bincode",
  "serde",
  "serde-big-array",
  "serde_json",

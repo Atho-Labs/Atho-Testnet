@@ -1,17 +1,21 @@
 //! Length-delimited RPC transport framing.
 use crate::request::RpcRequest;
 use crate::response::RpcResponse;
+use atho_core::constants::MAX_BLOCK_SERIALIZED_BYTES;
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, RPC_EMPTY_RESPONSE, RPC_MESSAGE_TOO_LARGE,
     RPC_SERIALIZATION, RPC_TRANSPORT_IO,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 use thiserror::Error;
 
-const MAX_RPC_MESSAGE_BYTES: usize = 1 << 20;
+// Internal RPC must be able to move full block templates and submitted blocks
+// without tripping a transport limit under heavy mempool load. Keep the cap
+// bounded but above the maximum serialized block size with headroom for framing.
+const MAX_RPC_MESSAGE_BYTES: usize = MAX_BLOCK_SERIALIZED_BYTES + (4 << 20);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -20,7 +24,7 @@ pub enum RpcTransportError {
     #[error("rpc transport io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("rpc transport serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(String),
     #[error("rpc transport returned an empty response")]
     EmptyResponse,
     #[error("rpc transport message exceeded the allowed size")]
@@ -44,7 +48,7 @@ impl AthoErrorMeta for RpcTransportError {
     fn safe_details(&self) -> Option<String> {
         match self {
             Self::Io(error) => Some(error.to_string()),
-            Self::Serialization(error) => Some(error.to_string()),
+            Self::Serialization(error) => Some(error.clone()),
             _ => None,
         }
     }
@@ -76,53 +80,42 @@ where
     W: Write,
     T: Serialize,
 {
-    let encoded = serde_json::to_string(message)?;
-    writer.write_all(encoded.as_bytes())?;
-    writer.write_all(b"\n")?;
+    let encoded = bincode::serialize(message)
+        .map_err(|err| RpcTransportError::Serialization(err.to_string()))?;
+    if encoded.len() > MAX_RPC_MESSAGE_BYTES {
+        return Err(RpcTransportError::MessageTooLarge);
+    }
+    let payload_len =
+        u32::try_from(encoded.len()).map_err(|_| RpcTransportError::MessageTooLarge)?;
+    writer.write_all(&payload_len.to_le_bytes())?;
+    writer.write_all(&encoded)?;
     writer.flush()?;
     Ok(())
 }
 
 pub fn read_message<R, T>(reader: &mut R) -> Result<T, RpcTransportError>
 where
-    R: BufRead,
+    R: Read,
     T: DeserializeOwned,
 {
-    let mut line = Vec::new();
-
-    loop {
-        let buffer = reader.fill_buf()?;
-        if buffer.is_empty() {
-            break;
+    let mut length_prefix = [0u8; 4];
+    match reader.read_exact(&mut length_prefix) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            return Err(RpcTransportError::EmptyResponse)
         }
-
-        if let Some(newline_index) = buffer.iter().position(|byte| *byte == b'\n') {
-            line.extend_from_slice(&buffer[..newline_index]);
-            reader.consume(newline_index + 1);
-            break;
-        }
-
-        line.extend_from_slice(buffer);
-        if line.len() > MAX_RPC_MESSAGE_BYTES {
-            return Err(RpcTransportError::MessageTooLarge);
-        }
-        let consumed = buffer.len();
-        reader.consume(consumed);
+        Err(err) => return Err(err.into()),
     }
-
-    if line.is_empty() {
+    let payload_len = u32::from_le_bytes(length_prefix) as usize;
+    if payload_len == 0 {
         return Err(RpcTransportError::EmptyResponse);
     }
-
-    if line.len() > MAX_RPC_MESSAGE_BYTES {
+    if payload_len > MAX_RPC_MESSAGE_BYTES {
         return Err(RpcTransportError::MessageTooLarge);
     }
-
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-
-    Ok(serde_json::from_slice(&line)?)
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload)?;
+    bincode::deserialize(&payload).map_err(|err| RpcTransportError::Serialization(err.to_string()))
 }
 
 fn connect_stream(address: &str) -> Result<TcpStream, RpcTransportError> {
@@ -153,17 +146,25 @@ fn connect_stream(address: &str) -> Result<TcpStream, RpcTransportError> {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use serde::Serialize;
 
-    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct TestMessage {
         value: String,
     }
 
     #[test]
-    fn read_message_parses_json_lines() {
-        let payload = br#"{"value":"atho"}"#;
+    fn read_message_parses_bincode_frames() {
+        let mut payload = Vec::new();
+        write_message(
+            &mut payload,
+            &TestMessage {
+                value: String::from("atho"),
+            },
+        )
+        .expect("encode");
         let mut reader = BufReader::new(&payload[..]);
-        let message: TestMessage = read_message(&mut reader).unwrap();
+        let message: TestMessage = read_message(&mut reader).expect("decode");
         assert_eq!(
             message,
             TestMessage {
@@ -173,18 +174,31 @@ mod tests {
     }
 
     #[test]
-    fn read_message_rejects_oversized_lines() {
-        let payload = vec![b'a'; MAX_RPC_MESSAGE_BYTES + 1];
+    fn read_message_rejects_oversized_frames() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&((MAX_RPC_MESSAGE_BYTES + 1) as u32).to_le_bytes());
         let mut reader = BufReader::new(&payload[..]);
         let err = read_message::<_, TestMessage>(&mut reader).unwrap_err();
         assert!(matches!(err, RpcTransportError::MessageTooLarge));
     }
 
     #[test]
-    fn read_message_rejects_invalid_json() {
-        let payload = br#"{"value":"atho""#;
+    fn read_message_rejects_invalid_bincode_payloads() {
+        let payload = [4u8, 0, 0, 0, 1, 2, 3, 4];
         let mut reader = BufReader::new(&payload[..]);
         let err = read_message::<_, TestMessage>(&mut reader).unwrap_err();
         assert!(matches!(err, RpcTransportError::Serialization(_)));
+    }
+
+    #[test]
+    fn transport_accepts_messages_larger_than_one_mebibyte() {
+        let message = TestMessage {
+            value: "a".repeat((1 << 20) + 128),
+        };
+        let mut payload = Vec::new();
+        write_message(&mut payload, &message).expect("encode large payload");
+        let mut reader = BufReader::new(&payload[..]);
+        let decoded: TestMessage = read_message(&mut reader).expect("decode large payload");
+        assert_eq!(decoded, message);
     }
 }

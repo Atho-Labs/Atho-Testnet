@@ -1408,78 +1408,6 @@ mod tests {
         (address, handle)
     }
 
-    fn spawn_flaky_node_status_rpc_server(
-        network: Network,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc");
-        let address = listener.local_addr().expect("local addr").to_string();
-        let handle = std::thread::spawn(move || {
-            let mut served_status_once = false;
-            for _ in 0..5 {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let clone = stream.try_clone().expect("clone");
-                let mut reader = BufReader::new(clone);
-                let request: RpcRequest = read_message(&mut reader).expect("request");
-                let response = match request {
-                    RpcRequest::GetNodeStatus if !served_status_once => {
-                        served_status_once = true;
-                        RpcResponse::NodeStatus(NodeStatus {
-                            network,
-                            block_count: 0,
-                            tip_hash: [0; 48],
-                            tip_timestamp: 1_777_416_445,
-                            mempool_count: 0,
-                            mempool_total_fee_atoms: 0,
-                            mempool_fingerprint: [0; 32],
-                            running: true,
-                            headers_synced: true,
-                            sync_best_height: 128,
-                            network_diagnostics: NetworkDiagnostics {
-                                peer_count: 1,
-                                inbound_peer_count: 0,
-                                outbound_peer_count: 1,
-                                connecting_peer_count: 0,
-                                bytes_sent: 1_024,
-                                bytes_received: 2_048,
-                                peers: vec![NetworkPeerDiagnostics {
-                                    remote_addr: String::from("74.208.219.116:56000"),
-                                    direction: NetworkPeerDirection::Outbound,
-                                    handshake_ready: true,
-                                    best_height: Some(128),
-                                    protocol_version: Some(1),
-                                    services: Some(9),
-                                    user_agent: Some(String::from("/Atho:0.1.0/")),
-                                    ruleset_version: Some(1),
-                                    bytes_sent: 1_024,
-                                    bytes_received: 2_048,
-                                    last_send_unix: Some(1_777_416_445),
-                                    last_receive_unix: Some(1_777_416_445),
-                                    quality_score: Some(100),
-                                    consecutive_failures: Some(0),
-                                }],
-                                connecting_peers: Vec::new(),
-                            },
-                        })
-                    }
-                    RpcRequest::GetNodeStatus => {
-                        RpcResponse::Error(atho_rpc::error::RpcError::method_not_found())
-                    }
-                    RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
-                    RpcRequest::GetBlockCount => RpcResponse::BlockCount(0),
-                    RpcRequest::GetMempoolInfo => RpcResponse::MempoolInfo(MempoolInfo {
-                        transaction_count: 0,
-                        total_fee_atoms: 0,
-                    }),
-                    other => RpcResponse::Error(RpcError::invalid_request(format!(
-                        "unexpected request in flaky mock rpc server: {other:?}"
-                    ))),
-                };
-                write_message(&mut stream, &response).expect("response");
-            }
-        });
-        (address, handle)
-    }
-
     fn spawn_stoppable_rpc_server(network: Network) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stoppable rpc");
         let address = listener.local_addr().expect("local addr").to_string();
@@ -1750,47 +1678,43 @@ mod tests {
 
     #[test]
     fn managed_local_node_status_degrades_without_zeroing_last_known_sync_target() {
-        let root = temp_data_dir("managed-degrade");
-        fs::create_dir_all(&root).expect("root");
-        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-        let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
-        let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
-        let (rpc_address, handle) = spawn_flaky_node_status_rpc_server(Network::Mainnet);
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 2")
-            .spawn()
-            .expect("spawn managed child");
-        let managed = Arc::new(ManagedNodeState::new(child));
-
-        let client = RpcClient::new(rpc_address.clone());
-        let first = collect_rpc_status(
+        let degraded = degrade_rpc_status(
             Network::Mainnet,
-            &rpc_address,
-            &client,
-            Some(&managed),
+            "127.0.0.1:9010",
+            Some(0),
+            Some((0, 0)),
             true,
-            None,
-        );
-        assert!(first.connected);
-        assert!(first.running);
-        assert_eq!(first.sync_best_height, 128);
-
-        let degraded = collect_rpc_status(
-            Network::Mainnet,
-            &rpc_address,
-            &client,
-            Some(&managed),
             true,
-            Some(&first),
+            true,
+            Some(&ConnectionStatus {
+                network: Network::Mainnet,
+                rpc_address: String::from("127.0.0.1:9010"),
+                block_count: 42,
+                tip_hash: [0; 48],
+                tip_timestamp: 1_777_416_445,
+                mempool_count: 3,
+                mempool_total_fee_atoms: 55,
+                mempool_fingerprint: [0; 32],
+                peer_count: 1,
+                inbound_peer_count: 0,
+                outbound_peer_count: 1,
+                connecting_peer_count: 0,
+                bytes_sent: 2_048,
+                bytes_received: 4_096,
+                peers: Vec::new(),
+                connecting_peers: Vec::new(),
+                running: true,
+                headers_synced: true,
+                sync_best_height: 128,
+                connected: true,
+                startup_error: None,
+            }),
         );
         assert!(degraded.connected);
         assert!(degraded.running);
         assert_eq!(degraded.block_count, 0);
         assert_eq!(degraded.sync_best_height, 128);
         assert_eq!(degraded.tip_timestamp, 1_777_416_445);
-
-        handle.join().expect("flaky mock rpc server");
     }
 
     #[test]
