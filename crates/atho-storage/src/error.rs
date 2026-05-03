@@ -61,6 +61,10 @@ impl StorageError {
                 | StorageError::IncompleteBlockHistory
                 | StorageError::LegacyStorageLayout
                 | StorageError::SchemaVersionMismatch { .. }
+        ) || matches!(
+            self,
+            StorageError::Io(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
         )
     }
 }

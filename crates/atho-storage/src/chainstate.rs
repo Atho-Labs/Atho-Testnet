@@ -1455,6 +1455,34 @@ mod tests {
     }
 
     #[test]
+    fn truncated_raw_block_archive_rebuilds_from_index_on_startup() {
+        let root = temp_workspace("truncated-raw-archive");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let mut state = Chainstate::try_load_or_new(Network::Regnet).expect("state");
+        let block = build_coinbase_successor(&state);
+        let tip_hash = block.header.block_hash();
+        state.connect_block(&block).expect("connect block");
+        drop(state);
+
+        let store = BlockFileStore::open(Network::Regnet).expect("store");
+        let raw_file = store.file_path(0);
+        let original_len = fs::metadata(&raw_file).expect("raw metadata").len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&raw_file)
+            .expect("open raw file")
+            .set_len(original_len.saturating_sub(1))
+            .expect("truncate raw file");
+
+        let recovered = Chainstate::try_load_or_recover(Network::Regnet).expect("recovered");
+        assert_eq!(recovered.height, 1);
+        assert_eq!(recovered.tip_hash, tip_hash);
+        assert_eq!(recovered.blocks().len(), 2);
+        assert!(!crate::path::quarantine_dir().exists());
+    }
+
+    #[test]
     fn legacy_chain_logs_are_quarantined_during_recovery() {
         let root = temp_workspace("legacy-recover");
         fs::create_dir_all(root.join("dev/chain")).expect("chain dir");

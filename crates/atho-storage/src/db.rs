@@ -338,13 +338,18 @@ impl Database {
                     if block.header.block_hash() != record.block_hash
                         || block.header.height != record.height
                     {
-                        return Err(StorageError::CorruptData);
+                        // Fall through to the indexed archive below. LMDB metadata
+                        // remains authoritative when a raw flat-file record is stale
+                        // or damaged.
+                    } else {
+                        block.fees_total_atoms = record.fees_total_atoms;
+                        block.fees_miner_atoms = record.fees_miner_atoms;
+                        return Ok(Some(block));
                     }
-                    block.fees_total_atoms = record.fees_total_atoms;
-                    block.fees_miner_atoms = record.fees_miner_atoms;
-                    return Ok(Some(block));
                 }
-                Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(StorageError::Io(err))
+                    if Self::can_rebuild_from_index_after_raw_read_error(&err) => {}
+                Err(StorageError::CorruptData | StorageError::CrossNetworkReplay) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -403,6 +408,13 @@ impl Database {
             records.push(tx);
         }
         Ok(records)
+    }
+
+    fn can_rebuild_from_index_after_raw_read_error(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+        )
     }
 
     /// Returns every archived block metadata record.
@@ -1141,6 +1153,7 @@ mod tests {
     use atho_core::transaction::{Transaction, TxInput, TxOutput};
     use std::ffi::OsString;
     use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1305,5 +1318,43 @@ mod tests {
             .block_storage_path()
             .join(format!("blk{:05}.dat", second_record.file_number))
             .exists());
+    }
+
+    #[test]
+    fn load_block_rebuilds_when_raw_archive_has_wrong_network_magic() {
+        let root = temp_data_dir("raw-cross-network");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+        let block = sample_block(Network::Regnet, 0, [0; 48]);
+        let block_hash = block.header.block_hash();
+        database.append_block(0, &block).expect("append block");
+        let record = database
+            .load_block_record(block_hash)
+            .expect("load record")
+            .expect("record");
+        let location = record.file_location();
+        let raw_path = database
+            .block_storage_path()
+            .join(format!("blk{:05}.dat", location.file_number));
+        let mut raw_file = fs::OpenOptions::new()
+            .write(true)
+            .open(raw_path)
+            .expect("open raw block file");
+        raw_file
+            .seek(SeekFrom::Start(location.record_offset))
+            .expect("seek raw wrapper");
+        raw_file
+            .write_all(&Network::Mainnet.p2p_magic())
+            .expect("write wrong magic");
+        raw_file.flush().expect("flush raw corruption");
+
+        let recovered = database
+            .load_block(block_hash)
+            .expect("load block from indexed metadata")
+            .expect("block");
+
+        assert_eq!(recovered.header.block_hash(), block_hash);
+        assert_eq!(recovered.header.network_id, Network::Regnet);
+        assert_eq!(recovered.transactions, block.transactions);
     }
 }
