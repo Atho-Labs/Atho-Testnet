@@ -16,6 +16,14 @@ target/
 .DS_Store
 Thumbs.db
 
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Git metadata backups created while repairing downloaded archives
+.git.empty-backup-*/
+
 # Miscellaneous
 tmp/
 **/tmp/
