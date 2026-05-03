@@ -23,10 +23,11 @@ use atho_node::validation::{
 };
 use atho_rpc::command::CommandResponse;
 use atho_rpc::command::{command_definition, help_payload, parse_command_line, search_commands};
+use atho_rpc::error::RpcError;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
-    MempoolSpentInput, RpcResponse, WalletActivityEntry as RpcWalletActivityEntry,
-    WalletActivityKind as RpcWalletActivityKind,
+    BlockTemplate, MempoolSpentInput, NodeStatus, RpcResponse,
+    WalletActivityEntry as RpcWalletActivityEntry, WalletActivityKind as RpcWalletActivityKind,
 };
 use atho_rpc::transport::RpcClient;
 use atho_storage::utxo::UtxoEntry;
@@ -57,10 +58,10 @@ mod wallet_ledger;
 mod widgets;
 pub(crate) use models::{
     AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode, DebugWindowTab,
-    ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, NavTab,
-    NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab, ReceiveRequestRecord,
-    SendJob, SendOutcome, SyncProgressSample, WalletActivityKind, WalletActivityRow,
-    WalletBalanceSummary, WalletManagementForm,
+    ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, MiningStaleTemplate,
+    NavTab, NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab,
+    ReceiveRequestRecord, SendJob, SendOutcome, SyncProgressSample, WalletActivityKind,
+    WalletActivityRow, WalletBalanceSummary, WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
@@ -68,6 +69,8 @@ const WALLET_DISCOVERY_SCAN_STEPS: &[usize] = &[32, 128, 256, 512, 1_000];
 const MIN_WALLET_DISCOVERY_SCAN_LIMIT: usize = 32;
 const MAX_WALLET_DISCOVERY_SCAN_LIMIT: usize = 20_000;
 const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
+const MINING_TEMPLATE_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+const MINING_TEMPLATE_WATCH_SLEEP_SLICE: Duration = Duration::from_millis(50);
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
@@ -1562,6 +1565,38 @@ impl DesktopApp {
                     self.start_mining_job();
                 }
             }
+            Ok(MiningJobResult::StaleTemplate(stale)) => {
+                let current_height = stale
+                    .current_height
+                    .map(|height| height.to_string())
+                    .unwrap_or_else(|| String::from("unknown"));
+                self.mining_status = format!(
+                    "Mining template for height {} went stale; refreshing from height {}",
+                    stale.height, current_height
+                );
+                self.last_error = None;
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "mining template stale height={} prev={} current_height={} current_tip={} solved_hash={}",
+                        stale.height,
+                        hex::encode(stale.previous_block_hash),
+                        current_height,
+                        stale
+                            .current_tip_hash
+                            .map(hex::encode)
+                            .unwrap_or_else(|| String::from("unknown")),
+                        stale
+                            .solved_block_hash
+                            .map(hex::encode)
+                            .unwrap_or_else(|| String::from("none")),
+                    ),
+                );
+                self.pending_mining_restart = None;
+                if !job.stop_requested.load(Ordering::Acquire) {
+                    self.start_mining_job();
+                }
+            }
             Ok(MiningJobResult::Cancelled) => {
                 let _ = atho_node::dev::append_log("atho-qt", "mining worker cancelled");
                 self.last_error = None;
@@ -1678,8 +1713,10 @@ impl DesktopApp {
         let connection = self.connection.clone();
         let reward_script = self.mining_reward_script();
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let mining_stop_requested = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let stop_for_thread = Arc::clone(&stop_requested);
+        let mining_stop_for_thread = Arc::clone(&mining_stop_requested);
         self.mining_status = format!(
             "Starting generation with {} thread(s) [{}]",
             cores, requested_backend
@@ -1704,6 +1741,7 @@ impl DesktopApp {
                 mining_backend,
                 reward_script,
                 stop_for_thread,
+                mining_stop_for_thread,
             );
             let _ = sender.send(result);
         });
@@ -1711,6 +1749,7 @@ impl DesktopApp {
         self.mining_job = Some(MiningJob {
             started_at: Instant::now(),
             stop_requested,
+            mining_stop_requested,
             receiver,
         });
     }
@@ -1765,6 +1804,7 @@ impl DesktopApp {
         self.last_error = None;
         if let Some(job) = &self.mining_job {
             job.stop_requested.store(true, Ordering::Release);
+            job.mining_stop_requested.store(true, Ordering::Release);
             self.mining_status = String::from("Stopping miner");
             let _ = atho_node::dev::append_log("atho-qt", "stop miner requested");
         } else {
@@ -1782,6 +1822,7 @@ impl DesktopApp {
             self.pending_mining_restart = Some(cores);
             if let Some(job) = &self.mining_job {
                 job.stop_requested.store(true, Ordering::Release);
+                job.mining_stop_requested.store(true, Ordering::Release);
             }
             self.mining_status = format!(
                 "Restarting miner with {} thread(s) [{}]",
@@ -3792,14 +3833,141 @@ fn available_mining_cores() -> u32 {
         .max(1)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MiningTemplateTip {
+    height: u64,
+    previous_block_hash: [u8; 48],
+}
+
+impl From<&BlockTemplate> for MiningTemplateTip {
+    fn from(template: &BlockTemplate) -> Self {
+        Self {
+            height: template.height,
+            previous_block_hash: template.previous_block_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MiningTemplateStaleStatus {
+    current_height: u64,
+    current_tip_hash: [u8; 48],
+}
+
+fn mining_template_stale_status_for_node(
+    tip: MiningTemplateTip,
+    status: &NodeStatus,
+) -> Option<MiningTemplateStaleStatus> {
+    if status.block_count.saturating_add(1) != tip.height
+        || status.tip_hash != tip.previous_block_hash
+    {
+        Some(MiningTemplateStaleStatus {
+            current_height: status.block_count,
+            current_tip_hash: status.tip_hash,
+        })
+    } else {
+        None
+    }
+}
+
+fn mining_template_stale_status(
+    connection: &ReadOnlyNodeConnection,
+    tip: MiningTemplateTip,
+) -> Option<MiningTemplateStaleStatus> {
+    match connection.request(RpcRequest::GetNodeStatus) {
+        RpcResponse::NodeStatus(status) => mining_template_stale_status_for_node(tip, &status),
+        _ => None,
+    }
+}
+
+fn stale_mining_template_result(
+    tip: MiningTemplateTip,
+    status: Option<MiningTemplateStaleStatus>,
+    solved_block_hash: Option<[u8; 48]>,
+) -> MiningJobResult {
+    MiningJobResult::StaleTemplate(MiningStaleTemplate {
+        height: tip.height,
+        previous_block_hash: tip.previous_block_hash,
+        current_height: status.map(|status| status.current_height),
+        current_tip_hash: status.map(|status| status.current_tip_hash),
+        solved_block_hash,
+    })
+}
+
+fn is_invalid_block_height_error(error: &RpcError) -> bool {
+    error.code == atho_errors::BLK_INVALID_HEIGHT.code.as_str()
+}
+
+fn mined_block_submit_error_result(
+    connection: &ReadOnlyNodeConnection,
+    tip: MiningTemplateTip,
+    block_hash: [u8; 48],
+    error: RpcError,
+) -> MiningJobResult {
+    if is_invalid_block_height_error(&error) {
+        let stale_status = mining_template_stale_status(connection, tip);
+        if stale_status.is_some() {
+            return stale_mining_template_result(tip, stale_status, Some(block_hash));
+        }
+    }
+    MiningJobResult::Failed(error.to_string())
+}
+
+fn spawn_mining_template_watcher(
+    connection: ReadOnlyNodeConnection,
+    tip: MiningTemplateTip,
+    user_stop_requested: Arc<AtomicBool>,
+    mining_stop_requested: Arc<AtomicBool>,
+    stale_detected: Arc<AtomicBool>,
+    watcher_finished: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !watcher_finished.load(Ordering::Acquire) {
+            if user_stop_requested.load(Ordering::Acquire) {
+                mining_stop_requested.store(true, Ordering::Release);
+                return;
+            }
+
+            if let Some(status) = mining_template_stale_status(&connection, tip) {
+                stale_detected.store(true, Ordering::Release);
+                mining_stop_requested.store(true, Ordering::Release);
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!(
+                        "mining template stale height={} prev={} current_height={} current_tip={}",
+                        tip.height,
+                        hex::encode(tip.previous_block_hash),
+                        status.current_height,
+                        hex::encode(status.current_tip_hash),
+                    ),
+                );
+                return;
+            }
+
+            let sleep_started = Instant::now();
+            while sleep_started.elapsed() < MINING_TEMPLATE_WATCH_INTERVAL {
+                if watcher_finished.load(Ordering::Acquire) {
+                    return;
+                }
+                if user_stop_requested.load(Ordering::Acquire) {
+                    mining_stop_requested.store(true, Ordering::Release);
+                    return;
+                }
+                thread::sleep(MINING_TEMPLATE_WATCH_SLEEP_SLICE);
+            }
+        }
+    })
+}
+
 fn mine_via_connection(
     connection: crate::connection::ReadOnlyNodeConnection,
     cores: u32,
     backend: MiningBackendKind,
     reward_script: Option<Vec<u8>>,
     stop_requested: Arc<AtomicBool>,
+    mining_stop_requested: Arc<AtomicBool>,
 ) -> MiningJobResult {
-    if stop_requested.load(Ordering::Acquire) {
+    if stop_requested.load(Ordering::Acquire) || mining_stop_requested.load(Ordering::Acquire) {
         return MiningJobResult::Cancelled;
     }
     let _ = atho_node::dev::append_log("atho-qt", "requesting block template");
@@ -3808,6 +3976,7 @@ fn mine_via_connection(
         RpcResponse::Error(err) => return MiningJobResult::Failed(err.to_string()),
         other => return MiningJobResult::Failed(format!("unexpected rpc response: {other:?}")),
     };
+    let template_tip = MiningTemplateTip::from(&template);
     let block = if let Some(reward_script) = reward_script.as_deref() {
         rewrite_reward_script(&template.block, reward_script)
     } else {
@@ -3826,17 +3995,48 @@ fn mine_via_connection(
             reward_script.is_some()
         ),
     );
-    let mined_template = atho_rpc::response::BlockTemplate {
+    let mined_template = BlockTemplate {
         block,
         ..template.clone()
     };
-    let report = match controller.mine_block_reported(mined_template, stop_requested) {
+    let stale_detected = Arc::new(AtomicBool::new(false));
+    let watcher_finished = Arc::new(AtomicBool::new(false));
+    let watcher = spawn_mining_template_watcher(
+        connection.clone(),
+        template_tip,
+        Arc::clone(&stop_requested),
+        Arc::clone(&mining_stop_requested),
+        Arc::clone(&stale_detected),
+        Arc::clone(&watcher_finished),
+    );
+
+    let mining_result =
+        controller.mine_block_reported(mined_template, Arc::clone(&mining_stop_requested));
+    watcher_finished.store(true, Ordering::Release);
+    if watcher.join().is_err() {
+        let _ = atho_node::dev::append_log("atho-qt", "mining template watcher panicked");
+    }
+
+    let report = match mining_result {
         Ok(report) => report,
         Err(atho_node::mining_backend::MiningBackendError::Cancelled) => {
+            if stop_requested.load(Ordering::Acquire) {
+                return MiningJobResult::Cancelled;
+            }
+            if stale_detected.load(Ordering::Acquire) {
+                return stale_mining_template_result(
+                    template_tip,
+                    mining_template_stale_status(&connection, template_tip),
+                    None,
+                );
+            }
             return MiningJobResult::Cancelled;
         }
         Err(err) => return MiningJobResult::Failed(err.to_string()),
     };
+    if stop_requested.load(Ordering::Acquire) {
+        return MiningJobResult::Cancelled;
+    }
     let accelerator_label = report
         .accelerator
         .as_ref()
@@ -3845,6 +4045,10 @@ fn mine_via_connection(
     let block_hash = block.header.block_hash();
     let backend_used = report.backend_used.label().to_string();
     let fallback_reason = report.fallback_reason.clone();
+    let stale_status = mining_template_stale_status(&connection, template_tip);
+    if stale_status.is_some() || stale_detected.load(Ordering::Acquire) {
+        return stale_mining_template_result(template_tip, stale_status, Some(block_hash));
+    }
     match connection.request(RpcRequest::SubmitBlock(block)) {
         RpcResponse::BlockSubmitted { accepted: true, .. } => {
             MiningJobResult::Completed(MiningOutcome {
@@ -3872,7 +4076,9 @@ fn mine_via_connection(
             accelerator_label,
             fallback_reason,
         }),
-        RpcResponse::Error(err) => MiningJobResult::Failed(err.to_string()),
+        RpcResponse::Error(err) => {
+            mined_block_submit_error_result(&connection, template_tip, block_hash, err)
+        }
         other => MiningJobResult::Failed(format!("unexpected rpc response: {other:?}")),
     }
 }
@@ -4970,6 +5176,60 @@ mod tests {
             "unexpected mining status: {}",
             app.mining_status
         );
+    }
+
+    #[test]
+    fn stale_mined_block_submit_refreshes_template_instead_of_failing() {
+        let root = temp_sandbox_root("stale-mined-block");
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("data");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
+
+        let connection = ReadOnlyNodeConnection::new(Network::Regnet);
+        assert!(connection.status().running);
+        assert_eq!(connection.status().block_count, 0);
+
+        let template = match connection.request(RpcRequest::GetBlockTemplate) {
+            RpcResponse::BlockTemplate(template) => template,
+            other => panic!("expected block template, got {other:?}"),
+        };
+        let template_tip = MiningTemplateTip::from(&template);
+        let node_status = match connection.request(RpcRequest::GetNodeStatus) {
+            RpcResponse::NodeStatus(status) => status,
+            other => panic!("expected node status, got {other:?}"),
+        };
+        assert!(mining_template_stale_status_for_node(template_tip, &node_status).is_none());
+
+        let stale_block = Miner::new(1).solve_block(template.block);
+        let stale_block_hash = stale_block.header.block_hash();
+        let _competing_hash = mine_local_block(&connection);
+
+        let node_status = match connection.request(RpcRequest::GetNodeStatus) {
+            RpcResponse::NodeStatus(status) => status,
+            other => panic!("expected node status, got {other:?}"),
+        };
+        let stale_status = mining_template_stale_status_for_node(template_tip, &node_status)
+            .expect("template should be stale after a competing block advances the tip");
+        assert_eq!(stale_status.current_height, 1);
+
+        let response = connection.request(RpcRequest::SubmitBlock(stale_block));
+        let error = match response {
+            RpcResponse::Error(error) => error,
+            other => panic!("expected stale block-height error, got {other:?}"),
+        };
+        assert!(is_invalid_block_height_error(&error));
+
+        match mined_block_submit_error_result(&connection, template_tip, stale_block_hash, error) {
+            MiningJobResult::StaleTemplate(stale) => {
+                assert_eq!(stale.height, template_tip.height);
+                assert_eq!(stale.previous_block_hash, template_tip.previous_block_hash);
+                assert_eq!(stale.current_height, Some(1));
+                assert_eq!(stale.solved_block_hash, Some(stale_block_hash));
+            }
+            other => panic!("expected stale-template retry, got {other:?}"),
+        }
     }
 
     #[test]

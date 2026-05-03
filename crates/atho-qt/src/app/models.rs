@@ -342,8 +342,18 @@ pub(crate) struct MiningOutcome {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct MiningStaleTemplate {
+    pub(crate) height: u64,
+    pub(crate) previous_block_hash: [u8; 48],
+    pub(crate) current_height: Option<u64>,
+    pub(crate) current_tip_hash: Option<[u8; 48]>,
+    pub(crate) solved_block_hash: Option<[u8; 48]>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum MiningJobResult {
     Completed(MiningOutcome),
+    StaleTemplate(MiningStaleTemplate),
     Cancelled,
     Failed(String),
 }
@@ -352,6 +362,7 @@ pub(crate) enum MiningJobResult {
 pub(crate) struct MiningJob {
     pub(crate) started_at: Instant,
     pub(crate) stop_requested: Arc<AtomicBool>,
+    pub(crate) mining_stop_requested: Arc<AtomicBool>,
     pub(crate) receiver: mpsc::Receiver<MiningJobResult>,
 }
 
