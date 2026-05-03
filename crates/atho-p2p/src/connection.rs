@@ -3,7 +3,9 @@ use crate::address_manager::{format_remote_addr, AddressManager};
 use crate::banlist::BanList;
 use crate::config::network_params;
 use crate::handshake::{HandshakeAction, HandshakeState};
-use crate::protocol::{MessagePayload, NetworkMessage, PeerAddress, ProtocolError, VersionMessage};
+use crate::protocol::{
+    Hash48, MessagePayload, NetworkMessage, PeerAddress, ProtocolError, VersionMessage,
+};
 use atho_core::network::Network;
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, P2P_BANNED_PEER, P2P_INBOUND_LIMIT, P2P_OUTBOUND_LIMIT,
@@ -277,6 +279,12 @@ impl ConnectionManager {
                 .remote_version()
                 .map(|version| version.best_height)
         })
+    }
+
+    pub fn note_peer_tip(&mut self, remote_addr: &str, height: u64, tip_hash: Hash48) {
+        if let Some(session) = self.sessions.get_mut(remote_addr) {
+            session.handshake.note_remote_tip(height, tip_hash);
+        }
     }
 
     pub fn direction(&self, remote_addr: &str) -> Option<ConnectionDirection> {

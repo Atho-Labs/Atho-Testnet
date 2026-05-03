@@ -1,6 +1,7 @@
 //! Block and header download coordination primitives.
 use crate::protocol::{Hash48, InventoryKind, InventoryVector};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadAssignment {
@@ -14,6 +15,7 @@ pub struct BlockDownloadScheduler {
     pending: VecDeque<Hash48>,
     inflight_by_peer: BTreeMap<String, BTreeSet<Hash48>>,
     inflight_owner: BTreeMap<Hash48, String>,
+    inflight_started: BTreeMap<Hash48, Instant>,
     peer_hints: BTreeMap<Hash48, BTreeSet<String>>,
     completed: BTreeSet<Hash48>,
 }
@@ -30,6 +32,7 @@ impl BlockDownloadScheduler {
         if let Some(inflight) = self.inflight_by_peer.remove(peer) {
             for hash in inflight {
                 self.inflight_owner.remove(&hash);
+                self.inflight_started.remove(&hash);
                 if !self.pending.contains(&hash) && !self.completed.contains(&hash) {
                     self.pending.push_back(hash);
                 }
@@ -75,6 +78,7 @@ impl BlockDownloadScheduler {
                 inflight.remove(&hash);
             }
         }
+        self.inflight_started.remove(&hash);
     }
 
     pub fn note_not_found(&mut self, peer: &str, hashes: &[[u8; 48]]) {
@@ -85,6 +89,7 @@ impl BlockDownloadScheduler {
                 }
             }
             self.inflight_owner.remove(&hash);
+            self.inflight_started.remove(&hash);
             if let Some(inflight) = self.inflight_by_peer.get_mut(peer) {
                 inflight.remove(&hash);
             }
@@ -142,6 +147,7 @@ impl BlockDownloadScheduler {
                 .or_default()
                 .insert(hash);
             self.inflight_owner.insert(hash, peer.clone());
+            self.inflight_started.insert(hash, Instant::now());
             staged.entry(peer).or_default().push(InventoryVector {
                 kind: InventoryKind::Block,
                 hash,
@@ -185,6 +191,108 @@ impl BlockDownloadScheduler {
             })
             .min_by_key(|(inflight, rotation, _)| (*inflight, *rotation))
             .map(|(_, _, peer)| peer.clone())
+    }
+
+    pub fn assignment_for_peer(
+        &mut self,
+        peer: &str,
+        max_blocks_in_flight: usize,
+        max_requests_per_peer: usize,
+    ) -> Option<DownloadAssignment> {
+        if !self.ready_peers.contains(peer)
+            || self.pending.is_empty()
+            || max_blocks_in_flight == 0
+            || max_requests_per_peer == 0
+        {
+            return None;
+        }
+
+        let mut total_inflight = self
+            .inflight_by_peer
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        if total_inflight >= max_blocks_in_flight {
+            return None;
+        }
+        let peer_inflight = self
+            .inflight_by_peer
+            .get(peer)
+            .map(BTreeSet::len)
+            .unwrap_or(0);
+        let peer_capacity = max_requests_per_peer.saturating_sub(peer_inflight);
+        if peer_capacity == 0 {
+            return None;
+        }
+
+        let mut inventory = Vec::new();
+        let mut skipped = Vec::new();
+        let scan_limit = self.pending.len();
+        for _ in 0..scan_limit {
+            if total_inflight >= max_blocks_in_flight || inventory.len() >= peer_capacity {
+                break;
+            }
+            let Some(hash) = self.pending.pop_front() else {
+                break;
+            };
+            let hinted_to_peer = self
+                .peer_hints
+                .get(&hash)
+                .is_none_or(|hints| hints.contains(peer));
+            if !hinted_to_peer {
+                skipped.push(hash);
+                continue;
+            }
+
+            self.inflight_by_peer
+                .entry(peer.to_string())
+                .or_default()
+                .insert(hash);
+            self.inflight_owner.insert(hash, peer.to_string());
+            self.inflight_started.insert(hash, Instant::now());
+            inventory.push(InventoryVector {
+                kind: InventoryKind::Block,
+                hash,
+            });
+            total_inflight = total_inflight.saturating_add(1);
+        }
+        for hash in skipped.into_iter().rev() {
+            self.pending.push_front(hash);
+        }
+
+        (!inventory.is_empty()).then_some(DownloadAssignment {
+            peer: peer.to_string(),
+            inventory,
+        })
+    }
+
+    pub fn requeue_stale_inflight(&mut self, timeout: Duration) -> usize {
+        let now = Instant::now();
+        let stale = self
+            .inflight_started
+            .iter()
+            .filter_map(|(hash, started)| {
+                (now.duration_since(*started) >= timeout).then_some(*hash)
+            })
+            .collect::<Vec<_>>();
+        let mut requeued = 0usize;
+        for hash in stale {
+            self.inflight_started.remove(&hash);
+            if let Some(owner) = self.inflight_owner.remove(&hash) {
+                if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
+                    inflight.remove(&hash);
+                }
+            }
+            if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
+                self.pending.push_back(hash);
+                requeued = requeued.saturating_add(1);
+            }
+        }
+        requeued
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.inflight_owner.is_empty()
     }
 }
 
@@ -240,5 +348,24 @@ mod tests {
                 .sum::<usize>(),
             4
         );
+    }
+
+    #[test]
+    fn stale_inflight_requests_are_requeued_for_retry() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_headers("left", [[7; 48]]);
+
+        let first = scheduler.assignments(1, 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].inventory[0].hash, Hash48::from([7; 48]));
+        assert!(scheduler.assignments(1, 1).is_empty());
+
+        assert_eq!(scheduler.requeue_stale_inflight(Duration::ZERO), 1);
+        let retry = scheduler
+            .assignment_for_peer("left", 1, 1)
+            .expect("retry assignment");
+        assert_eq!(retry.peer, "left");
+        assert_eq!(retry.inventory[0].hash, Hash48::from([7; 48]));
     }
 }

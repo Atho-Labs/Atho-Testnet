@@ -5,7 +5,7 @@
 //! compatibility.
 //!
 //! P2P SECURITY: Peers that fail this handshake never reach relay or sync code.
-use crate::protocol::{MessagePayload, NetworkMessage, ProtocolError, VersionMessage};
+use crate::protocol::{Hash48, MessagePayload, NetworkMessage, ProtocolError, VersionMessage};
 use atho_core::network::Network;
 
 /// Direction of the in-progress handshake.
@@ -73,6 +73,16 @@ impl HandshakeState {
     /// Returns the remote peer's validated version message, if one was seen.
     pub fn remote_version(&self) -> Option<&VersionMessage> {
         self.remote_version.as_ref()
+    }
+
+    /// Promotes the remembered remote tip after post-handshake observations.
+    pub fn note_remote_tip(&mut self, height: u64, tip_hash: Hash48) {
+        if let Some(version) = self.remote_version.as_mut() {
+            if height >= version.best_height {
+                version.best_height = height;
+                version.tip_hash = tip_hash;
+            }
+        }
     }
 
     /// Returns `true` once the handshake is fully complete.

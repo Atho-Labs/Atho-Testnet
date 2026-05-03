@@ -5,7 +5,7 @@ use crate::protocol::{
     GetHeadersMessage, Hash48, InventoryKind, InventoryVector, MessagePayload, NetworkMessage,
     PeerAddress, ProtocolError, VersionMessage, LOCAL_NODE_SERVICES,
 };
-use crate::sync::SyncState;
+use crate::sync::{block_locator, SyncState};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::{pow, rules};
 use atho_core::genesis;
@@ -103,6 +103,12 @@ impl RelayLoop {
         NetworkMessage::new(self.network, MessagePayload::GetHeaders(message))
     }
 
+    pub fn reseed_locator_from_local_tip(&mut self, blocks: &[Block]) {
+        self.sync.locator_hashes = block_locator(blocks);
+        self.sync.inflight_headers_peer = None;
+        self.sync.requested_locator_hashes.clear();
+    }
+
     pub fn accept_headers(&mut self, headers: &[BlockHeader]) -> Result<(), ProtocolError> {
         self.sync.accept_headers(self.network, headers)
     }
@@ -126,6 +132,30 @@ impl RelayLoop {
         if local_best_height >= self.sync.best_height {
             self.sync.headers_synced = true;
             self.sync.inflight_headers_peer = None;
+        }
+    }
+
+    pub fn note_observed_tip(
+        &mut self,
+        blocks: &[Block],
+        observed_height: u64,
+        observed_tip: [u8; 48],
+    ) {
+        let local_best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
+        let advanced_target = observed_height > self.sync.best_height;
+        if observed_height >= self.sync.best_height {
+            self.sync.best_height = observed_height;
+            self.sync.best_tip = Some(Hash48::from(observed_tip));
+        }
+        self.sync.best_height = self.sync.best_height.max(local_best_height);
+        if local_best_height >= self.sync.best_height {
+            self.sync.headers_synced = true;
+            self.sync.inflight_headers_peer = None;
+            self.sync.best_tip = blocks
+                .last()
+                .map(|block| Hash48::from(block.header.block_hash()));
+        } else if advanced_target {
+            self.sync.headers_synced = false;
         }
     }
 
@@ -305,5 +335,18 @@ mod tests {
             relay.sync.locator_hashes.first().copied(),
             Some(Hash48::from(local_blocks[0].header.block_hash()))
         );
+    }
+
+    #[test]
+    fn observed_future_tip_advances_target_without_claiming_header_sync() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+        relay.prime(&local_blocks);
+
+        relay.note_observed_tip(&local_blocks, 7, [7; 48]);
+
+        assert_eq!(relay.sync.best_height, 7);
+        assert_eq!(relay.sync.best_tip, Some(Hash48::from([7; 48])));
+        assert!(!relay.sync.headers_synced);
     }
 }

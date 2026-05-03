@@ -30,6 +30,7 @@ const OUTBOUND_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(32);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
 
@@ -616,6 +617,7 @@ fn spawn_peer_thread(
                 Duration::from_millis(network_params(peer_network).limits.handshake_timeout_ms);
             let handshake_started = SystemTime::now();
             let mut handshake_ready = false;
+            let mut last_sync_maintenance = SystemTime::now();
 
             loop {
                 if stop_requested.load(Ordering::Acquire) {
@@ -678,6 +680,37 @@ fn spawn_peer_thread(
                                     last_activity = SystemTime::now();
                                 }
                             }
+                        }
+                        if handshake_ready
+                            && last_sync_maintenance.elapsed().unwrap_or_default()
+                                >= SYNC_MAINTENANCE_INTERVAL
+                        {
+                            let events = {
+                                let mut state = state.lock().expect("p2p runtime state poisoned");
+                                match state.p2p_maintain_peer_sync(&peer_id) {
+                                    Ok(events) => events,
+                                    Err(err) => {
+                                        return format!(
+                                            "sync maintenance failed peer={peer_id} error={err}"
+                                        );
+                                    }
+                                }
+                            };
+                            let bytes_sent = match flush_send_events(&mut stream, &peer_id, events)
+                            {
+                                Ok(bytes_sent) => bytes_sent,
+                                Err(err) => {
+                                    return format!(
+                                        "sync maintenance send failed peer={peer_id} error={err}"
+                                    );
+                                }
+                            };
+                            if bytes_sent > 0 {
+                                let mut state = state.lock().expect("p2p runtime state poisoned");
+                                state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                                last_activity = SystemTime::now();
+                            }
+                            last_sync_maintenance = SystemTime::now();
                         }
                         if handshake_ready
                             && last_activity.elapsed().unwrap_or_default() >= KEEPALIVE_INTERVAL

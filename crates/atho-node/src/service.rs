@@ -768,6 +768,19 @@ impl NodeService {
         Ok(result)
     }
 
+    pub fn p2p_maintain_peer_sync(
+        &mut self,
+        remote_addr: &str,
+    ) -> Result<Vec<ConnectionEvent>, NodeError> {
+        let events = self
+            .orchestrator
+            .sync
+            .maintain_peer_sync(remote_addr, &self.orchestrator.runtime.node)
+            .map_err(sync_error_into_node)?;
+        self.refresh_runtime_views();
+        Ok(events)
+    }
+
     pub fn p2p_disconnect_peer(&mut self, remote_addr: &str, reason: String) -> Option<SyncNotice> {
         let notice = self.orchestrator.sync.disconnect_peer(
             remote_addr,
