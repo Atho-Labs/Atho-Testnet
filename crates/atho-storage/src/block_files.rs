@@ -64,6 +64,20 @@ impl BlockFileStore {
     }
 
     pub fn append_block(&self, block: &Block) -> Result<BlockFileLocation, StorageError> {
+        self.append_block_with_minimum_file_number(block, None)
+    }
+
+    pub fn append_block_with_minimum_file_number(
+        &self,
+        block: &Block,
+        minimum_file_number: Option<u64>,
+    ) -> Result<BlockFileLocation, StorageError> {
+        // Recreate the archive path on every append. A running node can keep
+        // LMDB handles alive even after an operator deletes the network root,
+        // but raw block persistence must not fail just because the archive
+        // directory vanished from the filesystem namespace.
+        fs::create_dir_all(&self.root)?;
+
         let payload = block.canonical_bytes();
         let payload_length = u32::try_from(payload.len()).map_err(|_| StorageError::CorruptData)?;
         if payload_length == 0 || payload.len() > MAX_BLOCK_SERIALIZED_BYTES {
@@ -72,7 +86,11 @@ impl BlockFileStore {
 
         let record_length = BLOCK_FILE_RECORD_OVERHEAD_BYTES + payload.len() as u64;
         let rotation_bytes = rotation_bytes();
-        let mut file_number = self.highest_file_number()?.unwrap_or(0);
+        let minimum_file_number = minimum_file_number.unwrap_or(0);
+        let mut file_number = self
+            .highest_file_number()?
+            .unwrap_or(minimum_file_number)
+            .max(minimum_file_number);
         let mut record_offset = match self.file_path(file_number).metadata() {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
@@ -414,6 +432,29 @@ mod tests {
         assert_eq!(path.metadata().expect("metadata").len(), original_len);
         let loaded = repaired.read_block(location).expect("read block");
         assert_eq!(loaded.header.block_hash(), block.header.block_hash());
+    }
+
+    #[test]
+    fn append_recreates_missing_archive_dir_after_external_deletion() {
+        let root = temp_root("recreate-archive-dir");
+        let _guard = EnvVarGuard::set_path(path::ATHO_DATA_DIR_ENV, &root);
+        let store = BlockFileStore::open(Network::Regnet).expect("open store");
+        let first = sample_block(Network::Regnet, 1, [0; 48]);
+        store.append_block(&first).expect("append first block");
+
+        fs::remove_dir_all(store.root()).expect("remove archive dir");
+        assert!(!store.root().exists());
+
+        let second = sample_block(Network::Regnet, 2, first.header.block_hash());
+        let location = store
+            .append_block_with_minimum_file_number(&second, Some(1))
+            .expect("append after directory recreation");
+        assert!(store.root().exists());
+        assert_eq!(location.file_number, 1);
+
+        let loaded = store.read_block(location).expect("read recreated block");
+        assert_eq!(loaded.header, second.header);
+        assert_eq!(loaded.transactions, second.transactions);
     }
 
     #[test]

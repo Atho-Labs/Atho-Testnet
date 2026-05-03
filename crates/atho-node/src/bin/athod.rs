@@ -325,6 +325,16 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
     let data_dir = runtime
         .data_dir
         .ok_or_else(|| "wipe requires --data-dir PATH".to_string())?;
+    let rpc_address = runtime
+        .rpc_addr
+        .unwrap_or_else(|| atho_node::runtime::default_rpc_bind_address(network));
+    if local_rpc_endpoint_matches_network(network, &rpc_address)? {
+        return Err(format!(
+            "refusing to wipe {} while a live local node is still serving {} on rpc={rpc_address}; stop the node first",
+            data_dir,
+            network.id()
+        ));
+    }
     let root = std::path::PathBuf::from(data_dir);
     if runtime.include_wallets {
         atho_node::dev::wipe_root_including_wallets(&root).map_err(|err| err.to_string())?;
@@ -333,6 +343,49 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
     }
     println!("wiped {}", root.display());
     Ok(())
+}
+
+fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Result<bool, String> {
+    let client = RpcClient::new(rpc_address.to_string());
+    match client.call(&RpcRequest::GetNodeStatus) {
+        Ok(RpcResponse::NodeStatus(status)) => {
+            if status.network == network {
+                return Ok(true);
+            }
+            return Err(format!(
+                "rpc address {rpc_address} is serving {}; expected {}",
+                status.network.id(),
+                network.id()
+            ));
+        }
+        Ok(RpcResponse::Error(err)) => {
+            return Err(format!(
+                "rpc address {rpc_address} refused wipe preflight for {}: {err}",
+                network.id()
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => {}
+    }
+
+    match client.call(&RpcRequest::GetNetwork) {
+        Ok(RpcResponse::Network(label)) => {
+            if label == network.id() {
+                Ok(true)
+            } else {
+                Err(format!(
+                    "rpc address {rpc_address} is serving {label}; expected {}",
+                    network.id()
+                ))
+            }
+        }
+        Ok(RpcResponse::Error(err)) => Err(format!(
+            "rpc address {rpc_address} refused wipe preflight for {}: {err}",
+            network.id()
+        )),
+        Ok(_) => Ok(false),
+        Err(_) => Ok(false),
+    }
 }
 
 fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
@@ -472,6 +525,10 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_rpc::transport::{read_message, write_message};
+    use std::io::BufReader;
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn runtime_cli_parses_operator_flags() {
@@ -539,5 +596,26 @@ mod tests {
         let args = vec![String::from("--network"), String::from("prune-test")];
         let parsed = parse_runtime_cli(&args).expect("parse");
         assert_eq!(parsed.network, Some(Network::Prunetest));
+    }
+
+    #[test]
+    fn wipe_preflight_detects_live_same_network_rpc_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let rpc_address = listener.local_addr().expect("local addr").to_string();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let _request = read_message::<_, RpcRequest>(&mut reader).expect("read request");
+                write_message(
+                    &mut stream,
+                    &RpcResponse::Network(Network::Testnet.id().to_string()),
+                )
+                .expect("write response");
+            }
+        });
+
+        assert!(local_rpc_endpoint_matches_network(Network::Testnet, &rpc_address).expect("probe"));
+        server.join().expect("join server");
     }
 }

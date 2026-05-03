@@ -447,7 +447,10 @@ impl Database {
         if self.load_block_record(block.header.block_hash())?.is_some() {
             return Ok(());
         }
-        let location = self.block_store.append_block(block)?;
+        let archive_hint = self.archive_append_file_hint()?;
+        let location = self
+            .block_store
+            .append_block_with_minimum_file_number(block, archive_hint)?;
         self.write_with_retry(|state| {
             let mut txn = state.env.begin_rw_txn()?;
             write_block_archive(&mut txn, state, self.network, height, block, location)?;
@@ -568,7 +571,13 @@ impl Database {
             if self.load_block_record(block.header.block_hash())?.is_some() {
                 None
             } else {
-                Some((height, block, self.block_store.append_block(block)?))
+                let archive_hint = self.archive_append_file_hint()?;
+                Some((
+                    height,
+                    block,
+                    self.block_store
+                        .append_block_with_minimum_file_number(block, archive_hint)?,
+                ))
             }
         } else {
             None
@@ -852,6 +861,19 @@ impl Database {
             *fault.lock().expect("commit fault mutex poisoned") = None;
         }
     }
+
+    fn archive_append_file_hint(&self) -> Result<Option<u64>, StorageError> {
+        if self.block_store.highest_file_number()?.is_some() {
+            return Ok(None);
+        }
+
+        Ok(self
+            .list_block_records()?
+            .into_iter()
+            .map(|record| record.file_number)
+            .max()
+            .map(|file_number| file_number.saturating_add(1)))
+    }
 }
 
 impl Dataset {
@@ -1115,7 +1137,10 @@ mod tests {
     use super::*;
     use crate::path::ATHO_DATA_DIR_ENV;
     use crate::test_support::acquire_global_test_lock;
+    use atho_core::block::{merkle_root, witness_root};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput};
     use std::ffi::OsString;
+    use std::fs;
     use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1157,6 +1182,35 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn sample_block(network: Network, height: u64, previous_block_hash: [u8; 48]) -> Block {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [height as u8; 48],
+                output_index: 0,
+                unlocking_script: vec![height as u8, 1, 2],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 5_000_000_000,
+                locking_script: vec![3, 4, height as u8],
+            }],
+            lock_time: height as u32,
+            witness: vec![],
+        };
+        let header = BlockHeader {
+            version: 1,
+            network_id: network,
+            height,
+            previous_block_hash,
+            merkle_root: merkle_root(&[tx.clone()]),
+            witness_root: witness_root(&[tx.clone()]),
+            timestamp: 1_700_000_000 + height,
+            difficulty_target_or_bits: [7; 48],
+            nonce: 42 + height,
+        };
+        Block::new(header, vec![tx])
     }
 
     #[test]
@@ -1220,5 +1274,36 @@ mod tests {
         assert_eq!(loaded.quality_score, 72);
         assert_eq!(loaded.consecutive_failures, 3);
         assert_eq!(loaded.backoff_until_unix, 1_700_000_123);
+    }
+
+    #[test]
+    fn append_block_uses_next_file_number_after_archive_dir_is_deleted() {
+        let root = temp_data_dir("append-after-archive-loss");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+
+        let first = sample_block(Network::Regnet, 0, [0; 48]);
+        database.append_block(0, &first).expect("append first");
+        let first_record = database
+            .load_block_record(first.header.block_hash())
+            .expect("load first record")
+            .expect("first record present");
+        assert_eq!(first_record.file_number, 0);
+
+        fs::remove_dir_all(database.block_storage_path()).expect("remove archive dir");
+        assert!(!database.block_storage_path().exists());
+
+        let second = sample_block(Network::Regnet, 1, first.header.block_hash());
+        database.append_block(1, &second).expect("append second");
+        let second_record = database
+            .load_block_record(second.header.block_hash())
+            .expect("load second record")
+            .expect("second record present");
+        assert_eq!(second_record.file_number, 1);
+        assert!(database.block_storage_path().exists());
+        assert!(database
+            .block_storage_path()
+            .join(format!("blk{:05}.dat", second_record.file_number))
+            .exists());
     }
 }
