@@ -710,114 +710,114 @@ fn recipient_and_change_amounts(
 impl Wallet {
     fn build_signed_spend_transaction_from_parts(
         &self,
-    selected_utxos: &[WalletSpendUtxo],
-    version: u16,
-    recipient_digest: [u8; 32],
-    recipient_atoms: u64,
-    change_output: Option<(u64, Vec<u8>)>,
-    lock_time: u32,
-) -> Result<Transaction, WalletSpendBuildError> {
-    let mut outputs = vec![TxOutput {
-        value_atoms: recipient_atoms,
-        locking_script: recipient_digest.to_vec(),
-    }];
-    if let Some((change_atoms, change_script)) = change_output {
-        outputs.push(TxOutput {
-            value_atoms: change_atoms,
-            locking_script: change_script,
-        });
-    }
+        selected_utxos: &[WalletSpendUtxo],
+        version: u16,
+        recipient_digest: [u8; 32],
+        recipient_atoms: u64,
+        change_output: Option<(u64, Vec<u8>)>,
+        lock_time: u32,
+    ) -> Result<Transaction, WalletSpendBuildError> {
+        let mut outputs = vec![TxOutput {
+            value_atoms: recipient_atoms,
+            locking_script: recipient_digest.to_vec(),
+        }];
+        if let Some((change_atoms, change_script)) = change_output {
+            outputs.push(TxOutput {
+                value_atoms: change_atoms,
+                locking_script: change_script,
+            });
+        }
 
-    let inputs = selected_utxos
-        .iter()
-        .map(|utxo| TxInput {
-            previous_txid: utxo.previous_txid,
-            output_index: utxo.output_index,
-            unlocking_script: utxo.locking_script.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let mut tx = Transaction {
-        version,
-        inputs,
-        outputs,
-        lock_time,
-        witness: vec![],
-        tx_pow_nonce: 0,
-        tx_pow_bits: 0,
-    };
-    let txid = tx.txid();
-
-    let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<(u32, &WalletSpendUtxo)>>::new();
-    for (input_index, utxo) in selected_utxos.iter().enumerate() {
-        grouped_inputs
-            .entry(utxo.locking_script.clone())
-            .or_default()
-            .push((input_index as u32, utxo));
-    }
-
-    let mut signer_groups = Vec::with_capacity(grouped_inputs.len());
-    for (locking_script, group_utxos) in grouped_inputs {
-        let address = self
-            .address_for_locking_script(&locking_script)
-            .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
-        let keypair = self.keypair_for_path(address.path);
-        let input_indexes = group_utxos
+        let inputs = selected_utxos
             .iter()
-            .map(|(input_index, _)| *input_index)
+            .map(|utxo| TxInput {
+                previous_txid: utxo.previous_txid,
+                output_index: utxo.output_index,
+                unlocking_script: utxo.locking_script.clone(),
+            })
             .collect::<Vec<_>>();
-        let digest = transaction_signing_digest_for_input_indexes(&tx, &input_indexes);
-        let signature = sign(
-            AthoSignatureDomain::Transaction,
-            &keypair.secret_key,
-            &digest,
-        )
-        .map_err(|err| WalletSpendBuildError::SigningFailed(err.to_string()))?;
-        let sig_bytes = signature.0.clone();
-        signer_groups.push(WitnessSignerGroup {
-            signature: sig_bytes.clone(),
-            pubkey: keypair.public_key.0.clone(),
-            input_refs: group_utxos
+
+        let mut tx = Transaction {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let txid = tx.txid();
+
+        let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<(u32, &WalletSpendUtxo)>>::new();
+        for (input_index, utxo) in selected_utxos.iter().enumerate() {
+            grouped_inputs
+                .entry(utxo.locking_script.clone())
+                .or_default()
+                .push((input_index as u32, utxo));
+        }
+
+        let mut signer_groups = Vec::with_capacity(grouped_inputs.len());
+        for (locking_script, group_utxos) in grouped_inputs {
+            let address = self
+                .address_for_locking_script(&locking_script)
+                .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
+            let keypair = self.keypair_for_path(address.path);
+            let input_indexes = group_utxos
                 .iter()
-                .map(|(input_index, _)| WitnessInputRef {
-                    input_index: *input_index,
-                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, *input_index),
-                    witness_commit_ref: [0; 16],
-                })
-                .collect(),
+                .map(|(input_index, _)| *input_index)
+                .collect::<Vec<_>>();
+            let digest = transaction_signing_digest_for_input_indexes(&tx, &input_indexes);
+            let signature = sign(
+                AthoSignatureDomain::Transaction,
+                &keypair.secret_key,
+                &digest,
+            )
+            .map_err(|err| WalletSpendBuildError::SigningFailed(err.to_string()))?;
+            let sig_bytes = signature.0.clone();
+            signer_groups.push(WitnessSignerGroup {
+                signature: sig_bytes.clone(),
+                pubkey: keypair.public_key.0.clone(),
+                input_refs: group_utxos
+                    .iter()
+                    .map(|(input_index, _)| WitnessInputRef {
+                        input_index: *input_index,
+                        sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, *input_index),
+                        witness_commit_ref: [0; 16],
+                    })
+                    .collect(),
+            });
+        }
+        signer_groups.sort_by_key(|group| {
+            group
+                .input_refs
+                .first()
+                .map(|input_ref| input_ref.input_index)
+                .unwrap_or(u32::MAX)
         });
+        let mut signer_groups = signer_groups.into_iter();
+        let primary_group = signer_groups
+            .next()
+            .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
+        tx.witness = TxWitness {
+            signature: primary_group.signature,
+            pubkey: primary_group.pubkey,
+            input_refs: primary_group.input_refs,
+            additional_signers: signer_groups.collect(),
+        }
+        .canonical_bytes();
+        let witness_root = tx.witness_commitment_hash();
+        let mut witness = tx
+            .witness_payload()
+            .ok_or(WalletSpendBuildError::SigningFailed(String::from(
+                "invalid staged witness payload",
+            )))?;
+        witness.for_each_input_ref_mut(|input_ref| {
+            input_ref.witness_commit_ref =
+                derive_witness_commit_ref(&txid, &witness_root, input_ref.input_index);
+        });
+        tx.witness = witness.canonical_bytes();
+        Ok(tx)
     }
-    signer_groups.sort_by_key(|group| {
-        group
-            .input_refs
-            .first()
-            .map(|input_ref| input_ref.input_index)
-            .unwrap_or(u32::MAX)
-    });
-    let mut signer_groups = signer_groups.into_iter();
-    let primary_group = signer_groups
-        .next()
-        .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
-    tx.witness = TxWitness {
-        signature: primary_group.signature,
-        pubkey: primary_group.pubkey,
-        input_refs: primary_group.input_refs,
-        additional_signers: signer_groups.collect(),
-    }
-    .canonical_bytes();
-    let witness_root = tx.witness_commitment_hash();
-    let mut witness = tx
-        .witness_payload()
-        .ok_or(WalletSpendBuildError::SigningFailed(String::from(
-            "invalid staged witness payload",
-        )))?;
-    witness.for_each_input_ref_mut(|input_ref| {
-        input_ref.witness_commit_ref =
-            derive_witness_commit_ref(&txid, &witness_root, input_ref.input_index);
-    });
-    tx.witness = witness.canonical_bytes();
-    Ok(tx)
-}
 }
 
 fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {

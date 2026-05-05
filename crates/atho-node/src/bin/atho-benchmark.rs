@@ -3,7 +3,7 @@
 use atho_core::block::Block;
 use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -429,7 +429,7 @@ fn build_spend_transaction(
         tx_pow_nonce: 0,
         tx_pow_bits: 0,
     };
-    let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+    let fee_atoms = minimum_required_fee_atoms(network, &tx);
     tx.outputs[0].value_atoms = input_total
         .checked_sub(fee_atoms)
         .ok_or_else(|| String::from("fixture input value too small"))?;
@@ -458,7 +458,7 @@ fn build_spend_transaction(
     }
     .canonical_bytes();
 
-    let _ = network;
+    solve_transaction_pow(network, &mut tx, fee_atoms);
     Ok((tx, fee_atoms))
 }
 
@@ -969,6 +969,7 @@ fn command_workflow_invocations(network: Network) -> Vec<CommandInvocation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_node::validation::validate_transaction;
 
     #[test]
     fn command_workflow_invocations_cover_console_read_path() {
@@ -997,5 +998,21 @@ mod tests {
         let result = bench_command_help(1).expect("command help bench");
         assert_eq!(result.name, "command_help_local");
         assert_eq!(result.runs, 1);
+    }
+
+    #[test]
+    fn benchmark_fixture_transactions_follow_live_policy() {
+        let network = Network::Regnet;
+        let keypair = generate_from_seed(b"atho-benchmark-test").expect("keypair");
+        let utxo = make_funding_utxo(network, &keypair, 0);
+        let output_script = atho_core::address::public_key_digest(network, &keypair.public_key.0);
+        let (tx, fee_atoms) = build_spend_transaction(
+            network,
+            std::slice::from_ref(&utxo),
+            &keypair,
+            &output_script,
+        )
+        .expect("fixture tx");
+        validate_transaction(&tx, fee_atoms, network).expect("fixture must validate");
     }
 }

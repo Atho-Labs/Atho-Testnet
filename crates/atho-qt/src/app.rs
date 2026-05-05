@@ -2814,9 +2814,7 @@ impl DesktopApp {
             self.send_include_fee_in_total,
         );
         if max_sendable == 0 {
-            return String::from(
-                "No spendable wallet balance can cover a valid transaction fee",
-            );
+            return String::from("No spendable wallet balance can cover a valid transaction fee");
         }
         format!(
             "The wallet cannot cover {} after fees. Max spendable now: {}.",
@@ -2838,7 +2836,11 @@ impl DesktopApp {
                 .utxo
                 .value_atoms
                 .cmp(&left.utxo.value_atoms)
-                .then(left.address.payment_digest.cmp(&right.address.payment_digest))
+                .then(
+                    left.address
+                        .payment_digest
+                        .cmp(&right.address.payment_digest),
+                )
                 .then(left.utxo.txid.cmp(&right.utxo.txid))
                 .then(left.utxo.output_index.cmp(&right.utxo.output_index))
         });
@@ -2853,7 +2855,8 @@ impl DesktopApp {
             signer_groups.insert(candidate.address.payment_digest);
             selected.push(candidate);
             let signer_group_count = signer_groups.len();
-            let estimate_exact_fee = Self::estimate_fee(network, selected.len(), 1, signer_group_count);
+            let estimate_exact_fee =
+                Self::estimate_fee(network, selected.len(), 1, signer_group_count);
             let estimate_change_fee =
                 Self::estimate_fee(network, selected.len(), 2, signer_group_count);
 
@@ -2861,7 +2864,9 @@ impl DesktopApp {
                 let recipient_one_output = amount_atoms.saturating_sub(estimate_exact_fee);
                 let recipient_two_output = amount_atoms.saturating_sub(estimate_change_fee);
                 let excess = total.saturating_sub(amount_atoms);
-                if total >= amount_atoms && excess < min_output && recipient_one_output >= min_output
+                if total >= amount_atoms
+                    && excess < min_output
+                    && recipient_one_output >= min_output
                 {
                     Some(1)
                 } else if total > amount_atoms

@@ -558,6 +558,9 @@ fn make_spend_tx(
         additional_signers: vec![],
     };
     tx.witness = witness.canonical_bytes();
+    if huge_output_script {
+        return tx;
+    }
     if let Some(fee_atoms) = tx
         .checked_output_value_atoms()
         .and_then(|output_total| input_value.checked_sub(output_total))
@@ -804,5 +807,18 @@ fn other_network(network: Network) -> Network {
         Network::Testnet => Network::Regnet,
         Network::Regnet => Network::Mainnet,
         Network::Prunetest => Network::Regnet,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_attack_fixture_skips_pow_solving() {
+        let tx = tx_oversized(Network::Regnet).transaction;
+        assert_eq!(tx.tx_pow_bits, 0);
+        assert_eq!(tx.tx_pow_nonce, 0);
+        assert!(tx.full_size_bytes() > MAX_TRANSACTION_SIZE_BYTES);
     }
 }

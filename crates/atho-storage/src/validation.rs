@@ -289,7 +289,10 @@ fn witness_signer_groups(witness: &TxWitness) -> Vec<WitnessSignerGroup> {
     groups
 }
 
-fn verify_witness_signer_groups(tx: &Transaction, witness: &TxWitness) -> Result<(), ValidationError> {
+fn verify_witness_signer_groups(
+    tx: &Transaction,
+    witness: &TxWitness,
+) -> Result<(), ValidationError> {
     for signer_group in witness_signer_groups(witness) {
         if signer_group.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
             return Err(ValidationError::InvalidWitness);
