@@ -4174,7 +4174,11 @@ mod tests {
             app.refresh_status_only_for_test().expect("app refresh");
             app.poll_send_job();
             app.poll_mining_job();
+            app.poll_wallet_scan_job();
             app.poll_wallet_preparation_job();
+            if app.wallet.is_some() {
+                app.refresh_wallet_cache_if_needed();
+            }
             if predicate(app) {
                 return;
             }

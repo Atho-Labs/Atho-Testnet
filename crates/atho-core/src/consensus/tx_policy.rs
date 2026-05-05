@@ -199,6 +199,14 @@ fn transaction_pow_nonce_start(preimage: &[u8; 32]) -> u64 {
 
 pub fn transaction_pow_is_valid(network: Network, tx: &Transaction, fee_atoms: u64) -> bool {
     let required_bits = required_tx_pow_bits(network, tx, fee_atoms);
+    transaction_pow_is_valid_for_bits(network, tx, required_bits)
+}
+
+pub fn transaction_pow_is_valid_for_bits(
+    network: Network,
+    tx: &Transaction,
+    required_bits: u8,
+) -> bool {
     if required_bits == 0 {
         return true;
     }

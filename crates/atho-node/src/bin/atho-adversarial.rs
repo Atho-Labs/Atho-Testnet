@@ -5,6 +5,7 @@ use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::consensus::signatures::transaction_signing_digest;
 use atho_core::consensus::subsidy;
+use atho_core::consensus::tx_policy::solve_transaction_pow;
 use atho_core::constants::{
     COINBASE_MATURITY_BLOCKS, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
     STANDARD_TX_CONFIRMATIONS,
@@ -370,7 +371,8 @@ fn valid_block(network: Network, height: u64, txs: Vec<Transaction>) -> Block {
 fn valid_spend_fixture() -> (FalconKeypair, UtxoEntry, Transaction, u64) {
     let keypair = generate_from_seed(b"atho-adversarial-spend").expect("keypair");
     let utxo = valid_utxo(Network::Mainnet, 0, BASE_TX_VALUE);
-    let tx = signed_base_tx(&keypair, utxo.txid, BASE_TX_OUTPUT);
+    let mut tx = signed_base_tx(&keypair, utxo.txid, BASE_TX_OUTPUT);
+    solve_transaction_pow(Network::Mainnet, &mut tx, BASE_TX_FEE);
     (keypair, utxo, tx, BASE_TX_FEE)
 }
 
@@ -435,6 +437,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
             .collect(),
     };
     tx.witness = witness.canonical_bytes();
+    solve_transaction_pow(Network::Mainnet, &mut tx, 20);
     (keypair, utxo_a, utxo_b, tx, 20)
 }
 
@@ -1431,7 +1434,8 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                             ));
                         }
                         Err(StorageError::CorruptData)
-                        | Err(StorageError::IncompleteBlockHistory) => report.pass(),
+                        | Err(StorageError::IncompleteBlockHistory)
+                        | Err(StorageError::LegacyStorageLayout) => report.pass(),
                         Err(err) => {
                             report.fail_reject(format!(
                                 "case={i} kind={kind} incomplete legacy snapshot wrong error {err}"
@@ -1448,7 +1452,9 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                                 "case={i} kind={kind} malformed legacy snapshot accepted"
                             ));
                         }
-                        Err(StorageError::CorruptData) => report.pass(),
+                        Err(StorageError::CorruptData) | Err(StorageError::LegacyStorageLayout) => {
+                            report.pass()
+                        }
                         Err(err) => {
                             report.fail_reject(format!(
                                 "case={i} kind={kind} malformed legacy snapshot wrong error {err}"

@@ -14,7 +14,7 @@ use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::tx_policy::{
     maximum_standard_outputs, minimum_output_amount_atoms, minimum_required_fee_atoms,
-    required_tx_pow_bits, transaction_pow_is_valid,
+    required_tx_pow_bits, transaction_pow_is_valid_for_bits,
 };
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
@@ -24,7 +24,7 @@ use atho_core::constants::{
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
-use atho_core::transaction::Transaction;
+use atho_core::transaction::{Transaction, TxWitness};
 use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, BLK_BLOCK_TOO_LARGE, BLK_COINBASE_REWARD_MISMATCH,
@@ -110,6 +110,11 @@ pub enum ValidationError {
     BlockNetworkMismatch,
     #[error("multiple coinbase transactions")]
     MultipleCoinbaseTransactions,
+}
+
+struct PreparedTransactionValidation {
+    txid: [u8; 48],
+    witness: TxWitness,
 }
 
 impl AthoErrorMeta for ValidationError {
@@ -258,6 +263,94 @@ pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationEr
     Ok(())
 }
 
+fn verify_transaction_signature_prepared(
+    prepared: PreparedTransactionValidation,
+) -> Result<(), ValidationError> {
+    if prepared.witness.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
+        return Err(ValidationError::InvalidWitness);
+    }
+    if prepared.witness.signature.len() != FALCON_512_SIGNATURE_BYTES {
+        return Err(ValidationError::InvalidWitness);
+    }
+    let verified = falcon::verify(
+        AthoSignatureDomain::Transaction,
+        &FalconPublicKey(prepared.witness.pubkey),
+        &prepared.txid,
+        &FalconSignature(prepared.witness.signature),
+    )
+    .map_err(|_| ValidationError::InvalidWitness)?;
+    if !verified {
+        return Err(ValidationError::InvalidWitness);
+    }
+    Ok(())
+}
+
+fn prepare_transaction_validation(
+    tx: &Transaction,
+    fee_atoms: u64,
+    network: Network,
+    height: u64,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<PreparedTransactionValidation, ValidationError> {
+    if tx.is_coinbase() {
+        return Err(ValidationError::NoInputs);
+    }
+    let supported_version =
+        rules::is_supported_transaction_version_with_schedule(tx.version, height, schedule);
+    if !supported_version {
+        return Err(ValidationError::InvalidTransactionVersion);
+    }
+    if tx.outputs.is_empty() {
+        return Err(ValidationError::NoOutputs);
+    }
+    if tx.outputs.len() > maximum_standard_outputs(network, tx) {
+        return Err(ValidationError::TooManyOutputs);
+    }
+    let raw_size_bytes = tx.full_size_bytes();
+    let vsize_bytes = tx.vsize_bytes();
+    if raw_size_bytes > MAX_TRANSACTION_RAW_BYTES || vsize_bytes > MAX_TRANSACTION_VBYTES {
+        return Err(ValidationError::TransactionTooLarge);
+    }
+    if tx.outputs.iter().any(|output| output.value_atoms == 0) {
+        return Err(ValidationError::ZeroValueOutput);
+    }
+    let mut seen = BTreeSet::new();
+    for input in &tx.inputs {
+        if !seen.insert((input.previous_txid, input.output_index)) {
+            return Err(ValidationError::DuplicateInput);
+        }
+    }
+    let minimum_fee = minimum_required_fee_atoms(network, tx);
+    if fee_atoms < minimum_fee {
+        return Err(ValidationError::FeeBelowMinimum);
+    }
+    let dust_floor = minimum_output_amount_atoms(network, tx);
+    if tx
+        .outputs
+        .iter()
+        .any(|output| output.value_atoms < dust_floor)
+    {
+        return Err(ValidationError::DustOutput);
+    }
+    let witness = tx
+        .witness_payload()
+        .ok_or(ValidationError::InvalidWitness)?;
+    if witness.input_refs.len() != tx.inputs.len() {
+        return Err(ValidationError::InvalidWitness);
+    }
+    if witness.signature.is_empty() || witness.pubkey.is_empty() {
+        return Err(ValidationError::InvalidWitness);
+    }
+    let txid = tx.txid();
+    for (index, input_ref) in witness.input_refs.iter().enumerate() {
+        let expected_short = derive_sig_ref_short(&txid, &witness.signature, index as u32);
+        if input_ref.sig_ref_short != expected_short {
+            return Err(ValidationError::WitnessInputReferenceMismatch);
+        }
+    }
+    Ok(PreparedTransactionValidation { txid, witness })
+}
+
 fn locking_script_matches_public_key(
     network: Network,
     locking_script: &[u8],
@@ -332,64 +425,7 @@ pub fn validate_transaction_structure_for_height_with_schedule(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
-    if tx.is_coinbase() {
-        return Err(ValidationError::NoInputs);
-    }
-    let supported_version =
-        rules::is_supported_transaction_version_with_schedule(tx.version, height, schedule);
-    if !supported_version {
-        return Err(ValidationError::InvalidTransactionVersion);
-    }
-    if tx.outputs.is_empty() {
-        return Err(ValidationError::NoOutputs);
-    }
-    if tx.outputs.len() > maximum_standard_outputs(network, tx) {
-        return Err(ValidationError::TooManyOutputs);
-    }
-    let raw_size_bytes = tx.full_size_bytes();
-    let vsize_bytes = tx.vsize_bytes();
-    if raw_size_bytes > MAX_TRANSACTION_RAW_BYTES || vsize_bytes > MAX_TRANSACTION_VBYTES {
-        return Err(ValidationError::TransactionTooLarge);
-    }
-    if tx.outputs.iter().any(|output| output.value_atoms == 0) {
-        return Err(ValidationError::ZeroValueOutput);
-    }
-    // SECURITY: Reject duplicate inputs before fee or ownership accounting so
-    // one transaction cannot attempt an intra-transaction double spend.
-    let mut seen = BTreeSet::new();
-    for input in &tx.inputs {
-        if !seen.insert((input.previous_txid, input.output_index)) {
-            return Err(ValidationError::DuplicateInput);
-        }
-    }
-    let minimum_fee = minimum_required_fee_atoms(network, tx);
-    if fee_atoms < minimum_fee {
-        return Err(ValidationError::FeeBelowMinimum);
-    }
-    let dust_floor = minimum_output_amount_atoms(network, tx);
-    if tx
-        .outputs
-        .iter()
-        .any(|output| output.value_atoms < dust_floor)
-    {
-        return Err(ValidationError::DustOutput);
-    }
-    let witness = tx
-        .witness_payload()
-        .ok_or(ValidationError::InvalidWitness)?;
-    if witness.input_refs.len() != tx.inputs.len() {
-        return Err(ValidationError::InvalidWitness);
-    }
-    if witness.signature.is_empty() || witness.pubkey.is_empty() {
-        return Err(ValidationError::InvalidWitness);
-    }
-    let txid = tx.txid();
-    for (index, input_ref) in witness.input_refs.iter().enumerate() {
-        let expected_short = derive_sig_ref_short(&txid, &witness.signature, index as u32);
-        if input_ref.sig_ref_short != expected_short {
-            return Err(ValidationError::WitnessInputReferenceMismatch);
-        }
-    }
+    let _ = prepare_transaction_validation(tx, fee_atoms, network, height, schedule)?;
     Ok(())
 }
 
@@ -401,17 +437,15 @@ pub fn validate_transaction_for_height_with_schedule(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
-    validate_transaction_structure_for_height_with_schedule(
-        tx, fee_atoms, network, height, schedule,
-    )?;
+    let prepared = prepare_transaction_validation(tx, fee_atoms, network, height, schedule)?;
     let required_bits = required_tx_pow_bits(network, tx, fee_atoms);
     if tx.tx_pow_bits != required_bits {
         return Err(ValidationError::WrongTransactionPowBits);
     }
-    if !transaction_pow_is_valid(network, tx, fee_atoms) {
+    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
-    verify_transaction_signature(tx)?;
+    verify_transaction_signature_prepared(prepared)?;
     Ok(())
 }
 
@@ -427,15 +461,10 @@ pub fn validate_transaction_with_context_structure_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    validate_transaction_structure_for_height_with_schedule(
-        tx,
-        fee_atoms,
-        network,
-        spend_height,
-        schedule,
-    )?;
+    let prepared = prepare_transaction_validation(tx, fee_atoms, network, spend_height, schedule)?;
     let actual_fee = validate_transaction_with_context_common_and_schedule(
         tx,
+        &prepared,
         network,
         spend_height,
         lookup,
@@ -448,7 +477,7 @@ where
     if tx.tx_pow_bits != required_bits {
         return Err(ValidationError::WrongTransactionPowBits);
     }
-    if !transaction_pow_is_valid(network, tx, actual_fee) {
+    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
     Ok(actual_fee)
@@ -466,15 +495,11 @@ pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    validate_transaction_structure_for_height_with_schedule(
-        tx,
-        minimum_fee_atoms,
-        network,
-        spend_height,
-        schedule,
-    )?;
+    let prepared =
+        prepare_transaction_validation(tx, minimum_fee_atoms, network, spend_height, schedule)?;
     let actual_fee = validate_transaction_with_context_common_and_schedule(
         tx,
+        &prepared,
         network,
         spend_height,
         lookup,
@@ -487,7 +512,7 @@ where
     if tx.tx_pow_bits != required_bits {
         return Err(ValidationError::WrongTransactionPowBits);
     }
-    if !transaction_pow_is_valid(network, tx, actual_fee) {
+    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
     Ok(actual_fee)
@@ -495,6 +520,7 @@ where
 
 fn validate_transaction_with_context_common_and_schedule<F>(
     tx: &Transaction,
+    prepared: &PreparedTransactionValidation,
     network: Network,
     spend_height: u64,
     mut lookup: F,
@@ -503,17 +529,9 @@ fn validate_transaction_with_context_common_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    let witness = tx
-        .witness_payload()
-        .ok_or(ValidationError::InvalidWitness)?;
-    let txid = tx.txid();
     let mut input_total = 0u64;
-    let mut seen = BTreeSet::new();
 
     for (index, input) in tx.inputs.iter().enumerate() {
-        if !seen.insert((input.previous_txid, input.output_index)) {
-            return Err(ValidationError::DuplicateInput);
-        }
         // SECURITY: A missing UTXO or mismatched locking script indicates an
         // attempt to spend coins the witness does not control.
         let utxo =
@@ -524,14 +542,25 @@ where
         if utxo.network != network {
             return Err(ValidationError::InputOwnershipMismatch);
         }
-        if !locking_script_matches_public_key(utxo.network, &utxo.locking_script, &witness.pubkey) {
+        if !locking_script_matches_public_key(
+            utxo.network,
+            &utxo.locking_script,
+            &prepared.witness.pubkey,
+        ) {
             return Err(ValidationError::InputOwnershipMismatch);
         }
         if !utxo.is_spendable_at(spend_height) {
             return Err(ValidationError::InsufficientConfirmations);
         }
-        let expected_ref = derive_sig_ref_short(&txid, &witness.signature, index as u32);
-        if witness.input_refs.get(index).map(|item| item.sig_ref_short) != Some(expected_ref) {
+        let expected_ref =
+            derive_sig_ref_short(&prepared.txid, &prepared.witness.signature, index as u32);
+        if prepared
+            .witness
+            .input_refs
+            .get(index)
+            .map(|item| item.sig_ref_short)
+            != Some(expected_ref)
+        {
             return Err(ValidationError::WitnessInputReferenceMismatch);
         }
         input_total = input_total
@@ -598,15 +627,26 @@ pub fn validate_transaction_with_context_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    let actual_fee = validate_transaction_with_context_structure_and_schedule(
+    let prepared = prepare_transaction_validation(tx, fee_atoms, network, spend_height, schedule)?;
+    let actual_fee = validate_transaction_with_context_common_and_schedule(
         tx,
-        fee_atoms,
+        &prepared,
         network,
         spend_height,
         lookup,
         schedule,
     )?;
-    verify_transaction_signature(tx)?;
+    if actual_fee != fee_atoms {
+        return Err(ValidationError::FeeMismatch);
+    }
+    let required_bits = required_tx_pow_bits(network, tx, actual_fee);
+    if tx.tx_pow_bits != required_bits {
+        return Err(ValidationError::WrongTransactionPowBits);
+    }
+    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
+        return Err(ValidationError::InvalidTransactionPowNonce);
+    }
+    verify_transaction_signature_prepared(prepared)?;
     Ok(actual_fee)
 }
 
