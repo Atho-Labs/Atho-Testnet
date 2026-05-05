@@ -17,28 +17,84 @@ use sha3::{Digest, Sha3_384};
 /// Compact witness reference that binds an input to the shared witness payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessInputRef {
+    pub input_index: u32,
     #[serde(with = "serde_big_array::BigArray")]
     pub sig_ref_short: [u8; 2],
     #[serde(with = "serde_big_array::BigArray")]
     pub witness_commit_ref: [u8; 16],
 }
 
-/// Shared witness payload carried by an Atho transaction.
-///
-/// Atho groups the Falcon signature, Falcon public key, and per-input witness
-/// references into one canonical witness blob to keep transaction hashing and
-/// relay deterministic.
+/// One signer group inside a transaction witness bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct TxWitness {
+pub struct WitnessSignerGroup {
     pub signature: Vec<u8>,
     pub pubkey: Vec<u8>,
     pub input_refs: Vec<WitnessInputRef>,
 }
 
+/// Shared witness payload carried by an Atho transaction.
+///
+/// Atho keeps one primary signer group plus optional additional signer groups
+/// inside one canonical witness blob so transactions can spend multiple wallet
+/// address groups without paying a Falcon signature per input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TxWitness {
+    pub signature: Vec<u8>,
+    pub pubkey: Vec<u8>,
+    pub input_refs: Vec<WitnessInputRef>,
+    pub additional_signers: Vec<WitnessSignerGroup>,
+}
+
 impl TxWitness {
     /// Returns `true` when no witness fields are populated.
     pub fn is_empty(&self) -> bool {
-        self.signature.is_empty() && self.pubkey.is_empty() && self.input_refs.is_empty()
+        self.signature.is_empty()
+            && self.pubkey.is_empty()
+            && self.input_refs.is_empty()
+            && self.additional_signers.is_empty()
+    }
+
+    pub fn signer_group_count(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            1 + self.additional_signers.len()
+        }
+    }
+
+    pub fn total_input_refs(&self) -> usize {
+        self.input_refs.len()
+            + self
+                .additional_signers
+                .iter()
+                .map(|group| group.input_refs.len())
+                .sum::<usize>()
+    }
+
+    pub fn for_each_signer_group<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&[u8], &[u8], &[WitnessInputRef]),
+    {
+        if !self.is_empty() {
+            visitor(&self.signature, &self.pubkey, &self.input_refs);
+            for group in &self.additional_signers {
+                visitor(&group.signature, &group.pubkey, &group.input_refs);
+            }
+        }
+    }
+
+    pub fn for_each_input_ref_mut<F>(&mut self, mut visitor: F)
+    where
+        F: FnMut(&mut WitnessInputRef),
+    {
+        for input_ref in &mut self.input_refs {
+            visitor(input_ref);
+        }
+        for group in &mut self.additional_signers {
+            for input_ref in &mut group.input_refs {
+                visitor(input_ref);
+            }
+        }
     }
 
     /// Serializes the witness in the canonical full-transaction form.
@@ -50,8 +106,22 @@ impl TxWitness {
         out.extend_from_slice(&self.pubkey);
         out.extend_from_slice(&(self.input_refs.len() as u32).to_le_bytes());
         for item in &self.input_refs {
+            out.extend_from_slice(&item.input_index.to_le_bytes());
             out.extend_from_slice(&item.sig_ref_short);
             out.extend_from_slice(&item.witness_commit_ref);
+        }
+        out.extend_from_slice(&(self.additional_signers.len() as u32).to_le_bytes());
+        for group in &self.additional_signers {
+            out.extend_from_slice(&(group.signature.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.signature);
+            out.extend_from_slice(&(group.pubkey.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.pubkey);
+            out.extend_from_slice(&(group.input_refs.len() as u32).to_le_bytes());
+            for item in &group.input_refs {
+                out.extend_from_slice(&item.input_index.to_le_bytes());
+                out.extend_from_slice(&item.sig_ref_short);
+                out.extend_from_slice(&item.witness_commit_ref);
+            }
         }
         out
     }
@@ -64,7 +134,20 @@ impl TxWitness {
                 + compact_size_len(self.pubkey.len())
                 + self.pubkey.len()
                 + compact_size_len(self.input_refs.len())
-                + self.input_refs.len() * 18,
+                + self.input_refs.len() * 22
+                + compact_size_len(self.additional_signers.len())
+                + self
+                    .additional_signers
+                    .iter()
+                    .map(|group| {
+                        compact_size_len(group.signature.len())
+                            + group.signature.len()
+                            + compact_size_len(group.pubkey.len())
+                            + group.pubkey.len()
+                            + compact_size_len(group.input_refs.len())
+                            + group.input_refs.len() * 22
+                    })
+                    .sum::<usize>(),
         );
         write_compact_size(&mut out, self.signature.len());
         out.extend_from_slice(&self.signature);
@@ -72,8 +155,22 @@ impl TxWitness {
         out.extend_from_slice(&self.pubkey);
         write_compact_size(&mut out, self.input_refs.len());
         for item in &self.input_refs {
+            out.extend_from_slice(&item.input_index.to_le_bytes());
             out.extend_from_slice(&item.sig_ref_short);
             out.extend_from_slice(&item.witness_commit_ref);
+        }
+        write_compact_size(&mut out, self.additional_signers.len());
+        for group in &self.additional_signers {
+            write_compact_size(&mut out, group.signature.len());
+            out.extend_from_slice(&group.signature);
+            write_compact_size(&mut out, group.pubkey.len());
+            out.extend_from_slice(&group.pubkey);
+            write_compact_size(&mut out, group.input_refs.len());
+            for item in &group.input_refs {
+                out.extend_from_slice(&item.input_index.to_le_bytes());
+                out.extend_from_slice(&item.sig_ref_short);
+                out.extend_from_slice(&item.witness_commit_ref);
+            }
         }
         out
     }
@@ -85,6 +182,13 @@ impl TxWitness {
         out.extend_from_slice(&self.signature);
         out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&(self.additional_signers.len() as u32).to_le_bytes());
+        for group in &self.additional_signers {
+            out.extend_from_slice(&(group.signature.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.signature);
+            out.extend_from_slice(&(group.pubkey.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.pubkey);
+        }
         out
     }
 
@@ -123,12 +227,9 @@ impl TxWitness {
         if ref_count > MAX_WITNESS_INPUT_REFS {
             return None;
         }
-        let input_ref_bytes = ref_count.checked_mul(18)?;
-        if bytes.len() != offset.checked_add(input_ref_bytes)? {
-            return None;
-        }
         let mut input_refs = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
+            let input_index = read_u32(bytes, &mut offset)?;
             let sig_ref_short = {
                 let bytes = bytes.get(offset..offset.checked_add(2)?)?;
                 let mut out = [0u8; 2];
@@ -144,8 +245,57 @@ impl TxWitness {
                 out
             };
             input_refs.push(WitnessInputRef {
+                input_index,
                 sig_ref_short,
                 witness_commit_ref,
+            });
+        }
+        let additional_group_count = read_u32(bytes, &mut offset)? as usize;
+        let mut additional_signers = Vec::with_capacity(additional_group_count);
+        let mut total_ref_count = ref_count;
+        for _ in 0..additional_group_count {
+            let signature_len = read_u32(bytes, &mut offset)? as usize;
+            if signature_len != FALCON_512_SIGNATURE_BYTES {
+                return None;
+            }
+            let signature = read_vec(bytes, &mut offset, signature_len)?;
+            let pubkey_len = read_u32(bytes, &mut offset)? as usize;
+            if pubkey_len != FALCON_512_PUBLIC_KEY_BYTES {
+                return None;
+            }
+            let pubkey = read_vec(bytes, &mut offset, pubkey_len)?;
+            let group_ref_count = read_u32(bytes, &mut offset)? as usize;
+            total_ref_count = total_ref_count.checked_add(group_ref_count)?;
+            if total_ref_count > MAX_WITNESS_INPUT_REFS {
+                return None;
+            }
+            let mut group_input_refs = Vec::with_capacity(group_ref_count);
+            for _ in 0..group_ref_count {
+                let input_index = read_u32(bytes, &mut offset)?;
+                let sig_ref_short = {
+                    let bytes = bytes.get(offset..offset.checked_add(2)?)?;
+                    let mut out = [0u8; 2];
+                    out.copy_from_slice(bytes);
+                    offset += 2;
+                    out
+                };
+                let witness_commit_ref = {
+                    let bytes = bytes.get(offset..offset.checked_add(16)?)?;
+                    let mut out = [0u8; 16];
+                    out.copy_from_slice(bytes);
+                    offset += 16;
+                    out
+                };
+                group_input_refs.push(WitnessInputRef {
+                    input_index,
+                    sig_ref_short,
+                    witness_commit_ref,
+                });
+            }
+            additional_signers.push(WitnessSignerGroup {
+                signature,
+                pubkey,
+                input_refs: group_input_refs,
             });
         }
         if offset != bytes.len() {
@@ -155,6 +305,7 @@ impl TxWitness {
             signature,
             pubkey,
             input_refs,
+            additional_signers,
         })
     }
 }
@@ -421,13 +572,34 @@ impl Transaction {
         sha3_384(&out)
     }
 
-    /// Canonical prehash for Atho transaction signatures.
-    ///
-    /// This is the exact message digest signed under the
-    /// `ATHO_TX_SIGN_V1` domain: `SHA3-384(base_bytes())`, where
-    /// `base_bytes()` excludes witness data.
+    fn update_signing_hasher_for_input_indexes<D: Digest>(
+        &self,
+        hasher: &mut D,
+        input_indexes: &[u32],
+    ) {
+        self.update_base_hasher(hasher);
+        hasher.update((input_indexes.len() as u32).to_le_bytes());
+        for input_index in input_indexes {
+            hasher.update(input_index.to_le_bytes());
+        }
+    }
+
+    /// Canonical prehash for Atho transaction signatures that cover all inputs.
     pub fn signing_digest(&self) -> [u8; 48] {
-        self.txid()
+        let mut hasher = Sha3_384::new();
+        self.update_base_hasher(&mut hasher);
+        hasher.update((self.inputs.len() as u32).to_le_bytes());
+        for input_index in 0..self.inputs.len() {
+            hasher.update((input_index as u32).to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    /// Canonical prehash for one grouped signer inside a transaction.
+    pub fn signing_digest_for_input_indexes(&self, input_indexes: &[u32]) -> [u8; 48] {
+        let mut hasher = Sha3_384::new();
+        self.update_signing_hasher_for_input_indexes(&mut hasher, input_indexes);
+        hasher.finalize().into()
     }
 
     pub fn witness_payload(&self) -> Option<TxWitness> {
@@ -575,7 +747,7 @@ mod tests {
             tx_pow_bits: 0,
         };
 
-        assert_eq!(tx.txid(), tx.signing_digest());
+        assert_ne!(tx.txid(), tx.signing_digest());
         assert!(!tx.canonical_bytes().is_empty());
         assert_eq!(tx.vsize_bytes(), tx.weight_bytes().div_ceil(4));
     }
@@ -691,14 +863,17 @@ mod tests {
             pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![
                 WitnessInputRef {
+                    input_index: 0,
                     sig_ref_short: [6, 7],
                     witness_commit_ref: [8; 16],
                 },
                 WitnessInputRef {
+                    input_index: 1,
                     sig_ref_short: [9, 10],
                     witness_commit_ref: [11; 16],
                 },
             ],
+            additional_signers: vec![],
         };
         let encoded = payload.canonical_bytes();
         let decoded = TxWitness::from_bytes(&encoded).unwrap();
@@ -711,9 +886,11 @@ mod tests {
             signature: vec![1; FALCON_512_SIGNATURE_BYTES + 1],
             pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: [6, 7],
                 witness_commit_ref: [8; 16],
             }],
+            additional_signers: vec![],
         };
         let encoded = payload.canonical_bytes();
         assert!(TxWitness::from_bytes(&encoded).is_none());
@@ -725,9 +902,11 @@ mod tests {
             signature: vec![1; FALCON_512_SIGNATURE_BYTES],
             pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES + 1],
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: [6, 7],
                 witness_commit_ref: [8; 16],
             }],
+            additional_signers: vec![],
         };
         let encoded = payload.canonical_bytes();
         assert!(TxWitness::from_bytes(&encoded).is_none());
@@ -739,9 +918,11 @@ mod tests {
             signature: vec![1; FALCON_512_SIGNATURE_BYTES],
             pubkey: vec![4; FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: [6, 7],
                 witness_commit_ref: [8; 16],
             }],
+            additional_signers: vec![],
         };
         let mut encoded = payload.canonical_bytes();
         encoded.pop();
@@ -783,9 +964,11 @@ mod tests {
                 signature: vec![1; FALCON_512_SIGNATURE_BYTES],
                 pubkey: vec![2; FALCON_512_PUBLIC_KEY_BYTES],
                 input_refs: vec![WitnessInputRef {
+                    input_index: 0,
                     sig_ref_short: [3, 4],
                     witness_commit_ref: [5; 16],
                 }],
+                additional_signers: vec![],
             }
             .canonical_bytes(),
             tx_pow_nonce: 7,

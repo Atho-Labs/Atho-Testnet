@@ -11,7 +11,9 @@ use crate::utxo::{UtxoEntry, UtxoSet};
 use atho_core::address::public_key_digest;
 use atho_core::block::Block;
 use atho_core::consensus::rules;
-use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+use atho_core::consensus::signatures::{
+    transaction_signing_digest, transaction_signing_digest_for_input_indexes, AthoSignatureDomain,
+};
 use atho_core::consensus::tx_policy::{
     maximum_standard_outputs, minimum_output_amount_atoms, minimum_required_fee_atoms,
     required_tx_pow_bits, transaction_pow_is_valid_for_bits,
@@ -24,7 +26,7 @@ use atho_core::constants::{
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
-use atho_core::transaction::{Transaction, TxWitness};
+use atho_core::transaction::{Transaction, TxWitness, WitnessInputRef, WitnessSignerGroup};
 use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, BLK_BLOCK_TOO_LARGE, BLK_COINBASE_REWARD_MISMATCH,
@@ -113,8 +115,15 @@ pub enum ValidationError {
 }
 
 struct PreparedTransactionValidation {
-    txid: [u8; 48],
-    witness: TxWitness,
+    signer_groups: Vec<PreparedSignerGroup>,
+    signer_group_by_input: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct PreparedSignerGroup {
+    signature: Vec<u8>,
+    pubkey: Vec<u8>,
+    input_refs: Vec<WitnessInputRef>,
 }
 
 impl AthoErrorMeta for ValidationError {
@@ -201,32 +210,16 @@ pub fn derive_witness_commit_ref(
 
 /// Rebuilds the transaction witness references against the selected block root.
 pub fn finalize_witness_commit_refs(tx: &Transaction, block_witness_root: [u8; 48]) -> Transaction {
-    let Some(witness) = tx.witness_payload() else {
+    let Some(mut witness) = tx.witness_payload() else {
         return tx.clone();
     };
     let txid = tx.txid();
-    let input_refs = witness
-        .input_refs
-        .iter()
-        .enumerate()
-        .map(
-            |(index, input_ref)| atho_core::transaction::WitnessInputRef {
-                sig_ref_short: input_ref.sig_ref_short,
-                witness_commit_ref: derive_witness_commit_ref(
-                    &txid,
-                    &block_witness_root,
-                    index as u32,
-                ),
-            },
-        )
-        .collect();
+    witness.for_each_input_ref_mut(|input_ref| {
+        input_ref.witness_commit_ref =
+            derive_witness_commit_ref(&txid, &block_witness_root, input_ref.input_index);
+    });
     Transaction {
-        witness: atho_core::transaction::TxWitness {
-            signature: witness.signature,
-            pubkey: witness.pubkey,
-            input_refs,
-        }
-        .canonical_bytes(),
+        witness: witness.canonical_bytes(),
         ..tx.clone()
     }
 }
@@ -243,44 +236,87 @@ pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationEr
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
-    if witness.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
-        return Err(ValidationError::InvalidWitness);
-    }
-    if witness.signature.len() != FALCON_512_SIGNATURE_BYTES {
-        return Err(ValidationError::InvalidWitness);
-    }
-    let signing_digest = transaction_signing_digest(tx);
-    let verified = falcon::verify(
-        AthoSignatureDomain::Transaction,
-        &FalconPublicKey(witness.pubkey),
-        &signing_digest,
-        &FalconSignature(witness.signature),
-    )
-    .map_err(|_| ValidationError::InvalidWitness)?;
-    if !verified {
-        return Err(ValidationError::InvalidWitness);
-    }
+    verify_witness_signer_groups(tx, &witness)?;
     Ok(())
 }
 
 fn verify_transaction_signature_prepared(
+    tx: &Transaction,
     prepared: PreparedTransactionValidation,
 ) -> Result<(), ValidationError> {
-    if prepared.witness.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
-        return Err(ValidationError::InvalidWitness);
+    for signer_group in prepared.signer_groups {
+        if signer_group.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
+            return Err(ValidationError::InvalidWitness);
+        }
+        if signer_group.signature.len() != FALCON_512_SIGNATURE_BYTES {
+            return Err(ValidationError::InvalidWitness);
+        }
+        let input_indexes = signer_group
+            .input_refs
+            .iter()
+            .map(|input_ref| input_ref.input_index)
+            .collect::<Vec<_>>();
+        let signing_digest = if input_indexes.len() == tx.inputs.len() {
+            transaction_signing_digest(tx)
+        } else {
+            transaction_signing_digest_for_input_indexes(tx, &input_indexes)
+        };
+        let verified = falcon::verify(
+            AthoSignatureDomain::Transaction,
+            &FalconPublicKey(signer_group.pubkey),
+            &signing_digest,
+            &FalconSignature(signer_group.signature),
+        )
+        .map_err(|_| ValidationError::InvalidWitness)?;
+        if !verified {
+            return Err(ValidationError::InvalidWitness);
+        }
     }
-    if prepared.witness.signature.len() != FALCON_512_SIGNATURE_BYTES {
-        return Err(ValidationError::InvalidWitness);
+    Ok(())
+}
+
+fn witness_signer_groups(witness: &TxWitness) -> Vec<WitnessSignerGroup> {
+    if witness.is_empty() {
+        return Vec::new();
     }
-    let verified = falcon::verify(
-        AthoSignatureDomain::Transaction,
-        &FalconPublicKey(prepared.witness.pubkey),
-        &prepared.txid,
-        &FalconSignature(prepared.witness.signature),
-    )
-    .map_err(|_| ValidationError::InvalidWitness)?;
-    if !verified {
-        return Err(ValidationError::InvalidWitness);
+    let mut groups = Vec::with_capacity(1 + witness.additional_signers.len());
+    groups.push(WitnessSignerGroup {
+        signature: witness.signature.clone(),
+        pubkey: witness.pubkey.clone(),
+        input_refs: witness.input_refs.clone(),
+    });
+    groups.extend(witness.additional_signers.clone());
+    groups
+}
+
+fn verify_witness_signer_groups(tx: &Transaction, witness: &TxWitness) -> Result<(), ValidationError> {
+    for signer_group in witness_signer_groups(witness) {
+        if signer_group.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
+            return Err(ValidationError::InvalidWitness);
+        }
+        if signer_group.signature.len() != FALCON_512_SIGNATURE_BYTES {
+            return Err(ValidationError::InvalidWitness);
+        }
+        let input_indexes = signer_group
+            .input_refs
+            .iter()
+            .map(|input_ref| input_ref.input_index)
+            .collect::<Vec<_>>();
+        let signing_digest = if input_indexes.len() == tx.inputs.len() {
+            transaction_signing_digest(tx)
+        } else {
+            transaction_signing_digest_for_input_indexes(tx, &input_indexes)
+        };
+        let verified = falcon::verify(
+            AthoSignatureDomain::Transaction,
+            &FalconPublicKey(signer_group.pubkey),
+            &signing_digest,
+            &FalconSignature(signer_group.signature),
+        )
+        .map_err(|_| ValidationError::InvalidWitness)?;
+        if !verified {
+            return Err(ValidationError::InvalidWitness);
+        }
     }
     Ok(())
 }
@@ -335,20 +371,72 @@ fn prepare_transaction_validation(
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
-    if witness.input_refs.len() != tx.inputs.len() {
+    if witness.signer_group_count() == 0 {
         return Err(ValidationError::InvalidWitness);
     }
-    if witness.signature.is_empty() || witness.pubkey.is_empty() {
+    if witness.total_input_refs() != tx.inputs.len() {
         return Err(ValidationError::InvalidWitness);
     }
     let txid = tx.txid();
-    for (index, input_ref) in witness.input_refs.iter().enumerate() {
-        let expected_short = derive_sig_ref_short(&txid, &witness.signature, index as u32);
-        if input_ref.sig_ref_short != expected_short {
-            return Err(ValidationError::WitnessInputReferenceMismatch);
+    let signer_groups = witness_signer_groups(&witness);
+    let mut signer_group_by_input = vec![usize::MAX; tx.inputs.len()];
+    let mut previous_first_input = None;
+
+    for (group_index, signer_group) in signer_groups.iter().enumerate() {
+        if signer_group.signature.is_empty()
+            || signer_group.pubkey.is_empty()
+            || signer_group.input_refs.is_empty()
+        {
+            return Err(ValidationError::InvalidWitness);
+        }
+        let mut previous_input_index = None;
+        let first_input_index = signer_group
+            .input_refs
+            .first()
+            .map(|input_ref| input_ref.input_index)
+            .ok_or(ValidationError::InvalidWitness)?;
+        if previous_first_input.is_some_and(|previous| first_input_index <= previous) {
+            return Err(ValidationError::InvalidWitness);
+        }
+        previous_first_input = Some(first_input_index);
+
+        for input_ref in &signer_group.input_refs {
+            let input_index = input_ref.input_index as usize;
+            if input_index >= tx.inputs.len() {
+                return Err(ValidationError::InvalidWitness);
+            }
+            if previous_input_index.is_some_and(|previous| input_ref.input_index <= previous) {
+                return Err(ValidationError::InvalidWitness);
+            }
+            previous_input_index = Some(input_ref.input_index);
+            if signer_group_by_input[input_index] != usize::MAX {
+                return Err(ValidationError::WitnessInputReferenceMismatch);
+            }
+            let expected_short =
+                derive_sig_ref_short(&txid, &signer_group.signature, input_ref.input_index);
+            if input_ref.sig_ref_short != expected_short {
+                return Err(ValidationError::WitnessInputReferenceMismatch);
+            }
+            signer_group_by_input[input_index] = group_index;
         }
     }
-    Ok(PreparedTransactionValidation { txid, witness })
+    if signer_group_by_input
+        .iter()
+        .any(|group_index| *group_index == usize::MAX)
+    {
+        return Err(ValidationError::WitnessInputReferenceMismatch);
+    }
+    Ok(PreparedTransactionValidation {
+        signer_groups: signer_groups
+            .into_iter()
+            .map(|signer_group| PreparedSignerGroup {
+                signature: signer_group.signature,
+                pubkey: signer_group.pubkey,
+                input_refs: signer_group.input_refs,
+            })
+            .collect(),
+        signer_group_by_input,
+    })
 }
 
 fn locking_script_matches_public_key(
@@ -445,7 +533,7 @@ pub fn validate_transaction_for_height_with_schedule(
     if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
-    verify_transaction_signature_prepared(prepared)?;
+    verify_transaction_signature_prepared(tx, prepared)?;
     Ok(())
 }
 
@@ -545,23 +633,12 @@ where
         if !locking_script_matches_public_key(
             utxo.network,
             &utxo.locking_script,
-            &prepared.witness.pubkey,
+            &prepared.signer_groups[prepared.signer_group_by_input[index]].pubkey,
         ) {
             return Err(ValidationError::InputOwnershipMismatch);
         }
         if !utxo.is_spendable_at(spend_height) {
             return Err(ValidationError::InsufficientConfirmations);
-        }
-        let expected_ref =
-            derive_sig_ref_short(&prepared.txid, &prepared.witness.signature, index as u32);
-        if prepared
-            .witness
-            .input_refs
-            .get(index)
-            .map(|item| item.sig_ref_short)
-            != Some(expected_ref)
-        {
-            return Err(ValidationError::WitnessInputReferenceMismatch);
         }
         input_total = input_total
             .checked_add(utxo.value_atoms)
@@ -646,7 +723,7 @@ where
     if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
-    verify_transaction_signature_prepared(prepared)?;
+    verify_transaction_signature_prepared(tx, prepared)?;
     Ok(actual_fee)
 }
 
@@ -918,11 +995,13 @@ pub fn validate_block_with_context_and_schedule(
         let witness = tx
             .witness_payload()
             .ok_or(ValidationError::InvalidWitness)?;
-        for (index, input_ref) in witness.input_refs.iter().enumerate() {
-            let expected_commit =
-                derive_witness_commit_ref(&txid, &block_witness_root, index as u32);
-            if input_ref.witness_commit_ref != expected_commit {
-                return Err(ValidationError::WitnessInputReferenceMismatch);
+        for signer_group in witness_signer_groups(&witness) {
+            for input_ref in signer_group.input_refs {
+                let expected_commit =
+                    derive_witness_commit_ref(&txid, &block_witness_root, input_ref.input_index);
+                if input_ref.witness_commit_ref != expected_commit {
+                    return Err(ValidationError::WitnessInputReferenceMismatch);
+                }
             }
         }
 
@@ -1034,9 +1113,11 @@ mod tests {
             signature: signature_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         let fee_atoms = utxo
@@ -1301,9 +1382,11 @@ mod tests {
             signature: signature.clone(),
             pubkey: vec![2u8; FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&txid, &signature, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         };
         tx.witness = witness.canonical_bytes();
 
@@ -1396,9 +1479,11 @@ mod tests {
             signature: signature_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         let fee_atoms = utxo
@@ -1527,9 +1612,11 @@ mod tests {
             signature: signature_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         let fee_atoms = minimum_required_fee_atoms(Network::Mainnet, &tx);
@@ -1588,9 +1675,11 @@ mod tests {
             signature: sig_bytes.clone(),
             pubkey: wrong.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
 
@@ -1705,9 +1794,11 @@ mod tests {
             signature: signature_bytes.clone(),
             pubkey: funding_keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         };
         let staged_tx = Transaction {
             witness: staged_witness.canonical_bytes(),
@@ -1721,9 +1812,11 @@ mod tests {
             signature: signature_bytes.clone(),
             pubkey: funding_keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: derive_witness_commit_ref(&tx.txid(), &block_witness_root, 0),
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);

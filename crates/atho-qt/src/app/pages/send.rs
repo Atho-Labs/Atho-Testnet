@@ -1,15 +1,16 @@
 use crate::app::{widgets, DesktopApp};
 use crate::resources;
-use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_PER_VBYTE_ATOMS};
+use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use eframe::egui;
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let available_balance = app.wallet_balance_atoms();
     let send_block_reason = app.wallet_send_block_reason();
+    let send_in_progress = app.send_job.is_some();
 
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(430.0);
-        render_send_form(app, ui, available_balance);
+        render_send_form(app, ui, available_balance, send_in_progress);
         ui.add_space(6.0);
         if let Some(reason) = send_block_reason.as_deref() {
             widgets::panel_frame().show(ui, |ui| {
@@ -27,16 +28,34 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         }
         render_fee_panel(app, ui);
         ui.add_space(6.0);
-        widgets::muted_label(ui, &app.send_status);
+        ui.horizontal_wrapped(|ui| {
+            if send_in_progress {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.add_space(4.0);
+            }
+            widgets::muted_label(ui, &app.send_status);
+        });
         ui.add_space(6.0);
-        render_send_actions(app, ui, available_balance, send_block_reason.as_deref());
+        render_send_actions(
+            app,
+            ui,
+            available_balance,
+            send_block_reason.as_deref(),
+            send_in_progress,
+        );
     });
 }
 
-fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance: u64) {
+fn render_send_form(
+    app: &mut DesktopApp,
+    ui: &mut egui::Ui,
+    _available_balance: u64,
+    send_in_progress: bool,
+) {
     widgets::panel_frame()
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
+            let mut trigger_send = false;
             egui::Grid::new("send_form")
                 .num_columns(2)
                 .spacing([10.0, 8.0])
@@ -48,17 +67,31 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
                         );
                     ui.horizontal(|ui| {
                         let address_width = (ui.available_width() - 102.0).max(220.0);
-                        ui.add_sized(
+                        let address_response = ui.add_sized(
                             [address_width, 28.0],
                             egui::TextEdit::singleline(&mut app.send_to)
                                 .hint_text("Enter a base56 Atho address"),
-                        )
-                        .on_hover_text(
+                        );
+                        if address_response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            trigger_send = true;
+                        }
+                        address_response.on_hover_text(
                             "Paste or type the recipient address. Wrong-network addresses are rejected before send.",
                         );
                         if widgets::icon_button(
                             ui,
                             resources::address_book_icon(14.0),
+                            "Open recipient address book",
+                        )
+                        .clicked()
+                        {
+                            app.open_recipient_address_book();
+                        }
+                        if widgets::icon_button(
+                            ui,
+                            resources::receive_icon(14.0),
                             "Use current receiving address",
                         )
                         .clicked()
@@ -96,20 +129,41 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
                     );
                     ui.end_row();
 
-                    ui.label(egui::RichText::new("Amount (ATHO):").size(13.0).strong())
+                    ui.label(egui::RichText::new("Amount:").size(13.0).strong())
                         .on_hover_text(
                             format!(
-                                "Examples: 1, 1.25. Up to {} decimal places are supported on this network. Spendable outputs must be at least {}.",
-                                atho_core::constants::decimals_for_network(app.active_network()),
-                                widgets::format_atoms(app.active_network(), DUST_RELAY_VALUE_ATOMS),
+                                "Up to {} decimal places are supported for {} input. Spendable outputs must be at least 1 nATHO / 1,000 atoms.",
+                                app.send_input_unit().max_decimals(),
+                                app.send_input_unit().label(),
                             ),
                         );
                     ui.horizontal(|ui| {
-                        ui.add_sized(
+                        let amount_response = ui.add_sized(
                             [150.0, 28.0],
                             egui::TextEdit::singleline(&mut app.send_amount)
-                                .hint_text("Examples: 1, 1.25, 0.00000050"),
+                                .hint_text("Enter amount"),
                         );
+                        if amount_response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            trigger_send = true;
+                        }
+                        egui::ComboBox::from_id_source("send_input_unit")
+                            .selected_text(app.send_input_unit().label())
+                            .width(84.0)
+                            .show_ui(ui, |ui| {
+                                for unit in crate::app::amounts::InputUnit::variants() {
+                                    if ui
+                                        .selectable_label(
+                                            app.send_input_unit() == unit,
+                                            unit.label(),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.set_send_input_unit(unit);
+                                    }
+                                }
+                            });
                         ui.checkbox(
                             &mut app.send_include_fee_in_total,
                             "Include fee in total amount",
@@ -117,7 +171,7 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
                         .on_hover_text(
                             "If enabled, the fee is deducted from the typed amount instead of added on top.",
                         );
-                        let fill_response = ui.button("Use available balance");
+                        let fill_response = ui.button("Use max spendable");
                         if fill_response.clicked() {
                             if let Err(err) = app.use_max_sendable_amount() {
                                 app.last_error = Some(err.clone());
@@ -125,7 +179,7 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
                             }
                         }
                         fill_response.on_hover_text(
-                            "Fill the largest amount the current spend path can send in one transaction.",
+                            "Fill the largest amount the current one-address spend path can send in one transaction.",
                         );
                     });
                     ui.end_row();
@@ -135,13 +189,25 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
             widgets::muted_label(
                 ui,
                 &format!(
-                    "The current spend path signs one wallet address at a time. Spendable outputs must be at least {}. “Use available balance” fills the largest amount currently spendable in one transaction.",
-                    widgets::format_atoms(app.active_network(), DUST_RELAY_VALUE_ATOMS)
+                    "The current spend path can combine spendable wallet-owned inputs into one grouped-signature transaction. Minimum output: 1 nATHO / 1,000 atoms. “Use max spendable” fills the largest amount currently spendable in one transaction."
                 ),
             );
             ui.add_space(8.0);
             ui.separator();
+            if app.recipient_address_book_open || app.recipient_address_editor_open {
+                ui.add_space(10.0);
+                render_recipient_address_book_panel(app, ui);
+                ui.add_space(8.0);
+                ui.separator();
+            }
             ui.add_space(24.0);
+
+            if trigger_send && !send_in_progress {
+                if let Err(err) = app.submit_send_transaction() {
+                    app.last_error = Some(err.clone());
+                    app.send_status = err;
+                }
+            }
         });
 }
 
@@ -170,9 +236,15 @@ fn render_send_actions(
     ui: &mut egui::Ui,
     available_balance: u64,
     send_block_reason: Option<&str>,
+    send_in_progress: bool,
 ) {
-    let send_enabled = send_block_reason.is_none();
+    let send_enabled = send_block_reason.is_none() && !send_in_progress;
     let compact = ui.available_width() < 760.0;
+    let send_hover_reason = if send_in_progress {
+        Some("A transaction is already being finalized")
+    } else {
+        send_block_reason
+    };
     if compact {
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -190,7 +262,7 @@ fn render_send_actions(
                         app.send_status = err;
                     }
                 }
-                if let Some(reason) = send_block_reason {
+                if let Some(reason) = send_hover_reason {
                     send_response.on_hover_text(reason);
                 }
                 if ui
@@ -205,18 +277,26 @@ fn render_send_actions(
                     app.send_amount.clear();
                     app.send_fee.clear();
                     app.send_include_fee_in_total = false;
-                    app.send_status = String::from("Enter a destination and ATHO amount.");
+                    app.send_status = String::from("Enter a destination address and amount.");
                 }
-                let _ = ui.add_enabled(
-                    false,
-                    egui::Button::image_and_text(resources::add_icon(14.0), "Add Recipient"),
-                );
+                if ui
+                    .add_sized(
+                        [138.0, 28.0],
+                        egui::Button::image_and_text(
+                            resources::add_icon(14.0),
+                            "Add to Address Book",
+                        ),
+                    )
+                    .clicked()
+                {
+                    app.start_add_current_recipient_to_address_book();
+                }
             });
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
                     "Wallet total available: {}",
-                    widgets::format_atoms(app.active_network(), available_balance)
+                    app.format_amount(available_balance)
                 ))
                 .size(13.0)
                 .strong(),
@@ -243,7 +323,7 @@ fn render_send_actions(
                 app.send_status = err;
             }
         }
-        if let Some(reason) = send_block_reason {
+        if let Some(reason) = send_hover_reason {
             send_response.on_hover_text(reason);
         }
         if ui
@@ -258,18 +338,23 @@ fn render_send_actions(
             app.send_amount.clear();
             app.send_fee.clear();
             app.send_include_fee_in_total = false;
-            app.send_status = String::from("Enter a destination and ATHO amount.");
+            app.send_status = String::from("Enter a destination address and amount.");
         }
-        let _ = ui.add_enabled(
-            false,
-            egui::Button::image_and_text(resources::add_icon(14.0), "Add Recipient"),
-        );
+        if ui
+            .add_sized(
+                [138.0, 28.0],
+                egui::Button::image_and_text(resources::add_icon(14.0), "Add to Address Book"),
+            )
+            .clicked()
+        {
+            app.start_add_current_recipient_to_address_book();
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "Wallet total available: {}",
-                    widgets::format_atoms(app.active_network(), available_balance)
+                    app.format_amount(available_balance)
                 ))
                 .size(13.0)
                 .strong(),
@@ -279,4 +364,163 @@ fn render_send_actions(
             );
         });
     });
+}
+
+fn render_recipient_address_book_panel(app: &mut DesktopApp, ui: &mut egui::Ui) {
+    widgets::panel_frame()
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                widgets::section_header(ui, "Recipient Address Book");
+                ui.add_space(8.0);
+                ui.add_sized(
+                    [220.0, 28.0],
+                    egui::TextEdit::singleline(&mut app.recipient_address_book_filter)
+                        .hint_text("Search label or address"),
+                );
+                if ui.button("Save Current Recipient").clicked() {
+                    app.start_add_current_recipient_to_address_book();
+                }
+                if ui.button("Close").clicked() {
+                    app.recipient_address_book_open = false;
+                    app.recipient_address_editor_open = false;
+                }
+            });
+            ui.add_space(8.0);
+
+            if app.recipient_address_editor_open {
+                ui.horizontal(|ui| {
+                    ui.label("Label");
+                    ui.add_sized(
+                        [200.0, 28.0],
+                        egui::TextEdit::singleline(&mut app.recipient_address_editor_label)
+                            .hint_text("Recipient label"),
+                    );
+                    ui.label("Address");
+                    ui.add_sized(
+                        [360.0, 28.0],
+                        egui::TextEdit::singleline(&mut app.recipient_address_editor_address)
+                            .hint_text("Recipient address"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Notes");
+                    ui.add_sized(
+                        [640.0, 28.0],
+                        egui::TextEdit::singleline(&mut app.recipient_address_editor_notes)
+                            .hint_text("Optional notes"),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        if let Err(err) = app.save_recipient_address_book_entry() {
+                            app.last_error = Some(err.clone());
+                            app.send_status = err;
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        app.recipient_address_editor_open = false;
+                        app.recipient_address_editor_id = None;
+                        app.recipient_address_editor_label.clear();
+                        app.recipient_address_editor_address.clear();
+                        app.recipient_address_editor_notes.clear();
+                    }
+                });
+                ui.add_space(10.0);
+            }
+
+            let filter = app
+                .recipient_address_book_filter
+                .trim()
+                .to_ascii_lowercase();
+            let mut filtered_entries = app
+                .recipient_address_book
+                .iter()
+                .filter(|entry| {
+                    filter.is_empty()
+                        || entry.label.to_ascii_lowercase().contains(&filter)
+                        || entry.address.to_ascii_lowercase().contains(&filter)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            filtered_entries.sort_by(|left, right| {
+                right
+                    .last_used_at_unix
+                    .cmp(&left.last_used_at_unix)
+                    .then(
+                        left.label
+                            .to_ascii_lowercase()
+                            .cmp(&right.label.to_ascii_lowercase()),
+                    )
+                    .then(left.address.cmp(&right.address))
+            });
+
+            if filtered_entries.is_empty() {
+                widgets::muted_label(
+                    ui,
+                    "No saved recipients yet. Save a destination here for one-click reuse.",
+                );
+                return;
+            }
+
+            let mut select_id = None::<String>;
+            let mut edit_id = None::<String>;
+            let mut delete_id = None::<String>;
+
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for entry in &filtered_entries {
+                        widgets::panel_frame()
+                            .inner_margin(egui::Margin::same(8.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&entry.label).size(13.0).strong(),
+                                        );
+                                        widgets::muted_label(ui, &entry.address);
+                                        if !entry.notes.trim().is_empty() {
+                                            widgets::muted_label(ui, &entry.notes);
+                                        }
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Delete").clicked() {
+                                                delete_id = Some(entry.id.clone());
+                                            }
+                                            if ui.button("Edit").clicked() {
+                                                edit_id = Some(entry.id.clone());
+                                            }
+                                            if ui.button("Use").clicked() {
+                                                select_id = Some(entry.id.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+
+            if let Some(id) = select_id {
+                if let Err(err) = app.select_recipient_address_book_entry(&id) {
+                    app.last_error = Some(err.clone());
+                    app.send_status = err;
+                }
+            }
+            if let Some(id) = edit_id {
+                app.edit_recipient_address_book_entry(&id);
+            }
+            if let Some(id) = delete_id {
+                if let Err(err) = app.delete_recipient_address_book_entry(&id) {
+                    app.last_error = Some(err.clone());
+                    app.send_status = err;
+                }
+            }
+        });
 }

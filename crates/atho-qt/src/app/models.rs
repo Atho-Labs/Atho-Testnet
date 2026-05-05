@@ -369,11 +369,39 @@ pub(crate) struct MiningJob {
 #[derive(Debug, Clone)]
 pub(crate) struct SendOutcome {
     pub(crate) fee_atoms: u64,
-    pub(crate) message: String,
+    pub(crate) txid: [u8; 48],
+    pub(crate) tx_pow_nonce: u64,
+    pub(crate) tx_pow_bits: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendProgressStage {
+    Preparing,
+    Signing,
+    FinalizingProof,
+    Broadcasting,
+}
+
+impl SendProgressStage {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing transaction…",
+            Self::Signing => "Signing transaction…",
+            Self::FinalizingProof => "Finalizing anti-spam proof…",
+            Self::Broadcasting => "Broadcasting transaction…",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SendJobEvent {
+    Progress { stage: SendProgressStage },
+    Finished(Result<SendOutcome, String>),
 }
 
 #[derive(Debug)]
 pub(crate) struct SendJob {
     pub(crate) started_at: Instant,
-    pub(crate) receiver: mpsc::Receiver<Result<SendOutcome, String>>,
+    pub(crate) stage: SendProgressStage,
+    pub(crate) receiver: mpsc::Receiver<SendJobEvent>,
 }

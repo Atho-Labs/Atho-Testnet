@@ -430,9 +430,11 @@ pub(crate) fn signed_spend_transaction(
             signature: sig_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![atho_core::transaction::WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         let witness_root = tx.witness_commitment_hash();
@@ -440,9 +442,11 @@ pub(crate) fn signed_spend_transaction(
             signature: sig_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![atho_core::transaction::WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, 0),
                 witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, 0),
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         let fee = minimum_required_fee_atoms(network, &tx);

@@ -461,14 +461,17 @@ fn tx_duplicate_input() -> BuiltTransaction {
         pubkey: keypair.public_key.0.clone(),
         input_refs: vec![
             WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             },
             WitnessInputRef {
+                input_index: 1,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 1),
                 witness_commit_ref: [0; 16],
             },
         ],
+        additional_signers: vec![],
     };
     tx.witness = witness.canonical_bytes();
     BuiltTransaction {
@@ -548,9 +551,11 @@ fn make_spend_tx(
         signature: signature_bytes,
         pubkey: keypair.public_key.0.clone(),
         input_refs: vec![WitnessInputRef {
+            input_index: 0,
             sig_ref_short,
             witness_commit_ref: [0; 16],
         }],
+        additional_signers: vec![],
     };
     tx.witness = witness.canonical_bytes();
     if let Some(fee_atoms) = tx

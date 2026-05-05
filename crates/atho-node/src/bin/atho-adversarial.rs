@@ -309,9 +309,11 @@ fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u
         signature: sig_bytes.clone(),
         pubkey: keypair.public_key.0.clone(),
         input_refs: vec![WitnessInputRef {
+            input_index: 0,
             sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, 0),
             witness_commit_ref: [0; 16],
         }],
+        additional_signers: vec![],
     };
     tx.witness = witness.canonical_bytes();
     tx
@@ -431,10 +433,12 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         pubkey: keypair.public_key.0.clone(),
         input_refs: (0..tx.inputs.len())
             .map(|index| WitnessInputRef {
+                input_index: index as u32,
                 sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, index as u32),
                 witness_commit_ref: [0; 16],
             })
             .collect(),
+        additional_signers: vec![],
     };
     tx.witness = witness.canonical_bytes();
     solve_transaction_pow(Network::Mainnet, &mut tx, 20);

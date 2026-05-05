@@ -2108,6 +2108,8 @@ fn render_transaction_value(network: Network, index: usize, tx: &Transaction) ->
         "weight_bytes": tx.weight_bytes(),
         "vsize_bytes": tx.vsize_bytes(),
         "has_witness": !tx.witness.is_empty(),
+        "tx_pow_nonce": tx.tx_pow_nonce,
+        "tx_pow_bits": tx.tx_pow_bits,
         "inputs": tx.inputs.iter().map(render_transaction_input_value).collect::<Vec<_>>(),
         "outputs": tx
             .outputs
@@ -2654,7 +2656,27 @@ mod tests {
         assert_eq!(command.data["header"]["network"], "atho-regnet");
         assert_eq!(command.data["transaction_count"], 1);
         assert!(command.data.get("fees_burned_atoms").is_none());
+        assert_eq!(command.data["transactions"][0]["tx_pow_nonce"], 0);
+        assert_eq!(command.data["transactions"][0]["tx_pow_bits"], 0);
         assert!(command.data["transactions"][0]["outputs"][0]["locking_script_hex"].is_string());
+    }
+
+    #[test]
+    fn render_transaction_value_exposes_transaction_pow_fields() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 123,
+            tx_pow_bits: 19,
+        };
+
+        let rendered = render_transaction_value(Network::Regnet, 0, &tx);
+
+        assert_eq!(rendered["tx_pow_nonce"], 123);
+        assert_eq!(rendered["tx_pow_bits"], 19);
     }
 
     #[test]

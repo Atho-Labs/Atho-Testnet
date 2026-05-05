@@ -36,11 +36,20 @@ impl AthoSignatureDomain {
 /// This is the exact message prehash passed to Falcon-512 RS under the
 /// `ATHO_TX_SIGN_V1` domain:
 ///
-/// - canonical source: `Transaction::base_bytes()`
+/// - canonical source: `Transaction::base_bytes()` plus the covered input set
 /// - hash function: `SHA3-384`
 /// - output size: 48 bytes
 pub fn transaction_signing_digest(tx: &Transaction) -> [u8; 48] {
     tx.signing_digest()
+}
+
+/// Canonical grouped-signer prehash used when one transaction spends multiple
+/// wallet address groups.
+pub fn transaction_signing_digest_for_input_indexes(
+    tx: &Transaction,
+    input_indexes: &[u32],
+) -> [u8; 48] {
+    tx.signing_digest_for_input_indexes(input_indexes)
 }
 
 /// Canonical block prehash reserved for Atho block-signature use.

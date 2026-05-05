@@ -44,7 +44,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         });
 
         ui.add_space(8.0);
-        widgets::table_header(ui, &["Date", "Type", "Label", "Amount (ATHO)"]);
+        widgets::table_header(ui, &["Date", "Type", "Label", "Amount"]);
         ui.separator();
         ui.add_space(6.0);
 
@@ -80,8 +80,8 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                     |ui| {
                                         widgets::row_value_signed(
                                             ui,
-                                            app.active_network(),
                                             row.amount_atoms,
+                                            app.display_unit(),
                                         )
                                     },
                                 );

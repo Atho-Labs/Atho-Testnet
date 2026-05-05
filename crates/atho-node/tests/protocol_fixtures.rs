@@ -33,10 +33,12 @@ fn witness_bytes(tx: &Transaction) -> Vec<u8> {
         pubkey: keypair.public_key.0.clone(),
         input_refs: (0..tx.inputs.len())
             .map(|index| WitnessInputRef {
+                input_index: index as u32,
                 sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
                 witness_commit_ref: [0; 16],
             })
             .collect(),
+        additional_signers: vec![],
     };
     let staged_tx = Transaction {
         witness: staged.canonical_bytes(),
@@ -50,10 +52,12 @@ fn witness_bytes(tx: &Transaction) -> Vec<u8> {
         pubkey: keypair.public_key.0,
         input_refs: (0..tx.inputs.len())
             .map(|index| WitnessInputRef {
+                input_index: index as u32,
                 sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
                 witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, index as u32),
             })
             .collect(),
+        additional_signers: vec![],
     }
     .canonical_bytes()
 }

@@ -295,12 +295,23 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         ui.separator();
                         ui.add(resources::hd_enabled_icon(16.0))
                             .on_hover_text("HD wallet mode is enabled.");
-                        ui.label(
-                            egui::RichText::new("ATHO")
-                                .size(13.0)
-                                .strong()
-                                .color(widgets::TEXT),
-                        );
+                        egui::ComboBox::from_id_source("shell_display_unit")
+                            .selected_text(app.display_unit().label())
+                            .width(92.0)
+                            .show_ui(ui, |ui| {
+                                for unit in crate::app::amounts::DisplayUnit::variants() {
+                                    if ui
+                                        .selectable_label(app.display_unit() == unit, unit.label())
+                                        .clicked()
+                                    {
+                                        app.set_display_unit(unit);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Display unit for balances, history, and wallet amounts. This only changes UI formatting; consensus remains integer atoms.",
+                            );
                         ui.separator();
                         widgets::muted_label(ui, &app.view_model.network_label);
                     },
@@ -404,6 +415,12 @@ fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {
             });
         });
 
+    if !app.view_model.chain_synced() && (hide_requested || !open) {
+        app.sync_status_hidden_until_synced = true;
+    }
+    if app.view_model.chain_synced() {
+        app.sync_status_hidden_until_synced = false;
+    }
     app.show_sync_status_dialog = open && !hide_requested;
 }
 

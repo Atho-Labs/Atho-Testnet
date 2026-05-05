@@ -14,15 +14,6 @@ use crate::transaction::Transaction;
 use getrandom::getrandom;
 use sha3::{Digest, Sha3_256};
 
-fn read_le_u32(bytes: &[u8], offset: &mut usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let slice = bytes.get(*offset..end)?;
-    let mut out = [0u8; 4];
-    out.copy_from_slice(slice);
-    *offset = end;
-    Some(u32::from_le_bytes(out))
-}
-
 fn update_tx_pow_message_hasher(hasher: &mut Sha3_256, tx: &Transaction) {
     tx.update_base_hasher(hasher);
 
@@ -30,63 +21,27 @@ fn update_tx_pow_message_hasher(hasher: &mut Sha3_256, tx: &Transaction) {
         hasher.update(0u32.to_le_bytes());
         return;
     }
-
-    let mut offset = 0usize;
-    let Some(signature_len) = read_le_u32(&tx.witness, &mut offset).map(|len| len as usize) else {
+    let Some(witness) = tx.witness_payload() else {
         hasher.update(0u32.to_le_bytes());
         return;
     };
-    let Some(signature) = tx.witness.get(offset..offset.saturating_add(signature_len)) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    offset += signature_len;
-
-    let Some(pubkey_len) = read_le_u32(&tx.witness, &mut offset).map(|len| len as usize) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    let Some(pubkey) = tx.witness.get(offset..offset.saturating_add(pubkey_len)) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    offset += pubkey_len;
-
-    let Some(ref_count) = read_le_u32(&tx.witness, &mut offset) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    let Some(ref_bytes_len) = (ref_count as usize).checked_mul(18) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    let Some(expected_end) = offset.checked_add(ref_bytes_len) else {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    };
-    if expected_end != tx.witness.len() {
-        hasher.update(0u32.to_le_bytes());
-        return;
-    }
 
     // Wallet tx PoW must survive block assembly. The per-input
     // witness_commit_ref is block-specific and is rewritten when a miner
     // binds the transaction to a block witness root, so exclude it here
     // while still binding the PoW to the signed witness material.
-    hasher.update((signature_len as u32).to_le_bytes());
-    hasher.update(signature);
-    hasher.update((pubkey_len as u32).to_le_bytes());
-    hasher.update(pubkey);
-    hasher.update(ref_count.to_le_bytes());
-
-    for _ in 0..ref_count {
-        let Some(sig_ref_short) = tx.witness.get(offset..offset.saturating_add(2)) else {
-            hasher.update(0u32.to_le_bytes());
-            return;
-        };
-        hasher.update(sig_ref_short);
-        offset = offset.saturating_add(18);
-    }
+    hasher.update((witness.signer_group_count() as u32).to_le_bytes());
+    witness.for_each_signer_group(|signature, pubkey, input_refs| {
+        hasher.update((signature.len() as u32).to_le_bytes());
+        hasher.update(signature);
+        hasher.update((pubkey.len() as u32).to_le_bytes());
+        hasher.update(pubkey);
+        hasher.update((input_refs.len() as u32).to_le_bytes());
+        for input_ref in input_refs {
+            hasher.update(input_ref.input_index.to_le_bytes());
+            hasher.update(input_ref.sig_ref_short);
+        }
+    });
 }
 
 pub fn minimum_required_fee_atoms(network: Network, tx: &Transaction) -> u64 {
@@ -374,9 +329,11 @@ mod tests {
             signature: vec![7; crate::constants::FALCON_512_SIGNATURE_BYTES],
             pubkey: vec![8; crate::constants::FALCON_512_PUBLIC_KEY_BYTES],
             input_refs: vec![WitnessInputRef {
+                input_index: 0,
                 sig_ref_short: [9, 10],
                 witness_commit_ref: [0; 16],
             }],
+            additional_signers: vec![],
         }
         .canonical_bytes();
         inflate_tx_to_min_vbytes(&mut tx, 500);

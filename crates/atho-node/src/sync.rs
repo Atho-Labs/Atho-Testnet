@@ -1365,10 +1365,12 @@ mod tests {
             pubkey: pubkey.clone(),
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
+                    input_index: index as u32,
                     sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
                     witness_commit_ref: [0; 16],
                 })
                 .collect(),
+            additional_signers: vec![],
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
@@ -1382,6 +1384,7 @@ mod tests {
             pubkey,
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
+                    input_index: index as u32,
                     sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
                     witness_commit_ref: derive_witness_commit_ref(
                         &txid,
@@ -1390,6 +1393,7 @@ mod tests {
                     ),
                 })
                 .collect(),
+            additional_signers: vec![],
         }
         .canonical_bytes()
     }

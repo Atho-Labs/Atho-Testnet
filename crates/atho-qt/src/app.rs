@@ -3,12 +3,14 @@ use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection, StatusMonitor}
 use crate::error::QtError;
 use crate::state::UiState;
 use crate::view::ViewModel;
+use amounts::{
+    format_amount_atoms, format_amount_atoms_without_unit, format_fee_atoms, parse_amount_to_atoms,
+    ClientDisplayPreferences, DisplayUnit, InputUnit,
+};
 use atho_core::address::decode_base56_address;
 use atho_core::block::{merkle_root, Block};
 use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
-use atho_core::constants::{
-    atoms_per_atho_for_network, decimals_for_network, DUST_RELAY_VALUE_ATOMS,
-};
+use atho_core::constants::DUST_RELAY_VALUE_ATOMS;
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
@@ -33,7 +35,8 @@ use atho_wallet::hd::AddressKind;
 use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::datafile::WalletEncryptionMode;
 use atho_wallet::wallet::{
-    Wallet, WalletAddress, WalletSpendRequest, WalletSpendUtxo, DEFAULT_RESTORE_GAP_LIMIT,
+    Wallet, WalletAddress, WalletSpendProgressStage, WalletSpendRequest, WalletSpendUtxo,
+    DEFAULT_RESTORE_GAP_LIMIT,
 };
 use eframe::egui;
 use getrandom::getrandom;
@@ -47,6 +50,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod amounts;
 mod dialogs;
 mod mnemonic_ui;
 mod models;
@@ -60,8 +64,9 @@ pub(crate) use models::{
     AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode, DebugWindowTab,
     ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, MiningStaleTemplate,
     NavTab, NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab,
-    ReceiveRequestRecord, SendJob, SendOutcome, SyncProgressSample, WalletActivityKind,
-    WalletActivityRow, WalletBalanceSummary, WalletManagementForm,
+    ReceiveRequestRecord, SendJob, SendJobEvent, SendOutcome, SendProgressStage,
+    SyncProgressSample, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
+    WalletManagementForm,
 };
 
 const RECEIVE_ADDRESS_LIST_LIMIT: usize = 100;
@@ -101,6 +106,15 @@ pub struct DesktopApp {
     send_amount: String,
     send_include_fee_in_total: bool,
     send_fee: String,
+    display_preferences: ClientDisplayPreferences,
+    recipient_address_book: Vec<RecipientAddressEntry>,
+    recipient_address_book_filter: String,
+    recipient_address_book_open: bool,
+    recipient_address_editor_open: bool,
+    recipient_address_editor_id: Option<String>,
+    recipient_address_editor_label: String,
+    recipient_address_editor_address: String,
+    recipient_address_editor_notes: String,
     receive_label: String,
     receive_amount: String,
     receive_message: String,
@@ -151,6 +165,7 @@ pub struct DesktopApp {
     theme_initialized: bool,
     compact_viewport: bool,
     show_sync_status_dialog: bool,
+    sync_status_hidden_until_synced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -161,10 +176,10 @@ struct SpendableWalletUtxo {
 
 #[derive(Debug, Clone)]
 struct SelectedSpendPlan {
-    address: WalletAddress,
     utxos: Vec<UtxoEntry>,
     total_input_atoms: u64,
     output_count: usize,
+    signer_group_count: usize,
     transaction_version: u16,
     estimated_fee_atoms: u64,
 }
@@ -233,6 +248,17 @@ struct WalletStartupMetadata {
     recorded_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RecipientAddressEntry {
+    id: String,
+    label: String,
+    address: String,
+    notes: String,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    last_used_at_unix: Option<u64>,
+}
+
 impl DesktopApp {
     fn active_network(&self) -> Network {
         self.connection.network()
@@ -255,6 +281,8 @@ impl DesktopApp {
         let launch_page = LaunchPage::Welcome;
         let available_cores = available_mining_cores();
         let configured_backend = MiningBackendKind::from_env().unwrap_or_default();
+        let display_preferences = load_client_display_preferences(network);
+        let recipient_address_book = load_recipient_address_book(network);
 
         let mut app = Self {
             connection,
@@ -290,10 +318,19 @@ impl DesktopApp {
             send_amount: String::new(),
             send_include_fee_in_total: false,
             send_fee: String::new(),
+            display_preferences,
+            recipient_address_book,
+            recipient_address_book_filter: String::new(),
+            recipient_address_book_open: false,
+            recipient_address_editor_open: false,
+            recipient_address_editor_id: None,
+            recipient_address_editor_label: String::new(),
+            recipient_address_editor_address: String::new(),
+            recipient_address_editor_notes: String::new(),
             receive_label: String::new(),
             receive_amount: String::new(),
             receive_message: String::new(),
-            send_status: String::from("Enter a destination and ATHO amount."),
+            send_status: String::from("Enter a destination address and amount."),
             debug_console_status: String::from("Type help to see commands grouped by area."),
             send_job: None,
             wallet_preparation_job: None,
@@ -342,6 +379,7 @@ impl DesktopApp {
             theme_initialized: false,
             compact_viewport: false,
             show_sync_status_dialog: false,
+            sync_status_hidden_until_synced: false,
         };
 
         app.view_model.network_label = app.connection.network().id().to_string();
@@ -367,6 +405,7 @@ impl DesktopApp {
     }
 
     fn apply_connection_status(&mut self, status: ConnectionStatus) {
+        let previously_synced = self.view_model.chain_synced();
         let previous_block_count = self.view_model.block_count;
         let previous_mempool_count = self.view_model.mempool_count;
         let previous_tip_hash = self.view_model.tip_hash;
@@ -421,6 +460,18 @@ impl DesktopApp {
         if let Some(error) = startup_error {
             self.wallet_readiness_gate_active = false;
             self.last_error = Some(error);
+        }
+
+        let currently_syncing =
+            status.connected && status.running && !self.view_model.chain_synced();
+        if currently_syncing {
+            if !self.sync_status_hidden_until_synced {
+                self.show_sync_status_dialog = true;
+            }
+        } else if previously_synced != self.view_model.chain_synced()
+            || self.view_model.chain_synced()
+        {
+            self.sync_status_hidden_until_synced = false;
         }
 
         if self.wallet.is_some()
@@ -586,7 +637,7 @@ impl DesktopApp {
         self.send_amount.clear();
         self.send_fee.clear();
         self.send_include_fee_in_total = false;
-        self.send_status = String::from("Enter a destination and ATHO amount.");
+        self.send_status = String::from("Enter a destination address and amount.");
         self.mining_status = String::from("Idle");
         self.last_mined_block_hash = None;
         self.last_error = None;
@@ -1654,44 +1705,67 @@ impl DesktopApp {
     }
 
     fn poll_send_job(&mut self) {
-        let Some(job) = self.send_job.take() else {
+        let Some(mut job) = self.send_job.take() else {
             return;
         };
 
-        match job.receiver.try_recv() {
-            Ok(Ok(outcome)) => {
-                self.send_fee = widgets::format_atoms(self.active_network(), outcome.fee_atoms);
-                self.send_status = outcome.message;
-                self.last_error = None;
-                self.wallet_cache_dirty = true;
-                let _ = atho_node::dev::append_log(
-                    "atho-qt",
-                    &format!("send outcome fee_atoms={}", outcome.fee_atoms),
-                );
-            }
-            Ok(Err(err)) => {
-                self.send_status = format!("Submission failed: {err}");
-                self.last_error = Some(err);
-                let _ = atho_node::dev::append_log(
-                    "atho-qt",
-                    &format!(
-                        "send submission failed error={}",
-                        self.last_error.as_deref().unwrap_or("unknown")
-                    ),
-                );
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                self.send_job = Some(job);
-                return;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.send_status = String::from("Submission worker disconnected");
-                self.last_error = Some(String::from("submission worker disconnected"));
-                let _ = atho_node::dev::append_log("atho-qt", "send worker disconnected");
+        let mut keep_job = true;
+        let mut disconnected = false;
+        while keep_job {
+            match job.receiver.try_recv() {
+                Ok(SendJobEvent::Progress { stage }) => {
+                    job.stage = stage;
+                    self.send_status = stage.label().to_string();
+                }
+                Ok(SendJobEvent::Finished(Ok(outcome))) => {
+                    self.send_fee = self.format_fee_amount(outcome.fee_atoms);
+                    self.send_status = format!(
+                        "Transaction submitted {} (send proof {} bits @ nonce {})",
+                        hex::encode(outcome.txid),
+                        outcome.tx_pow_bits,
+                        outcome.tx_pow_nonce
+                    );
+                    self.last_error = None;
+                    self.wallet_cache_dirty = true;
+                    let submitted_address = self.send_to.clone();
+                    self.mark_recipient_address_book_entry_used(&submitted_address);
+                    keep_job = false;
+                    let _ = atho_node::dev::append_log(
+                        "atho-qt",
+                        &format!(
+                            "send outcome fee_atoms={} tx_pow_bits={} tx_pow_nonce={}",
+                            outcome.fee_atoms, outcome.tx_pow_bits, outcome.tx_pow_nonce
+                        ),
+                    );
+                }
+                Ok(SendJobEvent::Finished(Err(err))) => {
+                    self.send_status = format!("Submission failed: {err}");
+                    self.last_error = Some(err);
+                    keep_job = false;
+                    let _ = atho_node::dev::append_log(
+                        "atho-qt",
+                        &format!(
+                            "send submission failed error={}",
+                            self.last_error.as_deref().unwrap_or("unknown")
+                        ),
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.send_job = Some(job);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    keep_job = false;
+                }
             }
         }
 
-        if self.send_job.is_none() {
+        if disconnected {
+            self.send_status = String::from("Submission worker disconnected");
+            self.last_error = Some(String::from("submission worker disconnected"));
+            let _ = atho_node::dev::append_log("atho-qt", "send worker disconnected");
+        } else {
             let elapsed = job.started_at.elapsed();
             self.send_status = format!("{} ({}s)", self.send_status, elapsed.as_secs());
         }
@@ -2076,6 +2150,182 @@ impl DesktopApp {
         fs::write(metadata_path, bytes).map_err(|err| err.to_string())
     }
 
+    fn persist_client_display_preferences(&self) -> Result<(), String> {
+        let preferences_path = client_display_preferences_path(self.connection.network());
+        if let Some(parent) = preferences_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let bytes =
+            serde_json::to_vec_pretty(&self.display_preferences).map_err(|err| err.to_string())?;
+        fs::write(preferences_path, bytes).map_err(|err| err.to_string())
+    }
+
+    fn persist_recipient_address_book(&self) -> Result<(), String> {
+        let address_book_path = recipient_address_book_path(self.connection.network());
+        if let Some(parent) = address_book_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let bytes = serde_json::to_vec_pretty(&self.recipient_address_book)
+            .map_err(|err| err.to_string())?;
+        fs::write(address_book_path, bytes).map_err(|err| err.to_string())
+    }
+
+    pub(crate) fn open_recipient_address_book(&mut self) {
+        self.recipient_address_book_open = true;
+        self.recipient_address_editor_open = false;
+        self.recipient_address_book_filter.clear();
+    }
+
+    pub(crate) fn start_add_current_recipient_to_address_book(&mut self) {
+        self.recipient_address_book_open = true;
+        self.recipient_address_editor_open = true;
+        self.recipient_address_editor_id = None;
+        self.recipient_address_editor_label = self.send_label.trim().to_owned();
+        self.recipient_address_editor_address = self.send_to.trim().to_owned();
+        self.recipient_address_editor_notes.clear();
+    }
+
+    pub(crate) fn edit_recipient_address_book_entry(&mut self, id: &str) {
+        let Some(entry) = self
+            .recipient_address_book
+            .iter()
+            .find(|entry| entry.id == id)
+        else {
+            self.last_error = Some(String::from("Recipient address book entry not found"));
+            return;
+        };
+        self.recipient_address_book_open = true;
+        self.recipient_address_editor_open = true;
+        self.recipient_address_editor_id = Some(entry.id.clone());
+        self.recipient_address_editor_label = entry.label.clone();
+        self.recipient_address_editor_address = entry.address.clone();
+        self.recipient_address_editor_notes = entry.notes.clone();
+    }
+
+    pub(crate) fn save_recipient_address_book_entry(&mut self) -> Result<(), String> {
+        let label = self.recipient_address_editor_label.trim();
+        let address = self.recipient_address_editor_address.trim();
+        let notes = self.recipient_address_editor_notes.trim();
+        if label.is_empty() {
+            return Err(String::from("Enter a recipient label"));
+        }
+        if address.is_empty() {
+            return Err(String::from("Enter a recipient address"));
+        }
+        let (_, network) = decode_base56_address(address).map_err(|err| err.to_string())?;
+        if network != self.connection.network() {
+            return Err(format!("Address belongs to {}", network.id()));
+        }
+        let now = current_unix_seconds();
+        if self.recipient_address_book.iter().any(|entry| {
+            entry.address.eq_ignore_ascii_case(address)
+                && match self.recipient_address_editor_id.as_ref() {
+                    Some(current_id) => current_id != &entry.id,
+                    None => true,
+                }
+        }) {
+            return Err(String::from(
+                "That address is already saved in the recipient address book",
+            ));
+        }
+        if let Some(existing_id) = self.recipient_address_editor_id.as_ref() {
+            if let Some(entry) = self
+                .recipient_address_book
+                .iter_mut()
+                .find(|entry| &entry.id == existing_id)
+            {
+                entry.label = label.to_owned();
+                entry.address = address.to_owned();
+                entry.notes = notes.to_owned();
+                entry.updated_at_unix = now;
+            } else {
+                return Err(String::from("Recipient address book entry not found"));
+            }
+        } else {
+            self.recipient_address_book.push(RecipientAddressEntry {
+                id: recipient_address_entry_id(address, now),
+                label: label.to_owned(),
+                address: address.to_owned(),
+                notes: notes.to_owned(),
+                created_at_unix: now,
+                updated_at_unix: now,
+                last_used_at_unix: None,
+            });
+        }
+        self.recipient_address_book.sort_by(|left, right| {
+            left.label
+                .to_ascii_lowercase()
+                .cmp(&right.label.to_ascii_lowercase())
+                .then(left.address.cmp(&right.address))
+        });
+        self.persist_recipient_address_book()?;
+        self.recipient_address_editor_open = false;
+        self.recipient_address_editor_id = None;
+        self.recipient_address_editor_label.clear();
+        self.recipient_address_editor_address.clear();
+        self.recipient_address_editor_notes.clear();
+        self.last_error = None;
+        self.send_status = String::from("Recipient saved to address book");
+        Ok(())
+    }
+
+    pub(crate) fn delete_recipient_address_book_entry(&mut self, id: &str) -> Result<(), String> {
+        let original_len = self.recipient_address_book.len();
+        self.recipient_address_book.retain(|entry| entry.id != id);
+        if self.recipient_address_book.len() == original_len {
+            return Err(String::from("Recipient address book entry not found"));
+        }
+        self.persist_recipient_address_book()?;
+        self.last_error = None;
+        self.send_status = String::from("Recipient removed from address book");
+        Ok(())
+    }
+
+    pub(crate) fn select_recipient_address_book_entry(&mut self, id: &str) -> Result<(), String> {
+        let now = current_unix_seconds();
+        let Some(index) = self
+            .recipient_address_book
+            .iter()
+            .position(|entry| entry.id == id)
+        else {
+            return Err(String::from("Recipient address book entry not found"));
+        };
+        let (address, label) = {
+            let entry = &mut self.recipient_address_book[index];
+            entry.last_used_at_unix = Some(now);
+            entry.updated_at_unix = now;
+            (entry.address.clone(), entry.label.clone())
+        };
+        self.send_to = address;
+        if !label.trim().is_empty() {
+            self.send_label = label.clone();
+        }
+        self.persist_recipient_address_book()?;
+        self.recipient_address_book_open = false;
+        self.recipient_address_editor_open = false;
+        self.last_error = None;
+        self.send_status = format!("Loaded recipient {label}");
+        Ok(())
+    }
+
+    fn mark_recipient_address_book_entry_used(&mut self, address: &str) {
+        let normalized = address.trim();
+        let Some(index) = self
+            .recipient_address_book
+            .iter()
+            .position(|entry| entry.address == normalized)
+        else {
+            return;
+        };
+        let now = current_unix_seconds();
+        {
+            let entry = &mut self.recipient_address_book[index];
+            entry.last_used_at_unix = Some(now);
+            entry.updated_at_unix = now;
+        }
+        let _ = self.persist_recipient_address_book();
+    }
+
     fn change_wallet_passphrase(&mut self, password: &str) -> Result<(), String> {
         let wallet_path = self
             .wallet_path
@@ -2322,7 +2572,7 @@ impl DesktopApp {
         if destination.is_empty() {
             return Err(String::from("Enter a destination address"));
         }
-        let amount = Self::parse_send_amount_atoms(self.active_network(), &self.send_amount)?;
+        let amount = Self::parse_send_amount_atoms(self.send_input_unit(), &self.send_amount)?;
         if amount == 0 {
             return Err(String::from("Amount must be greater than zero"));
         }
@@ -2380,7 +2630,6 @@ impl DesktopApp {
             None
         };
         let spend_request = WalletSpendRequest {
-            spend_address: selected_plan.address.clone(),
             selected_utxos: selected_plan
                 .utxos
                 .iter()
@@ -2398,44 +2647,79 @@ impl DesktopApp {
             lock_time: tx_lock_time,
             change_address: change_address.clone(),
         };
-        let built_spend = {
-            let wallet = self
-                .wallet_ref()
-                .ok_or_else(|| String::from("Load or create a wallet first"))?;
-            wallet
-                .build_signed_payment_transaction(spend_request)
-                .map_err(|err| err.to_string())?
-        };
-        let final_transaction = built_spend.transaction;
-        let fee_atoms = built_spend.fee_atoms;
-        let output_total_atoms = final_transaction
-            .checked_output_value_atoms()
-            .ok_or_else(|| String::from("transaction output total overflow"))?;
-        let actual_fee = total_input_atoms
-            .checked_sub(output_total_atoms)
-            .ok_or_else(|| String::from("selected inputs do not cover amount and fee"))?;
-        if actual_fee != fee_atoms {
-            return Err(String::from("transaction fee calculation mismatch"));
-        }
         let (sender, receiver) = mpsc::channel();
         let rpc_address = self.connection.rpc_address().to_string();
         let use_local_node = self.connection.has_local_node();
         let connection = self.connection.clone();
-        let txid = final_transaction.txid();
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?
+            .clone();
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "submitting transaction rpc={} txid={} amount_atoms={} fee_atoms={} include_fee_total={} inputs={} outputs={}",
+                "submitting transaction rpc={} amount_atoms={} estimated_fee_atoms={} include_fee_total={} inputs={} outputs={}",
                 rpc_address,
-                hex::encode(txid),
                 amount,
-                fee_atoms,
+                selected_plan.estimated_fee_atoms,
                 self.send_include_fee_in_total,
                 selected_plan.utxos.len(),
-                final_transaction.outputs.len()
+                selected_plan.output_count
             ),
         );
         std::thread::spawn(move || {
+            let _ = sender.send(SendJobEvent::Progress {
+                stage: SendProgressStage::Preparing,
+            });
+            let built_spend =
+                wallet.build_signed_payment_transaction_with_progress(spend_request, |stage| {
+                    let mapped = match stage {
+                        WalletSpendProgressStage::Preparing => SendProgressStage::Preparing,
+                        WalletSpendProgressStage::Signing => SendProgressStage::Signing,
+                        WalletSpendProgressStage::FinalizingProof => {
+                            SendProgressStage::FinalizingProof
+                        }
+                    };
+                    let _ = sender.send(SendJobEvent::Progress { stage: mapped });
+                });
+            let built_spend = match built_spend {
+                Ok(spend) => spend,
+                Err(err) => {
+                    let _ = sender.send(SendJobEvent::Finished(Err(err.to_string())));
+                    return;
+                }
+            };
+            let final_transaction = built_spend.transaction;
+            let fee_atoms = built_spend.fee_atoms;
+            let output_total_atoms = match final_transaction.checked_output_value_atoms() {
+                Some(total) => total,
+                None => {
+                    let _ = sender.send(SendJobEvent::Finished(Err(String::from(
+                        "transaction output total overflow",
+                    ))));
+                    return;
+                }
+            };
+            let actual_fee = match total_input_atoms.checked_sub(output_total_atoms) {
+                Some(fee) => fee,
+                None => {
+                    let _ = sender.send(SendJobEvent::Finished(Err(String::from(
+                        "selected inputs do not cover amount and fee",
+                    ))));
+                    return;
+                }
+            };
+            if actual_fee != fee_atoms {
+                let _ = sender.send(SendJobEvent::Finished(Err(String::from(
+                    "transaction fee calculation mismatch",
+                ))));
+                return;
+            }
+            let tx_pow_nonce = final_transaction.tx_pow_nonce;
+            let tx_pow_bits = final_transaction.tx_pow_bits;
+            let _ = sender.send(SendJobEvent::Progress {
+                stage: SendProgressStage::Broadcasting,
+            });
             let result = if use_local_node {
                 match connection.request(RpcRequest::SubmitTransaction {
                     transaction: final_transaction,
@@ -2443,7 +2727,9 @@ impl DesktopApp {
                 }) {
                     RpcResponse::TransactionSubmitted(txid) => Ok(SendOutcome {
                         fee_atoms,
-                        message: format!("Transaction submitted {}", hex::encode(txid)),
+                        txid,
+                        tx_pow_nonce,
+                        tx_pow_bits,
                     }),
                     RpcResponse::Error(err) => Err(err.to_string()),
                     other => Err(format!("unexpected rpc response: {other:?}")),
@@ -2456,21 +2742,24 @@ impl DesktopApp {
                 }) {
                     Ok(RpcResponse::TransactionSubmitted(txid)) => Ok(SendOutcome {
                         fee_atoms,
-                        message: format!("Transaction submitted {}", hex::encode(txid)),
+                        txid,
+                        tx_pow_nonce,
+                        tx_pow_bits,
                     }),
                     Ok(RpcResponse::Error(err)) => Err(err.to_string()),
                     Ok(other) => Err(format!("unexpected rpc response: {other:?}")),
                     Err(err) => Err(err.to_string()),
                 }
             };
-            let _ = sender.send(result);
+            let _ = sender.send(SendJobEvent::Finished(result));
         });
 
-        self.send_fee = widgets::format_atoms(self.active_network(), fee_atoms);
-        self.send_status = String::from("Submitting transaction...");
+        self.send_fee = self.format_fee_amount(selected_plan.estimated_fee_atoms);
+        self.send_status = SendProgressStage::Preparing.label().to_string();
         self.last_error = None;
         self.send_job = Some(SendJob {
             started_at: Instant::now(),
+            stage: SendProgressStage::Preparing,
             receiver,
         });
         Ok(())
@@ -2495,20 +2784,20 @@ impl DesktopApp {
         );
         if sendable_atoms == 0 {
             return Err(String::from(
-                "No single wallet address has enough confirmed balance to cover a spendable transaction fee",
+                "No spendable wallet balance can cover a valid transaction fee",
             ));
         }
-        self.send_amount = Self::format_send_amount_input(self.active_network(), sendable_atoms);
+        self.send_amount = Self::format_send_amount_input(self.send_input_unit(), sendable_atoms);
         self.last_error = None;
         self.send_status = if self.send_include_fee_in_total {
             format!(
-                "Filled the largest currently spendable total amount: {}",
-                widgets::format_atoms(self.active_network(), sendable_atoms)
+                "Filled the largest currently spendable wallet total amount: {}",
+                self.format_amount(sendable_atoms)
             )
         } else {
             format!(
-                "Filled the largest currently spendable recipient amount: {}",
-                widgets::format_atoms(self.active_network(), sendable_atoms)
+                "Filled the largest currently spendable wallet recipient amount: {}",
+                self.format_amount(sendable_atoms)
             )
         };
         Ok(())
@@ -2526,13 +2815,13 @@ impl DesktopApp {
         );
         if max_sendable == 0 {
             return String::from(
-                "No single wallet address has enough confirmed balance to cover a spendable transaction fee",
+                "No spendable wallet balance can cover a valid transaction fee",
             );
         }
         format!(
-            "No single wallet address can cover {}. The current spend path signs one address at a time. Max spendable now: {}. Use a smaller amount or keep future mining rewards on one address.",
-            widgets::format_atoms(self.active_network(), amount),
-            widgets::format_atoms(self.active_network(), max_sendable)
+            "The wallet cannot cover {} after fees. Max spendable now: {}.",
+            self.format_amount(amount),
+            self.format_amount(max_sendable)
         )
     }
 
@@ -2543,99 +2832,83 @@ impl DesktopApp {
         include_fee_in_total: bool,
     ) -> Result<Option<SelectedSpendPlan>, String> {
         let min_output = Self::wallet_min_output_amount_atoms(network);
+        let mut candidates = candidates;
+        candidates.sort_by(|left, right| {
+            right
+                .utxo
+                .value_atoms
+                .cmp(&left.utxo.value_atoms)
+                .then(left.address.payment_digest.cmp(&right.address.payment_digest))
+                .then(left.utxo.txid.cmp(&right.utxo.txid))
+                .then(left.utxo.output_index.cmp(&right.utxo.output_index))
+        });
+
         let mut best: Option<SelectedSpendPlan> = None;
-        for mut group in Self::group_spendable_inputs_by_address(candidates).into_values() {
-            group.sort_by(|left, right| {
-                right
-                    .utxo
-                    .value_atoms
-                    .cmp(&left.utxo.value_atoms)
-                    .then(left.utxo.txid.cmp(&right.utxo.txid))
-                    .then(left.utxo.output_index.cmp(&right.utxo.output_index))
-            });
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        let mut signer_groups = std::collections::BTreeSet::<[u8; 32]>::new();
 
-            let mut selected = Vec::new();
-            let mut total = 0u64;
+        for candidate in candidates {
+            total = total.saturating_add(candidate.utxo.value_atoms);
+            signer_groups.insert(candidate.address.payment_digest);
+            selected.push(candidate);
+            let signer_group_count = signer_groups.len();
+            let estimate_exact_fee = Self::estimate_fee(network, selected.len(), 1, signer_group_count);
+            let estimate_change_fee =
+                Self::estimate_fee(network, selected.len(), 2, signer_group_count);
 
-            for candidate in group {
-                total = total.saturating_add(candidate.utxo.value_atoms);
-                selected.push(candidate);
-                let estimate_exact_fee = Self::estimate_fee(network, selected.len(), 1);
-                let estimate_change_fee = Self::estimate_fee(network, selected.len(), 2);
-
-                let candidate_output_count = if include_fee_in_total {
-                    let recipient_one_output = amount_atoms.saturating_sub(estimate_exact_fee);
-                    let recipient_two_output = amount_atoms.saturating_sub(estimate_change_fee);
-                    let excess = total.saturating_sub(amount_atoms);
-                    if total >= amount_atoms
-                        && excess < min_output
-                        && recipient_one_output >= min_output
-                    {
-                        Some(1)
-                    } else if total > amount_atoms
-                        && excess >= min_output
-                        && recipient_two_output >= min_output
-                    {
-                        Some(2)
-                    } else {
-                        None
-                    }
-                } else if amount_atoms >= min_output {
-                    let exact_target = amount_atoms.checked_add(estimate_exact_fee);
-                    let change_target = amount_atoms.checked_add(estimate_change_fee);
-                    if exact_target.is_some_and(|target| {
-                        total >= target && total.saturating_sub(target) < min_output
-                    }) {
-                        Some(1)
-                    } else if change_target.is_some_and(|target| {
-                        total > target && total.saturating_sub(target) >= min_output
-                    }) {
-                        Some(2)
-                    } else {
-                        None
-                    }
+            let candidate_output_count = if include_fee_in_total {
+                let recipient_one_output = amount_atoms.saturating_sub(estimate_exact_fee);
+                let recipient_two_output = amount_atoms.saturating_sub(estimate_change_fee);
+                let excess = total.saturating_sub(amount_atoms);
+                if total >= amount_atoms && excess < min_output && recipient_one_output >= min_output
+                {
+                    Some(1)
+                } else if total > amount_atoms
+                    && excess >= min_output
+                    && recipient_two_output >= min_output
+                {
+                    Some(2)
                 } else {
                     None
-                };
+                }
+            } else if amount_atoms >= min_output {
+                let exact_target = amount_atoms.checked_add(estimate_exact_fee);
+                let change_target = amount_atoms.checked_add(estimate_change_fee);
+                if exact_target.is_some_and(|target| {
+                    total >= target && total.saturating_sub(target) < min_output
+                }) {
+                    Some(1)
+                } else if change_target.is_some_and(|target| {
+                    total > target && total.saturating_sub(target) >= min_output
+                }) {
+                    Some(2)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-                if let Some(output_count) = candidate_output_count {
-                    let estimated_fee_atoms =
-                        Self::estimate_fee(network, selected.len(), output_count);
-                    let signing_address = selected
-                        .first()
-                        .expect("selected spend plan must have at least one input")
-                        .address
-                        .clone();
-                    let candidate = SelectedSpendPlan {
-                        address: signing_address,
-                        utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
-                        total_input_atoms: total,
-                        output_count,
-                        transaction_version: 1,
-                        estimated_fee_atoms,
-                    };
-                    best = Self::prefer_candidate(best, candidate);
-                    if output_count == 1 {
-                        break;
-                    }
+            if let Some(output_count) = candidate_output_count {
+                let estimated_fee_atoms =
+                    Self::estimate_fee(network, selected.len(), output_count, signer_group_count);
+                let candidate = SelectedSpendPlan {
+                    utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
+                    total_input_atoms: total,
+                    output_count,
+                    signer_group_count,
+                    transaction_version: 1,
+                    estimated_fee_atoms,
+                };
+                best = Self::prefer_candidate(best, candidate);
+                if output_count == 1 && total >= amount_atoms {
+                    break;
                 }
             }
         }
 
         Ok(best)
-    }
-
-    fn group_spendable_inputs_by_address(
-        candidates: Vec<SpendableWalletUtxo>,
-    ) -> std::collections::BTreeMap<[u8; 32], Vec<SpendableWalletUtxo>> {
-        let mut groups = std::collections::BTreeMap::<[u8; 32], Vec<SpendableWalletUtxo>>::new();
-        for candidate in candidates {
-            groups
-                .entry(candidate.address.payment_digest)
-                .or_default()
-                .push(candidate);
-        }
-        groups
     }
 
     fn max_single_address_sendable_atoms(
@@ -2644,30 +2917,30 @@ impl DesktopApp {
         include_fee_in_total: bool,
     ) -> u64 {
         let min_output = Self::wallet_min_output_amount_atoms(network);
-        let mut best = 0u64;
-        for group in Self::group_spendable_inputs_by_address(candidates).into_values() {
-            let total = group
-                .iter()
-                .map(|entry| entry.utxo.value_atoms)
-                .sum::<u64>();
-            let fee = Self::estimate_fee(network, group.len(), 1);
-            let sendable = if include_fee_in_total {
-                if total > fee && total.saturating_sub(fee) >= min_output {
-                    total
-                } else {
-                    0
-                }
+        let total = candidates
+            .iter()
+            .map(|entry| entry.utxo.value_atoms)
+            .sum::<u64>();
+        let signer_group_count = candidates
+            .iter()
+            .map(|entry| entry.address.payment_digest)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let fee = Self::estimate_fee(network, candidates.len(), 1, signer_group_count);
+        if include_fee_in_total {
+            if total > fee && total.saturating_sub(fee) >= min_output {
+                total
             } else {
-                let recipient_atoms = total.saturating_sub(fee);
-                if recipient_atoms >= min_output {
-                    recipient_atoms
-                } else {
-                    0
-                }
-            };
-            best = best.max(sendable);
+                0
+            }
+        } else {
+            let recipient_atoms = total.saturating_sub(fee);
+            if recipient_atoms >= min_output {
+                recipient_atoms
+            } else {
+                0
+            }
         }
-        best
     }
 
     fn prefer_candidate(
@@ -2684,9 +2957,14 @@ impl DesktopApp {
                         && candidate_inputs < existing_inputs)
                     || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
                         && candidate_inputs == existing_inputs
+                        && candidate.signer_group_count < existing.signer_group_count)
+                    || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
+                        && candidate_inputs == existing_inputs
+                        && candidate.signer_group_count == existing.signer_group_count
                         && candidate.output_count < existing.output_count)
                     || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
                         && candidate_inputs == existing_inputs
+                        && candidate.signer_group_count == existing.signer_group_count
                         && candidate.output_count == existing.output_count
                         && candidate.total_input_atoms < existing.total_input_atoms)
                 {
@@ -2698,7 +2976,12 @@ impl DesktopApp {
         }
     }
 
-    fn estimate_fee(network: Network, input_count: usize, output_count: usize) -> u64 {
+    fn estimate_fee(
+        network: Network,
+        input_count: usize,
+        output_count: usize,
+        signer_group_count: usize,
+    ) -> u64 {
         let mut inputs = Vec::with_capacity(input_count);
         for index in 0..input_count {
             inputs.push(TxInput {
@@ -2714,15 +2997,38 @@ impl DesktopApp {
                 locking_script: vec![0; 32],
             });
         }
+        let signer_group_count = signer_group_count.max(1).min(input_count.max(1));
+        let mut primary_input_refs = Vec::new();
+        let mut additional_signers = Vec::new();
+        for group_index in 0..signer_group_count {
+            let input_index = group_index as u32;
+            let input_ref = atho_core::transaction::WitnessInputRef {
+                input_index,
+                sig_ref_short: [0; 2],
+                witness_commit_ref: [0; 16],
+            };
+            if group_index == 0 {
+                primary_input_refs.push(input_ref);
+            } else {
+                additional_signers.push(atho_core::transaction::WitnessSignerGroup {
+                    signature: vec![0; FALCON_512_SIGNATURE_BYTES],
+                    pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
+                    input_refs: vec![input_ref],
+                });
+            }
+        }
+        for input_index in signer_group_count..input_count {
+            primary_input_refs.push(atho_core::transaction::WitnessInputRef {
+                input_index: input_index as u32,
+                sig_ref_short: [0; 2],
+                witness_commit_ref: [0; 16],
+            });
+        }
         let witness = TxWitness {
             signature: vec![0; FALCON_512_SIGNATURE_BYTES],
             pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
-            input_refs: (0..input_count)
-                .map(|_| atho_core::transaction::WitnessInputRef {
-                    sig_ref_short: [0; 2],
-                    witness_commit_ref: [0; 16],
-                })
-                .collect(),
+            input_refs: primary_input_refs,
+            additional_signers,
         }
         .canonical_bytes();
         let tx = Transaction {
@@ -2745,7 +3051,10 @@ impl DesktopApp {
     fn dust_amount_error_message(network: Network) -> String {
         format!(
             "Spendable outputs must be at least {}",
-            widgets::format_atoms(network, Self::wallet_min_output_amount_atoms(network))
+            format_amount_atoms(
+                Self::wallet_min_output_amount_atoms(network),
+                DisplayUnit::NanoAtho
+            )
         )
     }
 
@@ -2763,85 +3072,52 @@ impl DesktopApp {
         u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
     }
 
-    pub(crate) fn format_send_amount_input(network: Network, atoms: u64) -> String {
-        let scale = atoms_per_atho_for_network(network);
-        let decimals = decimals_for_network(network);
-        let whole = atoms / scale;
-        let fractional = atoms % scale;
-        if fractional == 0 {
-            return whole.to_string();
-        }
-
-        let mut fractional_text = format!("{fractional:0decimals$}");
-        while fractional_text.ends_with('0') {
-            fractional_text.pop();
-        }
-        format!("{whole}.{fractional_text}")
+    pub(crate) fn format_send_amount_input(input_unit: InputUnit, atoms: u64) -> String {
+        format_amount_atoms_without_unit(atoms, input_unit)
     }
 
-    fn parse_send_amount_atoms(network: Network, input: &str) -> Result<u64, String> {
-        let normalized: String = input
-            .trim()
-            .chars()
-            .filter(|ch| !ch.is_whitespace() && *ch != ',')
-            .collect();
-        if normalized.is_empty() {
-            return Err(String::from("Enter an amount"));
-        }
-        if normalized.starts_with('-') {
-            return Err(String::from("Amount must be greater than zero"));
-        }
-        let normalized = normalized.strip_prefix('+').unwrap_or(&normalized);
-        let mut parts = normalized.split('.');
-        let whole_text = parts.next().unwrap_or_default();
-        let fractional_text = parts.next();
-        if parts.next().is_some() {
-            return Err(String::from("Amount may contain only one decimal point"));
-        }
+    fn parse_send_amount_atoms(input_unit: InputUnit, input: &str) -> Result<u64, String> {
+        parse_amount_to_atoms(input, input_unit)
+    }
 
-        let whole_atoms = if whole_text.is_empty() {
-            0
-        } else if whole_text.chars().all(|ch| ch.is_ascii_digit()) {
-            whole_text
-                .parse::<u64>()
-                .map_err(|_| String::from("Amount is too large"))?
-        } else {
-            return Err(String::from(
-                "Amount must contain only digits, commas, and one decimal point",
-            ));
-        };
+    pub(crate) fn display_unit(&self) -> DisplayUnit {
+        self.display_preferences.display_unit
+    }
 
-        let fractional_atoms = match fractional_text {
-            None => 0,
-            Some(text) if text.is_empty() => 0,
-            Some(text) => {
-                let decimals = decimals_for_network(network);
-                if text.len() > decimals {
-                    return Err(format!("Amount supports up to {decimals} decimal places"));
-                }
-                if !text.chars().all(|ch| ch.is_ascii_digit()) {
-                    return Err(String::from(
-                        "Amount must contain only digits, commas, and one decimal point",
-                    ));
-                }
-                let mut padded = text.to_string();
-                while padded.len() < decimals {
-                    padded.push('0');
-                }
-                padded
-                    .parse::<u64>()
-                    .map_err(|_| String::from("Amount is too large"))?
+    pub(crate) fn send_input_unit(&self) -> InputUnit {
+        self.display_preferences.send_input_unit
+    }
+
+    pub(crate) fn set_display_unit(&mut self, unit: DisplayUnit) {
+        if self.display_preferences.display_unit == unit {
+            return;
+        }
+        self.display_preferences = self.display_preferences.with_display_unit(unit);
+        let _ = self.persist_client_display_preferences();
+    }
+
+    pub(crate) fn set_send_input_unit(&mut self, unit: InputUnit) {
+        if self.display_preferences.send_input_unit == unit {
+            return;
+        }
+        if !self.send_amount.trim().is_empty() {
+            if let Ok(amount_atoms) = Self::parse_send_amount_atoms(
+                self.display_preferences.send_input_unit,
+                &self.send_amount,
+            ) {
+                self.send_amount = Self::format_send_amount_input(unit, amount_atoms);
             }
-        };
-
-        let atoms = whole_atoms
-            .checked_mul(atoms_per_atho_for_network(network))
-            .and_then(|value| value.checked_add(fractional_atoms))
-            .ok_or_else(|| String::from("Amount is too large"))?;
-        if atoms == 0 {
-            return Err(String::from("Amount must be greater than zero"));
         }
-        Ok(atoms)
+        self.display_preferences = self.display_preferences.with_send_input_unit(unit);
+        let _ = self.persist_client_display_preferences();
+    }
+
+    pub(crate) fn format_amount(&self, atoms: u64) -> String {
+        format_amount_atoms(atoms, self.display_unit())
+    }
+
+    pub(crate) fn format_fee_amount(&self, atoms: u64) -> String {
+        format_fee_atoms(atoms, self.display_unit())
     }
 
     fn current_receive_address_text(&self) -> String {
@@ -3673,6 +3949,41 @@ fn startup_wallet_metadata_path(network: Network) -> PathBuf {
         .join("last-wallet.json")
 }
 
+fn client_display_preferences_path(network: Network) -> PathBuf {
+    atho_storage::path::wallet_root()
+        .join(network.id())
+        .join("client-display.json")
+}
+
+fn recipient_address_book_path(network: Network) -> PathBuf {
+    atho_storage::path::wallet_root()
+        .join(network.id())
+        .join("recipient-address-book.json")
+}
+
+fn load_client_display_preferences(network: Network) -> ClientDisplayPreferences {
+    let path = client_display_preferences_path(network);
+    let Ok(bytes) = fs::read(path) else {
+        return ClientDisplayPreferences::default();
+    };
+    serde_json::from_slice::<ClientDisplayPreferences>(&bytes).unwrap_or_default()
+}
+
+fn load_recipient_address_book(network: Network) -> Vec<RecipientAddressEntry> {
+    let path = recipient_address_book_path(network);
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<RecipientAddressEntry>>(&bytes).unwrap_or_default()
+}
+
+fn recipient_address_entry_id(address: &str, created_at_unix: u64) -> String {
+    let mut preimage = Vec::with_capacity(address.len() + core::mem::size_of::<u64>());
+    preimage.extend_from_slice(address.as_bytes());
+    preimage.extend_from_slice(&created_at_unix.to_be_bytes());
+    hex::encode(sha3_256(&preimage))
+}
+
 fn legacy_startup_wallet_metadata_path(network: Network) -> PathBuf {
     legacy_wallet_root()
         .join(network.id())
@@ -4047,7 +4358,6 @@ mod tests {
 
     fn build_wallet_test_spend(
         wallet: &Wallet,
-        spend_address: WalletAddress,
         funding_utxos: &[UtxoEntry],
         recipient_digest: [u8; 32],
         amount_atoms: u64,
@@ -4055,7 +4365,6 @@ mod tests {
         change_address: Option<WalletAddress>,
     ) -> Transaction {
         let request = WalletSpendRequest {
-            spend_address,
             selected_utxos: funding_utxos
                 .iter()
                 .map(|utxo| WalletSpendUtxo {
@@ -4228,11 +4537,10 @@ mod tests {
         assert!(seeded.is_some(), "expected local test backend");
 
         let funding_utxo = funding_utxo.expect("funding utxo");
-        let fee_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 1);
+        let fee_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 1, 1);
         let credited_atoms = value_atoms.saturating_sub(fee_atoms);
         let transaction = build_wallet_test_spend(
             &funding_wallet,
-            funding_address,
             std::slice::from_ref(&funding_utxo),
             recipient_digest,
             credited_atoms,
@@ -4283,10 +4591,12 @@ mod tests {
             pubkey: keypair.public_key.0.clone(),
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
+                    input_index: index as u32,
                     sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
                     witness_commit_ref: [0; 16],
                 })
                 .collect(),
+            additional_signers: vec![],
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
@@ -4300,6 +4610,7 @@ mod tests {
             pubkey: keypair.public_key.0,
             input_refs: (0..tx.inputs.len())
                 .map(|index| WitnessInputRef {
+                    input_index: index as u32,
                     sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
                     witness_commit_ref: derive_witness_commit_ref(
                         &txid,
@@ -4308,6 +4619,7 @@ mod tests {
                     ),
                 })
                 .collect(),
+            additional_signers: vec![],
         }
         .canonical_bytes()
     }
@@ -4491,25 +4803,25 @@ mod tests {
     fn parses_decimal_atho_amounts_with_commas() {
         let scale = atoms_per_atho_for_network(Network::Mainnet);
         let atoms =
-            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "10,000.445444444444").unwrap();
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "10,000.445444444444").unwrap();
         assert_eq!(atoms, 10_000 * scale + 445_444_444_444);
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.938449").unwrap(),
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.938449").unwrap(),
             938_449_000_000
         );
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms(Network::Regnet, "0.938449").unwrap(),
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.938449").unwrap(),
             938_449_000_000
         );
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms(Network::Regnet, "1").unwrap(),
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "1").unwrap(),
             scale
         );
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.000000000001").unwrap(),
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.000000000001").unwrap(),
             1
         );
-        assert!(DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.0000000000001").is_err());
+        assert!(DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.0000000000001").is_err());
     }
 
     #[test]
@@ -4517,17 +4829,174 @@ mod tests {
         let scale = atoms_per_atho_for_network(Network::Mainnet);
         let atoms = 10_000 * scale + 445_444_444_444;
         assert_eq!(
-            DesktopApp::format_send_amount_input(Network::Mainnet, atoms),
-            "10000.445444444444"
+            DesktopApp::format_send_amount_input(InputUnit::Atho, atoms),
+            "10,000.445444444444"
         );
         assert_eq!(
-            DesktopApp::format_send_amount_input(Network::Mainnet, scale),
+            DesktopApp::format_send_amount_input(InputUnit::Atho, scale),
             "1"
         );
         assert_eq!(
-            DesktopApp::format_send_amount_input(Network::Regnet, scale),
+            DesktopApp::format_send_amount_input(InputUnit::Atho, scale),
             "1"
         );
+    }
+
+    #[test]
+    fn display_preferences_persist_across_app_restart() {
+        let root = temp_sandbox_root("display-preferences");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+
+        let mut first = DesktopApp::new(Network::Regnet);
+        first.set_display_unit(DisplayUnit::NanoAtho);
+        first.set_send_input_unit(InputUnit::Atom);
+
+        let second = DesktopApp::new(Network::Regnet);
+        assert_eq!(second.display_unit(), DisplayUnit::NanoAtho);
+        assert_eq!(second.send_input_unit(), InputUnit::Atom);
+    }
+
+    #[test]
+    fn switching_send_input_units_reformats_existing_amount() {
+        let root = temp_sandbox_root("switch-send-input-units");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let atoms = 1_250_000_000;
+        app.set_send_input_unit(InputUnit::Atho);
+        app.send_amount = DesktopApp::format_send_amount_input(InputUnit::Atho, atoms);
+
+        app.set_send_input_unit(InputUnit::MilliAtho);
+        assert_eq!(app.send_amount, "1.25");
+
+        app.set_send_input_unit(InputUnit::Atom);
+        assert_eq!(app.send_amount, "1,250,000,000");
+    }
+
+    #[test]
+    fn recipient_address_book_persists_and_reloads() {
+        let root = temp_sandbox_root("recipient-address-book");
+        fs::create_dir_all(&root).expect("root");
+        let wallet_root = root.join("wallet");
+        fs::create_dir_all(&wallet_root).expect("wallet root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _wallet = EnvVarGuard::set_path(ATHO_WALLET_DIR_ENV, &wallet_root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x53u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let recipient = wallet.checkout_receive_address();
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.send_to = recipient.address.clone();
+        app.send_label = String::from("Test recipient");
+        app.start_add_current_recipient_to_address_book();
+        app.recipient_address_editor_notes = String::from("Sandbox");
+        app.save_recipient_address_book_entry()
+            .expect("save recipient address book entry");
+
+        let reloaded = DesktopApp::new(Network::Regnet);
+        assert_eq!(reloaded.recipient_address_book.len(), 1);
+        assert_eq!(reloaded.recipient_address_book[0].label, "Test recipient");
+        assert_eq!(
+            reloaded.recipient_address_book[0].address,
+            recipient.address
+        );
+    }
+
+    #[test]
+    fn sync_status_dialog_auto_opens_until_hidden() {
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.apply_connection_status(ConnectionStatus {
+            network: Network::Regnet,
+            rpc_address: String::from("127.0.0.1:18445"),
+            block_count: 10,
+            tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x22; 32],
+            peer_count: 1,
+            inbound_peer_count: 0,
+            outbound_peer_count: 1,
+            connecting_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            connecting_peers: Vec::new(),
+            running: true,
+            headers_synced: false,
+            sync_best_height: 20,
+            connected: true,
+            startup_error: None,
+        });
+        assert!(app.show_sync_status_dialog);
+        app.show_sync_status_dialog = false;
+        app.sync_status_hidden_until_synced = true;
+
+        app.apply_connection_status(ConnectionStatus {
+            network: Network::Regnet,
+            rpc_address: String::from("127.0.0.1:18445"),
+            block_count: 20,
+            tip_hash: [0x12; 48],
+            tip_timestamp: 1_777_416_500,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x23; 32],
+            peer_count: 1,
+            inbound_peer_count: 0,
+            outbound_peer_count: 1,
+            connecting_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            connecting_peers: Vec::new(),
+            running: true,
+            headers_synced: true,
+            sync_best_height: 20,
+            connected: true,
+            startup_error: None,
+        });
+        assert!(!app.sync_status_hidden_until_synced);
+    }
+
+    #[test]
+    fn poll_send_job_updates_progress_and_submission_details() {
+        let mut app = DesktopApp::new(Network::Mainnet);
+        let (sender, receiver) = mpsc::channel();
+        app.send_job = Some(SendJob {
+            started_at: Instant::now(),
+            stage: SendProgressStage::Preparing,
+            receiver,
+        });
+        sender
+            .send(SendJobEvent::Progress {
+                stage: SendProgressStage::FinalizingProof,
+            })
+            .expect("progress");
+        app.poll_send_job();
+        assert!(app.send_job.is_some());
+        assert_eq!(app.send_status, "Finalizing anti-spam proof…");
+
+        sender
+            .send(SendJobEvent::Finished(Ok(SendOutcome {
+                fee_atoms: 650,
+                txid: [0x22; 48],
+                tx_pow_nonce: 123,
+                tx_pow_bits: 19,
+            })))
+            .expect("finished");
+        app.poll_send_job();
+        assert!(app.send_job.is_none());
+        assert!(app.send_status.contains("Transaction submitted"));
+        assert!(app.send_status.contains("send proof 19 bits @ nonce 123"));
+        assert!(app.send_fee.contains("650 atoms"));
     }
 
     #[test]
@@ -4547,7 +5016,6 @@ mod tests {
 
         let tx = build_wallet_test_spend(
             &wallet,
-            spend_address,
             std::slice::from_ref(&funding),
             [0x22; 32],
             9_000,
@@ -4567,7 +5035,7 @@ mod tests {
             Network::Regnet,
         );
         let address = wallet.checkout_receive_address();
-        let exact_fee = DesktopApp::estimate_fee(Network::Regnet, 1, 1);
+        let exact_fee = DesktopApp::estimate_fee(Network::Regnet, 1, 1, 1);
         let total_input_atoms = 20_000u64;
         let amount_atoms = total_input_atoms
             .saturating_sub(exact_fee)
@@ -4594,7 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn select_wallet_utxos_does_not_span_multiple_addresses() {
+    fn select_wallet_utxos_can_span_multiple_addresses() {
         let mut wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[0x6au8; 32], MnemonicLength::Words24).unwrap(),
             "",
@@ -4638,7 +5106,9 @@ mod tests {
         )
         .expect("selection");
 
-        assert!(plan.is_none());
+        let plan = plan.expect("multi-address plan");
+        assert_eq!(plan.utxos.len(), 2);
+        assert_eq!(plan.signer_group_count, 2);
     }
 
     #[test]
@@ -4691,11 +5161,11 @@ mod tests {
             plan.total_input_atoms,
             120 * atoms_per_atho_for_network(Network::Regnet)
         );
-        assert_eq!(plan.address.payment_digest, address.payment_digest);
+        assert_eq!(plan.signer_group_count, 1);
     }
 
     #[test]
-    fn max_sendable_amount_prefers_largest_single_address_group() {
+    fn max_sendable_amount_uses_full_wallet_balance() {
         let mut wallet = Wallet::from_mnemonic(
             MnemonicPhrase::from_entropy(&[0x6cu8; 32], MnemonicLength::Words24).unwrap(),
             "",
@@ -4745,8 +5215,8 @@ mod tests {
 
         let sendable =
             DesktopApp::max_single_address_sendable_atoms(candidates, Network::Regnet, false);
-        assert!(sendable > 59 * atoms_per_atho_for_network(Network::Regnet));
-        assert!(sendable < 60 * atoms_per_atho_for_network(Network::Regnet));
+        assert!(sendable > 104 * atoms_per_atho_for_network(Network::Regnet));
+        assert!(sendable < 105 * atoms_per_atho_for_network(Network::Regnet));
     }
 
     #[test]
@@ -4765,16 +5235,18 @@ mod tests {
         );
         for tx in &rewritten.transactions[1..] {
             let witness = tx.witness_payload().expect("witness payload");
-            for (index, input_ref) in witness.input_refs.iter().enumerate() {
-                assert_eq!(
-                    input_ref.witness_commit_ref,
-                    derive_witness_commit_ref(
-                        &tx.txid(),
-                        &rewritten.header.witness_root,
-                        index as u32,
-                    )
-                );
-            }
+            witness.for_each_signer_group(|_, _, input_refs| {
+                for input_ref in input_refs {
+                    assert_eq!(
+                        input_ref.witness_commit_ref,
+                        derive_witness_commit_ref(
+                            &tx.txid(),
+                            &rewritten.header.witness_root,
+                            input_ref.input_index,
+                        )
+                    );
+                }
+            });
         }
     }
 
@@ -5464,7 +5936,7 @@ mod tests {
 
         app.send_to = recipient.address.clone();
         app.send_amount = DesktopApp::format_send_amount_input(
-            Network::Regnet,
+            InputUnit::Atho,
             5 * atoms_per_atho_for_network(Network::Regnet),
         );
         app.submit_send_transaction().expect("submit send");

@@ -559,7 +559,7 @@ fn render_address_pool_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                             )
                             .on_hover_text(format!(
                                 "{} atoms across {} UTXO(s)",
-                                widgets::format_atoms(app.active_network(), row.total_atoms),
+                                app.format_amount(row.total_atoms),
                                 row.utxo_count
                             ));
                         } else {

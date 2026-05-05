@@ -12,16 +12,20 @@ use crate::keypool::Keypool;
 use crate::mnemonic::MnemonicPhrase;
 use crate::snapshot::WalletSnapshot;
 use atho_core::address::address_parts_from_public_key;
-use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+use atho_core::consensus::signatures::{
+    transaction_signing_digest_for_input_indexes, AthoSignatureDomain,
+};
 use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_ATOMS};
 use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
-use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+use atho_core::transaction::{
+    Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef, WitnessSignerGroup,
+};
 use atho_crypto::falcon::{self, sign, FalconKeypair};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
@@ -56,7 +60,6 @@ pub struct WalletSpendUtxo {
 /// Wallet-side spend request used to build, sign, and PoW-stamp one payment transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletSpendRequest {
-    pub spend_address: WalletAddress,
     pub selected_utxos: Vec<WalletSpendUtxo>,
     pub recipient_digest: [u8; 32],
     pub amount_atoms: u64,
@@ -72,6 +75,13 @@ pub struct WalletBuiltSpend {
     pub transaction: Transaction,
     pub fee_atoms: u64,
     pub change_used: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletSpendProgressStage {
+    Preparing,
+    Signing,
+    FinalizingProof,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -295,11 +305,20 @@ impl Wallet {
         &self,
         request: WalletSpendRequest,
     ) -> Result<WalletBuiltSpend, WalletSpendBuildError> {
+        self.build_signed_payment_transaction_with_progress(request, |_| {})
+    }
+
+    pub fn build_signed_payment_transaction_with_progress<F>(
+        &self,
+        request: WalletSpendRequest,
+        mut progress: F,
+    ) -> Result<WalletBuiltSpend, WalletSpendBuildError>
+    where
+        F: FnMut(WalletSpendProgressStage),
+    {
+        progress(WalletSpendProgressStage::Preparing);
         if request.selected_utxos.is_empty() {
             return Err(WalletSpendBuildError::NoInputs);
-        }
-        if request.spend_address.network != self.network {
-            return Err(WalletSpendBuildError::WrongNetwork);
         }
         if request
             .change_address
@@ -307,15 +326,6 @@ impl Wallet {
             .is_some_and(|address| address.network != self.network)
         {
             return Err(WalletSpendBuildError::WrongNetwork);
-        }
-
-        let spend_script = request.spend_address.payment_digest.to_vec();
-        if request
-            .selected_utxos
-            .iter()
-            .any(|utxo| utxo.locking_script != spend_script)
-        {
-            return Err(WalletSpendBuildError::InputOwnershipMismatch);
         }
 
         let min_output = DUST_RELAY_VALUE_ATOMS;
@@ -328,7 +338,6 @@ impl Wallet {
             .iter()
             .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value_atoms))
             .ok_or(WalletSpendBuildError::AmountOverflow)?;
-        let keypair = self.keypair_for_path(request.spend_address.path);
         let mut fee_atoms = MIN_TX_FEE_ATOMS;
 
         for _ in 0..4 {
@@ -339,8 +348,8 @@ impl Wallet {
                 request.include_fee_in_total,
                 min_output,
             )?;
-            let transaction = build_signed_spend_transaction_from_parts(
-                &keypair,
+            progress(WalletSpendProgressStage::Signing);
+            let transaction = self.build_signed_spend_transaction_from_parts(
                 &request.selected_utxos,
                 request.transaction_version,
                 request.recipient_digest,
@@ -354,8 +363,8 @@ impl Wallet {
             )?;
             let actual_fee = minimum_required_fee_atoms(self.network, &transaction);
             if actual_fee == fee_atoms {
-                let mut transaction = build_signed_spend_transaction_from_parts(
-                    &keypair,
+                progress(WalletSpendProgressStage::Signing);
+                let mut transaction = self.build_signed_spend_transaction_from_parts(
                     &request.selected_utxos,
                     request.transaction_version,
                     request.recipient_digest,
@@ -388,6 +397,7 @@ impl Wallet {
                 if change_atoms > 0 && final_fee != actual_fee {
                     return Err(WalletSpendBuildError::FeeLoopDidNotConverge);
                 }
+                progress(WalletSpendProgressStage::FinalizingProof);
                 solve_transaction_pow(self.network, &mut transaction, final_fee);
                 return Ok(WalletBuiltSpend {
                     transaction,
@@ -399,6 +409,15 @@ impl Wallet {
         }
 
         Err(WalletSpendBuildError::FeeLoopDidNotConverge)
+    }
+
+    fn address_for_locking_script(&self, locking_script: &[u8]) -> Option<WalletAddress> {
+        if locking_script.len() != 32 {
+            return None;
+        }
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(locking_script);
+        self.address_for_payment_digest(&digest)
     }
 
     pub fn address_for_payment_digest(&self, digest: &[u8; 32]) -> Option<WalletAddress> {
@@ -688,8 +707,9 @@ fn recipient_and_change_amounts(
     }
 }
 
-fn build_signed_spend_transaction_from_parts(
-    keypair: &FalconKeypair,
+impl Wallet {
+    fn build_signed_spend_transaction_from_parts(
+        &self,
     selected_utxos: &[WalletSpendUtxo],
     version: u16,
     recipient_digest: [u8; 32],
@@ -726,43 +746,78 @@ fn build_signed_spend_transaction_from_parts(
         tx_pow_nonce: 0,
         tx_pow_bits: 0,
     };
-    let digest = transaction_signing_digest(&tx);
-    let signature = sign(
-        AthoSignatureDomain::Transaction,
-        &keypair.secret_key,
-        &digest,
-    )
-    .map_err(|err| WalletSpendBuildError::SigningFailed(err.to_string()))?;
     let txid = tx.txid();
-    let sig_bytes = signature.0.clone();
-    tx.witness = TxWitness {
-        signature: sig_bytes.clone(),
-        pubkey: keypair.public_key.0.clone(),
-        input_refs: selected_utxos
+
+    let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<(u32, &WalletSpendUtxo)>>::new();
+    for (input_index, utxo) in selected_utxos.iter().enumerate() {
+        grouped_inputs
+            .entry(utxo.locking_script.clone())
+            .or_default()
+            .push((input_index as u32, utxo));
+    }
+
+    let mut signer_groups = Vec::with_capacity(grouped_inputs.len());
+    for (locking_script, group_utxos) in grouped_inputs {
+        let address = self
+            .address_for_locking_script(&locking_script)
+            .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
+        let keypair = self.keypair_for_path(address.path);
+        let input_indexes = group_utxos
             .iter()
-            .enumerate()
-            .map(|(index, _)| WitnessInputRef {
-                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
-                witness_commit_ref: [0; 16],
-            })
-            .collect(),
+            .map(|(input_index, _)| *input_index)
+            .collect::<Vec<_>>();
+        let digest = transaction_signing_digest_for_input_indexes(&tx, &input_indexes);
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &digest,
+        )
+        .map_err(|err| WalletSpendBuildError::SigningFailed(err.to_string()))?;
+        let sig_bytes = signature.0.clone();
+        signer_groups.push(WitnessSignerGroup {
+            signature: sig_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: group_utxos
+                .iter()
+                .map(|(input_index, _)| WitnessInputRef {
+                    input_index: *input_index,
+                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, *input_index),
+                    witness_commit_ref: [0; 16],
+                })
+                .collect(),
+        });
+    }
+    signer_groups.sort_by_key(|group| {
+        group
+            .input_refs
+            .first()
+            .map(|input_ref| input_ref.input_index)
+            .unwrap_or(u32::MAX)
+    });
+    let mut signer_groups = signer_groups.into_iter();
+    let primary_group = signer_groups
+        .next()
+        .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
+    tx.witness = TxWitness {
+        signature: primary_group.signature,
+        pubkey: primary_group.pubkey,
+        input_refs: primary_group.input_refs,
+        additional_signers: signer_groups.collect(),
     }
     .canonical_bytes();
     let witness_root = tx.witness_commitment_hash();
-    tx.witness = TxWitness {
-        signature: sig_bytes.clone(),
-        pubkey: keypair.public_key.0.clone(),
-        input_refs: selected_utxos
-            .iter()
-            .enumerate()
-            .map(|(index, _)| WitnessInputRef {
-                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
-                witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, index as u32),
-            })
-            .collect(),
-    }
-    .canonical_bytes();
+    let mut witness = tx
+        .witness_payload()
+        .ok_or(WalletSpendBuildError::SigningFailed(String::from(
+            "invalid staged witness payload",
+        )))?;
+    witness.for_each_input_ref_mut(|input_ref| {
+        input_ref.witness_commit_ref =
+            derive_witness_commit_ref(&txid, &witness_root, input_ref.input_index);
+    });
+    tx.witness = witness.canonical_bytes();
     Ok(tx)
+}
 }
 
 fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
