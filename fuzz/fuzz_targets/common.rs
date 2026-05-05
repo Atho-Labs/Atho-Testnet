@@ -83,11 +83,13 @@ fn provisional_witness(input_count: usize, keypair: &FalconKeypair) -> TxWitness
         signature: vec![0; FALCON_512_SIGNATURE_BYTES],
         pubkey: keypair.public_key.0.clone(),
         input_refs: (0..input_count)
-            .map(|_| WitnessInputRef {
+            .map(|index| WitnessInputRef {
+                input_index: index as u32,
                 sig_ref_short: [0; 2],
                 witness_commit_ref: [0; 16],
             })
             .collect(),
+        additional_signers: vec![],
     }
 }
 
@@ -135,10 +137,12 @@ fn build_spend_transaction(
         pubkey: keypair.public_key.0.clone(),
         input_refs: (0..utxos.len())
             .map(|index| WitnessInputRef {
+                input_index: index as u32,
                 sig_ref_short: derive_sig_ref_short(&txid, &signature, index as u32),
                 witness_commit_ref: [0; 16],
             })
             .collect(),
+        additional_signers: vec![],
     }
     .canonical_bytes();
 
