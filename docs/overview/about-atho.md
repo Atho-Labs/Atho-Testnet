@@ -534,7 +534,7 @@ The signature system is domain-separated so different parts of the product canno
 
 | Domain | Frozen label | Typical use |
 | --- | --- | --- |
-| Transaction | `ATHO_TX_SIG_V1` | Transaction signing and verification |
+| Transaction | `ATHO_TX_SIGN_V1` | Transaction signing and verification |
 | Block | `ATHO_BLOCK_SIG_V1` | Reserved for block-signature use |
 | Wallet local | `ATHO_WALLET_LOCAL_SIG_V1` | Local wallet-only signing |
 | Package | `ATHO_PACKAGE_SIG_V1` | Packaged-release integrity contexts |

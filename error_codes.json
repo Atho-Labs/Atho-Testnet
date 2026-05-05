@@ -55,17 +55,6 @@
     "consensus_critical": true
   },
   {
-    "code": "ATHO-CONS-003",
-    "category": "consensus",
-    "severity": "critical",
-    "title": "Monetary Supply Exceeded",
-    "explanation": "Applying this block would exceed Atho's configured maximum supply.",
-    "common_cause": "The coinbase reward or fee accounting is invalid.",
-    "suggested_fix": "Recalculate subsidy and fee distribution for the candidate block.",
-    "user_facing": false,
-    "consensus_critical": true
-  },
-  {
     "code": "ATHO-NET-001",
     "category": "network",
     "severity": "error",
@@ -407,6 +396,39 @@
     "consensus_critical": true
   },
   {
+    "code": "ATHO-TX-012",
+    "category": "transaction",
+    "severity": "critical",
+    "title": "Too Many Outputs",
+    "explanation": "The transaction creates more outputs than Atho's standard anti-spam policy allows.",
+    "common_cause": "A wallet batch or spam-shaped transaction exceeded the configured output cap.",
+    "suggested_fix": "Reduce the output count or split the spend into smaller transactions.",
+    "user_facing": true,
+    "consensus_critical": true
+  },
+  {
+    "code": "ATHO-TX-013",
+    "category": "transaction",
+    "severity": "critical",
+    "title": "Wrong Transaction PoW Bits",
+    "explanation": "The transaction declares a wallet proof-of-work difficulty that does not match Atho policy.",
+    "common_cause": "The wallet used the wrong fee, size, or output-count inputs when calculating transaction PoW.",
+    "suggested_fix": "Recompute the required transaction PoW bits from the final signed transaction.",
+    "user_facing": true,
+    "consensus_critical": true
+  },
+  {
+    "code": "ATHO-TX-014",
+    "category": "transaction",
+    "severity": "critical",
+    "title": "Invalid Transaction PoW Nonce",
+    "explanation": "The wallet transaction proof-of-work nonce does not satisfy the required SHA3-256 difficulty.",
+    "common_cause": "The transaction changed after solving PoW or the nonce search used the wrong preimage.",
+    "suggested_fix": "Rebuild the signed transaction and solve the wallet PoW again.",
+    "user_facing": true,
+    "consensus_critical": true
+  },
+  {
     "code": "ATHO-UTXO-001",
     "category": "utxo",
     "severity": "critical",
@@ -445,8 +467,8 @@
     "severity": "error",
     "title": "Dust Output Rejected",
     "explanation": "The transaction creates an output below Atho's relay dust floor.",
-    "common_cause": "A wallet or sender attempted to create an output smaller than the 50-atom relay minimum.",
-    "suggested_fix": "Raise every spendable output to at least 50 atoms or combine the value into fees.",
+    "common_cause": "A wallet or sender attempted to create an output smaller than the 1,000-atom relay minimum.",
+    "suggested_fix": "Raise every spendable output to at least 1,000 atoms or combine the value into fees.",
     "user_facing": true,
     "consensus_critical": false
   },

@@ -38,6 +38,8 @@ use atho_rpc::response::{
 use atho_storage::db::PeerHealthRecord;
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use atho_wallet::snapshot::WalletSnapshot;
+
+const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1150,7 +1152,10 @@ impl NodeService {
             "size_bytes": block.size_bytes(),
             "weight_bytes": block.weight_bytes(),
             "vsize_bytes": block.vsize_bytes(),
-            "subsidy_atoms": subsidy::block_subsidy_atoms(block.header.height),
+            "subsidy_atoms": subsidy::block_subsidy_atoms_for_network(
+                block.header.network_id,
+                block.header.height,
+            ),
             "fees_atoms": block.fees_total_atoms,
             "total_output_atoms": total_output_atoms,
             "avg_tx_size_bytes": if transaction_count == 0 {
@@ -1247,7 +1252,8 @@ impl NodeService {
         let tip = self
             .block_record_by_height(self.orchestrator.runtime.node.height())?
             .ok_or_else(atho_rpc::error::RpcError::internal)?;
-        let scaled = pow::difficulty_ratio_scaled(&tip.difficulty_target_or_bits, 100_000_000);
+        let scaled =
+            pow::difficulty_ratio_scaled(&tip.difficulty_target_or_bits, DIFFICULTY_DISPLAY_SCALE);
         Ok(json!({
             "network": self.network().id(),
             "height": tip.height,
@@ -1304,7 +1310,7 @@ impl NodeService {
             "txouts": entries.len(),
             "bogosize": entries.iter().map(|entry| 48usize + 4 + 8 + entry.locking_script.len()).sum::<usize>(),
             "total_amount_atoms": total_amount_atoms,
-            "total_amount_atho": format_atoms_decimal(total_amount_atoms),
+            "total_amount_atho": format_atoms_decimal(self.network(), total_amount_atoms),
             "utxo_set_hash": hex::encode(utxo_set_hash(&entries)),
         }))
     }
@@ -1400,7 +1406,10 @@ impl NodeService {
             "block_version": ruleset.block_version,
             "transaction_version": ruleset.transaction_version,
             "next_target": hex::encode(next_target),
-            "difficulty": format_scaled_decimal(pow::difficulty_ratio_scaled(&next_target, 100_000_000), 8),
+            "difficulty": format_scaled_decimal(
+                pow::difficulty_ratio_scaled(&next_target, DIFFICULTY_DISPLAY_SCALE),
+                8
+            ),
         }))
     }
 
@@ -1551,6 +1560,7 @@ impl NodeService {
                 (
                     hex::encode(entry.txid()),
                     render_mempool_entry_value(
+                        self.network(),
                         &entry,
                         &mempool_dependencies(entry.txid(), &relation_entries),
                         &mempool_descendants(entry.txid(), &relation_entries),
@@ -1573,7 +1583,12 @@ impl NodeService {
             })?;
         let depends = mempool_dependencies(txid, &entries);
         let descendants = mempool_descendants(txid, &entries);
-        Ok(render_mempool_entry_value(&entry, &depends, &descendants))
+        Ok(render_mempool_entry_value(
+            self.network(),
+            &entry,
+            &depends,
+            &descendants,
+        ))
     }
 
     fn command_getmempoolancestors(
@@ -1594,7 +1609,12 @@ impl NodeService {
             ));
         }
         let ancestors = mempool_dependencies(txid, &entries);
-        Ok(render_mempool_relation_value(&entries, &ancestors, verbose))
+        Ok(render_mempool_relation_value(
+            self.network(),
+            &entries,
+            &ancestors,
+            verbose,
+        ))
     }
 
     fn command_getmempooldescendants(
@@ -1616,6 +1636,7 @@ impl NodeService {
         }
         let descendants = mempool_descendants(txid, &entries);
         Ok(render_mempool_relation_value(
+            self.network(),
             &entries,
             &descendants,
             verbose,
@@ -2116,7 +2137,7 @@ fn render_transaction_output_value(
     json!({
         "index": output_index,
         "value_atoms": output.value_atoms,
-        "value_atho": format_atoms_decimal(output.value_atoms),
+        "value_atho": format_atoms_decimal(network, output.value_atoms),
         "locking_script_bytes": output.locking_script.len(),
         "locking_script_hex": hex::encode(&output.locking_script),
         "address_hint": script_address_hint(network, &output.locking_script),
@@ -2128,10 +2149,12 @@ fn script_address_hint(network: Network, locking_script: &[u8]) -> Option<String
     Some(encode_base56_address(network, &digest))
 }
 
-fn format_atoms_decimal(atoms: u64) -> String {
-    let whole = atoms / atho_core::constants::ATOMS_PER_ATHO;
-    let fractional = atoms % atho_core::constants::ATOMS_PER_ATHO;
-    format!("{whole}.{fractional:08}")
+fn format_atoms_decimal(network: Network, atoms: u64) -> String {
+    let scale = atho_core::constants::atoms_per_atho_for_network(network);
+    let decimals = atho_core::constants::decimals_for_network(network);
+    let whole = atoms / scale;
+    let fractional = atoms % scale;
+    format!("{whole}.{fractional:0decimals$}")
 }
 
 fn format_scaled_decimal(value: u64, scale_digits: usize) -> String {
@@ -2149,7 +2172,7 @@ fn render_utxo_value(spend_height: u64, entry: &UtxoEntry) -> Value {
         "txid": hex::encode(entry.txid),
         "vout": entry.output_index,
         "value_atoms": entry.value_atoms,
-        "value_atho": format_atoms_decimal(entry.value_atoms),
+        "value_atho": format_atoms_decimal(entry.network, entry.value_atoms),
         "confirmations": entry.confirmation_count(spend_height),
         "coinbase": entry.is_coinbase,
         "spendable": entry.is_spendable_at(spend_height),
@@ -2175,6 +2198,7 @@ fn utxo_set_hash(entries: &[UtxoEntry]) -> [u8; 48] {
 }
 
 fn render_mempool_entry_value(
+    network: Network,
     entry: &MempoolEntry,
     depends: &[String],
     descendants: &[String],
@@ -2183,7 +2207,7 @@ fn render_mempool_entry_value(
         "txid": hex::encode(entry.txid()),
         "wtxid": hex::encode(entry.wtxid()),
         "fee_atoms": entry.fee_atoms,
-        "fee_atho": format_atoms_decimal(entry.fee_atoms),
+        "fee_atho": format_atoms_decimal(network, entry.fee_atoms),
         "base_size_bytes": entry.base_size_bytes(),
         "size_bytes": entry.raw_size_bytes(),
         "vsize_bytes": entry.vsize_bytes(),
@@ -2196,6 +2220,7 @@ fn render_mempool_entry_value(
 }
 
 fn render_mempool_relation_value(
+    network: Network,
     entries: &[MempoolEntry],
     txids: &[String],
     verbose: bool,
@@ -2215,7 +2240,7 @@ fn render_mempool_relation_value(
                 let descendants = mempool_descendants(entry.txid(), entries);
                 (
                     txid.clone(),
-                    render_mempool_entry_value(entry, &depends, &descendants),
+                    render_mempool_entry_value(network, entry, &depends, &descendants),
                 )
             })
         })
@@ -2520,6 +2545,23 @@ mod tests {
     }
 
     #[test]
+    fn format_atoms_decimal_keeps_exact_integer_scale() {
+        assert_eq!(format_atoms_decimal(Network::Mainnet, 1), "0.000000000001");
+        assert_eq!(
+            format_atoms_decimal(Network::Mainnet, 1_000),
+            "0.000000001000"
+        );
+        assert_eq!(
+            format_atoms_decimal(Network::Mainnet, 1_000_000_000_000),
+            "1.000000000000"
+        );
+        assert_eq!(
+            format_atoms_decimal(Network::Mainnet, 12_345_678_901_234),
+            "12.345678901234"
+        );
+    }
+
+    #[test]
     fn rendered_status_marks_peer_target_above_local_height_as_not_synced() {
         let status = NodeStatus {
             network: Network::Mainnet,
@@ -2634,6 +2676,8 @@ mod tests {
                     outputs: vec![],
                     lock_time: 0,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 },
                 0,
             ));

@@ -7,6 +7,7 @@
 //! fee-floor checks happen here before transactions are mined into templates.
 use crate::dev;
 use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
+use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,6 +118,7 @@ impl Mempool {
     fn validate_entry<F>(
         &self,
         entry: &MempoolEntry,
+        network: Network,
         spend_height: u64,
         mut lookup: F,
     ) -> Result<u64, ValidationError>
@@ -126,6 +128,7 @@ impl Mempool {
         let fee = validate_transaction_with_context_for_mempool(
             &entry.transaction,
             entry.fee_atoms,
+            network,
             spend_height,
             |txid, output_index| lookup(txid, output_index),
         )?;
@@ -139,6 +142,7 @@ impl Mempool {
     pub fn admit<F>(
         &mut self,
         entry: MempoolEntry,
+        network: Network,
         spend_height: u64,
         lookup: F,
     ) -> Result<[u8; 48], ValidationError>
@@ -149,7 +153,7 @@ impl Mempool {
         if self.entries.contains_key(&txid) {
             return Err(ValidationError::MempoolConflict);
         }
-        self.validate_entry(&entry, spend_height, lookup)?;
+        self.validate_entry(&entry, network, spend_height, lookup)?;
         self.reserve_inputs(&entry.transaction)?;
         self.entries.insert(txid, entry);
         let entry = self
@@ -164,6 +168,7 @@ impl Mempool {
     pub fn admit_many<F>(
         &mut self,
         entries: Vec<MempoolEntry>,
+        network: Network,
         spend_height: u64,
         mut lookup: F,
     ) -> Result<Vec<[u8; 48]>, ValidationError>
@@ -172,7 +177,7 @@ impl Mempool {
     {
         let mut txids = Vec::with_capacity(entries.len());
         for entry in entries {
-            let txid = self.admit(entry, spend_height, &mut lookup)?;
+            let txid = self.admit(entry, network, spend_height, &mut lookup)?;
             txids.push(txid);
         }
         Ok(txids)
@@ -182,7 +187,7 @@ impl Mempool {
     ///
     /// PERFORMANCE: Revalidation is bulk work triggered on tip changes, so it
     /// avoids repeated logging and reuses the caller's UTXO lookup closure.
-    pub fn revalidate<F>(&mut self, spend_height: u64, mut lookup: F)
+    pub fn revalidate<F>(&mut self, network: Network, spend_height: u64, mut lookup: F)
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
@@ -191,7 +196,7 @@ impl Mempool {
         let before = current.len();
         for (txid, entry) in current {
             if self
-                .validate_entry(&entry, spend_height, &mut lookup)
+                .validate_entry(&entry, network, spend_height, &mut lookup)
                 .is_ok()
                 && self.reserve_inputs(&entry.transaction).is_ok()
             {
@@ -244,15 +249,17 @@ impl Mempool {
 
     pub fn valid_transactions<F>(
         &self,
+        network: Network,
         spend_height: u64,
         mut lookup: F,
     ) -> Result<(Vec<Transaction>, u64), ValidationError>
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let (entries, fees) = self.validated_entries(spend_height, |txid, output_index| {
-            lookup(txid, output_index)
-        })?;
+        let (entries, fees) =
+            self.validated_entries(network, spend_height, |txid, output_index| {
+                lookup(txid, output_index)
+            })?;
         Ok((
             entries.into_iter().map(|entry| entry.transaction).collect(),
             fees,
@@ -261,6 +268,7 @@ impl Mempool {
 
     pub fn validated_entries<F>(
         &self,
+        network: Network,
         spend_height: u64,
         mut lookup: F,
     ) -> Result<(Vec<MempoolEntry>, u64), ValidationError>
@@ -286,6 +294,7 @@ impl Mempool {
             let fee = validate_transaction_with_context_for_mempool(
                 &entry.transaction,
                 entry.fee_atoms,
+                network,
                 spend_height,
                 |txid, output_index| lookup(txid, output_index),
             )?;
@@ -297,6 +306,7 @@ impl Mempool {
 
     pub fn validated_entries_for_mining<F>(
         &self,
+        network: Network,
         spend_height: u64,
         mut lookup: F,
     ) -> (Vec<MempoolEntry>, u64, usize)
@@ -323,6 +333,7 @@ impl Mempool {
             match validate_transaction_with_context_for_mempool(
                 &entry.transaction,
                 entry.fee_atoms,
+                network,
                 spend_height,
                 |txid, output_index| lookup(txid, output_index),
             ) {
@@ -366,6 +377,7 @@ mod tests {
     use super::*;
     use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::consensus::tx_policy::solve_transaction_pow;
     use atho_core::constants::DUST_RELAY_VALUE_ATOMS;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
@@ -397,6 +409,8 @@ mod tests {
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx.clone()
         };
         let witness_root = staged_tx.witness_commitment_hash();
@@ -437,14 +451,18 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
 
         let txid = mempool
-            .admit(MempoolEntry::new(tx, 500), 0, |_, _| None)
+            .admit(MempoolEntry::new(tx, 500), Network::Mainnet, 0, |_, _| None)
             .err()
             .expect("missing utxo should fail");
 
@@ -467,9 +485,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
 
@@ -499,13 +521,22 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let err = mempool
-            .admit(MempoolEntry::new(tx, 10_000), 10, |_, _| None)
+            .admit(
+                MempoolEntry::new(tx, 10_000),
+                Network::Regnet,
+                10,
+                |_, _| None,
+            )
             .unwrap_err();
         assert_eq!(err, ValidationError::DustOutput);
     }
@@ -526,15 +557,20 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let txid = tx.txid();
         mempool.insert_unchecked(MempoolEntry::new(tx, 10_000));
 
-        let (entries, fees, skipped) = mempool.validated_entries_for_mining(10, |_, _| None);
+        let (entries, fees, skipped) =
+            mempool.validated_entries_for_mining(Network::Regnet, 10, |_, _| None);
         assert!(entries.is_empty());
         assert_eq!(fees, 0);
         assert_eq!(skipped, 1);
@@ -557,9 +593,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
-        let low = Transaction {
+        let mut low = Transaction {
             witness: witness_bytes_for_tx(&low),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..low
         };
         let high = Transaction {
@@ -575,11 +615,17 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
-        let high = Transaction {
+        let mut high = Transaction {
             witness: witness_bytes_for_tx(&high),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..high
         };
+        solve_transaction_pow(Network::Mainnet, &mut low, 2_500);
+        solve_transaction_pow(Network::Mainnet, &mut high, 3_000);
 
         let low_txid = low.txid();
         let high_txid = high.txid();
@@ -617,7 +663,7 @@ mod tests {
         );
 
         let (txs, fees) = mempool
-            .valid_transactions(7, |txid, output_index| {
+            .valid_transactions(Network::Mainnet, 7, |txid, output_index| {
                 utxos.get(&(*txid, output_index)).cloned()
             })
             .expect("both transactions should validate");
@@ -643,13 +689,22 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let err = mempool
-            .admit(MempoolEntry::new(tx, 2_500), 10, |_, _| None)
+            .admit(
+                MempoolEntry::new(tx, 2_500),
+                Network::Mainnet,
+                10,
+                |_, _| None,
+            )
             .unwrap_err();
         assert_eq!(err, ValidationError::InvalidTransactionVersion);
     }
@@ -670,9 +725,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
-        let valid = Transaction {
+        let mut valid = Transaction {
             witness: witness_bytes_for_tx(&valid),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..valid
         };
         let invalid = Transaction {
@@ -688,11 +747,16 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let invalid = Transaction {
             witness: witness_bytes_for_tx(&invalid),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..invalid
         };
+        solve_transaction_pow(Network::Mainnet, &mut valid, 3_000);
 
         let valid_entry = MempoolEntry::new(valid.clone(), 3_000);
         let invalid_entry = MempoolEntry::new(invalid.clone(), 3_000);
@@ -713,8 +777,8 @@ mod tests {
             ),
         );
 
-        let (entries, fees, skipped) = mempool
-            .validated_entries_for_mining(7, |txid, output_index| {
+        let (entries, fees, skipped) =
+            mempool.validated_entries_for_mining(Network::Mainnet, 7, |txid, output_index| {
                 utxos.get(&(*txid, output_index)).cloned()
             });
 

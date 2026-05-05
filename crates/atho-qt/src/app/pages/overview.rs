@@ -11,12 +11,19 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     if stacked {
         render_balances_panel(app, ui, &summary);
         ui.add_space(8.0);
-        render_recent_transactions(ui, app.ui_state.connected, chain_synced, &rows);
+        render_recent_transactions(
+            ui,
+            app.active_network(),
+            app.ui_state.connected,
+            chain_synced,
+            &rows,
+        );
     } else {
         ui.columns(2, |columns| {
             render_balances_panel(app, &mut columns[0], &summary);
             render_recent_transactions(
                 &mut columns[1],
+                app.active_network(),
                 app.ui_state.connected,
                 chain_synced,
                 &rows,
@@ -49,19 +56,28 @@ fn render_balances_panel(
             .show(ui, |ui| {
                 widgets::row_label(ui, "Available:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(summary.available_atoms));
+                    widgets::row_value(
+                        ui,
+                        &widgets::format_atoms(app.active_network(), summary.available_atoms),
+                    );
                 });
                 ui.end_row();
 
                 widgets::row_label(ui, "Pending:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(summary.pending_atoms));
+                    widgets::row_value(
+                        ui,
+                        &widgets::format_atoms(app.active_network(), summary.pending_atoms),
+                    );
                 });
                 ui.end_row();
 
                 widgets::row_label(ui, "Total:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &widgets::format_atoms(summary.total_atoms));
+                    widgets::row_value(
+                        ui,
+                        &widgets::format_atoms(app.active_network(), summary.total_atoms),
+                    );
                 });
                 ui.end_row();
             });
@@ -84,6 +100,7 @@ fn render_balances_panel(
 
 fn render_recent_transactions(
     ui: &mut egui::Ui,
+    network: atho_core::network::Network,
     connected: bool,
     chain_synced: bool,
     rows: &[crate::app::WalletActivityRow],
@@ -144,7 +161,7 @@ fn render_recent_transactions(
                 );
                 ui.add_sized([84.0, 0.0], egui::Label::new(row.kind.label()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value_signed(ui, row.amount_atoms);
+                    widgets::row_value_signed(ui, network, row.amount_atoms);
                 });
             });
             let response = ui.add_sized(

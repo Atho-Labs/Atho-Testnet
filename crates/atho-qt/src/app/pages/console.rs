@@ -140,7 +140,7 @@ fn render_information_tab(app: &DesktopApp, ui: &mut egui::Ui) {
             &format!(
                 "{} tx / {}",
                 app.view_model.mempool_count,
-                widgets::format_atoms(app.view_model.mempool_total_fee_atoms)
+                widgets::format_atoms(app.active_network(), app.view_model.mempool_total_fee_atoms)
             ),
         );
         info_row(

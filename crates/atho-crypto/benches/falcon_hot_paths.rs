@@ -17,6 +17,8 @@ fn sample_transaction() -> Transaction {
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     }
 }
 

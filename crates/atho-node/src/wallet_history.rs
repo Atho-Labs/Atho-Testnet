@@ -149,6 +149,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: Vec::new(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         }
     }
 
@@ -168,6 +170,8 @@ mod tests {
             outputs,
             lock_time: 0,
             witness: Vec::new(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         }
     }
 

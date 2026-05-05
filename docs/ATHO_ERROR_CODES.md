@@ -52,16 +52,6 @@ This registry is generated from `crates/atho-errors` and is the canonical source
 - Common Cause: The block target field is corrupted or calculated incorrectly.
 - Suggested Fix: Recompute the canonical target and verify difficulty encoding.
 
-## ATHO-CONS-003
-- Category: `CONS`
-- Title: Monetary Supply Exceeded
-- Severity: `critical`
-- User Facing: `false`
-- Consensus Critical: `true`
-- Explanation: Applying this block would exceed Atho's configured maximum supply.
-- Common Cause: The coinbase reward or fee accounting is invalid.
-- Suggested Fix: Recalculate subsidy and fee distribution for the candidate block.
-
 ## ATHO-NET-001
 - Category: `NET`
 - Title: Invalid Network Selection
@@ -372,6 +362,36 @@ This registry is generated from `crates/atho-errors` and is the canonical source
 - Common Cause: A coinbase or newly created output was spent before the required confirmation depth.
 - Suggested Fix: Wait for the required number of confirmations before spending the output.
 
+## ATHO-TX-012
+- Category: `TX`
+- Title: Too Many Outputs
+- Severity: `critical`
+- User Facing: `true`
+- Consensus Critical: `true`
+- Explanation: The transaction creates more outputs than Atho's standard anti-spam policy allows.
+- Common Cause: A wallet batch or spam-shaped transaction exceeded the configured output cap.
+- Suggested Fix: Reduce the output count or split the spend into smaller transactions.
+
+## ATHO-TX-013
+- Category: `TX`
+- Title: Wrong Transaction PoW Bits
+- Severity: `critical`
+- User Facing: `true`
+- Consensus Critical: `true`
+- Explanation: The transaction declares a wallet proof-of-work difficulty that does not match Atho policy.
+- Common Cause: The wallet used the wrong fee, size, or output-count inputs when calculating transaction PoW.
+- Suggested Fix: Recompute the required transaction PoW bits from the final signed transaction.
+
+## ATHO-TX-014
+- Category: `TX`
+- Title: Invalid Transaction PoW Nonce
+- Severity: `critical`
+- User Facing: `true`
+- Consensus Critical: `true`
+- Explanation: The wallet transaction proof-of-work nonce does not satisfy the required SHA3-256 difficulty.
+- Common Cause: The transaction changed after solving PoW or the nonce search used the wrong preimage.
+- Suggested Fix: Rebuild the signed transaction and solve the wallet PoW again.
+
 ## ATHO-UTXO-001
 - Category: `UTXO`
 - Title: Missing UTXO Entry
@@ -409,8 +429,8 @@ This registry is generated from `crates/atho-errors` and is the canonical source
 - User Facing: `true`
 - Consensus Critical: `false`
 - Explanation: The transaction creates an output below Atho's relay dust floor.
-- Common Cause: A wallet or sender attempted to create an output smaller than the 50-atom relay minimum.
-- Suggested Fix: Raise every spendable output to at least 50 atoms or combine the value into fees.
+- Common Cause: A wallet or sender attempted to create an output smaller than the 1,000-atom relay minimum.
+- Suggested Fix: Raise every spendable output to at least 1,000 atoms or combine the value into fees.
 
 ## ATHO-SIG-001
 - Category: `SIG`

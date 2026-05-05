@@ -98,7 +98,11 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
 
                     ui.label(egui::RichText::new("Amount (ATHO):").size(13.0).strong())
                         .on_hover_text(
-                            "Examples: 1, 1.25, 0.50000000. Up to 8 decimal places are supported. Spendable outputs must be at least 50 atoms.",
+                            format!(
+                                "Examples: 1, 1.25. Up to {} decimal places are supported on this network. Spendable outputs must be at least {}.",
+                                atho_core::constants::decimals_for_network(app.active_network()),
+                                widgets::format_atoms(app.active_network(), DUST_RELAY_VALUE_ATOMS),
+                            ),
                         );
                     ui.horizontal(|ui| {
                         ui.add_sized(
@@ -132,7 +136,7 @@ fn render_send_form(app: &mut DesktopApp, ui: &mut egui::Ui, _available_balance:
                 ui,
                 &format!(
                     "The current spend path signs one wallet address at a time. Spendable outputs must be at least {}. “Use available balance” fills the largest amount currently spendable in one transaction.",
-                    widgets::format_atoms(DUST_RELAY_VALUE_ATOMS)
+                    widgets::format_atoms(app.active_network(), DUST_RELAY_VALUE_ATOMS)
                 ),
             );
             ui.add_space(8.0);
@@ -212,7 +216,7 @@ fn render_send_actions(
             ui.label(
                 egui::RichText::new(format!(
                     "Wallet total available: {}",
-                    widgets::format_atoms(available_balance)
+                    widgets::format_atoms(app.active_network(), available_balance)
                 ))
                 .size(13.0)
                 .strong(),
@@ -265,7 +269,7 @@ fn render_send_actions(
             ui.label(
                 egui::RichText::new(format!(
                     "Wallet total available: {}",
-                    widgets::format_atoms(available_balance)
+                    widgets::format_atoms(app.active_network(), available_balance)
                 ))
                 .size(13.0)
                 .strong(),

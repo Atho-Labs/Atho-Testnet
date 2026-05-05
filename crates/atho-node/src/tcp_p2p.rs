@@ -1140,7 +1140,7 @@ mod tests {
     use super::*;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::consensus::rules;
-    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+    use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
     use atho_core::genesis;
     use atho_p2p::config::MIN_SUPPORTED_PROTOCOL_VERSION;
     use atho_p2p::protocol::{VersionMessage, LOCAL_NODE_SERVICES};
@@ -1806,7 +1806,7 @@ mod tests {
         )
         .expect("signed transaction");
         let txid = transaction.txid();
-        let fee_atoms = transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &transaction);
         let response = {
             let mut state = left.state.lock().expect("left state");
             state.handle_mut(RpcRequest::SubmitTransaction {

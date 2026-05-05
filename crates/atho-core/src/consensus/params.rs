@@ -1,12 +1,16 @@
 use crate::constants::{
-    BLOCK_TIME_SECONDS, COINBASE_MATURITY_BLOCKS, HALVING_INTERVAL_BLOCKS,
-    INITIAL_BLOCK_REWARD_ATHO, MAX_SUPPLY_ATHO, MIN_TX_FEE_ATOMS, STANDARD_TX_CONFIRMATIONS,
+    ATOMS_PER_ATHO, BLOCK_TIME_SECONDS, COINBASE_MATURITY_BLOCKS, DECIMALS,
+    HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, MIN_TX_FEE_ATOMS,
+    STANDARD_TX_CONFIRMATIONS,
 };
+use crate::network::Network;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusParams {
-    pub max_supply_atho: u64,
-    pub initial_block_reward_atho: u64,
+    pub decimals: usize,
+    pub atoms_per_atho: u64,
+    pub max_supply_atho: Option<u64>,
+    pub initial_block_reward_atoms: u64,
     pub halving_interval_blocks: u64,
     pub coinbase_maturity_blocks: u64,
     pub standard_tx_confirmations: u64,
@@ -15,8 +19,10 @@ pub struct ConsensusParams {
 }
 
 pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
-    max_supply_atho: MAX_SUPPLY_ATHO,
-    initial_block_reward_atho: INITIAL_BLOCK_REWARD_ATHO,
+    decimals: DECIMALS,
+    atoms_per_atho: ATOMS_PER_ATHO,
+    max_supply_atho: None,
+    initial_block_reward_atoms: INITIAL_BLOCK_REWARD_ATOMS,
     halving_interval_blocks: HALVING_INTERVAL_BLOCKS,
     coinbase_maturity_blocks: COINBASE_MATURITY_BLOCKS,
     standard_tx_confirmations: STANDARD_TX_CONFIRMATIONS,
@@ -24,18 +30,28 @@ pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
     block_time_seconds: BLOCK_TIME_SECONDS,
 };
 
+pub const fn consensus_params_for_network(_network: Network) -> ConsensusParams {
+    CONSENSUS_PARAMS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn consensus_params_are_frozen() {
-        assert_eq!(CONSENSUS_PARAMS.max_supply_atho, 168_000_000);
-        assert_eq!(CONSENSUS_PARAMS.initial_block_reward_atho, 50);
-        assert_eq!(CONSENSUS_PARAMS.halving_interval_blocks, 1_680_000);
-        assert_eq!(CONSENSUS_PARAMS.coinbase_maturity_blocks, 150);
-        assert_eq!(CONSENSUS_PARAMS.standard_tx_confirmations, 7);
-        assert_eq!(CONSENSUS_PARAMS.min_tx_fee_atoms, 1);
-        assert_eq!(CONSENSUS_PARAMS.block_time_seconds, 75);
+        let params = consensus_params_for_network(Network::Mainnet);
+        assert_eq!(params.decimals, DECIMALS);
+        assert_eq!(params.atoms_per_atho, ATOMS_PER_ATHO);
+        assert_eq!(params.max_supply_atho, None);
+        assert_eq!(
+            params.initial_block_reward_atoms,
+            INITIAL_BLOCK_REWARD_ATOMS
+        );
+        assert_eq!(params.halving_interval_blocks, 1_680_000);
+        assert_eq!(params.coinbase_maturity_blocks, 150);
+        assert_eq!(params.standard_tx_confirmations, 7);
+        assert_eq!(params.min_tx_fee_atoms, 500);
+        assert_eq!(params.block_time_seconds, 75);
     }
 }

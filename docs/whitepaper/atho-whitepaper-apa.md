@@ -201,11 +201,11 @@ Atho's cryptographic design uses SHA3-256, SHA3-384, and Falcon-512 in distinct 
 
 Falcon-512 is the active signature scheme for transaction authorization. The Falcon submission describes a Fast-Fourier lattice-based compact signature scheme over NTRU, and the official specification lists Falcon-512 with 897-byte public keys and 666-byte signatures (Fouque et al., 2020). Atho's wrapper confirms those sizes in code and tests: public keys are 897 bytes, secret keys are 1,281 bytes, and signatures are 666 bytes. Those larger post-quantum signatures directly affect witness size, transaction size, and block capacity. Atho handles that through witness-separated sizing, maximum raw transaction bytes, maximum vbytes, and block weight rules.
 
-Transaction signing is intentionally deterministic with respect to the message being signed. The wallet signs `SHA3-384(Transaction::base_bytes())` under the frozen `ATHO_TX_SIG_V1` domain. The witness contains the signature, public key, and per-input references. The node reconstructs the same base bytes, derives the same signing digest, verifies under the same domain, and rejects mismatches. This exact byte matching requirement is the core anti-malleability rule for Atho signatures. Figure 3 shows the flow.
+Transaction signing is intentionally deterministic with respect to the message being signed. The wallet signs `SHA3-384(Transaction::base_bytes())` under the frozen `ATHO_TX_SIGN_V1` domain. The witness contains the signature, public key, and per-input references. The node reconstructs the same base bytes, derives the same signing digest, verifies under the same domain, and rejects mismatches. This exact byte matching requirement is the core anti-malleability rule for Atho signatures. Figure 3 shows the flow.
 
 ![Figure 3. Atho Transaction Signing and Verification Flow](assets/figure_03_signing_verification.png)
 
-*Figure 3. Transaction signing and verification bind wallet-created transaction bytes to the `ATHO_TX_SIG_V1` domain and the SHA3-384 signing digest.*
+*Figure 3. Transaction signing and verification bind wallet-created transaction bytes to the `ATHO_TX_SIGN_V1` domain and the SHA3-384 signing digest.*
 
 # 8. Falcon-512 Implementation in Atho
 
@@ -334,7 +334,7 @@ Atho's mempool is a validated, in-memory staging area. It is not consensus truth
 
 Admission runs through `validate_transaction_with_context`. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, minimum fee, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
 
-Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 50-atom relay dust floor, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
+Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 1,000-atom relay dust floor, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
 
 ![Figure 7. Mempool Admission Flow](assets/figure_07_mempool_admission.png)
 
@@ -565,7 +565,7 @@ UTXO: Unspent transaction output, the basic unit of spendable chain value. Chain
 
 # Appendix B: Protocol Constants
 
-The following source-derived constants are used throughout the paper: `ATOMS_PER_ATHO = 100_000_000`; `MAX_SUPPLY_ATHO = 168_000_000`; `INITIAL_BLOCK_REWARD_ATHO = 50`; `HALVING_INTERVAL_BLOCKS = 1_680_000`; `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`; `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`; `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`; `MAX_TRANSACTION_RAW_BYTES = 250_000`; `MAX_TRANSACTION_VBYTES = 250_000`; `ADDRESS_DIGEST_BYTES = 32`; `ADDRESS_CHECKSUM_BYTES = 4`; `ADDRESS_CHECKSUM_BASE56_CHARS = 6`; `WITNESS_SIGNATURE_REFERENCE_BYTES = 16`; `PROTOCOL_VERSION = 1`; `STORAGE_SCHEMA_VERSION = 3`; and `ATHO_SIGNATURE_RULES_VERSION = 1`.
+The following source-derived constants are used throughout the paper: `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`; `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`; `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`; `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`; `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`; `MAX_TRANSACTION_RAW_BYTES = 250_000`; `MAX_TRANSACTION_VBYTES = 250_000`; `ADDRESS_DIGEST_BYTES = 32`; `ADDRESS_CHECKSUM_BYTES = 4`; `ADDRESS_CHECKSUM_BASE56_CHARS = 6`; `WITNESS_SIGNATURE_REFERENCE_BYTES = 16`; `PROTOCOL_VERSION = 1`; `STORAGE_SCHEMA_VERSION = 3`; and `ATHO_SIGNATURE_RULES_VERSION = 1`.
 
 Current networks are mainnet, testnet, and regnet. Their internal IDs are `atho-mainnet`, `atho-testnet`, and `atho-regnet`; consensus IDs are 1, 2, and 3; visible prefixes are `A`, `T`, and `R`; P2P ports are 56000, 9100, and 9200; RPC ports are 9010, 9110, and 9210; and wire magic values are `a7 54 48 01`, `a7 54 48 02`, and `a7 54 48 03`.
 
@@ -627,7 +627,7 @@ function validate_transaction(tx, declared_fee, spend_height, utxo_set, rules):
     witness = parse_witness(tx.witness)
     if witness is missing or witness.input_refs.len != tx.inputs.len:
         return Reject("invalid witness")
-    if !verify_falcon_signature(ATHO_TX_SIG_V1, witness.pubkey, tx.signing_digest(), witness.signature):
+    if !verify_falcon_signature(ATHO_TX_SIGN_V1, witness.pubkey, tx.signing_digest(), witness.signature):
         return Reject("bad signature")
     input_total = 0
     for input in tx.inputs:
@@ -732,7 +732,7 @@ function rollback_reorg(old_suffix, new_suffix, chainstate):
 function wallet_signing(wallet, tx, path):
     keypair = wallet.keypair_for_path(path)
     digest = SHA3_384(tx.base_bytes())
-    signature = falcon_sign(ATHO_TX_SIG_V1, keypair.secret_key, digest)
+    signature = falcon_sign(ATHO_TX_SIGN_V1, keypair.secret_key, digest)
     witness = build_witness(signature, keypair.public_key, tx.inputs)
     return tx.with_witness(witness)
 

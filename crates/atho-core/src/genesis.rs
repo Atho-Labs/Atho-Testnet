@@ -8,7 +8,7 @@
 use crate::block::{merkle_root, witness_root, Block, BlockHeader};
 use crate::consensus::pow;
 use crate::consensus::rules::{BLOCK_VERSION_V1, TRANSACTION_VERSION_V1};
-use crate::constants::GENESIS_COINBASE_ATOMS;
+use crate::consensus::subsidy;
 use crate::network::Network;
 use crate::transaction::{Transaction, TxOutput};
 use hex_literal::hex;
@@ -22,14 +22,12 @@ const MAINNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
 const MAINNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const MAINNET_GENESIS_LOCK_TIME: u32 = 0;
 const MAINNET_GENESIS_TIMESTAMP: u64 = 1_773_360_488;
-const MAINNET_GENESIS_NONCE: u64 = 135_392;
 const MAINNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
+const MAINNET_GENESIS_NONCE: u64 = 20_164;
 const MAINNET_GENESIS_COINBASE_TXID: [u8; 48] =
-    hex!("641758f47d003c211adab6540ce624baf2223dc0892149ea24f8b9015873a0976b3b468200553e672888f4ea3d6e8134");
-const MAINNET_GENESIS_MERKLE_ROOT: [u8; 48] = MAINNET_GENESIS_COINBASE_TXID;
-const MAINNET_GENESIS_WITNESS_ROOT: [u8; 48] = MAINNET_GENESIS_COINBASE_TXID;
+    hex!("d5433104080b7866ca0a0e0cf4500b5312f1a97db394765eacb1f267caa1552b9ee2191704bfbdcf777cc55f2c861470");
 const MAINNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("00004eab876c38017f5f3f512e38ff9192106253912e0eefbe2eee4af732f7798e951f8ee2a3e2afe876927c2f21688f");
+    hex!("000049993ab4e8874c71e35c659756c3f13d17f5e688a1271800704009017a8d0f69d9b5d8da7d7e398f720b037fd2c8");
 
 const TESTNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHT22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -39,14 +37,12 @@ const TESTNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
 const TESTNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const TESTNET_GENESIS_LOCK_TIME: u32 = 0;
 const TESTNET_GENESIS_TIMESTAMP: u64 = 1_773_360_489;
-const TESTNET_GENESIS_NONCE: u64 = 31_066;
 const TESTNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
+const TESTNET_GENESIS_NONCE: u64 = 6_632;
 const TESTNET_GENESIS_COINBASE_TXID: [u8; 48] =
-    hex!("4f1bf33eb11b3c4d3369b23a7af3cc17b714787a207f78da76985f8808e5f1b42fb5a0c3810cd67f5f1a77f84c8fb826");
-const TESTNET_GENESIS_MERKLE_ROOT: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
-const TESTNET_GENESIS_WITNESS_ROOT: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
+    hex!("0da7f2bc20dff426397990d053f60534d27630e0b2e51ebdf9317a58c0507afb22c315e9ac440085944d451075caecd3");
 const TESTNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("000083b1a17dc251043f4a7dd9d5981c35382e6d17bb6fb05eab2bb83dde5fe8a08dc766c9fb3ce9e1342f6f2238ac8a");
+    hex!("0000860604effa76502794b0d0f4b4d0c3a08dec8ac0fd2fe1c05e235b31efe0144d8c9003478c5495e7566edecb40be");
 
 const REGNET_GENESIS_REWARD_ADDRESS: &str = TESTNET_GENESIS_REWARD_ADDRESS;
 const REGNET_GENESIS_REWARD_SCRIPT: [u8; 48] = TESTNET_GENESIS_REWARD_SCRIPT;
@@ -54,13 +50,11 @@ const REGNET_GENESIS_BLOCK_VERSION: u16 = BLOCK_VERSION_V1;
 const REGNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const REGNET_GENESIS_LOCK_TIME: u32 = 0;
 const REGNET_GENESIS_TIMESTAMP: u64 = TESTNET_GENESIS_TIMESTAMP;
-const REGNET_GENESIS_NONCE: u64 = 202_541;
 const REGNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
+const REGNET_GENESIS_NONCE: u64 = 87_837;
 const REGNET_GENESIS_COINBASE_TXID: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
-const REGNET_GENESIS_MERKLE_ROOT: [u8; 48] = REGNET_GENESIS_COINBASE_TXID;
-const REGNET_GENESIS_WITNESS_ROOT: [u8; 48] = REGNET_GENESIS_COINBASE_TXID;
 const REGNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("0000747cfb613e8e66e9cf9af1c6eb1c666f4879aa3a99fb90b5dc948c129587ed20112e5fd43d131c8eaedeca7d465a");
+    hex!("00005f08e72e60f4f87c4e11e24fe9b01b32b591df06e7dab2a21239be7efd75d43c0aee5573f69a4067a6117cc3ffdc");
 
 const PRUNETEST_GENESIS_REWARD_ADDRESS: &str =
     "ATHP22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -70,6 +64,10 @@ const PRUNETEST_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const PRUNETEST_GENESIS_LOCK_TIME: u32 = 0;
 const PRUNETEST_GENESIS_TIMESTAMP: u64 = 1_773_360_490;
 const PRUNETEST_GENESIS_TARGET: [u8; 48] = pow::PRUNETEST_INITIAL_TARGET;
+const PRUNETEST_GENESIS_NONCE: u64 = 48_371;
+const PRUNETEST_GENESIS_COINBASE_TXID: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
+const PRUNETEST_GENESIS_BLOCK_HASH: [u8; 48] =
+    hex!("0000b4f337af0e8119b30529a5e6bde81251a7ec579cc24e397f8ee117e63279765c000bb9d881b9e571fb573b56d72d");
 
 /// Fully materialized genesis state for one Atho network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,8 +135,7 @@ pub fn genesis_utxo_flag(network: Network) -> &'static str {
 
 /// Returns the genesis coinbase value in atoms.
 pub fn genesis_utxo_value(network: Network) -> u64 {
-    let _ = network;
-    GENESIS_COINBASE_ATOMS
+    subsidy::genesis_coinbase_atoms_for_network(network)
 }
 
 /// Re-solves the genesis profile from the static parameters.
@@ -190,11 +187,13 @@ pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
         version: tx_version,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: GENESIS_COINBASE_ATOMS,
+            value_atoms: subsidy::genesis_coinbase_atoms_for_network(network),
             locking_script: reward_script.to_vec(),
         }],
         lock_time,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let coinbase_txid = coinbase.txid();
     let transactions = vec![coinbase];
@@ -237,82 +236,88 @@ pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
 }
 
 fn mainnet() -> GenesisState {
-    genesis_state_from_parts(
-        Network::Mainnet,
-        MAINNET_GENESIS_REWARD_ADDRESS,
-        MAINNET_GENESIS_REWARD_SCRIPT,
-        MAINNET_GENESIS_BLOCK_VERSION,
-        MAINNET_GENESIS_TX_VERSION,
-        MAINNET_GENESIS_LOCK_TIME,
-        MAINNET_GENESIS_TIMESTAMP,
-        MAINNET_GENESIS_NONCE,
-        MAINNET_GENESIS_TARGET,
-        MAINNET_GENESIS_MERKLE_ROOT,
-        MAINNET_GENESIS_WITNESS_ROOT,
-        "",
-        MAINNET_GENESIS_COINBASE_TXID,
-        MAINNET_GENESIS_BLOCK_HASH,
-    )
+    static STATE: OnceLock<GenesisState> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            genesis_state_from_parts(
+                Network::Mainnet,
+                MAINNET_GENESIS_REWARD_ADDRESS,
+                MAINNET_GENESIS_REWARD_SCRIPT,
+                MAINNET_GENESIS_BLOCK_VERSION,
+                MAINNET_GENESIS_TX_VERSION,
+                MAINNET_GENESIS_LOCK_TIME,
+                MAINNET_GENESIS_TIMESTAMP,
+                MAINNET_GENESIS_NONCE,
+                MAINNET_GENESIS_TARGET,
+                MAINNET_GENESIS_COINBASE_TXID,
+                MAINNET_GENESIS_BLOCK_HASH,
+                Network::Mainnet.utxo_flag(),
+            )
+        })
+        .clone()
 }
 
 fn testnet() -> GenesisState {
-    genesis_state_from_parts(
-        Network::Testnet,
-        TESTNET_GENESIS_REWARD_ADDRESS,
-        TESTNET_GENESIS_REWARD_SCRIPT,
-        TESTNET_GENESIS_BLOCK_VERSION,
-        TESTNET_GENESIS_TX_VERSION,
-        TESTNET_GENESIS_LOCK_TIME,
-        TESTNET_GENESIS_TIMESTAMP,
-        TESTNET_GENESIS_NONCE,
-        TESTNET_GENESIS_TARGET,
-        TESTNET_GENESIS_MERKLE_ROOT,
-        TESTNET_GENESIS_WITNESS_ROOT,
-        "TEST-UTXO",
-        TESTNET_GENESIS_COINBASE_TXID,
-        TESTNET_GENESIS_BLOCK_HASH,
-    )
+    static STATE: OnceLock<GenesisState> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            genesis_state_from_parts(
+                Network::Testnet,
+                TESTNET_GENESIS_REWARD_ADDRESS,
+                TESTNET_GENESIS_REWARD_SCRIPT,
+                TESTNET_GENESIS_BLOCK_VERSION,
+                TESTNET_GENESIS_TX_VERSION,
+                TESTNET_GENESIS_LOCK_TIME,
+                TESTNET_GENESIS_TIMESTAMP,
+                TESTNET_GENESIS_NONCE,
+                TESTNET_GENESIS_TARGET,
+                TESTNET_GENESIS_COINBASE_TXID,
+                TESTNET_GENESIS_BLOCK_HASH,
+                Network::Testnet.utxo_flag(),
+            )
+        })
+        .clone()
 }
 
 fn regnet() -> GenesisState {
-    genesis_state_from_parts(
-        Network::Regnet,
-        REGNET_GENESIS_REWARD_ADDRESS,
-        REGNET_GENESIS_REWARD_SCRIPT,
-        REGNET_GENESIS_BLOCK_VERSION,
-        REGNET_GENESIS_TX_VERSION,
-        REGNET_GENESIS_LOCK_TIME,
-        REGNET_GENESIS_TIMESTAMP,
-        REGNET_GENESIS_NONCE,
-        REGNET_GENESIS_TARGET,
-        REGNET_GENESIS_MERKLE_ROOT,
-        REGNET_GENESIS_WITNESS_ROOT,
-        "REG-UTXO",
-        REGNET_GENESIS_COINBASE_TXID,
-        REGNET_GENESIS_BLOCK_HASH,
-    )
+    static STATE: OnceLock<GenesisState> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            genesis_state_from_parts(
+                Network::Regnet,
+                REGNET_GENESIS_REWARD_ADDRESS,
+                REGNET_GENESIS_REWARD_SCRIPT,
+                REGNET_GENESIS_BLOCK_VERSION,
+                REGNET_GENESIS_TX_VERSION,
+                REGNET_GENESIS_LOCK_TIME,
+                REGNET_GENESIS_TIMESTAMP,
+                REGNET_GENESIS_NONCE,
+                REGNET_GENESIS_TARGET,
+                REGNET_GENESIS_COINBASE_TXID,
+                REGNET_GENESIS_BLOCK_HASH,
+                Network::Regnet.utxo_flag(),
+            )
+        })
+        .clone()
 }
 
 fn prunetest() -> GenesisState {
     static STATE: OnceLock<GenesisState> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            let profile = regenerate_genesis_profile(Network::Prunetest);
             genesis_state_from_parts(
-                profile.network,
+                Network::Prunetest,
                 PRUNETEST_GENESIS_REWARD_ADDRESS,
-                profile.reward_script,
-                profile.block_version,
-                profile.tx_version,
-                profile.lock_time,
-                profile.timestamp,
-                profile.nonce,
-                profile.target,
-                profile.merkle_root,
-                profile.witness_root,
+                PRUNETEST_GENESIS_REWARD_SCRIPT,
+                PRUNETEST_GENESIS_BLOCK_VERSION,
+                PRUNETEST_GENESIS_TX_VERSION,
+                PRUNETEST_GENESIS_LOCK_TIME,
+                PRUNETEST_GENESIS_TIMESTAMP,
+                PRUNETEST_GENESIS_NONCE,
+                PRUNETEST_GENESIS_TARGET,
+                PRUNETEST_GENESIS_COINBASE_TXID,
+                PRUNETEST_GENESIS_BLOCK_HASH,
                 Network::Prunetest.utxo_flag(),
-                profile.coinbase_txid,
-                profile.block_hash,
             )
         })
         .clone()
@@ -328,25 +333,28 @@ fn genesis_state_from_parts(
     timestamp: u64,
     nonce: u64,
     target: [u8; 48],
-    merkle_root: [u8; 48],
-    witness_root: [u8; 48],
-    utxo_flag: &'static str,
     expected_coinbase_txid: [u8; 48],
     expected_block_hash: [u8; 48],
+    utxo_flag: &'static str,
 ) -> GenesisState {
     let coinbase = Transaction {
         version: tx_version,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: GENESIS_COINBASE_ATOMS,
+            value_atoms: subsidy::genesis_coinbase_atoms_for_network(network),
             locking_script: reward_script.to_vec(),
         }],
         lock_time,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let coinbase_txid = coinbase.txid();
     assert_eq!(coinbase_txid, expected_coinbase_txid);
     assert_eq!(coinbase.outputs[0].locking_script, reward_script);
+    let transactions = vec![coinbase];
+    let merkle_root = merkle_root(&transactions);
+    let witness_root = witness_root(&transactions);
 
     let header = BlockHeader {
         version: block_version,
@@ -361,7 +369,7 @@ fn genesis_state_from_parts(
     };
     let block = Block {
         header,
-        transactions: vec![coinbase],
+        transactions,
         witnesses: Default::default(),
         fees_total_atoms: 0,
         fees_miner_atoms: 0,
@@ -411,7 +419,7 @@ mod tests {
         assert_ne!(reg.block_hash, prune.block_hash);
         assert_eq!(
             main.block.transactions[0].outputs[0].value_atoms,
-            GENESIS_COINBASE_ATOMS
+            subsidy::genesis_coinbase_atoms_for_network(Network::Mainnet)
         );
         assert_eq!(main.block.header.version, 1);
         assert_eq!(main.block.header.previous_block_hash, [0; 48]);
@@ -422,7 +430,10 @@ mod tests {
         );
         assert_eq!(main.block.header.network_id, Network::Mainnet);
         assert_eq!(main.block.header.height, 0);
-        assert_eq!(main.block.header.nonce, MAINNET_GENESIS_NONCE);
+        assert!(pow::meets_target(
+            &main.block_hash,
+            &main.block.header.difficulty_target_or_bits
+        ));
         assert_eq!(main.block.transactions[0].version, 1);
         assert_eq!(main.block.transactions[0].inputs.len(), 0);
         assert_eq!(main.block.transactions[0].outputs.len(), 1);
@@ -435,7 +446,10 @@ mod tests {
             MAINNET_GENESIS_REWARD_SCRIPT
         );
         assert_eq!(main.block.witnesses.len(), 0);
-        assert_eq!(main.block.header.witness_root, MAINNET_GENESIS_WITNESS_ROOT);
+        assert_eq!(
+            main.block.header.witness_root,
+            main.block.compute_witness_root()
+        );
         assert_eq!(main.block.fees_total_atoms, 0);
         assert_eq!(main.block.fees_miner_atoms, 0);
         assert_eq!(test.utxo_flag, "TEST-UTXO");
@@ -447,5 +461,23 @@ mod tests {
             prune.block.header.difficulty_target_or_bits,
             PRUNETEST_GENESIS_TARGET
         );
+    }
+
+    #[test]
+    fn regenerated_profiles_match_frozen_genesis_state() {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Regnet,
+            Network::Prunetest,
+        ] {
+            let profile = regenerate_genesis_profile(network);
+            let state = genesis_state(network);
+            assert_eq!(profile.coinbase_txid, state.coinbase_txid);
+            assert_eq!(profile.block_hash, state.block_hash);
+            assert_eq!(profile.merkle_root, state.block.header.merkle_root);
+            assert_eq!(profile.witness_root, state.block.header.witness_root);
+            assert_eq!(profile.nonce, state.block.header.nonce);
+        }
     }
 }

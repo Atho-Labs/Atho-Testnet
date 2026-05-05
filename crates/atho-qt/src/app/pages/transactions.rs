@@ -77,7 +77,13 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                 widgets::elided_label(ui, &row.label, 56);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| widgets::row_value_signed(ui, row.amount_atoms),
+                                    |ui| {
+                                        widgets::row_value_signed(
+                                            ui,
+                                            app.active_network(),
+                                            row.amount_atoms,
+                                        )
+                                    },
                                 );
                                 ui.end_row();
                             });

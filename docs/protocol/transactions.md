@@ -84,7 +84,7 @@ Atho uses:
 
 The active transaction domain label is:
 
-- `ATHO_TX_SIG_V1`
+- `ATHO_TX_SIGN_V1`
 
 Implemented in:
 

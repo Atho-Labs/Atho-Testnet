@@ -1257,8 +1257,8 @@ mod tests {
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_core::block::{merkle_root, witness_root, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
     use atho_core::consensus::{pow, subsidy};
-    use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
     use atho_core::genesis;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
@@ -1372,6 +1372,8 @@ mod tests {
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx.clone()
         };
         let witness_root = staged_tx.witness_commitment_hash();
@@ -1403,11 +1405,13 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(height),
+                value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
                 locking_script: vec![1],
             }],
             lock_time: height as u32,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
         Block::new(
@@ -1461,11 +1465,30 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         Transaction {
             witness: witness_bytes_for_tx(&template),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..template
         }
+    }
+
+    fn sign_and_solve_transaction(
+        network: Network,
+        tx: Transaction,
+        fee_atoms: u64,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+            ..tx
+        };
+        solve_transaction_pow(network, &mut tx, fee_atoms);
+        tx
     }
 
     fn collect_events(
@@ -2058,17 +2081,21 @@ mod tests {
                 unlocking_script: seed_script.clone(),
             }],
             outputs: vec![TxOutput {
-                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                value_atoms: seed_value.saturating_sub(1),
                 locking_script: vec![2],
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let provisional = Transaction {
             witness: witness_bytes_for_tx(&template),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..template
         };
-        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &provisional);
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
@@ -2076,13 +2103,12 @@ mod tests {
             }],
             ..Transaction {
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
                 ..provisional
             }
         };
-        let signed = Transaction {
-            witness: witness_bytes_for_tx(&signed),
-            ..signed
-        };
+        let signed = sign_and_solve_transaction(Network::Regnet, signed, fee_atoms);
         let txid = right
             .node
             .submit_transaction(MempoolEntry::new(signed, fee_atoms))
@@ -2169,17 +2195,21 @@ mod tests {
                 unlocking_script: seed_script.clone(),
             }],
             outputs: vec![TxOutput {
-                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                value_atoms: seed_value.saturating_sub(1),
                 locking_script: vec![2],
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let provisional = Transaction {
             witness: witness_bytes_for_tx(&template),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..template
         };
-        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &provisional);
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
@@ -2187,13 +2217,12 @@ mod tests {
             }],
             ..Transaction {
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
                 ..provisional
             }
         };
-        let signed = Transaction {
-            witness: witness_bytes_for_tx(&signed),
-            ..signed
-        };
+        let signed = sign_and_solve_transaction(Network::Regnet, signed, fee_atoms);
         let txid = signed.txid();
 
         let (events, new_notices) = left
@@ -2246,17 +2275,21 @@ mod tests {
                 unlocking_script: seed_script.clone(),
             }],
             outputs: vec![TxOutput {
-                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                value_atoms: seed_value.saturating_sub(1),
                 locking_script: vec![2],
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let provisional = Transaction {
             witness: witness_bytes_for_tx(&template),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..template
         };
-        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &provisional);
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
@@ -2264,13 +2297,12 @@ mod tests {
             }],
             ..Transaction {
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
                 ..provisional
             }
         };
-        let signed = Transaction {
-            witness: witness_bytes_for_tx(&signed),
-            ..signed
-        };
+        let signed = sign_and_solve_transaction(Network::Regnet, signed, fee_atoms);
         let txid = right
             .node
             .submit_transaction(MempoolEntry::new(signed.clone(), fee_atoms))
@@ -2396,17 +2428,21 @@ mod tests {
                 unlocking_script: seed_script.clone(),
             }],
             outputs: vec![TxOutput {
-                value_atoms: seed_value - MIN_TX_FEE_PER_VBYTE_ATOMS,
+                value_atoms: seed_value.saturating_sub(1),
                 locking_script: vec![2],
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let provisional = Transaction {
             witness: witness_bytes_for_tx(&template),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..template
         };
-        let fee_atoms = provisional.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &provisional);
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
@@ -2414,13 +2450,12 @@ mod tests {
             }],
             ..Transaction {
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
                 ..provisional
             }
         };
-        let signed = Transaction {
-            witness: witness_bytes_for_tx(&signed),
-            ..signed
-        };
+        let signed = sign_and_solve_transaction(Network::Regnet, signed, fee_atoms);
         right
             .node
             .submit_transaction(MempoolEntry::new(signed.clone(), fee_atoms))
@@ -2479,6 +2514,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: Vec::new(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         });
 
         let mut outbound = Vec::new();

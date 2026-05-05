@@ -12,13 +12,18 @@ use crate::keypool::Keypool;
 use crate::mnemonic::MnemonicPhrase;
 use crate::snapshot::WalletSnapshot;
 use atho_core::address::address_parts_from_public_key;
+use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
+use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_ATOMS};
 use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
-use atho_crypto::falcon::{self, FalconKeypair};
+use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+use atho_crypto::falcon::{self, sign, FalconKeypair};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+use thiserror::Error;
 
 pub const DEFAULT_RESTORE_GAP_LIMIT: usize = 1_000;
 pub const WALLET_DATAFILE_NAME: &str = ".datafile";
@@ -37,6 +42,60 @@ pub struct WalletAddress {
     pub public_key: Vec<u8>,
     pub payment_digest: [u8; 32],
     pub checksum: [u8; 4],
+}
+
+/// Minimal spendable outpoint information required to build a wallet payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletSpendUtxo {
+    pub previous_txid: [u8; 48],
+    pub output_index: u32,
+    pub value_atoms: u64,
+    pub locking_script: Vec<u8>,
+}
+
+/// Wallet-side spend request used to build, sign, and PoW-stamp one payment transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletSpendRequest {
+    pub spend_address: WalletAddress,
+    pub selected_utxos: Vec<WalletSpendUtxo>,
+    pub recipient_digest: [u8; 32],
+    pub amount_atoms: u64,
+    pub include_fee_in_total: bool,
+    pub transaction_version: u16,
+    pub lock_time: u32,
+    pub change_address: Option<WalletAddress>,
+}
+
+/// Final wallet-built transaction ready for backend submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletBuiltSpend {
+    pub transaction: Transaction,
+    pub fee_atoms: u64,
+    pub change_used: bool,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum WalletSpendBuildError {
+    #[error("selected inputs are empty")]
+    NoInputs,
+    #[error("wallet request belongs to the wrong network")]
+    WrongNetwork,
+    #[error("selected inputs do not belong to the requested spend address")]
+    InputOwnershipMismatch,
+    #[error("amount must be at least the minimum spendable output")]
+    AmountBelowMinimumOutput,
+    #[error("amount must exceed the network fee")]
+    AmountBelowFee,
+    #[error("selected inputs do not cover the requested amount and fee")]
+    InsufficientFunds,
+    #[error("missing change address for a spend that requires one")]
+    MissingChangeAddress,
+    #[error("transaction fee calculation did not converge")]
+    FeeLoopDidNotConverge,
+    #[error("amount arithmetic overflowed")]
+    AmountOverflow,
+    #[error("wallet signing failed: {0}")]
+    SigningFailed(String),
 }
 
 /// User wallet state including key material, address bookkeeping, and snapshot data.
@@ -230,6 +289,116 @@ impl Wallet {
         });
         bytes.extend_from_slice(&path.index.to_le_bytes());
         falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available")
+    }
+
+    pub fn build_signed_payment_transaction(
+        &self,
+        request: WalletSpendRequest,
+    ) -> Result<WalletBuiltSpend, WalletSpendBuildError> {
+        if request.selected_utxos.is_empty() {
+            return Err(WalletSpendBuildError::NoInputs);
+        }
+        if request.spend_address.network != self.network {
+            return Err(WalletSpendBuildError::WrongNetwork);
+        }
+        if request
+            .change_address
+            .as_ref()
+            .is_some_and(|address| address.network != self.network)
+        {
+            return Err(WalletSpendBuildError::WrongNetwork);
+        }
+
+        let spend_script = request.spend_address.payment_digest.to_vec();
+        if request
+            .selected_utxos
+            .iter()
+            .any(|utxo| utxo.locking_script != spend_script)
+        {
+            return Err(WalletSpendBuildError::InputOwnershipMismatch);
+        }
+
+        let min_output = DUST_RELAY_VALUE_ATOMS;
+        if !request.include_fee_in_total && request.amount_atoms < min_output {
+            return Err(WalletSpendBuildError::AmountBelowMinimumOutput);
+        }
+
+        let total_input_atoms = request
+            .selected_utxos
+            .iter()
+            .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value_atoms))
+            .ok_or(WalletSpendBuildError::AmountOverflow)?;
+        let keypair = self.keypair_for_path(request.spend_address.path);
+        let mut fee_atoms = MIN_TX_FEE_ATOMS;
+
+        for _ in 0..4 {
+            let (recipient_atoms, change_atoms) = recipient_and_change_amounts(
+                total_input_atoms,
+                request.amount_atoms,
+                fee_atoms,
+                request.include_fee_in_total,
+                min_output,
+            )?;
+            let transaction = build_signed_spend_transaction_from_parts(
+                &keypair,
+                &request.selected_utxos,
+                request.transaction_version,
+                request.recipient_digest,
+                recipient_atoms,
+                if change_atoms > 0 {
+                    Some((change_atoms, vec![0u8; 32]))
+                } else {
+                    None
+                },
+                request.lock_time,
+            )?;
+            let actual_fee = minimum_required_fee_atoms(self.network, &transaction);
+            if actual_fee == fee_atoms {
+                let mut transaction = build_signed_spend_transaction_from_parts(
+                    &keypair,
+                    &request.selected_utxos,
+                    request.transaction_version,
+                    request.recipient_digest,
+                    recipient_atoms,
+                    if change_atoms > 0 {
+                        Some((
+                            change_atoms,
+                            request
+                                .change_address
+                                .as_ref()
+                                .ok_or(WalletSpendBuildError::MissingChangeAddress)?
+                                .payment_digest
+                                .to_vec(),
+                        ))
+                    } else {
+                        None
+                    },
+                    request.lock_time,
+                )?;
+                let final_fee = total_input_atoms
+                    .checked_sub(
+                        transaction
+                            .checked_output_value_atoms()
+                            .ok_or(WalletSpendBuildError::AmountOverflow)?,
+                    )
+                    .ok_or(WalletSpendBuildError::InsufficientFunds)?;
+                if final_fee < actual_fee {
+                    return Err(WalletSpendBuildError::FeeLoopDidNotConverge);
+                }
+                if change_atoms > 0 && final_fee != actual_fee {
+                    return Err(WalletSpendBuildError::FeeLoopDidNotConverge);
+                }
+                solve_transaction_pow(self.network, &mut transaction, final_fee);
+                return Ok(WalletBuiltSpend {
+                    transaction,
+                    fee_atoms: final_fee,
+                    change_used: change_atoms > 0,
+                });
+            }
+            fee_atoms = actual_fee;
+        }
+
+        Err(WalletSpendBuildError::FeeLoopDidNotConverge)
     }
 
     pub fn address_for_payment_digest(&self, digest: &[u8; 32]) -> Option<WalletAddress> {
@@ -474,6 +643,159 @@ impl Wallet {
             .refill_to_target_with_progress(&mut wallet.hd_wallet, progress);
         wallet
     }
+}
+
+fn recipient_and_change_amounts(
+    total_input_atoms: u64,
+    amount_atoms: u64,
+    fee_atoms: u64,
+    include_fee_in_total: bool,
+    min_output: u64,
+) -> Result<(u64, u64), WalletSpendBuildError> {
+    if include_fee_in_total {
+        if amount_atoms <= fee_atoms {
+            return Err(WalletSpendBuildError::AmountBelowFee);
+        }
+        let recipient_atoms = amount_atoms
+            .checked_sub(fee_atoms)
+            .ok_or(WalletSpendBuildError::AmountBelowFee)?;
+        if recipient_atoms < min_output {
+            return Err(WalletSpendBuildError::AmountBelowMinimumOutput);
+        }
+        let raw_change = total_input_atoms
+            .checked_sub(amount_atoms)
+            .ok_or(WalletSpendBuildError::InsufficientFunds)?;
+        let change_atoms = if raw_change < min_output {
+            0
+        } else {
+            raw_change
+        };
+        Ok((recipient_atoms, change_atoms))
+    } else {
+        if amount_atoms < min_output {
+            return Err(WalletSpendBuildError::AmountBelowMinimumOutput);
+        }
+        let raw_change = total_input_atoms
+            .checked_sub(amount_atoms)
+            .and_then(|value| value.checked_sub(fee_atoms))
+            .ok_or(WalletSpendBuildError::InsufficientFunds)?;
+        let change_atoms = if raw_change < min_output {
+            0
+        } else {
+            raw_change
+        };
+        Ok((amount_atoms, change_atoms))
+    }
+}
+
+fn build_signed_spend_transaction_from_parts(
+    keypair: &FalconKeypair,
+    selected_utxos: &[WalletSpendUtxo],
+    version: u16,
+    recipient_digest: [u8; 32],
+    recipient_atoms: u64,
+    change_output: Option<(u64, Vec<u8>)>,
+    lock_time: u32,
+) -> Result<Transaction, WalletSpendBuildError> {
+    let mut outputs = vec![TxOutput {
+        value_atoms: recipient_atoms,
+        locking_script: recipient_digest.to_vec(),
+    }];
+    if let Some((change_atoms, change_script)) = change_output {
+        outputs.push(TxOutput {
+            value_atoms: change_atoms,
+            locking_script: change_script,
+        });
+    }
+
+    let inputs = selected_utxos
+        .iter()
+        .map(|utxo| TxInput {
+            previous_txid: utxo.previous_txid,
+            output_index: utxo.output_index,
+            unlocking_script: utxo.locking_script.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut tx = Transaction {
+        version,
+        inputs,
+        outputs,
+        lock_time,
+        witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
+    };
+    let digest = transaction_signing_digest(&tx);
+    let signature = sign(
+        AthoSignatureDomain::Transaction,
+        &keypair.secret_key,
+        &digest,
+    )
+    .map_err(|err| WalletSpendBuildError::SigningFailed(err.to_string()))?;
+    let txid = tx.txid();
+    let sig_bytes = signature.0.clone();
+    tx.witness = TxWitness {
+        signature: sig_bytes.clone(),
+        pubkey: keypair.public_key.0.clone(),
+        input_refs: selected_utxos
+            .iter()
+            .enumerate()
+            .map(|(index, _)| WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                witness_commit_ref: [0; 16],
+            })
+            .collect(),
+    }
+    .canonical_bytes();
+    let witness_root = tx.witness_commitment_hash();
+    tx.witness = TxWitness {
+        signature: sig_bytes.clone(),
+        pubkey: keypair.public_key.0.clone(),
+        input_refs: selected_utxos
+            .iter()
+            .enumerate()
+            .map(|(index, _)| WitnessInputRef {
+                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
+                witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, index as u32),
+            })
+            .collect(),
+    }
+    .canonical_bytes();
+    Ok(tx)
+}
+
+fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
+    let mut preimage = Vec::with_capacity(
+        b"ATHO_SIG_REF_SHORT_V1".len() + txid.len() + signature.len() + core::mem::size_of::<u32>(),
+    );
+    preimage.extend_from_slice(b"ATHO_SIG_REF_SHORT_V1");
+    preimage.extend_from_slice(txid);
+    preimage.extend_from_slice(signature);
+    preimage.extend_from_slice(&input_index.to_be_bytes());
+    let digest = sha3_256(&preimage);
+    [digest[0], digest[1]]
+}
+
+fn derive_witness_commit_ref(
+    txid: &[u8; 48],
+    block_witness_root: &[u8; 48],
+    input_index: u32,
+) -> [u8; 16] {
+    let mut preimage = Vec::with_capacity(
+        b"ATHO_WITNESS_COMMIT_REF_V1".len()
+            + txid.len()
+            + core::mem::size_of::<u32>()
+            + block_witness_root.len(),
+    );
+    preimage.extend_from_slice(b"ATHO_WITNESS_COMMIT_REF_V1");
+    preimage.extend_from_slice(txid);
+    preimage.extend_from_slice(&input_index.to_be_bytes());
+    preimage.extend_from_slice(block_witness_root);
+    let digest = sha3_256(&preimage);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest[..16]);
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

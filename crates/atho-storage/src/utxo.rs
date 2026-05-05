@@ -292,6 +292,8 @@ mod tests {
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx.clone()
         };
         let witness_root = staged_tx.witness_commitment_hash();
@@ -358,9 +360,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let coinbase = Transaction {
@@ -372,6 +378,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase, tx];
         let mut block = Block::new(
@@ -417,9 +425,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let spend = Transaction {
             witness: witness_bytes_for_tx(&spend),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..spend
         };
         let coinbase = Transaction {
@@ -431,6 +443,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase, spend.clone(), spend];
         let block = Block::new(

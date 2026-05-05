@@ -763,6 +763,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             version: 1,
@@ -773,6 +775,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let block = Block {
             header: BlockHeader {
@@ -825,6 +829,8 @@ mod tests {
                     outputs: vec![],
                     lock_time: 0,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 },
             }],
             fees_total_atoms: 0,

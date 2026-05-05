@@ -10,7 +10,7 @@ The migration removed older, parallel cryptographic directions from the active r
 
 - Falcon-512 became the only active signature scheme
 - the Rust vendor tree became the active implementation source
-- Atho transaction signing was frozen to the `ATHO_TX_SIG_V1` domain
+- Atho transaction signing was frozen to the `ATHO_TX_SIGN_V1` domain
 - fixed-size Falcon signature and key expectations were wired into validation
 
 ## Why The Migration Happened
@@ -30,7 +30,7 @@ Without that cleanup, wallet, validator, and test code would continue to carry u
 - secret key size: `1,281 bytes`
 - signature size: `666 bytes`
 - transaction signing digest: `SHA3-384(Transaction::base_bytes())`
-- transaction domain label: `ATHO_TX_SIG_V1`
+- transaction domain label: `ATHO_TX_SIGN_V1`
 
 Reserved but inactive labels:
 

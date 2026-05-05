@@ -6,7 +6,7 @@ use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
 use atho_core::block::Block;
 use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -122,7 +122,10 @@ pub fn summarize_transaction(tx: &Transaction, fee_atoms: Option<u64>) -> String
     let weight_bytes = tx.weight_bytes();
     let vsize_bytes = tx.vsize_bytes();
     let witness_bytes = tx.witness_bytes();
-    let output_total_atoms = tx.output_value_atoms();
+    let output_total_atoms = tx
+        .checked_output_value_atoms()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| String::from("overflow"));
     let fee_text = fee_atoms
         .map(|fee| fee.to_string())
         .unwrap_or_else(|| String::from("n/a"));
@@ -355,7 +358,7 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
 
     let tx = signed_spend_transaction(network, seed_txid, seed_value, seed_script)?;
-    let tx_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+    let tx_fee = minimum_required_fee_atoms(network, &tx);
 
     let txid = node
         .admit_transaction(MempoolEntry::new(tx, tx_fee))
@@ -406,6 +409,8 @@ pub(crate) fn signed_spend_transaction(
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let digest = transaction_signing_digest(&tx);
         let signature = sign(
@@ -440,7 +445,7 @@ pub(crate) fn signed_spend_transaction(
             }],
         }
         .canonical_bytes();
-        let fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee = minimum_required_fee_atoms(network, &tx);
         if fee == last_fee {
             if seed_value < fee {
                 return Err(std::io::Error::new(
@@ -449,6 +454,7 @@ pub(crate) fn signed_spend_transaction(
                 ));
             }
             tx.outputs[0].value_atoms = seed_value - fee;
+            solve_transaction_pow(network, &mut tx, fee);
             return Ok(tx);
         }
         last_fee = fee;
@@ -487,8 +493,8 @@ pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
     match network {
         Network::Mainnet => ([0x11; 48], 2_000, 0x11),
         Network::Testnet => ([0x22; 48], 1_500, 0x22),
-        Network::Regnet => ([0x33; 48], 1_000, 0x33),
-        Network::Prunetest => ([0x44; 48], 750, 0x44),
+        Network::Regnet => ([0x33; 48], 2_000, 0x33),
+        Network::Prunetest => ([0x44; 48], 2_000, 0x44),
     }
 }
 
@@ -565,7 +571,7 @@ fn append_tx_rows(path: &PathBuf, height: u64, block: &Block) -> std::io::Result
             tx.weight_bytes(),
             tx.vsize_bytes(),
             tx.witness_bytes(),
-            tx.output_value_atoms(),
+            tx.checked_output_value_atoms().unwrap_or(u64::MAX),
             hex::encode(tx.canonical_bytes())
         )?;
     }

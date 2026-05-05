@@ -294,6 +294,8 @@ fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u
         }],
         lock_time: 0,
         witness: Vec::new(),
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let signature = sign(
         atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
@@ -340,6 +342,8 @@ fn valid_coinbase(_network: Network, height: u64, fee_atoms: u64) -> Transaction
         }],
         lock_time: height as u32,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     }
 }
 
@@ -410,6 +414,8 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let signature = sign(
         atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
@@ -521,7 +527,9 @@ fn tx_structure_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
             _ => Ok(()),
         };
 
-        let outcome = catch_unwind(AssertUnwindSafe(|| validate_transaction(&tx, fee_atoms)));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            validate_transaction(&tx, fee_atoms, Network::Mainnet)
+        }));
         match outcome {
             Ok(actual) => check_validation_result(
                 &mut report,
@@ -545,7 +553,13 @@ fn tx_structure_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
             }
         };
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            validate_transaction_with_context(&tx, fee_atoms, spend_height, lookup)
+            validate_transaction_with_context(
+                &tx,
+                fee_atoms,
+                Network::Mainnet,
+                spend_height,
+                lookup,
+            )
         }));
         let expected_ctx = match kind {
             12 => Ok(base_fee),
@@ -712,7 +726,9 @@ fn signature_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
             }
         };
 
-        let outcome = catch_unwind(AssertUnwindSafe(|| validate_transaction(&tx, base_fee)));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            validate_transaction(&tx, base_fee, Network::Mainnet)
+        }));
         match outcome {
             Ok(actual) => check_validation_result(
                 &mut report,
@@ -734,7 +750,7 @@ fn signature_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
             }
         };
         let actual = catch_unwind(AssertUnwindSafe(|| {
-            validate_transaction_with_context(&tx, base_fee, 10, &mut lookup)
+            validate_transaction_with_context(&tx, base_fee, Network::Mainnet, 10, &mut lookup)
         }));
         match actual {
             Ok(res) => {
@@ -766,30 +782,47 @@ fn utxo_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
         let kind = hash_seed(seed, i as u64) as usize % 8;
         let outcome = catch_unwind(AssertUnwindSafe(|| match kind {
             0 => {
-                let actual =
-                    validate_transaction_with_context(&tx, fee, 10, |txid, output_index| {
+                let actual = validate_transaction_with_context(
+                    &tx,
+                    fee,
+                    Network::Mainnet,
+                    10,
+                    |txid, output_index| {
                         if *txid == utxo.txid && output_index == utxo.output_index {
                             Some(utxo.clone())
                         } else {
                             None
                         }
-                    });
+                    },
+                );
                 assert!(actual.is_ok());
             }
             1 => {
-                assert!(validate_transaction_with_context(&tx, fee, 10, |_, _| None).is_err());
+                assert!(validate_transaction_with_context(
+                    &tx,
+                    fee,
+                    Network::Mainnet,
+                    10,
+                    |_, _| None,
+                )
+                .is_err());
             }
             2 => {
                 let mut bad = tx.clone();
                 bad.inputs[0].unlocking_script = vec![0xff];
-                let actual =
-                    validate_transaction_with_context(&bad, fee, 10, |txid, output_index| {
+                let actual = validate_transaction_with_context(
+                    &bad,
+                    fee,
+                    Network::Mainnet,
+                    10,
+                    |txid, output_index| {
                         if *txid == utxo.txid && output_index == utxo.output_index {
                             Some(utxo.clone())
                         } else {
                             None
                         }
-                    });
+                    },
+                );
                 assert!(actual.is_err());
             }
             3 => {
@@ -801,6 +834,7 @@ fn utxo_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
                 let actual = validate_transaction_with_context(
                     &immature_tx,
                     fee,
+                    Network::Mainnet,
                     COINBASE_MATURITY_BLOCKS - 2,
                     |_, _| Some(immature.clone()),
                 );
@@ -865,28 +899,37 @@ fn fee_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
         let outcome = catch_unwind(AssertUnwindSafe(|| match kind {
             0 => {
                 let minimum_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-                assert!(validate_transaction(&tx, minimum_fee.saturating_sub(1)).is_err());
+                assert!(
+                    validate_transaction(&tx, minimum_fee.saturating_sub(1), Network::Mainnet,)
+                        .is_err()
+                );
             }
             1 => {
-                assert!(validate_transaction(&tx, fee).is_ok());
+                assert!(validate_transaction(&tx, fee, Network::Mainnet).is_ok());
             }
             2 => {
                 let mut bad = tx.clone();
                 bad.outputs[0].value_atoms = bad.outputs[0].value_atoms.saturating_add(1);
-                let actual =
-                    validate_transaction_with_context(&bad, fee, 10, |txid, output_index| {
+                let actual = validate_transaction_with_context(
+                    &bad,
+                    fee,
+                    Network::Mainnet,
+                    10,
+                    |txid, output_index| {
                         if *txid == utxo.txid && output_index == utxo.output_index {
                             Some(utxo.clone())
                         } else {
                             None
                         }
-                    });
+                    },
+                );
                 assert!(actual.is_err());
             }
             3 => {
                 let actual = validate_transaction_with_context(
                     &tx_overflow,
                     overflow_fee,
+                    Network::Mainnet,
                     10,
                     |txid, output_index| {
                         if *txid == utxo_a.txid && output_index == utxo_a.output_index {
@@ -903,16 +946,23 @@ fn fee_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
             4 => {
                 let mut zero = tx.clone();
                 zero.outputs[0].value_atoms = 0;
-                assert!(validate_transaction(&zero, fee).is_err());
+                assert!(validate_transaction(&zero, fee, Network::Mainnet).is_err());
             }
             5 => {
-                assert!(
-                    subsidy::cumulative_subsidy_atoms(u64::MAX / 2) <= subsidy::max_supply_atoms()
+                assert_eq!(
+                    subsidy::max_supply_atoms_for_network(Network::Mainnet),
+                    None
                 );
             }
             6 => {
-                assert_eq!(subsidy::block_subsidy_atho(1_679_999), 50);
-                assert_eq!(subsidy::block_subsidy_atho(1_680_000), 25);
+                assert_eq!(
+                    subsidy::get_block_reward_atoms(1_679_999),
+                    6_250_000_000_000
+                );
+                assert_eq!(
+                    subsidy::get_block_reward_atoms(1_680_000),
+                    3_125_000_000_000
+                );
             }
             _ => {
                 let _rate = tx.feerate_atoms_per_vbyte(fee);
@@ -1248,6 +1298,7 @@ fn confirmation_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
                     validate_transaction_with_context(
                         &tx,
                         fee,
+                        Network::Mainnet,
                         spend_height,
                         |txid, output_index| {
                             if *txid == utxo.txid && output_index == utxo.output_index {
@@ -1265,6 +1316,7 @@ fn confirmation_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
                 let err = validate_transaction_with_context(
                     &tx,
                     fee,
+                    Network::Mainnet,
                     spend_height,
                     |txid, output_index| {
                         if *txid == utxo.txid && output_index == utxo.output_index {
@@ -1449,7 +1501,9 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                         Network::Mainnet,
                         genesis.coinbase_txid,
                         0,
-                        atho_core::constants::GENESIS_COINBASE_ATOMS,
+                        atho_core::consensus::subsidy::genesis_coinbase_atoms_for_network(
+                            Network::Mainnet,
+                        ),
                         internal_hpk_bytes(Network::Mainnet, &genesis.reward_address)
                             .unwrap_or_else(|| genesis.reward_address.as_bytes().to_vec()),
                         0,
@@ -1495,7 +1549,7 @@ fn determinism_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                 let mut mempool = Mempool::new();
                 let entry = MempoolEntry::new(base_tx.clone(), fee);
                 let txid = mempool
-                    .admit(entry, 10, |txid, output_index| {
+                    .admit(entry, Network::Mainnet, 10, |txid, output_index| {
                         if *txid == utxo.txid && output_index == utxo.output_index {
                             Some(utxo.clone())
                         } else {

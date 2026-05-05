@@ -2454,7 +2454,7 @@ mod tests {
                         Network::Regnet,
                         [0x5a; 48],
                         0,
-                        20 * atho_core::constants::ATOMS_PER_ATHO,
+                        20 * atho_core::constants::atoms_per_atho_for_network(Network::Regnet),
                         vec![0x42; 32],
                         node.height(),
                         false,

@@ -94,10 +94,11 @@ impl Node {
             .import_snapshot_bundle(bundle)
             .map_err(NodeError::from)?;
         let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool
-            .revalidate(self.chainstate.height, |txid, output_index| {
-                updated_utxos.get(*txid, output_index).cloned()
-            });
+        self.mempool.revalidate(
+            self.network(),
+            self.chainstate.height,
+            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
+        );
         Ok(())
     }
 
@@ -363,10 +364,11 @@ impl Node {
         }
         self.mempool.remove_block_transactions(block);
         let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool
-            .revalidate(self.chainstate.height, |txid, output_index| {
-                updated_utxos.get(*txid, output_index).cloned()
-            });
+        self.mempool.revalidate(
+            self.network(),
+            self.chainstate.height,
+            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
+        );
         let mempool_count = self.mempool.len();
         let _ = dev::record_block(self.chainstate.height, block);
         let _ = dev::append_log(
@@ -381,11 +383,12 @@ impl Node {
 
     pub fn admit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
         let utxos = self.chainstate.utxo_snapshot();
-        let txid = self
-            .mempool
-            .admit(entry, self.chainstate.height, |txid, output_index| {
-                utxos.get(*txid, output_index).cloned()
-            })?;
+        let txid = self.mempool.admit(
+            entry,
+            self.network(),
+            self.chainstate.height,
+            |txid, output_index| utxos.get(*txid, output_index).cloned(),
+        )?;
         Ok(txid)
     }
 
@@ -443,6 +446,7 @@ impl Node {
                 };
                 let _ = self.mempool.admit(
                     MempoolEntry::new(tx.clone(), fee_atoms),
+                    self.network(),
                     self.chainstate.height,
                     |txid, output_index| utxos.get(*txid, output_index).cloned(),
                 );
@@ -450,10 +454,11 @@ impl Node {
         }
 
         let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool
-            .revalidate(self.chainstate.height, |txid, output_index| {
-                updated_utxos.get(*txid, output_index).cloned()
-            });
+        self.mempool.revalidate(
+            self.network(),
+            self.chainstate.height,
+            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
+        );
         Ok(selection)
     }
 
@@ -498,7 +503,7 @@ fn transaction_fee_from_utxos(
         let utxo = utxos.get(input.previous_txid, input.output_index)?;
         input_total = input_total.checked_add(utxo.value_atoms)?;
     }
-    input_total.checked_sub(tx.output_value_atoms())
+    input_total.checked_sub(tx.checked_output_value_atoms()?)
 }
 
 #[cfg(test)]
@@ -510,8 +515,9 @@ mod tests {
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
     use atho_core::consensus::{pow, subsidy};
-    use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_PER_VBYTE_ATOMS};
+    use atho_core::constants::DUST_RELAY_VALUE_ATOMS;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
@@ -545,6 +551,8 @@ mod tests {
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx.clone()
         };
         let witness_root = staged_tx.witness_commitment_hash();
@@ -622,6 +630,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             version: 1,
@@ -636,9 +646,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let transactions = vec![coinbase, tx];
@@ -678,6 +692,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             version: 1,
@@ -692,9 +708,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let transactions = vec![coinbase, tx];
@@ -746,12 +766,16 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
-        let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let fee_atoms = minimum_required_fee_atoms(Network::Mainnet, &tx);
         let tx = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: 2_000 - fee_atoms,
@@ -759,13 +783,18 @@ mod tests {
             }],
             ..Transaction {
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
                 ..tx
             }
         };
-        let tx = Transaction {
+        let mut tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
+        solve_transaction_pow(Network::Mainnet, &mut tx, fee_atoms);
         node.admit_transaction(MempoolEntry::new(tx.clone(), fee_atoms))
             .unwrap();
 
@@ -778,10 +807,10 @@ mod tests {
 
     #[test]
     fn node_rejects_sub_dust_transaction_submission() {
-        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
         node.chainstate
             .insert_utxo(UtxoEntry::new(
-                Network::Mainnet,
+                Network::Regnet,
                 [0x19; 48],
                 0,
                 2_000,
@@ -803,9 +832,13 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let tx = Transaction {
             witness: witness_bytes_for_tx(&tx),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx
         };
         let fee_atoms = 2_000 - (DUST_RELAY_VALUE_ATOMS - 1);
@@ -839,6 +872,53 @@ mod tests {
         assert_eq!(first.header.height, 1);
         assert_eq!(second.header.height, 2);
         assert_eq!(node.chainstate.height, 2);
+    }
+
+    #[test]
+    fn candidate_block_rejects_fee_total_overflow() {
+        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        node.chainstate.height = 6;
+        for txid in [[0x31; 48], [0x32; 48]] {
+            let locking_script = vec![1];
+            let utxo = UtxoEntry::new(
+                Network::Mainnet,
+                txid,
+                0,
+                u64::MAX,
+                locking_script.clone(),
+                0,
+                false,
+            );
+            node.chainstate.insert_utxo(utxo.clone()).unwrap();
+            let mut tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    previous_txid: utxo.txid,
+                    output_index: utxo.output_index,
+                    unlocking_script: locking_script.clone(),
+                }],
+                outputs: vec![TxOutput {
+                    value_atoms: DUST_RELAY_VALUE_ATOMS,
+                    locking_script: vec![2],
+                }],
+                lock_time: 0,
+                witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            };
+            tx.witness = witness_bytes_for_tx(&tx);
+            let fee_atoms = transaction_fee_from_utxos(&tx, &node.chainstate.utxo_snapshot())
+                .expect("fee atoms");
+            solve_transaction_pow(Network::Mainnet, &mut tx, fee_atoms);
+            node.admit_transaction(MempoolEntry::new(tx, fee_atoms))
+                .unwrap();
+        }
+
+        let err = node.build_candidate_block().unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::Validation(crate::validation::ValidationError::FeeMismatch)
+        ));
     }
 
     #[test]

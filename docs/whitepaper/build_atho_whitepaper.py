@@ -182,7 +182,7 @@ FIGURES: Dict[str, FigureSpec] = {
         "fig3",
         3,
         "Atho Transaction Signing and Verification Flow",
-        "Transaction signing and verification bind wallet-created transaction bytes to the `ATHO_TX_SIG_V1` domain and the SHA3-384 signing digest.",
+        "Transaction signing and verification bind wallet-created transaction bytes to the `ATHO_TX_SIGN_V1` domain and the SHA3-384 signing digest.",
         dedent(
             """
             flowchart LR
@@ -900,7 +900,7 @@ SECTIONS: List[Dict[str, object]] = [
             """
             Transaction signing is intentionally deterministic with respect to the
             message being signed. The wallet signs `SHA3-384(Transaction::base_bytes())`
-            under the frozen `ATHO_TX_SIG_V1` domain. The witness contains the
+            under the frozen `ATHO_TX_SIGN_V1` domain. The witness contains the
             signature, public key, and per-input references. The node reconstructs
             the same base bytes, derives the same signing digest, verifies under the
             same domain, and rejects mismatches. This exact byte matching requirement
@@ -1209,7 +1209,7 @@ SECTIONS: List[Dict[str, object]] = [
             Several policies are intentionally marked as not yet active or TBD. No
             explicit mempool expiry rule, replacement-by-fee policy, or memory-size
             cap was found in the source files inspected for this paper. The current
-            fee floor, 50-atom relay dust floor, and size limits provide baseline
+            fee floor, 1,000-atom relay dust floor, and size limits provide baseline
             spam resistance, but production hardening should add explicit memory and
             expiry behavior so long-running public nodes can bound resource use under
             adversarial load. Figure 7 shows the current admission flow.
@@ -1771,8 +1771,8 @@ APPENDICES: List[Dict[str, object]] = [
         p(
             """
             The following source-derived constants are used throughout the paper:
-            `ATOMS_PER_ATHO = 100_000_000`; `MAX_SUPPLY_ATHO = 168_000_000`;
-            `INITIAL_BLOCK_REWARD_ATHO = 50`; `HALVING_INTERVAL_BLOCKS = 1_680_000`;
+            `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`;
+            `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`;
             `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`;
             `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`;
             `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`;
@@ -1822,7 +1822,7 @@ APPENDICES: List[Dict[str, object]] = [
                 witness = parse_witness(tx.witness)
                 if witness is missing or witness.input_refs.len != tx.inputs.len:
                     return Reject("invalid witness")
-                if !verify_falcon_signature(ATHO_TX_SIG_V1, witness.pubkey, tx.signing_digest(), witness.signature):
+                if !verify_falcon_signature(ATHO_TX_SIGN_V1, witness.pubkey, tx.signing_digest(), witness.signature):
                     return Reject("bad signature")
                 input_total = 0
                 for input in tx.inputs:
@@ -1931,7 +1931,7 @@ APPENDICES: List[Dict[str, object]] = [
             function wallet_signing(wallet, tx, path):
                 keypair = wallet.keypair_for_path(path)
                 digest = SHA3_384(tx.base_bytes())
-                signature = falcon_sign(ATHO_TX_SIG_V1, keypair.secret_key, digest)
+                signature = falcon_sign(ATHO_TX_SIGN_V1, keypair.secret_key, digest)
                 witness = build_witness(signature, keypair.public_key, tx.inputs)
                 return tx.with_witness(witness)
 
@@ -2096,33 +2096,37 @@ def draw_sequence(spec: FigureSpec) -> None:
     plt.close(fig_obj)
 
 
-def block_subsidy_atho(height: int) -> int:
-    halvings = height // 1_680_000
-    if halvings >= 64:
-        return 0
-    return 50 >> halvings
+ATOMS_PER_ATHO = 1_000_000_000_000
+INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000
+TAIL_REWARD_ATOMS = 781_250_000_000
+HALVING_INTERVAL_BLOCKS = 1_680_000
 
 
-def cumulative_subsidy_atho(height: int) -> int:
-    remaining = height + 1
-    reward = 50
+def block_reward_atoms(height: int) -> int:
+    halvings = height // HALVING_INTERVAL_BLOCKS
+    reward = 0 if halvings >= 64 else INITIAL_BLOCK_REWARD_ATOMS >> halvings
+    return max(reward, TAIL_REWARD_ATOMS)
+
+
+def cumulative_issued_before_height(height: int) -> int:
+    remaining = max(height, 0)
+    reward = INITIAL_BLOCK_REWARD_ATOMS
     total = 0
-    interval = 1_680_000
-    for _ in range(64):
-        if reward == 0 or remaining == 0:
-            break
-        blocks = min(remaining, interval)
-        total += blocks * reward
+    while remaining > 0:
+        blocks = min(remaining, HALVING_INTERVAL_BLOCKS)
+        total += blocks * max(reward, TAIL_REWARD_ATOMS)
         remaining -= blocks
-        reward >>= 1
+        reward = max(reward // 2, TAIL_REWARD_ATOMS)
     return total
 
 
 def draw_emission_chart(spec: FigureSpec) -> None:
     max_height = 12_000_000
     heights = list(range(0, max_height + 1, 120_000))
-    rewards = [block_subsidy_atho(h) for h in heights]
-    supply = [cumulative_subsidy_atho(h) / 1_000_000 for h in heights]
+    rewards = [block_reward_atoms(h) / ATOMS_PER_ATHO for h in heights]
+    supply = [
+        cumulative_issued_before_height(h + 1) / ATOMS_PER_ATHO / 1_000_000 for h in heights
+    ]
 
     csv_path = ASSET_DIR / "atho_emission_model.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as fh:

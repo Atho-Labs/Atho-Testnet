@@ -1,54 +1,92 @@
-use crate::consensus::params::CONSENSUS_PARAMS;
-use crate::constants::{ATOMS_PER_ATHO, MAX_SUPPLY_ATOMS};
+use crate::constants::{
+    BLOCKS_PER_YEAR, HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, TAIL_REWARD_ATOMS,
+};
+use crate::network::Network;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubsidySchedule {
-    pub initial_block_reward_atho: u64,
+pub struct EmissionSchedule {
+    pub initial_block_reward_atoms: u64,
+    pub tail_reward_atoms: u64,
     pub halving_interval_blocks: u64,
+    pub blocks_per_year: u64,
 }
 
-pub const SUBSIDY_SCHEDULE: SubsidySchedule = SubsidySchedule {
-    initial_block_reward_atho: CONSENSUS_PARAMS.initial_block_reward_atho,
-    halving_interval_blocks: CONSENSUS_PARAMS.halving_interval_blocks,
+pub const EMISSION_SCHEDULE: EmissionSchedule = EmissionSchedule {
+    initial_block_reward_atoms: INITIAL_BLOCK_REWARD_ATOMS,
+    tail_reward_atoms: TAIL_REWARD_ATOMS,
+    halving_interval_blocks: HALVING_INTERVAL_BLOCKS,
+    blocks_per_year: BLOCKS_PER_YEAR,
 };
 
-pub fn block_subsidy_atho(height: u64) -> u64 {
-    let halvings = height / SUBSIDY_SCHEDULE.halving_interval_blocks;
-    if halvings >= 64 {
-        return 0;
+pub const TAIL_EMISSION_START_HEIGHT: u64 = EMISSION_SCHEDULE.halving_interval_blocks * 3;
+pub const YEAR_20_HEIGHT: u64 = EMISSION_SCHEDULE.blocks_per_year * 20;
+
+pub fn get_block_reward_atoms(height: u64) -> u64 {
+    let halvings = height / HALVING_INTERVAL_BLOCKS;
+    let reward = if halvings >= 64 {
+        0
+    } else {
+        INITIAL_BLOCK_REWARD_ATOMS >> halvings
+    };
+
+    if reward < TAIL_REWARD_ATOMS {
+        TAIL_REWARD_ATOMS
+    } else {
+        reward
     }
-    SUBSIDY_SCHEDULE.initial_block_reward_atho >> halvings
 }
 
 pub fn block_subsidy_atoms(height: u64) -> u64 {
-    block_subsidy_atho(height).saturating_mul(ATOMS_PER_ATHO)
+    get_block_reward_atoms(height)
 }
 
-pub fn cumulative_subsidy_atho(height: u64) -> u64 {
-    let mut remaining_blocks = height.saturating_add(1);
-    let mut reward = SUBSIDY_SCHEDULE.initial_block_reward_atho;
-    let interval = SUBSIDY_SCHEDULE.halving_interval_blocks;
-    let mut total = 0u64;
+pub fn block_subsidy_atoms_for_network(_network: Network, height: u64) -> u64 {
+    get_block_reward_atoms(height)
+}
 
-    for _ in 0..64 {
-        if reward == 0 || remaining_blocks == 0 {
-            break;
-        }
-        let blocks = remaining_blocks.min(interval);
-        total = total.saturating_add(blocks.saturating_mul(reward));
-        remaining_blocks = remaining_blocks.saturating_sub(blocks);
-        reward >>= 1;
+pub fn genesis_coinbase_atoms_for_network(_network: Network) -> u64 {
+    get_block_reward_atoms(0)
+}
+
+pub fn cumulative_issued_before_height(height: u64) -> u128 {
+    if height == 0 {
+        return 0;
     }
 
-    total
+    let mut remaining_blocks = height;
+    let mut issued = 0u128;
+    let mut reward = INITIAL_BLOCK_REWARD_ATOMS;
+
+    while remaining_blocks > 0 {
+        let era_blocks = remaining_blocks.min(HALVING_INTERVAL_BLOCKS);
+        let effective_reward = reward.max(TAIL_REWARD_ATOMS);
+        issued = issued.saturating_add((era_blocks as u128) * (effective_reward as u128));
+        remaining_blocks -= era_blocks;
+
+        if reward > TAIL_REWARD_ATOMS {
+            reward = (reward / 2).max(TAIL_REWARD_ATOMS);
+        } else {
+            reward = TAIL_REWARD_ATOMS;
+        }
+    }
+
+    issued
 }
 
-pub fn cumulative_subsidy_atoms(height: u64) -> u64 {
-    cumulative_subsidy_atho(height).saturating_mul(ATOMS_PER_ATHO)
+pub fn cumulative_issued_through_height(height: u64) -> u128 {
+    cumulative_issued_before_height(height.saturating_add(1))
 }
 
-pub fn max_supply_atoms() -> u64 {
-    MAX_SUPPLY_ATOMS
+pub fn cumulative_issued_before_height_for_network(_network: Network, height: u64) -> u128 {
+    cumulative_issued_before_height(height)
+}
+
+pub fn cumulative_issued_through_height_for_network(_network: Network, height: u64) -> u128 {
+    cumulative_issued_through_height(height)
+}
+
+pub fn max_supply_atoms_for_network(_network: Network) -> Option<u128> {
+    None
 }
 
 #[cfg(test)]
@@ -56,21 +94,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subsidy_starts_at_fifty_atho() {
-        assert_eq!(block_subsidy_atho(0), 50);
-        assert_eq!(block_subsidy_atoms(0), 50 * ATOMS_PER_ATHO);
+    fn reward_schedule_matches_requested_boundaries() {
+        assert_eq!(get_block_reward_atoms(0), 6_250_000_000_000);
+        assert_eq!(get_block_reward_atoms(1_679_999), 6_250_000_000_000);
+        assert_eq!(get_block_reward_atoms(1_680_000), 3_125_000_000_000);
+        assert_eq!(get_block_reward_atoms(3_359_999), 3_125_000_000_000);
+        assert_eq!(get_block_reward_atoms(3_360_000), 1_562_500_000_000);
+        assert_eq!(get_block_reward_atoms(5_039_999), 1_562_500_000_000);
+        assert_eq!(get_block_reward_atoms(5_040_000), 781_250_000_000);
+        assert_eq!(get_block_reward_atoms(10_000_000), 781_250_000_000);
     }
 
     #[test]
-    fn subsidy_halves_on_schedule() {
-        assert_eq!(block_subsidy_atho(1_679_999), 50);
-        assert_eq!(block_subsidy_atho(1_680_000), 25);
+    fn cumulative_supply_matches_requested_checkpoints() {
+        assert_eq!(cumulative_issued_before_height(0), 0);
+        assert_eq!(
+            cumulative_issued_before_height(1_680_000),
+            10_500_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+        );
+        assert_eq!(
+            cumulative_issued_before_height(3_360_000),
+            15_750_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+        );
+        assert_eq!(
+            cumulative_issued_before_height(5_040_000),
+            18_375_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+        );
+        assert_eq!(
+            cumulative_issued_before_height(8_409_600),
+            21_007_500u128 * crate::constants::ATOMS_PER_ATHO as u128
+        );
     }
 
     #[test]
-    fn cumulative_subsidy_is_bounded_by_max_supply() {
-        assert_eq!(cumulative_subsidy_atho(0), 50);
-        assert!(cumulative_subsidy_atoms(1_680_000) < max_supply_atoms());
-        assert!(cumulative_subsidy_atoms(u64::MAX / 2) <= max_supply_atoms());
+    fn tail_emission_identity_matches_requested_targets() {
+        assert_eq!(EMISSION_SCHEDULE.blocks_per_year, 420_480);
+        assert_eq!(TAIL_EMISSION_START_HEIGHT, 5_040_000);
+        assert_eq!(YEAR_20_HEIGHT, 8_409_600);
+        assert_eq!(
+            cumulative_issued_before_height(YEAR_20_HEIGHT),
+            21_007_500u128 * crate::constants::ATOMS_PER_ATHO as u128
+        );
+    }
+
+    #[test]
+    fn no_finite_max_supply_cap_remains() {
+        assert_eq!(max_supply_atoms_for_network(Network::Mainnet), None);
+        assert_eq!(max_supply_atoms_for_network(Network::Testnet), None);
+        assert_eq!(max_supply_atoms_for_network(Network::Regnet), None);
+        assert_eq!(max_supply_atoms_for_network(Network::Prunetest), None);
     }
 }

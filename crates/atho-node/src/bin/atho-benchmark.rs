@@ -424,6 +424,8 @@ fn build_spend_transaction(
         }],
         lock_time: 0,
         witness: provisional_witness(utxos.len(), keypair).canonical_bytes(),
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
     tx.outputs[0].value_atoms = input_total

@@ -1,8 +1,9 @@
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+use atho_core::consensus::tx_policy::solve_transaction_pow;
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
-    DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_SIZE_BYTES, MAX_SUPPLY_ATOMS, MAX_TRANSACTION_SIZE_BYTES,
+    DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_SIZE_BYTES, MAX_TRANSACTION_SIZE_BYTES,
     MIN_TX_FEE_PER_VBYTE_ATOMS,
 };
 use atho_core::genesis;
@@ -34,22 +35,22 @@ fn run() -> Result<(), String> {
     let mut total = 0usize;
 
     total += 1;
-    if tx_case("valid_tx_accepts", network, tx_valid())? {
+    if tx_case("valid_tx_accepts", network, tx_valid(network))? {
         passed += 1;
     }
 
     total += 1;
-    if tx_case("bad_signature_rejects", network, tx_bad_signature())? {
+    if tx_case("bad_signature_rejects", network, tx_bad_signature(network))? {
         passed += 1;
     }
 
     total += 1;
-    if tx_case("bad_fee_rejects", network, tx_bad_fee())? {
+    if tx_case("bad_fee_rejects", network, tx_bad_fee(network))? {
         passed += 1;
     }
 
     total += 1;
-    if tx_case("witness_ref_rejects", network, tx_bad_witness_ref())? {
+    if tx_case("witness_ref_rejects", network, tx_bad_witness_ref(network))? {
         passed += 1;
     }
 
@@ -59,7 +60,7 @@ fn run() -> Result<(), String> {
     }
 
     total += 1;
-    if tx_case("dust_like_spend_rejects", network, tx_dust_like())? {
+    if tx_case("dust_like_spend_rejects", network, tx_dust_like(network))? {
         passed += 1;
     }
 
@@ -69,12 +70,12 @@ fn run() -> Result<(), String> {
     }
 
     total += 1;
-    if tx_case("zero_output_rejects", network, tx_zero_output())? {
+    if tx_case("zero_output_rejects", network, tx_zero_output(network))? {
         passed += 1;
     }
 
     total += 1;
-    if tx_case("oversized_tx_rejects", network, tx_oversized())? {
+    if tx_case("oversized_tx_rejects", network, tx_oversized(network))? {
         passed += 1;
     }
 
@@ -242,15 +243,20 @@ fn run() -> Result<(), String> {
         passed += 1;
     }
 
-    println!(
-        "max_supply_bound={}",
-        if atho_core::consensus::subsidy::cumulative_subsidy_atoms(u64::MAX / 2) <= MAX_SUPPLY_ATOMS
-        {
-            "holds"
-        } else {
-            "violated"
-        }
-    );
+    let max_supply_bound = atho_core::consensus::subsidy::max_supply_atoms_for_network(network)
+        .map(|cap| {
+            if atho_core::consensus::subsidy::cumulative_issued_before_height_for_network(
+                network,
+                u64::MAX / 2,
+            ) <= cap
+            {
+                "holds"
+            } else {
+                "violated"
+            }
+        })
+        .unwrap_or("none");
+    println!("max_supply_bound={max_supply_bound}");
     println!("summary passed={passed} total={total}");
     Ok(())
 }
@@ -363,10 +369,10 @@ struct BuiltTransaction {
     expected: Result<(), ValidationError>,
 }
 
-fn tx_valid() -> BuiltTransaction {
+fn tx_valid(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = 9_000u64;
-    let tx = make_spend_tx(input_value, output_value, false, false, false);
+    let tx = make_spend_tx(network, input_value, output_value, false, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
@@ -374,10 +380,10 @@ fn tx_valid() -> BuiltTransaction {
     }
 }
 
-fn tx_bad_signature() -> BuiltTransaction {
+fn tx_bad_signature(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = 9_000u64;
-    let tx = make_spend_tx(input_value, output_value, true, false, false);
+    let tx = make_spend_tx(network, input_value, output_value, true, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
@@ -385,10 +391,10 @@ fn tx_bad_signature() -> BuiltTransaction {
     }
 }
 
-fn tx_bad_fee() -> BuiltTransaction {
+fn tx_bad_fee(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = 10_000u64;
-    let tx = make_spend_tx(input_value, output_value, false, false, false);
+    let tx = make_spend_tx(network, input_value, output_value, false, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: 0,
@@ -396,10 +402,10 @@ fn tx_bad_fee() -> BuiltTransaction {
     }
 }
 
-fn tx_bad_witness_ref() -> BuiltTransaction {
+fn tx_bad_witness_ref(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = 9_000u64;
-    let tx = make_spend_tx(input_value, output_value, false, true, false);
+    let tx = make_spend_tx(network, input_value, output_value, false, true, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
@@ -407,10 +413,10 @@ fn tx_bad_witness_ref() -> BuiltTransaction {
     }
 }
 
-fn tx_dust_like() -> BuiltTransaction {
+fn tx_dust_like(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = DUST_RELAY_VALUE_ATOMS - 1;
-    let tx = make_spend_tx(input_value, output_value, false, false, false);
+    let tx = make_spend_tx(network, input_value, output_value, false, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
@@ -440,6 +446,8 @@ fn tx_duplicate_input() -> BuiltTransaction {
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let signature = sign(
         AthoSignatureDomain::Transaction,
@@ -470,9 +478,9 @@ fn tx_duplicate_input() -> BuiltTransaction {
     }
 }
 
-fn tx_zero_output() -> BuiltTransaction {
+fn tx_zero_output(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
-    let tx = make_spend_tx(input_value, 0, false, false, false);
+    let tx = make_spend_tx(network, input_value, 0, false, false, false);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value,
@@ -480,10 +488,10 @@ fn tx_zero_output() -> BuiltTransaction {
     }
 }
 
-fn tx_oversized() -> BuiltTransaction {
+fn tx_oversized(network: Network) -> BuiltTransaction {
     let input_value = 10_000u64;
     let output_value = 9_000u64;
-    let tx = make_spend_tx(input_value, output_value, false, false, true);
+    let tx = make_spend_tx(network, input_value, output_value, false, false, true);
     BuiltTransaction {
         transaction: tx,
         fee_atoms: input_value - output_value,
@@ -492,6 +500,7 @@ fn tx_oversized() -> BuiltTransaction {
 }
 
 fn make_spend_tx(
+    network: Network,
     input_value: u64,
     output_value: u64,
     mutate_signature: bool,
@@ -516,6 +525,8 @@ fn make_spend_tx(
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
 
     let signature = sign(
@@ -542,7 +553,12 @@ fn make_spend_tx(
         }],
     };
     tx.witness = witness.canonical_bytes();
-    let _ = input_value;
+    if let Some(fee_atoms) = tx
+        .checked_output_value_atoms()
+        .and_then(|output_total| input_value.checked_sub(output_total))
+    {
+        solve_transaction_pow(network, &mut tx, fee_atoms);
+    }
     tx
 }
 
@@ -569,6 +585,8 @@ fn build_coinbase_block(
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let transactions = vec![coinbase];
     let header = BlockHeader {
@@ -599,6 +617,8 @@ fn build_double_coinbase_block(
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let coinbase_b = Transaction {
         version: 1,
@@ -609,6 +629,8 @@ fn build_double_coinbase_block(
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let transactions = vec![coinbase_a, coinbase_b];
     let header = BlockHeader {
@@ -635,9 +657,11 @@ fn build_double_spend_block(network: Network) -> Block {
         }],
         lock_time: 7,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
-    let spend_a = make_block_spend_tx();
-    let mut spend_b = make_block_spend_tx();
+    let spend_a = make_block_spend_tx(network);
+    let mut spend_b = make_block_spend_tx(network);
     spend_b.outputs[0].value_atoms = spend_b.outputs[0].value_atoms.saturating_sub(1);
     let transactions = vec![coinbase, spend_a, spend_b];
     let block_witness_root = witness_root(&transactions);
@@ -659,19 +683,24 @@ fn build_double_spend_block(network: Network) -> Block {
     Block::new(header, transactions)
 }
 
-fn make_block_spend_tx() -> Transaction {
+fn make_block_spend_tx(network: Network) -> Transaction {
     let input_value = 10_000u64;
     let mut output_value = input_value.saturating_sub(1);
     for _ in 0..64 {
-        let tx = make_spend_tx(input_value, output_value, false, false, false);
+        let tx = make_spend_tx(network, input_value, output_value, false, false, false);
         let required_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-        let actual_fee = input_value.saturating_sub(tx.output_value_atoms());
+        let Some(output_total_atoms) = tx.checked_output_value_atoms() else {
+            break;
+        };
+        let Some(actual_fee) = input_value.checked_sub(output_total_atoms) else {
+            break;
+        };
         if actual_fee == required_fee {
             return tx;
         }
         output_value = input_value.saturating_sub(required_fee);
     }
-    make_spend_tx(input_value, output_value, false, false, false)
+    make_spend_tx(network, input_value, output_value, false, false, false)
 }
 
 fn immature_coinbase_spend_case(network: Network) -> Result<bool, String> {
@@ -690,7 +719,7 @@ fn immature_coinbase_spend_case(network: Network) -> Result<bool, String> {
     )
     .map_err(|err| err.to_string())?;
 
-    let tx = make_spend_tx(10_000, 9_000, false, false, false);
+    let tx = make_spend_tx(network, 10_000, 9_000, false, false, false);
     let result = node.submit_transaction(atho_node::mempool::MempoolEntry::new(tx, 1_000));
     match result {
         Err(atho_node::error::NodeError::Validation(

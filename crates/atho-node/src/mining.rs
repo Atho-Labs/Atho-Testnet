@@ -16,6 +16,7 @@ use atho_core::crypto::hash::sha3_384;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxOutput};
 use atho_crypto::falcon;
+use atho_storage::validation::ValidationError;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,11 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let utxos = node.utxo_snapshot();
     let height = node.height().saturating_add(1);
-    let (validated_entries, _, skipped_entries) = node
-        .mempool
-        .validated_entries_for_mining(height, |txid, output_index| {
-            utxos.get(*txid, output_index).cloned()
-        });
+    let (validated_entries, _, skipped_entries) =
+        node.mempool
+            .validated_entries_for_mining(node.network(), height, |txid, output_index| {
+                utxos.get(*txid, output_index).cloned()
+            });
     if skipped_entries > 0 {
         let _ = dev::append_log(
             "miner",
@@ -40,7 +41,8 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
         );
     }
     let active_rules = rules::rules_at_height(height);
-    let subsidy_atoms = subsidy::block_subsidy_atoms(node.height().saturating_add(1));
+    let subsidy_atoms =
+        subsidy::block_subsidy_atoms_for_network(node.network(), node.height().saturating_add(1));
     let (reward_address, reward_script) = reward_target_for_height(node.network(), height);
     let previous_block_hash = node.tip_hash();
     let timestamp = candidate_block_timestamp(node.blocks());
@@ -65,6 +67,8 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let header_size_bytes = header_template.canonical_size_bytes();
     let coinbase_base_bytes = coinbase_template.base_size_bytes();
@@ -118,7 +122,9 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
 
         block_base_bytes = next_base_bytes;
         block_full_bytes = next_full_bytes;
-        selected_fee_atoms = selected_fee_atoms.saturating_add(fee_atoms);
+        selected_fee_atoms = selected_fee_atoms
+            .checked_add(fee_atoms)
+            .ok_or(NodeError::Validation(ValidationError::FeeMismatch))?;
         selected_transactions.push(tx);
     }
 
@@ -126,11 +132,15 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
         version: active_rules.transaction_version,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy_atoms.saturating_add(selected_fee_atoms),
+            value_atoms: subsidy_atoms.checked_add(selected_fee_atoms).ok_or(
+                NodeError::Validation(ValidationError::CoinbaseRewardMismatch),
+            )?,
             locking_script: reward_script,
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let mut transactions = Vec::with_capacity(selected_transactions.len().saturating_add(1));
     transactions.push(coinbase);

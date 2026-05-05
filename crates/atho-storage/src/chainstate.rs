@@ -9,7 +9,7 @@ use crate::validation;
 use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
-use atho_core::constants::{GENESIS_COINBASE_ATOMS, PRUNE_DEPTH_BLOCKS};
+use atho_core::constants::PRUNE_DEPTH_BLOCKS;
 use atho_core::genesis;
 use atho_core::network::Network;
 use std::fs::{self, File};
@@ -87,7 +87,7 @@ impl Chainstate {
                 network,
                 genesis.coinbase_txid,
                 0,
-                GENESIS_COINBASE_ATOMS,
+                genesis::genesis_utxo_value(network),
                 locking_script,
                 0,
             ))
@@ -1075,11 +1075,13 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(height),
+                value_atoms: subsidy::block_subsidy_atoms_for_network(state.network, height),
                 locking_script: vec![height as u8],
             }],
             lock_time: u32::try_from(height).unwrap_or(u32::MAX),
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
         let previous_timestamp = state
@@ -1178,6 +1180,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
         let block = solve_block(Block::new(
@@ -1228,6 +1232,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
         let block = solve_block(Block::new(
@@ -1281,6 +1287,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
         let block = solve_block(Block::new(
@@ -1352,11 +1360,13 @@ mod tests {
                 version: 1,
                 inputs: vec![],
                 outputs: vec![TxOutput {
-                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, height),
                     locking_script: vec![height as u8],
                 }],
                 lock_time: 0,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             };
             let transactions = vec![coinbase];
             let block = solve_block(Block::new(
@@ -1577,11 +1587,13 @@ mod tests {
                 version: 1,
                 inputs: vec![],
                 outputs: vec![TxOutput {
-                    value_atoms: subsidy::block_subsidy_atoms(height),
+                    value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Mainnet, height),
                     locking_script: vec![height as u8],
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             };
             let transactions = vec![coinbase];
             let block = solve_block(Block::new(
@@ -1632,6 +1644,8 @@ mod tests {
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             };
             let transactions = vec![coinbase];
             let block = solve_block(Block::new(
@@ -1677,6 +1691,8 @@ mod tests {
             }],
             lock_time: 1,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         }];
         let block = solve_block(Block::new(
             BlockHeader {
@@ -1734,6 +1750,8 @@ mod tests {
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }];
             let block = Block::new(
                 BlockHeader {
@@ -1962,6 +1980,8 @@ mod tests {
                     }],
                     lock_time: 1,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -1972,6 +1992,8 @@ mod tests {
                     }],
                     lock_time: 1,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(1),
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
@@ -1988,6 +2010,8 @@ mod tests {
                 }],
                 lock_time: 1,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_1).unwrap();
@@ -2007,6 +2031,8 @@ mod tests {
                     }],
                     lock_time: 2,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2017,6 +2043,8 @@ mod tests {
                     }],
                     lock_time: 2,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(10_000),
                 difficulty_target_or_bits: state.next_difficulty_target(),
@@ -2031,6 +2059,8 @@ mod tests {
                 }],
                 lock_time: 2,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_2).unwrap();
@@ -2051,6 +2081,8 @@ mod tests {
                     }],
                     lock_time: 22,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2061,6 +2093,8 @@ mod tests {
                     }],
                     lock_time: 22,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(10),
                 difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
@@ -2075,6 +2109,8 @@ mod tests {
                 }],
                 lock_time: 22,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         let fork_history = vec![
@@ -2097,6 +2133,8 @@ mod tests {
                     }],
                     lock_time: 33,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2107,6 +2145,8 @@ mod tests {
                     }],
                     lock_time: 33,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(11),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
@@ -2124,6 +2164,8 @@ mod tests {
                 }],
                 lock_time: 33,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
 
@@ -2164,6 +2206,8 @@ mod tests {
                     }],
                     lock_time: 1,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2174,6 +2218,8 @@ mod tests {
                     }],
                     lock_time: 1,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(1),
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
@@ -2190,6 +2236,8 @@ mod tests {
                 }],
                 lock_time: 1,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_1).unwrap();
@@ -2209,6 +2257,8 @@ mod tests {
                     }],
                     lock_time: 2,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2219,6 +2269,8 @@ mod tests {
                     }],
                     lock_time: 2,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(2),
                 difficulty_target_or_bits: state.next_difficulty_target(),
@@ -2233,6 +2285,8 @@ mod tests {
                 }],
                 lock_time: 2,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_2).unwrap();
@@ -2251,6 +2305,8 @@ mod tests {
                     }],
                     lock_time: 3,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2261,6 +2317,8 @@ mod tests {
                     }],
                     lock_time: 3,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(20_000),
                 difficulty_target_or_bits: state.next_difficulty_target(),
@@ -2275,6 +2333,8 @@ mod tests {
                 }],
                 lock_time: 3,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_3).unwrap();
@@ -2293,6 +2353,8 @@ mod tests {
                     }],
                     lock_time: 4,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2303,6 +2365,8 @@ mod tests {
                     }],
                     lock_time: 4,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(20_001),
                 difficulty_target_or_bits: state.next_difficulty_target(),
@@ -2317,6 +2381,8 @@ mod tests {
                 }],
                 lock_time: 4,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         state.connect_block(&main_4).unwrap();
@@ -2342,6 +2408,8 @@ mod tests {
                     }],
                     lock_time: 22,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2352,6 +2420,8 @@ mod tests {
                     }],
                     lock_time: 22,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(10),
                 difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
@@ -2366,6 +2436,8 @@ mod tests {
                 }],
                 lock_time: 22,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         let fork_history = vec![
@@ -2388,6 +2460,8 @@ mod tests {
                     }],
                     lock_time: 33,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2398,6 +2472,8 @@ mod tests {
                     }],
                     lock_time: 33,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(11),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
@@ -2415,6 +2491,8 @@ mod tests {
                 }],
                 lock_time: 33,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
         let fork_history = vec![
@@ -2438,6 +2516,8 @@ mod tests {
                     }],
                     lock_time: 44,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 witness_root: witness_root(&[Transaction {
                     version: 1,
@@ -2448,6 +2528,8 @@ mod tests {
                     }],
                     lock_time: 44,
                     witness: vec![],
+                    tx_pow_nonce: 0,
+                    tx_pow_bits: 0,
                 }]),
                 timestamp: genesis_timestamp.saturating_add(12),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
@@ -2465,6 +2547,8 @@ mod tests {
                 }],
                 lock_time: 44,
                 witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
             }],
         ));
 

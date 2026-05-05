@@ -1150,7 +1150,7 @@ mod tests {
     use crate::path::ATHO_DATA_DIR_ENV;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::block::{merkle_root, witness_root};
-    use atho_core::transaction::{Transaction, TxInput, TxOutput};
+    use atho_core::transaction::{Transaction, TxOutput};
     use std::ffi::OsString;
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -1200,17 +1200,17 @@ mod tests {
     fn sample_block(network: Network, height: u64, previous_block_hash: [u8; 48]) -> Block {
         let tx = Transaction {
             version: 1,
-            inputs: vec![TxInput {
-                previous_txid: [height as u8; 48],
-                output_index: 0,
-                unlocking_script: vec![height as u8, 1, 2],
-            }],
+            inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: 5_000_000_000,
+                value_atoms: atho_core::consensus::subsidy::block_subsidy_atoms_for_network(
+                    network, height,
+                ),
                 locking_script: vec![3, 4, height as u8],
             }],
             lock_time: height as u32,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let header = BlockHeader {
             version: 1,

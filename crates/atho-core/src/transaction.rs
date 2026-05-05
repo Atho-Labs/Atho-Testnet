@@ -7,10 +7,12 @@
 //! CONSENSUS: Transaction hashing must only use canonical byte layouts.
 use crate::constants::{
     FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES, MAX_WITNESS_INPUT_REFS,
+    TX_POW_BITS_BYTES, TX_POW_NONCE_BYTES,
 };
 use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_384};
 
 /// Compact witness reference that binds an input to the shared witness payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +186,8 @@ pub struct Transaction {
     pub outputs: Vec<TxOutput>,
     pub lock_time: u32,
     pub witness: Vec<u8>,
+    pub tx_pow_nonce: u64,
+    pub tx_pow_bits: u8,
 }
 
 impl Transaction {
@@ -193,13 +197,51 @@ impl Transaction {
     }
 
     /// Returns the sum of all output values in atoms.
-    pub fn output_value_atoms(&self) -> u64 {
-        self.outputs.iter().map(|output| output.value_atoms).sum()
+    pub fn checked_output_value_atoms(&self) -> Option<u64> {
+        self.outputs
+            .iter()
+            .try_fold(0u64, |total, output| total.checked_add(output.value_atoms))
     }
 
     /// Returns the canonical bytes used for txid calculation.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         self.base_bytes()
+    }
+
+    pub fn write_base_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
+        for input in &self.inputs {
+            out.extend_from_slice(&input.previous_txid);
+            out.extend_from_slice(&input.output_index.to_le_bytes());
+            out.extend_from_slice(&(input.unlocking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&input.unlocking_script);
+        }
+        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
+        for output in &self.outputs {
+            out.extend_from_slice(&output.value_atoms.to_le_bytes());
+            out.extend_from_slice(&(output.locking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&output.locking_script);
+        }
+        out.extend_from_slice(&self.lock_time.to_le_bytes());
+    }
+
+    pub fn update_base_hasher<D: Digest>(&self, hasher: &mut D) {
+        hasher.update(self.version.to_le_bytes());
+        hasher.update((self.inputs.len() as u32).to_le_bytes());
+        for input in &self.inputs {
+            hasher.update(input.previous_txid);
+            hasher.update(input.output_index.to_le_bytes());
+            hasher.update((input.unlocking_script.len() as u32).to_le_bytes());
+            hasher.update(&input.unlocking_script);
+        }
+        hasher.update((self.outputs.len() as u32).to_le_bytes());
+        for output in &self.outputs {
+            hasher.update(output.value_atoms.to_le_bytes());
+            hasher.update((output.locking_script.len() as u32).to_le_bytes());
+            hasher.update(&output.locking_script);
+        }
+        hasher.update(self.lock_time.to_le_bytes());
     }
 
     pub fn base_size_bytes(&self) -> usize {
@@ -235,6 +277,8 @@ impl Transaction {
             + 4
             + self.witness.len()
             + 4
+            + TX_POW_NONCE_BYTES
+            + TX_POW_BITS_BYTES
     }
 
     pub fn compact_size_bytes(&self) -> usize {
@@ -259,11 +303,27 @@ impl Transaction {
             + 4
             + compact_size_len(self.witness.len())
             + self.witness.len()
+            + TX_POW_NONCE_BYTES
+            + TX_POW_BITS_BYTES
     }
 
     /// Serializes the full transaction including witness bytes.
     pub fn full_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.full_size_bytes());
+        out.extend_from_slice(&self.full_bytes_without_pow_fields());
+        out.extend_from_slice(&self.tx_pow_nonce.to_le_bytes());
+        out.push(self.tx_pow_bits);
+        out
+    }
+
+    /// Serializes the full transaction including witness bytes but excluding
+    /// wallet transaction proof-of-work fields.
+    pub fn full_bytes_without_pow_fields(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            self.full_size_bytes()
+                .saturating_sub(TX_POW_NONCE_BYTES)
+                .saturating_sub(TX_POW_BITS_BYTES),
+        );
         out.extend_from_slice(&self.version.to_le_bytes());
         out.push(0x00);
         out.push(0x01);
@@ -306,27 +366,15 @@ impl Transaction {
         out.extend_from_slice(&self.lock_time.to_le_bytes());
         write_compact_size(&mut out, self.witness.len());
         out.extend_from_slice(&self.witness);
+        out.extend_from_slice(&self.tx_pow_nonce.to_le_bytes());
+        out.push(self.tx_pow_bits);
         out
     }
 
     /// Serializes the base transaction form used for txid hashing.
     pub fn base_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.base_size_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
-        for input in &self.inputs {
-            out.extend_from_slice(&input.previous_txid);
-            out.extend_from_slice(&input.output_index.to_le_bytes());
-            out.extend_from_slice(&(input.unlocking_script.len() as u32).to_le_bytes());
-            out.extend_from_slice(&input.unlocking_script);
-        }
-        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
-        for output in &self.outputs {
-            out.extend_from_slice(&output.value_atoms.to_le_bytes());
-            out.extend_from_slice(&(output.locking_script.len() as u32).to_le_bytes());
-            out.extend_from_slice(&output.locking_script);
-        }
-        out.extend_from_slice(&self.lock_time.to_le_bytes());
+        self.write_base_bytes(&mut out);
         out
     }
 
@@ -356,15 +404,13 @@ impl Transaction {
     /// CONSENSUS: Atho txids exclude witness bytes, matching the canonical base
     /// serialization used in UTXO references and Merkle roots.
     pub fn txid(&self) -> [u8; 48] {
-        sha3_384(&self.base_bytes())
+        let mut hasher = Sha3_384::new();
+        self.update_base_hasher(&mut hasher);
+        hasher.finalize().into()
     }
 
     pub fn wtxid(&self) -> [u8; 48] {
-        let mut out = Vec::with_capacity(self.base_size_bytes() + 4 + self.witness.len());
-        out.extend_from_slice(&self.base_bytes());
-        out.extend_from_slice(&(self.witness.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.witness);
-        sha3_384(&out)
+        sha3_384(&self.full_bytes())
     }
 
     pub fn witness_commitment_hash(&self) -> [u8; 48] {
@@ -378,7 +424,7 @@ impl Transaction {
     /// Canonical prehash for Atho transaction signatures.
     ///
     /// This is the exact message digest signed under the
-    /// `ATHO_TX_SIG_V1` domain: `SHA3-384(base_bytes())`, where
+    /// `ATHO_TX_SIGN_V1` domain: `SHA3-384(base_bytes())`, where
     /// `base_bytes()` excludes witness data.
     pub fn signing_digest(&self) -> [u8; 48] {
         self.txid()
@@ -480,15 +526,25 @@ impl Transaction {
             return None;
         }
         let lock_time = read_u32(bytes, &mut offset)?;
-        if offset != bytes.len() {
-            return None;
-        }
+        let (tx_pow_nonce, tx_pow_bits) = if offset == bytes.len() {
+            (0, 0)
+        } else {
+            let tx_pow_nonce = read_u64(bytes, &mut offset)?;
+            let tx_pow_bits = *bytes.get(offset)?;
+            offset += 1;
+            if offset != bytes.len() {
+                return None;
+            }
+            (tx_pow_nonce, tx_pow_bits)
+        };
         Some(Self {
             version,
             inputs,
             outputs,
             lock_time,
             witness,
+            tx_pow_nonce,
+            tx_pow_bits,
         })
     }
 }
@@ -515,6 +571,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
 
         assert_eq!(tx.txid(), tx.signing_digest());
@@ -537,6 +595,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let mut with_witness = base.clone();
         with_witness.witness = vec![9, 8, 7, 6];
@@ -544,6 +604,62 @@ mod tests {
         assert_eq!(base.txid(), with_witness.txid());
         assert_eq!(base.signing_digest(), with_witness.signing_digest());
         assert_ne!(base.wtxid(), with_witness.wtxid());
+    }
+
+    #[test]
+    fn pow_fields_do_not_change_txid_or_signing_digest() {
+        let base = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![4, 5],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let mut with_pow = base.clone();
+        with_pow.tx_pow_nonce = 42;
+        with_pow.tx_pow_bits = 19;
+
+        assert_eq!(base.txid(), with_pow.txid());
+        assert_eq!(base.signing_digest(), with_pow.signing_digest());
+        assert_eq!(
+            base.full_bytes_without_pow_fields(),
+            with_pow.full_bytes_without_pow_fields()
+        );
+    }
+
+    #[test]
+    fn pow_fields_change_full_bytes_and_wtxid() {
+        let base = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![4, 5],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let mut with_pow = base.clone();
+        with_pow.tx_pow_nonce = 42;
+        with_pow.tx_pow_bits = 19;
+
+        assert_ne!(base.full_bytes(), with_pow.full_bytes());
+        assert_ne!(base.wtxid(), with_pow.wtxid());
     }
 
     #[test]
@@ -561,6 +677,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![9, 9, 9],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
 
         assert!(tx.compact_bytes().len() <= tx.full_bytes().len());
@@ -670,9 +788,39 @@ mod tests {
                 }],
             }
             .canonical_bytes(),
+            tx_pow_nonce: 7,
+            tx_pow_bits: 18,
         };
         let encoded = tx.full_bytes();
         let decoded = Transaction::from_full_bytes(&encoded).expect("decode tx");
         assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn checked_output_value_atoms_rejects_overflow() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [9; 48],
+                output_index: 3,
+                unlocking_script: vec![1, 2, 3, 4],
+            }],
+            outputs: vec![
+                TxOutput {
+                    value_atoms: u64::MAX,
+                    locking_script: vec![5, 6],
+                },
+                TxOutput {
+                    value_atoms: 1,
+                    locking_script: vec![7, 8, 9],
+                },
+            ],
+            lock_time: 44,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+
+        assert_eq!(tx.checked_output_value_atoms(), None);
     }
 }

@@ -5,19 +5,32 @@
 //!
 //! CONSENSUS: Supply, block, and witness constants here feed directly into block
 //! and transaction validation. Changes require explicit protocol coordination.
-pub const ATOMS_PER_ATHO: u64 = 100_000_000;
-pub const MAX_SUPPLY_ATHO: u64 = 168_000_000;
-pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ATHO * ATOMS_PER_ATHO;
-pub const INITIAL_BLOCK_REWARD_ATHO: u64 = 50;
-pub const GENESIS_COINBASE_ATOMS: u64 = INITIAL_BLOCK_REWARD_ATHO * ATOMS_PER_ATHO;
+use crate::network::Network;
+
+// Display precision only. Consensus and backend accounting use integer atoms.
+pub const DECIMALS: usize = 12;
+pub const ATOMS_PER_ATHO: u64 = 1_000_000_000_000;
 pub const HALVING_INTERVAL_BLOCKS: u64 = 1_680_000;
 pub const COINBASE_MATURITY_BLOCKS: u64 = 150;
 pub const STANDARD_TX_CONFIRMATIONS: u64 = 7;
-pub const MIN_TX_FEE_PER_VBYTE_ATOMS: u64 = 1;
-pub const MIN_TX_FEE_ATOMS: u64 = MIN_TX_FEE_PER_VBYTE_ATOMS;
-pub const DUST_RELAY_VALUE_ATOMS: u64 = 50;
+pub const MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE: u64 = 1;
+pub const MIN_TX_FEE_PER_VBYTE_ATOMS: u64 = MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE;
+pub const MIN_TX_FEE_ATOMS: u64 = 500;
+pub const MIN_OUTPUT_AMOUNT_ATOMS: u64 = 1_000;
+pub const DUST_RELAY_VALUE_ATOMS: u64 = MIN_OUTPUT_AMOUNT_ATOMS;
+pub const MAX_STANDARD_OUTPUTS: usize = 64;
+pub const TX_POW_MIN_BITS: u8 = 16;
+pub const TX_POW_MAX_BITS: u8 = 28;
+pub const TX_POW_NONCE_BYTES: usize = 8;
+pub const TX_POW_BITS_BYTES: usize = 1;
+pub const TX_POW_DOMAIN: &[u8] = b"ATHO_TX_POW_V1";
+pub const TX_SIGN_DOMAIN: &[u8] = b"ATHO_TX_SIGN_V1";
 pub const BLOCK_TIME_SECONDS: u64 = 75;
 pub const TARGET_BLOCK_TIME_SECONDS: u64 = BLOCK_TIME_SECONDS;
+pub const BLOCKS_PER_YEAR: u64 = 420_480;
+pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = 6_250_000_000_000;
+pub const TAIL_REWARD_ATOMS: u64 = 781_250_000_000;
+pub const GENESIS_COINBASE_ATOMS: u64 = INITIAL_BLOCK_REWARD_ATOMS;
 pub const POW_RETARGET_INTERVAL_BLOCKS: u64 = 1;
 pub const POW_AVERAGING_WINDOW_BLOCKS: u64 = 17;
 pub const POW_MEDIAN_WINDOW_BLOCKS: u64 = 11;
@@ -60,3 +73,11 @@ pub const INPUT_REFERENCE_BYTES: usize = WITNESS_SIGNATURE_REFERENCE_BYTES;
 pub const ADDRESS_ROLE_DOMAIN: &str = "ATHO_ADDR_V1";
 
 pub const BASE56_ALPHABET: &str = "23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
+
+pub const fn atoms_per_atho_for_network(_network: Network) -> u64 {
+    ATOMS_PER_ATHO
+}
+
+pub const fn decimals_for_network(_network: Network) -> usize {
+    DECIMALS
+}

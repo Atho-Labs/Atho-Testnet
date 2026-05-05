@@ -4,7 +4,7 @@ use crate::transaction::Transaction;
 
 pub const ATHO_SIGNATURE_RULES_VERSION: u32 = 1;
 
-pub const ATHO_TX_SIG_V1: &str = "ATHO_TX_SIG_V1";
+pub const ATHO_TX_SIGN_V1: &str = "ATHO_TX_SIGN_V1";
 pub const ATHO_BLOCK_SIG_V1: &str = "ATHO_BLOCK_SIG_V1";
 pub const ATHO_WALLET_LOCAL_SIG_V1: &str = "ATHO_WALLET_LOCAL_SIG_V1";
 pub const ATHO_PACKAGE_SIG_V1: &str = "ATHO_PACKAGE_SIG_V1";
@@ -22,7 +22,7 @@ pub enum AthoSignatureDomain {
 impl AthoSignatureDomain {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Transaction => ATHO_TX_SIG_V1,
+            Self::Transaction => ATHO_TX_SIGN_V1,
             Self::Block => ATHO_BLOCK_SIG_V1,
             Self::WalletLocal => ATHO_WALLET_LOCAL_SIG_V1,
             Self::Package => ATHO_PACKAGE_SIG_V1,
@@ -34,7 +34,7 @@ impl AthoSignatureDomain {
 /// Canonical transaction prehash used for Atho Falcon signatures.
 ///
 /// This is the exact message prehash passed to Falcon-512 RS under the
-/// `ATHO_TX_SIG_V1` domain:
+/// `ATHO_TX_SIGN_V1` domain:
 ///
 /// - canonical source: `Transaction::base_bytes()`
 /// - hash function: `SHA3-384`
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn signature_domains_are_frozen() {
         assert_eq!(ATHO_SIGNATURE_RULES_VERSION, 1);
-        assert_eq!(AthoSignatureDomain::Transaction.label(), ATHO_TX_SIG_V1);
+        assert_eq!(AthoSignatureDomain::Transaction.label(), ATHO_TX_SIGN_V1);
         assert_eq!(AthoSignatureDomain::Block.label(), ATHO_BLOCK_SIG_V1);
         assert_eq!(
             AthoSignatureDomain::WalletLocal.label(),
@@ -68,7 +68,7 @@ mod tests {
         );
         assert_eq!(AthoSignatureDomain::Package.label(), ATHO_PACKAGE_SIG_V1);
         assert_eq!(AthoSignatureDomain::TestDev.label(), ATHO_TEST_DEV_SIG_V1);
-        assert_eq!(ATHO_TX_SIG_V1, "ATHO_TX_SIG_V1");
+        assert_eq!(ATHO_TX_SIGN_V1, "ATHO_TX_SIGN_V1");
         assert_eq!(ATHO_BLOCK_SIG_V1, "ATHO_BLOCK_SIG_V1");
         assert_eq!(ATHO_WALLET_LOCAL_SIG_V1, "ATHO_WALLET_LOCAL_SIG_V1");
         assert_eq!(ATHO_PACKAGE_SIG_V1, "ATHO_PACKAGE_SIG_V1");
@@ -90,6 +90,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
 
         assert_eq!(transaction_signing_digest(&tx), tx.signing_digest());

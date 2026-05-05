@@ -1,4 +1,5 @@
-use atho_core::constants::ATOMS_PER_ATHO;
+use atho_core::constants::{atoms_per_atho_for_network, decimals_for_network};
+use atho_core::network::Network;
 use eframe::egui;
 
 pub(crate) const SHELL_BG: egui::Color32 = egui::Color32::from_rgb(238, 239, 237);
@@ -104,14 +105,14 @@ pub(crate) fn row_value(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).size(13.0).strong().color(ACCENT));
 }
 
-pub(crate) fn row_value_signed(ui: &mut egui::Ui, atoms: i128) {
+pub(crate) fn row_value_signed(ui: &mut egui::Ui, network: Network, atoms: i128) {
     let color = if atoms < 0 {
         egui::Color32::from_rgb(153, 64, 64)
     } else {
         ACCENT
     };
     ui.label(
-        egui::RichText::new(format_signed_atoms(atoms))
+        egui::RichText::new(format_signed_atoms(network, atoms))
             .size(13.0)
             .strong()
             .color(color),
@@ -153,17 +154,19 @@ pub(crate) fn table_header(ui: &mut egui::Ui, headers: &[&str]) {
         });
 }
 
-pub(crate) fn format_atoms(atoms: u64) -> String {
-    let whole = atoms / ATOMS_PER_ATHO;
-    let fractional = atoms % ATOMS_PER_ATHO;
-    format!("{whole}.{fractional:08} ATHO")
+pub(crate) fn format_atoms(network: Network, atoms: u64) -> String {
+    let scale = atoms_per_atho_for_network(network);
+    let decimals = decimals_for_network(network);
+    let whole = atoms / scale;
+    let fractional = atoms % scale;
+    format!("{whole}.{fractional:0decimals$} ATHO")
 }
 
-pub(crate) fn format_signed_atoms(atoms: i128) -> String {
+pub(crate) fn format_signed_atoms(network: Network, atoms: i128) -> String {
     if atoms < 0 {
-        format!("-{}", format_atoms(atoms.unsigned_abs() as u64))
+        format!("-{}", format_atoms(network, atoms.unsigned_abs() as u64))
     } else {
-        format_atoms(atoms as u64)
+        format_atoms(network, atoms as u64)
     }
 }
 

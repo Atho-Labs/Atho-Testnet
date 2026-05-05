@@ -58,7 +58,7 @@ Tradeoff:
 
 Current frozen labels:
 
-- `ATHO_TX_SIG_V1`
+- `ATHO_TX_SIGN_V1`
 - `ATHO_BLOCK_SIG_V1`
 - `ATHO_WALLET_LOCAL_SIG_V1`
 - `ATHO_PACKAGE_SIG_V1`

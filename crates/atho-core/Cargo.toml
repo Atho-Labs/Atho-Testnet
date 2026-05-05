@@ -6,6 +6,7 @@ license = "Proprietary"
 
 [dependencies]
 atho-errors = { path = "../atho-errors" }
+getrandom = "0.2"
 hex = "0.4"
 hex-literal = "0.4"
 num-bigint = "0.4"

@@ -355,6 +355,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let digest = transaction_signing_digest(&tx);
         let signature = sign(

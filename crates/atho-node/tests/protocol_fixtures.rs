@@ -1,8 +1,9 @@
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
-use atho_core::consensus::params::CONSENSUS_PARAMS;
+use atho_core::consensus::params::consensus_params_for_network;
 use atho_core::consensus::pow;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::subsidy;
+use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
@@ -39,6 +40,8 @@ fn witness_bytes(tx: &Transaction) -> Vec<u8> {
     };
     let staged_tx = Transaction {
         witness: staged.canonical_bytes(),
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
         ..tx.clone()
     };
     let witness_root = staged_tx.witness_commitment_hash();
@@ -69,11 +72,18 @@ fn fixture_transaction() -> Transaction {
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
-    Transaction {
+    let mut tx = Transaction {
         witness: witness_bytes(&tx),
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
         ..tx
-    }
+    };
+    let fee = minimum_required_fee_atoms(Network::Mainnet, &tx);
+    solve_transaction_pow(Network::Mainnet, &mut tx, fee);
+    tx
 }
 
 fn fixture_block() -> Block {
@@ -86,6 +96,8 @@ fn fixture_block() -> Block {
         }],
         lock_time: 0,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
     let tx = fixture_transaction();
     let transactions = vec![coinbase, tx];
@@ -106,12 +118,17 @@ fn fixture_block() -> Block {
 
 #[test]
 fn protocol_fixture_freezes_core_parameters_and_validation() {
-    assert_eq!(CONSENSUS_PARAMS.max_supply_atho, 168_000_000);
-    assert_eq!(CONSENSUS_PARAMS.halving_interval_blocks, 1_680_000);
-    assert_eq!(CONSENSUS_PARAMS.min_tx_fee_atoms, 1);
+    let params = consensus_params_for_network(Network::Mainnet);
+    assert_eq!(params.max_supply_atho, None);
+    assert_eq!(params.halving_interval_blocks, 1_680_000);
+    assert_eq!(params.min_tx_fee_atoms, 500);
     let tx = fixture_transaction();
-    let minimum_fee = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-    assert_eq!(validate_transaction(&tx, minimum_fee), Ok(()));
+    let minimum_fee = minimum_required_fee_atoms(Network::Mainnet, &tx)
+        .max(tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS);
+    assert_eq!(
+        validate_transaction(&tx, minimum_fee, Network::Mainnet),
+        Ok(())
+    );
     assert_eq!(
         validate_block_without_pow(&fixture_block(), 0, Network::Mainnet),
         Ok(())

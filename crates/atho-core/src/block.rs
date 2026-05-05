@@ -430,6 +430,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
 
         let root = merkle_root(&[tx.clone(), tx]);
@@ -451,6 +453,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![9, 9, 9],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let header = BlockHeader {
             version: 1,
@@ -483,6 +487,8 @@ mod tests {
             }],
             lock_time: 0,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let header = BlockHeader {
             version: 1,

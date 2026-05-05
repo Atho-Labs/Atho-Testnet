@@ -4,7 +4,7 @@ use atho_core::address::public_key_digest;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
+use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
@@ -116,8 +116,10 @@ fn build_spend_transaction(
         }],
         lock_time: 0,
         witness: provisional_witness(utxos.len(), keypair).canonical_bytes(),
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     };
-    let fee_atoms = tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+    let fee_atoms = minimum_required_fee_atoms(network, &tx);
     tx.outputs[0].value_atoms = input_total
         .checked_sub(fee_atoms)
         .expect("fixture input covers fee");
@@ -140,7 +142,7 @@ fn build_spend_transaction(
     }
     .canonical_bytes();
 
-    let _ = network;
+    solve_transaction_pow(network, &mut tx, fee_atoms);
     (tx, fee_atoms)
 }
 
@@ -155,6 +157,8 @@ fn build_coinbase(network: Network, height: u64, reward_atoms: u64) -> Transacti
         }],
         lock_time: height as u32,
         witness: vec![],
+        tx_pow_nonce: 0,
+        tx_pow_bits: 0,
     }
 }
 

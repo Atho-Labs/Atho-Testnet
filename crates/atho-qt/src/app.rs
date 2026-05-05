@@ -5,22 +5,20 @@ use crate::state::UiState;
 use crate::view::ViewModel;
 use atho_core::address::decode_base56_address;
 use atho_core::block::{merkle_root, Block};
-use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-use atho_core::constants::{ATOMS_PER_ATHO, DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_PER_VBYTE_ATOMS};
+use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
+use atho_core::constants::{
+    atoms_per_atho_for_network, decimals_for_network, DUST_RELAY_VALUE_ATOMS,
+};
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
-use atho_crypto::falcon::{
-    sign, FalconKeypair, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
-};
+use atho_crypto::falcon::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
 #[cfg(test)]
 use atho_node::miner::Miner;
 use atho_node::mining_backend::{
     MiningAcceleratorInfo, MiningBackendKind, MiningController, MiningDeviceType,
 };
-use atho_node::validation::{
-    derive_sig_ref_short, derive_witness_commit_ref, finalize_witness_commit_refs,
-};
+use atho_node::validation::finalize_witness_commit_refs;
 use atho_rpc::command::CommandResponse;
 use atho_rpc::command::{command_definition, help_payload, parse_command_line, search_commands};
 use atho_rpc::error::RpcError;
@@ -34,7 +32,9 @@ use atho_storage::utxo::UtxoEntry;
 use atho_wallet::hd::AddressKind;
 use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
 use atho_wallet::wallet::datafile::WalletEncryptionMode;
-use atho_wallet::wallet::{Wallet, WalletAddress, DEFAULT_RESTORE_GAP_LIMIT};
+use atho_wallet::wallet::{
+    Wallet, WalletAddress, WalletSpendRequest, WalletSpendUtxo, DEFAULT_RESTORE_GAP_LIMIT,
+};
 use eframe::egui;
 use getrandom::getrandom;
 use rayon::prelude::*;
@@ -165,6 +165,7 @@ struct SelectedSpendPlan {
     utxos: Vec<UtxoEntry>,
     total_input_atoms: u64,
     output_count: usize,
+    transaction_version: u16,
     estimated_fee_atoms: u64,
 }
 
@@ -233,6 +234,10 @@ struct WalletStartupMetadata {
 }
 
 impl DesktopApp {
+    fn active_network(&self) -> Network {
+        self.connection.network()
+    }
+
     pub fn new(network: Network) -> Self {
         Self::new_with_rpc(network, None)
     }
@@ -1655,7 +1660,7 @@ impl DesktopApp {
 
         match job.receiver.try_recv() {
             Ok(Ok(outcome)) => {
-                self.send_fee = widgets::format_atoms(outcome.fee_atoms);
+                self.send_fee = widgets::format_atoms(self.active_network(), outcome.fee_atoms);
                 self.send_status = outcome.message;
                 self.last_error = None;
                 self.wallet_cache_dirty = true;
@@ -2317,12 +2322,14 @@ impl DesktopApp {
         if destination.is_empty() {
             return Err(String::from("Enter a destination address"));
         }
-        let amount = Self::parse_send_amount_atoms(&self.send_amount)?;
+        let amount = Self::parse_send_amount_atoms(self.active_network(), &self.send_amount)?;
         if amount == 0 {
             return Err(String::from("Amount must be greater than zero"));
         }
-        if !self.send_include_fee_in_total && amount < DUST_RELAY_VALUE_ATOMS {
-            return Err(Self::dust_amount_error_message());
+        if !self.send_include_fee_in_total
+            && amount < Self::wallet_min_output_amount_atoms(self.active_network())
+        {
+            return Err(Self::dust_amount_error_message(self.active_network()));
         }
 
         let (recipient_digest, network) =
@@ -2346,17 +2353,12 @@ impl DesktopApp {
 
         let selected_plan = Self::select_wallet_utxos(
             spendable_inputs.clone(),
+            self.active_network(),
             amount,
             self.send_include_fee_in_total,
         )?
         .ok_or_else(|| self.unspendable_send_amount_message(amount, &spendable_inputs))?;
 
-        let keypair = {
-            let wallet = self
-                .wallet_ref()
-                .ok_or_else(|| String::from("Load or create a wallet first"))?;
-            wallet.keypair_for_path(selected_plan.address.path)
-        };
         let total_input_atoms = selected_plan.total_input_atoms;
         let output_count = selected_plan.output_count;
         let tx_lock_time = Self::transaction_lock_time_nonce();
@@ -2377,61 +2379,40 @@ impl DesktopApp {
         } else {
             None
         };
-        let mut fee_atoms = selected_plan.estimated_fee_atoms;
-        let mut final_transaction = None;
-        for _ in 0..4 {
-            let (recipient_atoms, change_atoms) = if self.send_include_fee_in_total {
-                if amount <= fee_atoms {
-                    return Err(String::from("Amount must exceed the network fee"));
-                }
-                let recipient_atoms = amount
-                    .checked_sub(fee_atoms)
-                    .ok_or_else(|| String::from("Amount must exceed the network fee"))?;
-                let change_atoms = total_input_atoms
-                    .checked_sub(amount)
-                    .ok_or_else(|| String::from("selected inputs do not cover amount"))?;
-                (recipient_atoms, change_atoms)
-            } else if output_count == 1 {
-                (amount, 0)
-            } else {
-                let change_atoms = total_input_atoms
-                    .checked_sub(amount)
-                    .and_then(|value| value.checked_sub(fee_atoms))
-                    .ok_or_else(|| String::from("selected inputs do not cover amount plus fee"))?;
-                (amount, change_atoms)
-            };
-            if recipient_atoms < DUST_RELAY_VALUE_ATOMS {
-                return Err(if self.send_include_fee_in_total {
-                    format!(
-                        "Recipient amount after fees must be at least {}",
-                        widgets::format_atoms(DUST_RELAY_VALUE_ATOMS)
-                    )
-                } else {
-                    Self::dust_amount_error_message()
-                });
-            }
-            let transaction = Self::build_signed_spend_transaction(
-                &keypair,
-                &selected_plan.utxos,
-                recipient_digest,
-                recipient_atoms,
-                change_atoms,
-                change_address.clone(),
-                tx_lock_time,
-            )?;
-            let actual_fee = transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
-            if actual_fee == fee_atoms {
-                final_transaction = Some(transaction);
-                break;
-            }
-            fee_atoms = actual_fee;
-            final_transaction = Some(transaction);
-        }
-        let final_transaction = final_transaction
-            .ok_or_else(|| String::from("transaction fee calculation mismatch"))?;
-        fee_atoms = final_transaction.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS;
+        let spend_request = WalletSpendRequest {
+            spend_address: selected_plan.address.clone(),
+            selected_utxos: selected_plan
+                .utxos
+                .iter()
+                .map(|utxo| WalletSpendUtxo {
+                    previous_txid: utxo.txid,
+                    output_index: utxo.output_index,
+                    value_atoms: utxo.value_atoms,
+                    locking_script: utxo.locking_script.clone(),
+                })
+                .collect(),
+            recipient_digest,
+            amount_atoms: amount,
+            include_fee_in_total: self.send_include_fee_in_total,
+            transaction_version: selected_plan.transaction_version,
+            lock_time: tx_lock_time,
+            change_address: change_address.clone(),
+        };
+        let built_spend = {
+            let wallet = self
+                .wallet_ref()
+                .ok_or_else(|| String::from("Load or create a wallet first"))?;
+            wallet
+                .build_signed_payment_transaction(spend_request)
+                .map_err(|err| err.to_string())?
+        };
+        let final_transaction = built_spend.transaction;
+        let fee_atoms = built_spend.fee_atoms;
+        let output_total_atoms = final_transaction
+            .checked_output_value_atoms()
+            .ok_or_else(|| String::from("transaction output total overflow"))?;
         let actual_fee = total_input_atoms
-            .checked_sub(final_transaction.output_value_atoms())
+            .checked_sub(output_total_atoms)
             .ok_or_else(|| String::from("selected inputs do not cover amount and fee"))?;
         if actual_fee != fee_atoms {
             return Err(String::from("transaction fee calculation mismatch"));
@@ -2451,7 +2432,7 @@ impl DesktopApp {
                 fee_atoms,
                 self.send_include_fee_in_total,
                 selected_plan.utxos.len(),
-                output_count
+                final_transaction.outputs.len()
             ),
         );
         std::thread::spawn(move || {
@@ -2485,7 +2466,7 @@ impl DesktopApp {
             let _ = sender.send(result);
         });
 
-        self.send_fee = widgets::format_atoms(fee_atoms);
+        self.send_fee = widgets::format_atoms(self.active_network(), fee_atoms);
         self.send_status = String::from("Submitting transaction...");
         self.last_error = None;
         self.send_job = Some(SendJob {
@@ -2509,6 +2490,7 @@ impl DesktopApp {
         }
         let sendable_atoms = Self::max_single_address_sendable_atoms(
             spendable_inputs,
+            self.active_network(),
             self.send_include_fee_in_total,
         );
         if sendable_atoms == 0 {
@@ -2516,17 +2498,17 @@ impl DesktopApp {
                 "No single wallet address has enough confirmed balance to cover a spendable transaction fee",
             ));
         }
-        self.send_amount = Self::format_send_amount_input(sendable_atoms);
+        self.send_amount = Self::format_send_amount_input(self.active_network(), sendable_atoms);
         self.last_error = None;
         self.send_status = if self.send_include_fee_in_total {
             format!(
                 "Filled the largest currently spendable total amount: {}",
-                widgets::format_atoms(sendable_atoms)
+                widgets::format_atoms(self.active_network(), sendable_atoms)
             )
         } else {
             format!(
                 "Filled the largest currently spendable recipient amount: {}",
-                widgets::format_atoms(sendable_atoms)
+                widgets::format_atoms(self.active_network(), sendable_atoms)
             )
         };
         Ok(())
@@ -2539,6 +2521,7 @@ impl DesktopApp {
     ) -> String {
         let max_sendable = Self::max_single_address_sendable_atoms(
             spendable_inputs.to_vec(),
+            self.active_network(),
             self.send_include_fee_in_total,
         );
         if max_sendable == 0 {
@@ -2548,16 +2531,18 @@ impl DesktopApp {
         }
         format!(
             "No single wallet address can cover {}. The current spend path signs one address at a time. Max spendable now: {}. Use a smaller amount or keep future mining rewards on one address.",
-            widgets::format_atoms(amount),
-            widgets::format_atoms(max_sendable)
+            widgets::format_atoms(self.active_network(), amount),
+            widgets::format_atoms(self.active_network(), max_sendable)
         )
     }
 
     fn select_wallet_utxos(
         candidates: Vec<SpendableWalletUtxo>,
+        network: Network,
         amount_atoms: u64,
         include_fee_in_total: bool,
     ) -> Result<Option<SelectedSpendPlan>, String> {
+        let min_output = Self::wallet_min_output_amount_atoms(network);
         let mut best: Option<SelectedSpendPlan> = None;
         for mut group in Self::group_spendable_inputs_by_address(candidates).into_values() {
             group.sort_by(|left, right| {
@@ -2575,35 +2560,35 @@ impl DesktopApp {
             for candidate in group {
                 total = total.saturating_add(candidate.utxo.value_atoms);
                 selected.push(candidate);
-                let estimate_exact_fee = Self::estimate_fee(selected.len(), 1);
-                let estimate_change_fee = Self::estimate_fee(selected.len(), 2);
+                let estimate_exact_fee = Self::estimate_fee(network, selected.len(), 1);
+                let estimate_change_fee = Self::estimate_fee(network, selected.len(), 2);
 
                 let candidate_output_count = if include_fee_in_total {
                     let recipient_one_output = amount_atoms.saturating_sub(estimate_exact_fee);
                     let recipient_two_output = amount_atoms.saturating_sub(estimate_change_fee);
                     let excess = total.saturating_sub(amount_atoms);
                     if total >= amount_atoms
-                        && excess < DUST_RELAY_VALUE_ATOMS
-                        && recipient_one_output >= DUST_RELAY_VALUE_ATOMS
+                        && excess < min_output
+                        && recipient_one_output >= min_output
                     {
                         Some(1)
                     } else if total > amount_atoms
-                        && excess >= DUST_RELAY_VALUE_ATOMS
-                        && recipient_two_output >= DUST_RELAY_VALUE_ATOMS
+                        && excess >= min_output
+                        && recipient_two_output >= min_output
                     {
                         Some(2)
                     } else {
                         None
                     }
-                } else if amount_atoms >= DUST_RELAY_VALUE_ATOMS {
+                } else if amount_atoms >= min_output {
                     let exact_target = amount_atoms.checked_add(estimate_exact_fee);
                     let change_target = amount_atoms.checked_add(estimate_change_fee);
                     if exact_target.is_some_and(|target| {
-                        total >= target && total.saturating_sub(target) < DUST_RELAY_VALUE_ATOMS
+                        total >= target && total.saturating_sub(target) < min_output
                     }) {
                         Some(1)
                     } else if change_target.is_some_and(|target| {
-                        total > target && total.saturating_sub(target) >= DUST_RELAY_VALUE_ATOMS
+                        total > target && total.saturating_sub(target) >= min_output
                     }) {
                         Some(2)
                     } else {
@@ -2614,7 +2599,8 @@ impl DesktopApp {
                 };
 
                 if let Some(output_count) = candidate_output_count {
-                    let estimated_fee_atoms = Self::estimate_fee(selected.len(), output_count);
+                    let estimated_fee_atoms =
+                        Self::estimate_fee(network, selected.len(), output_count);
                     let signing_address = selected
                         .first()
                         .expect("selected spend plan must have at least one input")
@@ -2625,6 +2611,7 @@ impl DesktopApp {
                         utxos: selected.iter().map(|entry| entry.utxo.clone()).collect(),
                         total_input_atoms: total,
                         output_count,
+                        transaction_version: 1,
                         estimated_fee_atoms,
                     };
                     best = Self::prefer_candidate(best, candidate);
@@ -2653,24 +2640,26 @@ impl DesktopApp {
 
     fn max_single_address_sendable_atoms(
         candidates: Vec<SpendableWalletUtxo>,
+        network: Network,
         include_fee_in_total: bool,
     ) -> u64 {
+        let min_output = Self::wallet_min_output_amount_atoms(network);
         let mut best = 0u64;
         for group in Self::group_spendable_inputs_by_address(candidates).into_values() {
             let total = group
                 .iter()
                 .map(|entry| entry.utxo.value_atoms)
                 .sum::<u64>();
-            let fee = Self::estimate_fee(group.len(), 1);
+            let fee = Self::estimate_fee(network, group.len(), 1);
             let sendable = if include_fee_in_total {
-                if total > fee && total.saturating_sub(fee) >= DUST_RELAY_VALUE_ATOMS {
+                if total > fee && total.saturating_sub(fee) >= min_output {
                     total
                 } else {
                     0
                 }
             } else {
                 let recipient_atoms = total.saturating_sub(fee);
-                if recipient_atoms >= DUST_RELAY_VALUE_ATOMS {
+                if recipient_atoms >= min_output {
                     recipient_atoms
                 } else {
                     0
@@ -2709,7 +2698,7 @@ impl DesktopApp {
         }
     }
 
-    fn estimate_fee(input_count: usize, output_count: usize) -> u64 {
+    fn estimate_fee(network: Network, input_count: usize, output_count: usize) -> u64 {
         let mut inputs = Vec::with_capacity(input_count);
         for index in 0..input_count {
             inputs.push(TxInput {
@@ -2736,110 +2725,27 @@ impl DesktopApp {
                 .collect(),
         }
         .canonical_bytes();
-        Transaction {
+        let tx = Transaction {
             version: 1,
             inputs,
             outputs,
             lock_time: 0,
             witness,
-        }
-        .vsize_bytes() as u64
-            * MIN_TX_FEE_PER_VBYTE_ATOMS
-    }
-
-    fn build_signed_spend_transaction(
-        keypair: &FalconKeypair,
-        selected_utxos: &[UtxoEntry],
-        recipient_digest: [u8; 32],
-        amount_atoms: u64,
-        change_atoms: u64,
-        change_address: Option<WalletAddress>,
-        lock_time: u32,
-    ) -> Result<Transaction, String> {
-        if amount_atoms < DUST_RELAY_VALUE_ATOMS {
-            return Err(Self::dust_amount_error_message());
-        }
-        let change_atoms = Self::normalize_change_atoms(change_atoms);
-        let mut outputs = vec![TxOutput {
-            value_atoms: amount_atoms,
-            locking_script: recipient_digest.to_vec(),
-        }];
-        if change_atoms > 0 {
-            let change = change_address.ok_or_else(|| String::from("missing change address"))?;
-            outputs.push(TxOutput {
-                value_atoms: change_atoms,
-                locking_script: change.payment_digest.to_vec(),
-            });
-        }
-
-        let inputs: Vec<TxInput> = selected_utxos
-            .iter()
-            .map(|utxo| TxInput {
-                previous_txid: utxo.txid,
-                output_index: utxo.output_index,
-                unlocking_script: utxo.locking_script.clone(),
-            })
-            .collect();
-
-        let mut tx = Transaction {
-            version: 1,
-            inputs,
-            outputs,
-            lock_time,
-            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
-        let digest = transaction_signing_digest(&tx);
-        let signature = sign(
-            AthoSignatureDomain::Transaction,
-            &keypair.secret_key,
-            &digest,
-        )
-        .map_err(|err: atho_crypto::error::CryptoError| err.to_string())?;
-        let txid = tx.txid();
-        let sig_bytes = signature.0.clone();
-        tx.witness = TxWitness {
-            signature: sig_bytes.clone(),
-            pubkey: keypair.public_key.0.clone(),
-            input_refs: selected_utxos
-                .iter()
-                .enumerate()
-                .map(|(index, _utxo)| atho_core::transaction::WitnessInputRef {
-                    sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
-                    witness_commit_ref: [0; 16],
-                })
-                .collect(),
-        }
-        .canonical_bytes();
-        let witness_root = tx.witness_commitment_hash();
-        let input_refs = selected_utxos
-            .iter()
-            .enumerate()
-            .map(|(index, _utxo)| atho_core::transaction::WitnessInputRef {
-                sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, index as u32),
-                witness_commit_ref: derive_witness_commit_ref(&txid, &witness_root, index as u32),
-            })
-            .collect();
-        tx.witness = TxWitness {
-            signature: sig_bytes.clone(),
-            pubkey: keypair.public_key.0.clone(),
-            input_refs,
-        }
-        .canonical_bytes();
-        Ok(tx)
+        minimum_required_fee_atoms(network, &tx)
     }
 
-    fn normalize_change_atoms(change_atoms: u64) -> u64 {
-        if change_atoms < DUST_RELAY_VALUE_ATOMS {
-            0
-        } else {
-            change_atoms
-        }
+    fn wallet_min_output_amount_atoms(network: Network) -> u64 {
+        let _ = network;
+        DUST_RELAY_VALUE_ATOMS
     }
 
-    fn dust_amount_error_message() -> String {
+    fn dust_amount_error_message(network: Network) -> String {
         format!(
             "Spendable outputs must be at least {}",
-            widgets::format_atoms(DUST_RELAY_VALUE_ATOMS)
+            widgets::format_atoms(network, Self::wallet_min_output_amount_atoms(network))
         )
     }
 
@@ -2857,21 +2763,23 @@ impl DesktopApp {
         u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
     }
 
-    pub(crate) fn format_send_amount_input(atoms: u64) -> String {
-        let whole = atoms / ATOMS_PER_ATHO;
-        let fractional = atoms % ATOMS_PER_ATHO;
+    pub(crate) fn format_send_amount_input(network: Network, atoms: u64) -> String {
+        let scale = atoms_per_atho_for_network(network);
+        let decimals = decimals_for_network(network);
+        let whole = atoms / scale;
+        let fractional = atoms % scale;
         if fractional == 0 {
             return whole.to_string();
         }
 
-        let mut fractional_text = format!("{fractional:08}");
+        let mut fractional_text = format!("{fractional:0decimals$}");
         while fractional_text.ends_with('0') {
             fractional_text.pop();
         }
         format!("{whole}.{fractional_text}")
     }
 
-    fn parse_send_amount_atoms(input: &str) -> Result<u64, String> {
+    fn parse_send_amount_atoms(network: Network, input: &str) -> Result<u64, String> {
         let normalized: String = input
             .trim()
             .chars()
@@ -2907,8 +2815,9 @@ impl DesktopApp {
             None => 0,
             Some(text) if text.is_empty() => 0,
             Some(text) => {
-                if text.len() > 8 {
-                    return Err(String::from("Amount supports up to 8 decimal places"));
+                let decimals = decimals_for_network(network);
+                if text.len() > decimals {
+                    return Err(format!("Amount supports up to {decimals} decimal places"));
                 }
                 if !text.chars().all(|ch| ch.is_ascii_digit()) {
                     return Err(String::from(
@@ -2916,7 +2825,7 @@ impl DesktopApp {
                     ));
                 }
                 let mut padded = text.to_string();
-                while padded.len() < 8 {
+                while padded.len() < decimals {
                     padded.push('0');
                 }
                 padded
@@ -2926,7 +2835,7 @@ impl DesktopApp {
         };
 
         let atoms = whole_atoms
-            .checked_mul(ATOMS_PER_ATHO)
+            .checked_mul(atoms_per_atho_for_network(network))
             .and_then(|value| value.checked_add(fractional_atoms))
             .ok_or_else(|| String::from("Amount is too large"))?;
         if atoms == 0 {
@@ -4112,7 +4021,7 @@ mod tests {
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::pow;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-    use atho_core::constants::{ATOMS_PER_ATHO, STANDARD_TX_CONFIRMATIONS};
+    use atho_core::constants::{atoms_per_atho_for_network, STANDARD_TX_CONFIRMATIONS};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -4126,6 +4035,47 @@ mod tests {
 
     fn test_keypair() -> FalconKeypair {
         generate_from_seed(b"atho-qt-rewrite-reward").expect("deterministic keypair")
+    }
+
+    fn test_wallet(seed_byte: u8) -> Wallet {
+        Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[seed_byte; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        )
+    }
+
+    fn build_wallet_test_spend(
+        wallet: &Wallet,
+        spend_address: WalletAddress,
+        funding_utxos: &[UtxoEntry],
+        recipient_digest: [u8; 32],
+        amount_atoms: u64,
+        include_fee_in_total: bool,
+        change_address: Option<WalletAddress>,
+    ) -> Transaction {
+        let request = WalletSpendRequest {
+            spend_address,
+            selected_utxos: funding_utxos
+                .iter()
+                .map(|utxo| WalletSpendUtxo {
+                    previous_txid: utxo.txid,
+                    output_index: utxo.output_index,
+                    value_atoms: utxo.value_atoms,
+                    locking_script: utxo.locking_script.clone(),
+                })
+                .collect(),
+            recipient_digest,
+            amount_atoms,
+            include_fee_in_total,
+            transaction_version: 1,
+            lock_time: 0,
+            change_address,
+        };
+        wallet
+            .build_signed_payment_transaction(request)
+            .expect("build wallet test spend")
+            .transaction
     }
 
     struct EnvVarGuard {
@@ -4251,9 +4201,8 @@ mod tests {
         recipient_digest: [u8; 32],
         value_atoms: u64,
     ) -> ([u8; 48], u64) {
-        let funding_keypair = test_keypair();
-        let external_digest =
-            atho_core::address::public_key_digest(Network::Regnet, &funding_keypair.public_key.0);
+        let mut funding_wallet = test_wallet(0x73);
+        let funding_address = funding_wallet.checkout_receive_address();
         let mut funding_utxo = None;
         let seeded = app.with_local_system_for_test(|system| {
             system.sandbox_with_node_mut(|node| {
@@ -4262,7 +4211,7 @@ mod tests {
                     [0x6b; 48],
                     0,
                     value_atoms,
-                    external_digest.to_vec(),
+                    funding_address.payment_digest.to_vec(),
                     node.height()
                         .saturating_sub(STANDARD_TX_CONFIRMATIONS.saturating_sub(1)),
                     false,
@@ -4275,18 +4224,17 @@ mod tests {
         assert!(seeded.is_some(), "expected local test backend");
 
         let funding_utxo = funding_utxo.expect("funding utxo");
-        let fee_atoms = DesktopApp::estimate_fee(1, 1);
+        let fee_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 1);
         let credited_atoms = value_atoms.saturating_sub(fee_atoms);
-        let transaction = DesktopApp::build_signed_spend_transaction(
-            &test_keypair(),
+        let transaction = build_wallet_test_spend(
+            &funding_wallet,
+            funding_address,
             std::slice::from_ref(&funding_utxo),
             recipient_digest,
             credited_atoms,
-            0,
+            false,
             None,
-            1,
-        )
-        .expect("build funding transaction");
+        );
         match app.request(RpcRequest::SubmitTransaction {
             transaction,
             fee_atoms,
@@ -4338,6 +4286,8 @@ mod tests {
         };
         let staged_tx = Transaction {
             witness: staged.canonical_bytes(),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..tx.clone()
         };
         let witness_root = staged_tx.witness_commitment_hash();
@@ -4363,11 +4313,13 @@ mod tests {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: 50 * ATOMS_PER_ATHO,
+                value_atoms: atho_core::consensus::subsidy::block_subsidy_atoms(0),
                 locking_script: vec![0x11, 0x22, 0x33],
             }],
             lock_time: 1,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let spend = Transaction {
             version: 1,
@@ -4382,9 +4334,13 @@ mod tests {
             }],
             lock_time: 2,
             witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
         };
         let spend = Transaction {
             witness: witness_bytes(&spend),
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
             ..spend
         };
         let transactions = vec![coinbase, spend];
@@ -4529,53 +4485,71 @@ mod tests {
 
     #[test]
     fn parses_decimal_atho_amounts_with_commas() {
-        let atoms = DesktopApp::parse_send_amount_atoms("10,000.44544444").unwrap();
-        assert_eq!(atoms, 10_000 * ATOMS_PER_ATHO + 44_544_444);
+        let scale = atoms_per_atho_for_network(Network::Mainnet);
+        let atoms =
+            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "10,000.445444444444").unwrap();
+        assert_eq!(atoms, 10_000 * scale + 445_444_444_444);
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms("0.938449").unwrap(),
-            93_844_900
+            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.938449").unwrap(),
+            938_449_000_000
         );
+        assert_eq!(
+            DesktopApp::parse_send_amount_atoms(Network::Regnet, "0.938449").unwrap(),
+            938_449_000_000
+        );
+        assert_eq!(
+            DesktopApp::parse_send_amount_atoms(Network::Regnet, "1").unwrap(),
+            scale
+        );
+        assert_eq!(
+            DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.000000000001").unwrap(),
+            1
+        );
+        assert!(DesktopApp::parse_send_amount_atoms(Network::Mainnet, "0.0000000000001").is_err());
     }
 
     #[test]
     fn formats_atho_amounts_for_input() {
-        let atoms = 10_000 * ATOMS_PER_ATHO + 44_544_444;
+        let scale = atoms_per_atho_for_network(Network::Mainnet);
+        let atoms = 10_000 * scale + 445_444_444_444;
         assert_eq!(
-            DesktopApp::format_send_amount_input(atoms),
-            "10000.44544444"
+            DesktopApp::format_send_amount_input(Network::Mainnet, atoms),
+            "10000.445444444444"
         );
-        assert_eq!(DesktopApp::format_send_amount_input(ATOMS_PER_ATHO), "1");
+        assert_eq!(
+            DesktopApp::format_send_amount_input(Network::Mainnet, scale),
+            "1"
+        );
+        assert_eq!(
+            DesktopApp::format_send_amount_input(Network::Regnet, scale),
+            "1"
+        );
     }
 
     #[test]
     fn build_signed_spend_transaction_omits_dust_change_outputs() {
-        let keypair = test_keypair();
-        let change_address = Wallet::from_mnemonic(
-            MnemonicPhrase::from_entropy(&[0x6du8; 32], MnemonicLength::Words24).unwrap(),
-            "",
-            Network::Regnet,
-        )
-        .checkout_change_address();
+        let mut wallet = test_wallet(0x6d);
+        let spend_address = wallet.checkout_receive_address();
+        let change_address = wallet.checkout_change_address();
         let funding = UtxoEntry::new(
             Network::Regnet,
             [0x31; 48],
             0,
             10_000,
-            atho_core::address::public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec(),
+            spend_address.payment_digest.to_vec(),
             24,
             false,
         );
 
-        let tx = DesktopApp::build_signed_spend_transaction(
-            &keypair,
+        let tx = build_wallet_test_spend(
+            &wallet,
+            spend_address,
             std::slice::from_ref(&funding),
             [0x22; 32],
             9_000,
-            DUST_RELAY_VALUE_ATOMS - 1,
+            false,
             Some(change_address),
-            1,
-        )
-        .expect("build transaction");
+        );
 
         assert_eq!(tx.outputs.len(), 1);
         assert_eq!(tx.outputs[0].value_atoms, 9_000);
@@ -4589,7 +4563,7 @@ mod tests {
             Network::Regnet,
         );
         let address = wallet.checkout_receive_address();
-        let exact_fee = DesktopApp::estimate_fee(1, 1);
+        let exact_fee = DesktopApp::estimate_fee(Network::Regnet, 1, 1);
         let total_input_atoms = 20_000u64;
         let amount_atoms = total_input_atoms
             .saturating_sub(exact_fee)
@@ -4607,9 +4581,10 @@ mod tests {
             ),
         }];
 
-        let plan = DesktopApp::select_wallet_utxos(candidates, amount_atoms, false)
-            .expect("selection")
-            .expect("plan");
+        let plan =
+            DesktopApp::select_wallet_utxos(candidates, Network::Regnet, amount_atoms, false)
+                .expect("selection")
+                .expect("plan");
 
         assert_eq!(plan.output_count, 1);
     }
@@ -4631,7 +4606,7 @@ mod tests {
                     Network::Regnet,
                     [0x11; 48],
                     0,
-                    60 * ATOMS_PER_ATHO,
+                    60 * atoms_per_atho_for_network(Network::Regnet),
                     first.payment_digest.to_vec(),
                     24,
                     false,
@@ -4643,7 +4618,7 @@ mod tests {
                     Network::Regnet,
                     [0x22; 48],
                     0,
-                    60 * ATOMS_PER_ATHO,
+                    60 * atoms_per_atho_for_network(Network::Regnet),
                     second.payment_digest.to_vec(),
                     24,
                     false,
@@ -4651,8 +4626,13 @@ mod tests {
             },
         ];
 
-        let plan = DesktopApp::select_wallet_utxos(candidates, 100 * ATOMS_PER_ATHO, false)
-            .expect("selection");
+        let plan = DesktopApp::select_wallet_utxos(
+            candidates,
+            Network::Regnet,
+            100 * atoms_per_atho_for_network(Network::Regnet),
+            false,
+        )
+        .expect("selection");
 
         assert!(plan.is_none());
     }
@@ -4673,7 +4653,7 @@ mod tests {
                     Network::Regnet,
                     [0x11; 48],
                     0,
-                    60 * ATOMS_PER_ATHO,
+                    60 * atoms_per_atho_for_network(Network::Regnet),
                     address.payment_digest.to_vec(),
                     24,
                     false,
@@ -4685,7 +4665,7 @@ mod tests {
                     Network::Regnet,
                     [0x22; 48],
                     0,
-                    60 * ATOMS_PER_ATHO,
+                    60 * atoms_per_atho_for_network(Network::Regnet),
                     address.payment_digest.to_vec(),
                     24,
                     false,
@@ -4693,12 +4673,20 @@ mod tests {
             },
         ];
 
-        let plan = DesktopApp::select_wallet_utxos(candidates, 100 * ATOMS_PER_ATHO, false)
-            .expect("selection")
-            .expect("single-address plan");
+        let plan = DesktopApp::select_wallet_utxos(
+            candidates,
+            Network::Regnet,
+            100 * atoms_per_atho_for_network(Network::Regnet),
+            false,
+        )
+        .expect("selection")
+        .expect("single-address plan");
 
         assert_eq!(plan.utxos.len(), 2);
-        assert_eq!(plan.total_input_atoms, 120 * ATOMS_PER_ATHO);
+        assert_eq!(
+            plan.total_input_atoms,
+            120 * atoms_per_atho_for_network(Network::Regnet)
+        );
         assert_eq!(plan.address.payment_digest, address.payment_digest);
     }
 
@@ -4719,7 +4707,7 @@ mod tests {
                     Network::Regnet,
                     [0x11; 48],
                     0,
-                    25 * ATOMS_PER_ATHO,
+                    25 * atoms_per_atho_for_network(Network::Regnet),
                     first.payment_digest.to_vec(),
                     24,
                     false,
@@ -4731,7 +4719,7 @@ mod tests {
                     Network::Regnet,
                     [0x12; 48],
                     0,
-                    20 * ATOMS_PER_ATHO,
+                    20 * atoms_per_atho_for_network(Network::Regnet),
                     first.payment_digest.to_vec(),
                     24,
                     false,
@@ -4743,7 +4731,7 @@ mod tests {
                     Network::Regnet,
                     [0x21; 48],
                     0,
-                    60 * ATOMS_PER_ATHO,
+                    60 * atoms_per_atho_for_network(Network::Regnet),
                     second.payment_digest.to_vec(),
                     24,
                     false,
@@ -4751,9 +4739,10 @@ mod tests {
             },
         ];
 
-        let sendable = DesktopApp::max_single_address_sendable_atoms(candidates, false);
-        assert!(sendable > 59 * ATOMS_PER_ATHO);
-        assert!(sendable < 60 * ATOMS_PER_ATHO);
+        let sendable =
+            DesktopApp::max_single_address_sendable_atoms(candidates, Network::Regnet, false);
+        assert!(sendable > 59 * atoms_per_atho_for_network(Network::Regnet));
+        assert!(sendable < 60 * atoms_per_atho_for_network(Network::Regnet));
     }
 
     #[test]
@@ -5412,7 +5401,7 @@ mod tests {
             );
         }
 
-        let funding_atoms = 20 * ATOMS_PER_ATHO;
+        let funding_atoms = 20 * atoms_per_atho_for_network(Network::Regnet);
         let (_, credited_funding_atoms) = submit_external_funding_tx(
             &app.connection,
             current_address.payment_digest,
@@ -5465,7 +5454,10 @@ mod tests {
         let recipient = recipient_wallet.checkout_receive_address();
 
         app.send_to = recipient.address.clone();
-        app.send_amount = DesktopApp::format_send_amount_input(5 * ATOMS_PER_ATHO);
+        app.send_amount = DesktopApp::format_send_amount_input(
+            Network::Regnet,
+            5 * atoms_per_atho_for_network(Network::Regnet),
+        );
         app.submit_send_transaction().expect("submit send");
         wait_until_without_wallet_scan(
             "send transaction submitted",
@@ -5586,7 +5578,7 @@ mod tests {
         let (funding_txid, _) = submit_external_funding_tx(
             &app.connection,
             receive_address.payment_digest,
-            9 * ATOMS_PER_ATHO,
+            9 * atoms_per_atho_for_network(Network::Regnet),
         );
         wait_until(
             "funding tx reaches mempool",
