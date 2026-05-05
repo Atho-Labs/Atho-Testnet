@@ -5355,7 +5355,12 @@ mod tests {
             "initial wallet open",
             &mut app,
             Duration::from_secs(5),
-            |app| app.ui_state.connected && app.wallet.is_some(),
+            |app| {
+                app.ui_state.connected
+                    && app.wallet.is_some()
+                    && !app.wallet_readiness_gate_active
+                    && app.wallet_mining_block_reason().is_none()
+            },
         );
 
         app.receive_label = String::from("Primary");
