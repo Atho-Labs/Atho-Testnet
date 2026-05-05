@@ -73,6 +73,8 @@ mod tests {
     use super::*;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::network::Network;
+    use atho_storage::path::ATHO_DATA_DIR_ENV;
+    use std::ffi::OsString;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,6 +101,35 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+        _lock: crate::test_support::TestLockGuard,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn orchestrator_starts_runtime_and_marks_sync_state() {
         let root = std::env::temp_dir().join(format!(
@@ -111,6 +142,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("temp root");
         let _guard = CurrentDirGuard::switch_to(&root);
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let mut orchestrator = NodeOrchestrator::new(NodeConfig::new(Network::Mainnet));
         orchestrator.start();
         assert!(orchestrator.runtime.running);

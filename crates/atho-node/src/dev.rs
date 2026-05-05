@@ -412,7 +412,7 @@ pub(crate) fn signed_spend_transaction(
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
         };
-        let digest = transaction_signing_digest(&tx);
+        let digest = transaction_signing_digest(network, &tx);
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,

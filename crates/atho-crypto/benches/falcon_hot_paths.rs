@@ -1,4 +1,5 @@
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use atho_crypto::falcon::{generate_from_seed, sign, verify};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -24,7 +25,7 @@ fn sample_transaction() -> Transaction {
 
 fn bench_falcon_hot_paths(c: &mut Criterion) {
     let tx = sample_transaction();
-    let digest = transaction_signing_digest(&tx);
+    let digest = transaction_signing_digest(Network::Mainnet, &tx);
     let keypair = generate_from_seed(b"atho-falcon-bench").expect("falcon keypair");
     let signature = sign(
         AthoSignatureDomain::Transaction,

@@ -18,7 +18,9 @@ use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
-use atho_storage::db::{BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord};
+use atho_storage::db::{
+    BlockArchiveRecord, BlockPruneReport, FaucetRequestRecord, PeerHealthRecord, PeerRecord,
+};
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -177,6 +179,25 @@ impl Node {
         self.chainstate.save_peer(record).map_err(NodeError::from)
     }
 
+    pub fn load_faucet_request_record(
+        &self,
+        requester_id: &str,
+        destination_address: &str,
+    ) -> Result<Option<FaucetRequestRecord>, NodeError> {
+        self.chainstate
+            .load_faucet_request(requester_id, destination_address)
+            .map_err(NodeError::from)
+    }
+
+    pub fn save_faucet_request_record(
+        &self,
+        record: &FaucetRequestRecord,
+    ) -> Result<(), NodeError> {
+        self.chainstate
+            .save_faucet_request(record)
+            .map_err(NodeError::from)
+    }
+
     pub fn observe_peer(
         &self,
         remote_addr: impl Into<String>,
@@ -246,6 +267,14 @@ impl Node {
 
     pub fn difficulty_target_for_next_block(&self) -> [u8; 48] {
         pow::target_for_next_block(self.network(), self.chainstate.blocks())
+    }
+
+    pub fn difficulty_target_for_next_block_at(&self, timestamp: u64) -> [u8; 48] {
+        pow::target_for_next_block_with_timestamp(
+            self.network(),
+            self.chainstate.blocks(),
+            timestamp,
+        )
     }
 
     pub fn mempool_len(&self) -> usize {
@@ -528,12 +557,12 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+    fn witness_bytes_for_tx(network: Network, tx: &Transaction) -> Vec<u8> {
         let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(tx),
+            &transaction_signing_digest(network, tx),
         )
         .expect("falcon signature")
         .0;
@@ -654,7 +683,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -716,7 +745,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -774,7 +803,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -793,7 +822,7 @@ mod tests {
             }
         };
         let mut tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -840,7 +869,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -910,7 +939,7 @@ mod tests {
                 tx_pow_nonce: 0,
                 tx_pow_bits: 0,
             };
-            tx.witness = witness_bytes_for_tx(&tx);
+            tx.witness = witness_bytes_for_tx(Network::Mainnet, &tx);
             let fee_atoms = transaction_fee_from_utxos(&tx, &node.chainstate.utxo_snapshot())
                 .expect("fee atoms");
             solve_transaction_pow(Network::Mainnet, &mut tx, fee_atoms);

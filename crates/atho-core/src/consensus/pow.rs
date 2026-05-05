@@ -50,6 +50,7 @@ pub const POW_PROFILE: ProofOfWork = ProofOfWork {
 
 pub const SHA3_384_HASH_BITS: usize = 384;
 pub const SHA3_384_HASH_HEX_CHARS: usize = 96;
+pub const TESTNET_STALL_RESET_SECONDS: u64 = 600;
 
 pub const DIFFICULTY_PROFILE: DifficultyTargetProfile = DifficultyTargetProfile {
     genesis_target: hex!("0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
@@ -214,6 +215,34 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
 
 /// Computes the next required target from historical block headers.
 pub fn target_for_next_block(network: Network, previous_blocks: &[Block]) -> [u8; 48] {
+    let next_timestamp = previous_blocks
+        .last()
+        .map(|block| {
+            block
+                .header
+                .timestamp
+                .saturating_add(POW_PROFILE.target_block_time_seconds)
+        })
+        .unwrap_or_default();
+    target_for_next_block_with_timestamp(network, previous_blocks, next_timestamp)
+}
+
+/// Computes the next required target from historical block headers and the
+/// candidate block timestamp being validated or mined.
+pub fn target_for_next_block_with_timestamp(
+    network: Network,
+    previous_blocks: &[Block],
+    next_timestamp: u64,
+) -> [u8; 48] {
+    if network == Network::Testnet {
+        if let Some(previous_block) = previous_blocks.last() {
+            if next_timestamp.saturating_sub(previous_block.header.timestamp)
+                > TESTNET_STALL_RESET_SECONDS
+            {
+                return DIFFICULTY_PROFILE.min_difficulty_target;
+            }
+        }
+    }
     let headers: Vec<BlockHeader> = previous_blocks
         .iter()
         .map(|block| block.header.clone())
@@ -585,5 +614,89 @@ mod tests {
             ..Block::default()
         }];
         assert!(branch_is_preferred(&candidate, &current));
+    }
+
+    #[test]
+    fn testnet_stall_reset_does_not_trigger_at_exactly_ten_minutes() {
+        let previous = vec![Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Testnet,
+                height: 0,
+                previous_block_hash: [0; 48],
+                merkle_root: [0; 48],
+                witness_root: [0; 48],
+                timestamp: 1_000,
+                difficulty_target_or_bits: DIFFICULTY_PROFILE.max_difficulty_target,
+                nonce: 0,
+            },
+            ..Block::default()
+        }];
+
+        let target = target_for_next_block_with_timestamp(Network::Testnet, &previous, 1_600);
+        assert_eq!(target, initial_target_for_network(Network::Testnet));
+    }
+
+    #[test]
+    fn testnet_stall_reset_triggers_after_more_than_ten_minutes() {
+        let previous = vec![Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Testnet,
+                height: 0,
+                previous_block_hash: [0; 48],
+                merkle_root: [0; 48],
+                witness_root: [0; 48],
+                timestamp: 1_000,
+                difficulty_target_or_bits: DIFFICULTY_PROFILE.max_difficulty_target,
+                nonce: 0,
+            },
+            ..Block::default()
+        }];
+
+        let target = target_for_next_block_with_timestamp(Network::Testnet, &previous, 1_601);
+        assert_eq!(target, DIFFICULTY_PROFILE.min_difficulty_target);
+    }
+
+    #[test]
+    fn mainnet_does_not_apply_testnet_stall_reset() {
+        let previous = vec![Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 0,
+                previous_block_hash: [0; 48],
+                merkle_root: [0; 48],
+                witness_root: [0; 48],
+                timestamp: 1_000,
+                difficulty_target_or_bits: DIFFICULTY_PROFILE.max_difficulty_target,
+                nonce: 0,
+            },
+            ..Block::default()
+        }];
+
+        let target = target_for_next_block_with_timestamp(Network::Mainnet, &previous, 1_601);
+        assert_eq!(target, initial_target_for_network(Network::Mainnet));
+    }
+
+    #[test]
+    fn regnet_does_not_apply_testnet_stall_reset() {
+        let previous = vec![Block {
+            header: BlockHeader {
+                version: 1,
+                network_id: Network::Regnet,
+                height: 0,
+                previous_block_hash: [0; 48],
+                merkle_root: [0; 48],
+                witness_root: [0; 48],
+                timestamp: 1_000,
+                difficulty_target_or_bits: DIFFICULTY_PROFILE.max_difficulty_target,
+                nonce: 0,
+            },
+            ..Block::default()
+        }];
+
+        let target = target_for_next_block_with_timestamp(Network::Regnet, &previous, 1_601);
+        assert_eq!(target, initial_target_for_network(Network::Regnet));
     }
 }

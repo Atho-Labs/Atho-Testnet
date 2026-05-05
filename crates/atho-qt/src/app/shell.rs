@@ -10,6 +10,7 @@ pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
     render_toolbar(app, ctx);
     render_status_bar(app, ctx);
     render_sync_status_window(app, ctx);
+    render_testnet_refresh_notice_window(app, ctx);
     render_about_window(app, ctx);
     pages::console::render_window(app, ctx);
 
@@ -318,6 +319,34 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                 );
             });
         });
+}
+
+fn render_testnet_refresh_notice_window(app: &mut DesktopApp, ctx: &egui::Context) {
+    if !app.show_testnet_refresh_notice_dialog {
+        return;
+    }
+    let Some(notice) = app.testnet_refresh_notice.clone() else {
+        app.show_testnet_refresh_notice_dialog = false;
+        return;
+    };
+
+    let mut open = true;
+    egui::Window::new("Testnet Data Refreshed")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(460.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(&notice).color(widgets::TEXT).size(14.0));
+            ui.add_space(12.0);
+            if ui.button("OK").clicked() {
+                app.dismiss_testnet_refresh_notice();
+            }
+        });
+
+    if !open {
+        app.dismiss_testnet_refresh_notice();
+    }
 }
 
 fn render_sync_status_window(app: &mut DesktopApp, ctx: &egui::Context) {

@@ -12,6 +12,7 @@ use crate::utxo::UtxoEntry;
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::consensus::rules::STORAGE_SCHEMA_VERSION;
+use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction as CoreTransaction;
 use lmdb::{
@@ -51,6 +52,9 @@ const LEGACY_ADDRESSES_DIR: &str = "addresses";
 
 const SNAPSHOT_KEY: &[u8; 10] = b"chainstate";
 const SCHEMA_VERSION_KEY: &[u8; 14] = b"schema_version";
+const STORAGE_METADATA_KEY: &[u8; 16] = b"storage_metadata";
+const STORAGE_MAGIC: [u8; 4] = *b"ATHO";
+const SOFTWARE_STORAGE_VERSION: u32 = 1;
 
 #[cfg(test)]
 static COMMIT_FAULT: OnceLock<Mutex<Option<CommitFault>>> = OnceLock::new();
@@ -187,6 +191,39 @@ pub struct PeerHealthRecord {
     pub last_success_unix: Option<u64>,
 }
 
+/// Persisted testnet faucet cooldown record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FaucetRequestRecord {
+    pub network: Network,
+    pub requester_id: String,
+    pub destination_address: String,
+    pub last_request_height: u64,
+    pub amount_atoms: u64,
+    pub recorded_at_unix: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub txid: [u8; 48],
+}
+
+/// Persisted storage identity and compatibility record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageMetadata {
+    #[serde(with = "serde_big_array::BigArray")]
+    pub storage_magic: [u8; 4],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub network_magic: [u8; 4],
+    pub network_name: String,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub chain_id: [u8; 48],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub genesis_hash: [u8; 48],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub genesis_block_id: [u8; 48],
+    pub database_schema_version: u32,
+    pub software_storage_version: u32,
+    pub created_at_unix: u64,
+    pub last_opened_unix: u64,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFaultPoint {
@@ -256,6 +293,7 @@ impl Database {
             block_store,
             state: Mutex::new(state),
         };
+        database.ensure_storage_metadata()?;
         database.ensure_schema_version()?;
         Ok(database)
     }
@@ -287,6 +325,35 @@ impl Database {
         let snapshot: ChainstateSnapshot =
             bincode::deserialize(&snapshot_bytes).map_err(|_| StorageError::CorruptData)?;
         Ok(Some(snapshot))
+    }
+
+    pub fn load_storage_metadata(&self) -> Result<Option<StorageMetadata>, StorageError> {
+        match self.get(Dataset::Meta, STORAGE_METADATA_KEY)? {
+            Some(bytes) => deserialize_record(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn inspect_storage_metadata(
+        network: Network,
+    ) -> Result<Option<StorageMetadata>, StorageError> {
+        let root = path::database_dir(network);
+        if !root.exists() {
+            return Ok(None);
+        }
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(32)
+            .set_max_dbs(MAX_DBS)
+            .set_map_size(INITIAL_MAP_SIZE);
+        let env = builder.open(&root)?;
+        let meta = env.create_db(Some(META_DB), DatabaseFlags::empty())?;
+        let txn = env.begin_ro_txn()?;
+        match txn.get(meta, &STORAGE_METADATA_KEY) {
+            Ok(bytes) => deserialize_record(bytes).map(Some),
+            Err(LmdbError::NotFound) => Ok(None),
+            Err(err) => Err(StorageError::Lmdb(err)),
+        }
     }
 
     /// Loads one archived block metadata record by block hash.
@@ -738,6 +805,29 @@ impl Database {
         Ok(records)
     }
 
+    pub fn upsert_faucet_request(&self, record: &FaucetRequestRecord) -> Result<(), StorageError> {
+        let key = faucet_request_key(
+            record.network,
+            &record.requester_id,
+            &record.destination_address,
+        );
+        let value = bincode::serialize(record).map_err(|_| StorageError::CorruptData)?;
+        self.put(Dataset::Meta, &key, &value)
+    }
+
+    pub fn load_faucet_request(
+        &self,
+        network: Network,
+        requester_id: &str,
+        destination_address: &str,
+    ) -> Result<Option<FaucetRequestRecord>, StorageError> {
+        let key = faucet_request_key(network, requester_id, destination_address);
+        match self.get(Dataset::Meta, &key)? {
+            Some(bytes) => deserialize_record(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn ensure_schema_version(&self) -> Result<(), StorageError> {
         match self.get(Dataset::Meta, SCHEMA_VERSION_KEY)? {
             Some(bytes) => {
@@ -759,6 +849,60 @@ impl Database {
                     SCHEMA_VERSION_KEY,
                     &STORAGE_SCHEMA_VERSION.to_le_bytes(),
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_storage_metadata(&self) -> Result<(), StorageError> {
+        let now = current_unix_seconds();
+        let expected = expected_storage_metadata(self.network, now);
+        match self.load_storage_metadata()? {
+            Some(mut existing) => {
+                if existing.storage_magic != expected.storage_magic {
+                    return Err(StorageError::StorageMetadataMismatch {
+                        field: "storage_magic",
+                    });
+                }
+                if existing.network_magic != expected.network_magic {
+                    return Err(StorageError::StorageMetadataMismatch {
+                        field: "network_magic",
+                    });
+                }
+                if existing.network_name != expected.network_name {
+                    return Err(StorageError::StorageMetadataMismatch {
+                        field: "network_name",
+                    });
+                }
+                if existing.chain_id != expected.chain_id {
+                    return Err(StorageError::StorageMetadataMismatch { field: "chain_id" });
+                }
+                if existing.genesis_hash != expected.genesis_hash {
+                    return Err(StorageError::PersistedGenesisMismatch);
+                }
+                if existing.genesis_block_id != expected.genesis_block_id {
+                    return Err(StorageError::StorageMetadataMismatch {
+                        field: "genesis_block_id",
+                    });
+                }
+                if existing.database_schema_version != expected.database_schema_version {
+                    return Err(StorageError::SchemaVersionMismatch {
+                        expected: expected.database_schema_version,
+                        found: existing.database_schema_version,
+                    });
+                }
+                if existing.software_storage_version != expected.software_storage_version {
+                    return Err(StorageError::StorageMetadataMismatch {
+                        field: "software_storage_version",
+                    });
+                }
+                existing.last_opened_unix = now;
+                let value = bincode::serialize(&existing).map_err(|_| StorageError::CorruptData)?;
+                self.put(Dataset::Meta, STORAGE_METADATA_KEY, &value)?;
+            }
+            None => {
+                let value = bincode::serialize(&expected).map_err(|_| StorageError::CorruptData)?;
+                self.put(Dataset::Meta, STORAGE_METADATA_KEY, &value)?;
             }
         }
         Ok(())
@@ -886,6 +1030,43 @@ impl Database {
             .max()
             .map(|file_number| file_number.saturating_add(1)))
     }
+}
+
+fn expected_storage_metadata(network: Network, now: u64) -> StorageMetadata {
+    let genesis_hash = genesis::genesis_hash(network);
+    StorageMetadata {
+        storage_magic: STORAGE_MAGIC,
+        network_magic: network.p2p_magic(),
+        network_name: network.id().to_string(),
+        chain_id: genesis_hash,
+        genesis_hash,
+        genesis_block_id: genesis_hash,
+        database_schema_version: STORAGE_SCHEMA_VERSION,
+        software_storage_version: SOFTWARE_STORAGE_VERSION,
+        created_at_unix: now,
+        last_opened_unix: now,
+    }
+}
+
+fn faucet_request_key(network: Network, requester_id: &str, destination_address: &str) -> Vec<u8> {
+    let mut preimage =
+        Vec::with_capacity(network.id().len() + requester_id.len() + destination_address.len() + 2);
+    preimage.extend_from_slice(network.id().as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(requester_id.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(destination_address.as_bytes());
+    let digest = atho_core::crypto::hash::sha3_256(&preimage);
+    let mut key = b"faucet_request:".to_vec();
+    key.extend_from_slice(&digest);
+    key
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl Dataset {

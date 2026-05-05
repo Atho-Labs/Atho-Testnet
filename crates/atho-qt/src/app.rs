@@ -26,7 +26,7 @@ use atho_rpc::command::{command_definition, help_payload, parse_command_line, se
 use atho_rpc::error::RpcError;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
-    BlockTemplate, MempoolSpentInput, NodeStatus, RpcResponse,
+    BlockTemplate, FaucetSubmission, MempoolSpentInput, NodeStatus, RpcResponse,
     WalletActivityEntry as RpcWalletActivityEntry, WalletActivityKind as RpcWalletActivityKind,
 };
 use atho_rpc::transport::RpcClient;
@@ -118,6 +118,10 @@ pub struct DesktopApp {
     receive_label: String,
     receive_amount: String,
     receive_message: String,
+    faucet_manual_address: String,
+    faucet_amount: String,
+    faucet_status: String,
+    faucet_job: Option<FaucetJob>,
     send_status: String,
     debug_console_status: String,
     send_job: Option<SendJob>,
@@ -166,6 +170,8 @@ pub struct DesktopApp {
     compact_viewport: bool,
     show_sync_status_dialog: bool,
     sync_status_hidden_until_synced: bool,
+    testnet_refresh_notice: Option<String>,
+    show_testnet_refresh_notice_dialog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +230,12 @@ struct WalletPreparationOutcome {
 struct WalletScanJob {
     started_at: Instant,
     receiver: mpsc::Receiver<Result<WalletScanOutcome, String>>,
+}
+
+#[derive(Debug)]
+struct FaucetJob {
+    started_at: Instant,
+    receiver: mpsc::Receiver<Result<FaucetSubmission, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +342,10 @@ impl DesktopApp {
             receive_label: String::new(),
             receive_amount: String::new(),
             receive_message: String::new(),
+            faucet_manual_address: String::new(),
+            faucet_amount: String::from("100"),
+            faucet_status: String::from("Request up to 100 testnet ATHO for testing."),
+            faucet_job: None,
             send_status: String::from("Enter a destination address and amount."),
             debug_console_status: String::from("Type help to see commands grouped by area."),
             send_job: None,
@@ -380,6 +396,8 @@ impl DesktopApp {
             compact_viewport: false,
             show_sync_status_dialog: false,
             sync_status_hidden_until_synced: false,
+            testnet_refresh_notice: None,
+            show_testnet_refresh_notice_dialog: false,
         };
 
         app.view_model.network_label = app.connection.network().id().to_string();
@@ -389,6 +407,7 @@ impl DesktopApp {
             String::from("Disconnected")
         };
         app.refresh_mining_accelerator_info();
+        app.poll_testnet_refresh_notice();
         app.try_open_existing_wallet_on_startup();
         app
     }
@@ -396,7 +415,9 @@ impl DesktopApp {
     pub fn refresh(&mut self) -> Result<(), QtError> {
         let status = self.connection.status();
         self.apply_connection_status(status);
+        self.poll_testnet_refresh_notice();
         self.poll_wallet_preparation_job();
+        self.poll_faucet_job();
         if self.wallet.is_some() {
             self.wallet_cache_dirty = true;
             self.refresh_wallet_cache_if_needed();
@@ -632,6 +653,10 @@ impl DesktopApp {
         self.receive_label.clear();
         self.receive_amount.clear();
         self.receive_message.clear();
+        self.faucet_manual_address.clear();
+        self.faucet_amount = String::from("100");
+        self.faucet_status = String::from("Request up to 100 testnet ATHO for testing.");
+        self.faucet_job = None;
         self.send_to.clear();
         self.send_label.clear();
         self.send_amount.clear();
@@ -1769,6 +1794,150 @@ impl DesktopApp {
             let elapsed = job.started_at.elapsed();
             self.send_status = format!("{} ({}s)", self.send_status, elapsed.as_secs());
         }
+    }
+
+    fn poll_faucet_job(&mut self) {
+        let Some(job) = self.faucet_job.take() else {
+            return;
+        };
+
+        match job.receiver.try_recv() {
+            Ok(Ok(submission)) => {
+                self.faucet_status = format!(
+                    "Faucet transaction sent to mempool: {}. Try again after block {}.",
+                    hex::encode(submission.txid),
+                    submission.next_eligible_height
+                );
+                self.last_error = None;
+                self.wallet_cache_dirty = true;
+            }
+            Ok(Err(err)) => {
+                self.faucet_status = format!("Faucet request failed: {err}");
+                self.last_error = Some(err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                let elapsed = job.started_at.elapsed();
+                self.faucet_status =
+                    format!("Preparing faucet transaction… ({}s)", elapsed.as_secs());
+                self.faucet_job = Some(job);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.faucet_status = String::from("Faucet request worker disconnected");
+                self.last_error = Some(String::from("faucet request worker disconnected"));
+                return;
+            }
+        }
+
+        let elapsed = job.started_at.elapsed();
+        self.faucet_status = format!("{} ({}s)", self.faucet_status, elapsed.as_secs());
+    }
+
+    fn poll_testnet_refresh_notice(&mut self) {
+        if self.active_network() != Network::Testnet || self.testnet_refresh_notice.is_some() {
+            return;
+        }
+        let notice_path = atho_storage::path::testnet_refresh_notice_path();
+        let Ok(notice) = fs::read_to_string(&notice_path) else {
+            return;
+        };
+        let trimmed = notice.trim();
+        if trimmed.is_empty() {
+            let _ = fs::remove_file(notice_path);
+            return;
+        }
+        self.testnet_refresh_notice = Some(trimmed.to_owned());
+        self.show_testnet_refresh_notice_dialog = true;
+        let _ = fs::remove_file(notice_path);
+    }
+
+    pub(crate) fn dismiss_testnet_refresh_notice(&mut self) {
+        self.show_testnet_refresh_notice_dialog = false;
+        self.testnet_refresh_notice = None;
+    }
+
+    pub(crate) fn testnet_faucet_visible(&self) -> bool {
+        self.active_network() == Network::Testnet
+    }
+
+    pub(crate) fn set_faucet_amount_preset(&mut self, atho: u64) {
+        self.faucet_amount = atho.to_string();
+    }
+
+    pub(crate) fn faucet_destination_address(&self) -> String {
+        let manual = self.faucet_manual_address.trim();
+        if !manual.is_empty() {
+            return manual.to_owned();
+        }
+        self.current_receive_address_text()
+    }
+
+    pub(crate) fn start_testnet_faucet_request(&mut self) -> Result<(), String> {
+        if !self.testnet_faucet_visible() {
+            return Err(String::from("Testnet faucet is only available on testnet"));
+        }
+        if self.faucet_job.is_some() {
+            return Err(String::from("A faucet request is already in progress"));
+        }
+        if !self.ui_state.connected || !self.view_model.running {
+            return Err(String::from(
+                "Cannot request faucet funds while the local node is disconnected or still starting",
+            ));
+        }
+
+        let destination_address = self.faucet_destination_address();
+        if destination_address.is_empty() {
+            return Err(String::from(
+                "Select or enter a testnet destination address",
+            ));
+        }
+        let amount_atoms = parse_amount_to_atoms(&self.faucet_amount, InputUnit::Atho)?;
+        if amount_atoms > 100_000_000_000_000 {
+            return Err(String::from("Faucet requests are limited to 100 ATHO"));
+        }
+        let requester_id = load_or_create_faucet_client_id()?;
+        let connection = self.connection.clone();
+        let rpc_address = self.connection.rpc_address().to_string();
+        let use_local_node = self.connection.has_local_node();
+        let (sender, receiver) = mpsc::channel();
+
+        self.faucet_status = String::from("Creating faucet request…");
+        self.last_error = None;
+        std::thread::spawn(move || {
+            let response = if use_local_node {
+                connection.request(RpcRequest::RequestTestnetFaucet {
+                    destination_address,
+                    amount_atoms,
+                    requester_id,
+                })
+            } else {
+                let client = RpcClient::new(rpc_address);
+                match client.call(&RpcRequest::RequestTestnetFaucet {
+                    destination_address,
+                    amount_atoms,
+                    requester_id,
+                }) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        let _ = sender.send(Err(err.to_string()));
+                        return;
+                    }
+                }
+            };
+
+            let outcome = match response {
+                RpcResponse::TestnetFaucetSubmitted(submission) => Ok(submission),
+                RpcResponse::Error(err) => Err(err.to_string()),
+                other => Err(format!("unexpected rpc response: {other:?}")),
+            };
+            let _ = sender.send(outcome);
+        });
+
+        self.faucet_job = Some(FaucetJob {
+            started_at: Instant::now(),
+            receiver,
+        });
+        Ok(())
     }
 
     fn start_mining_job(&mut self) {
@@ -3966,6 +4135,10 @@ fn recipient_address_book_path(network: Network) -> PathBuf {
         .join("recipient-address-book.json")
 }
 
+fn faucet_client_id_path() -> PathBuf {
+    atho_storage::path::sandbox_root().join("faucet-client-id.txt")
+}
+
 fn load_client_display_preferences(network: Network) -> ClientDisplayPreferences {
     let path = client_display_preferences_path(network);
     let Ok(bytes) = fs::read(path) else {
@@ -3980,6 +4153,25 @@ fn load_recipient_address_book(network: Network) -> Vec<RecipientAddressEntry> {
         return Vec::new();
     };
     serde_json::from_slice::<Vec<RecipientAddressEntry>>(&bytes).unwrap_or_default()
+}
+
+fn load_or_create_faucet_client_id() -> Result<String, String> {
+    let path = faucet_client_id_path();
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut entropy = [0u8; 32];
+    getrandom(&mut entropy).map_err(|err| err.to_string())?;
+    let client_id = hex::encode(sha3_256(&entropy));
+    fs::write(&path, &client_id).map_err(|err| err.to_string())?;
+    Ok(client_id)
 }
 
 fn recipient_address_entry_id(address: &str, created_at_unix: u64) -> String {
@@ -4583,7 +4775,7 @@ mod tests {
     fn witness_bytes(tx: &Transaction) -> Vec<u8> {
         let keypair = test_keypair();
         let txid = tx.txid();
-        let digest = transaction_signing_digest(tx);
+        let digest = transaction_signing_digest(Network::Regnet, tx);
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
@@ -4913,6 +5105,59 @@ mod tests {
             reloaded.recipient_address_book[0].address,
             recipient.address
         );
+    }
+
+    #[test]
+    fn testnet_faucet_visibility_tracks_active_network() {
+        assert!(!DesktopApp::new(Network::Mainnet).testnet_faucet_visible());
+        assert!(DesktopApp::new(Network::Testnet).testnet_faucet_visible());
+    }
+
+    #[test]
+    fn faucet_job_waiting_state_shows_elapsed_progress() {
+        let mut app = DesktopApp::new(Network::Testnet);
+        let (_sender, receiver) = mpsc::channel();
+        app.faucet_job = Some(FaucetJob {
+            started_at: Instant::now() - Duration::from_secs(3),
+            receiver,
+        });
+
+        app.poll_faucet_job();
+
+        assert!(app.faucet_job.is_some());
+        assert!(app.faucet_status.contains("Preparing faucet transaction"));
+        assert!(app.faucet_status.contains("(3s)") || app.faucet_status.contains("(4s)"));
+    }
+
+    #[test]
+    fn testnet_refresh_notice_is_loaded_and_cleared() {
+        let root = temp_sandbox_root("testnet-refresh-notice");
+        fs::create_dir_all(&root).expect("root");
+        let wallet_root = root.join("wallet");
+        fs::create_dir_all(&wallet_root).expect("wallet root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _wallet = EnvVarGuard::set_path(ATHO_WALLET_DIR_ENV, &wallet_root);
+
+        fs::write(
+            atho_storage::path::testnet_refresh_notice_path(),
+            "Testnet data was refreshed because this testnet version uses a new genesis or storage format.\n",
+        )
+        .expect("write notice");
+
+        let mut app = DesktopApp::new(Network::Testnet);
+        app.poll_testnet_refresh_notice();
+        assert!(app.show_testnet_refresh_notice_dialog);
+        assert_eq!(
+            app.testnet_refresh_notice.as_deref(),
+            Some(
+                "Testnet data was refreshed because this testnet version uses a new genesis or storage format."
+            )
+        );
+        assert!(!atho_storage::path::testnet_refresh_notice_path().exists());
+
+        app.dismiss_testnet_refresh_notice();
+        assert!(!app.show_testnet_refresh_notice_dialog);
+        assert!(app.testnet_refresh_notice.is_none());
     }
 
     #[test]

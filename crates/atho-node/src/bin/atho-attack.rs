@@ -65,7 +65,11 @@ fn run() -> Result<(), String> {
     }
 
     total += 1;
-    if tx_case("duplicate_input_rejects", network, tx_duplicate_input())? {
+    if tx_case(
+        "duplicate_input_rejects",
+        network,
+        tx_duplicate_input(network),
+    )? {
         passed += 1;
     }
 
@@ -424,7 +428,7 @@ fn tx_dust_like(network: Network) -> BuiltTransaction {
     }
 }
 
-fn tx_duplicate_input() -> BuiltTransaction {
+fn tx_duplicate_input(network: Network) -> BuiltTransaction {
     let keypair = attack_keypair();
     let mut tx = Transaction {
         version: 1,
@@ -452,7 +456,7 @@ fn tx_duplicate_input() -> BuiltTransaction {
     let signature = sign(
         AthoSignatureDomain::Transaction,
         &keypair.secret_key,
-        &transaction_signing_digest(&tx),
+        &transaction_signing_digest(network, &tx),
     )
     .expect("falcon signature");
     let signature_bytes = signature.0.clone();
@@ -535,7 +539,7 @@ fn make_spend_tx(
     let signature = sign(
         AthoSignatureDomain::Transaction,
         &keypair.secret_key,
-        &transaction_signing_digest(&tx),
+        &transaction_signing_digest(network, &tx),
     )
     .expect("falcon signature");
     let mut signature_bytes = signature.0.clone();

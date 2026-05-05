@@ -229,19 +229,23 @@ pub fn finalize_witness_commit_refs(tx: &Transaction, block_witness_root: [u8; 4
 /// CONSENSUS: This check validates the canonical Atho signing digest. If wallet
 /// signing and validator verification ever disagree on the digest bytes, spends
 /// will fail network-wide.
-pub fn verify_transaction_signature(tx: &Transaction) -> Result<(), ValidationError> {
+pub fn verify_transaction_signature(
+    tx: &Transaction,
+    network: Network,
+) -> Result<(), ValidationError> {
     if tx.is_coinbase() {
         return Err(ValidationError::NoInputs);
     }
     let witness = tx
         .witness_payload()
         .ok_or(ValidationError::InvalidWitness)?;
-    verify_witness_signer_groups(tx, &witness)?;
+    verify_witness_signer_groups(tx, network, &witness)?;
     Ok(())
 }
 
 fn verify_transaction_signature_prepared(
     tx: &Transaction,
+    network: Network,
     prepared: PreparedTransactionValidation,
 ) -> Result<(), ValidationError> {
     for signer_group in prepared.signer_groups {
@@ -257,9 +261,9 @@ fn verify_transaction_signature_prepared(
             .map(|input_ref| input_ref.input_index)
             .collect::<Vec<_>>();
         let signing_digest = if input_indexes.len() == tx.inputs.len() {
-            transaction_signing_digest(tx)
+            transaction_signing_digest(network, tx)
         } else {
-            transaction_signing_digest_for_input_indexes(tx, &input_indexes)
+            transaction_signing_digest_for_input_indexes(network, tx, &input_indexes)
         };
         let verified = falcon::verify(
             AthoSignatureDomain::Transaction,
@@ -291,6 +295,7 @@ fn witness_signer_groups(witness: &TxWitness) -> Vec<WitnessSignerGroup> {
 
 fn verify_witness_signer_groups(
     tx: &Transaction,
+    network: Network,
     witness: &TxWitness,
 ) -> Result<(), ValidationError> {
     for signer_group in witness_signer_groups(witness) {
@@ -306,9 +311,9 @@ fn verify_witness_signer_groups(
             .map(|input_ref| input_ref.input_index)
             .collect::<Vec<_>>();
         let signing_digest = if input_indexes.len() == tx.inputs.len() {
-            transaction_signing_digest(tx)
+            transaction_signing_digest(network, tx)
         } else {
-            transaction_signing_digest_for_input_indexes(tx, &input_indexes)
+            transaction_signing_digest_for_input_indexes(network, tx, &input_indexes)
         };
         let verified = falcon::verify(
             AthoSignatureDomain::Transaction,
@@ -536,7 +541,7 @@ pub fn validate_transaction_for_height_with_schedule(
     if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
-    verify_transaction_signature_prepared(tx, prepared)?;
+    verify_transaction_signature_prepared(tx, network, prepared)?;
     Ok(())
 }
 
@@ -726,7 +731,7 @@ where
     if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
         return Err(ValidationError::InvalidTransactionPowNonce);
     }
-    verify_transaction_signature_prepared(tx, prepared)?;
+    verify_transaction_signature_prepared(tx, network, prepared)?;
     Ok(actual_fee)
 }
 
@@ -858,17 +863,18 @@ fn validate_block_impl_with_schedule(
         }
     }
     if block.transactions.len() > 1 {
-        verify_transaction_signatures_parallel(&block.transactions[1..])?;
+        verify_transaction_signatures_parallel(network, &block.transactions[1..])?;
     }
     Ok(())
 }
 
 fn verify_transaction_signatures_parallel(
+    network: Network,
     transactions: &[Transaction],
 ) -> Result<(), ValidationError> {
     let results: Vec<Result<(), ValidationError>> = transactions
         .par_iter()
-        .map(verify_transaction_signature)
+        .map(|tx| verify_transaction_signature(tx, network))
         .collect();
     for result in results {
         result?;
@@ -1108,7 +1114,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(&tx),
+            &transaction_signing_digest(Network::Regnet, &tx),
         )
         .expect("signature");
         let signature_bytes = signature.0.clone();
@@ -1474,7 +1480,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(&tx),
+            &transaction_signing_digest(Network::Regnet, &tx),
         )
         .expect("signature");
         let signature_bytes = signature.0.clone();
@@ -1570,6 +1576,145 @@ mod tests {
     }
 
     #[test]
+    fn cross_network_signature_replay_is_rejected_even_with_valid_local_pow() {
+        let keypair = generate_from_seed(b"atho-validation-cross-network").expect("keypair");
+        let locking_script = public_key_digest(Network::Mainnet, &keypair.public_key.0).to_vec();
+        let utxo = UtxoEntry::new(
+            Network::Mainnet,
+            [0x61; 48],
+            0,
+            20_000,
+            locking_script.clone(),
+            10,
+            false,
+        );
+        let mut tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: utxo.txid,
+                output_index: utxo.output_index,
+                unlocking_script: locking_script,
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 19_000,
+                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(Network::Testnet, &tx),
+        )
+        .expect("signature");
+        let signature_bytes = signature.0.clone();
+        tx.witness = TxWitness {
+            signature: signature_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: vec![WitnessInputRef {
+                input_index: 0,
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
+                witness_commit_ref: [0; 16],
+            }],
+            additional_signers: vec![],
+        }
+        .canonical_bytes();
+        let fee_atoms = utxo
+            .value_atoms
+            .checked_sub(
+                tx.checked_output_value_atoms()
+                    .expect("test transaction output total"),
+            )
+            .expect("test fee atoms");
+        solve_transaction_pow(Network::Mainnet, &mut tx, fee_atoms);
+        let lookup = |txid: &[u8; 48], output_index: u32| {
+            if *txid == utxo.txid && output_index == utxo.output_index {
+                Some(utxo.clone())
+            } else {
+                None
+            }
+        };
+
+        assert_eq!(
+            validate_transaction_with_context(&tx, fee_atoms, Network::Mainnet, 20, lookup),
+            Err(ValidationError::InvalidWitness)
+        );
+    }
+
+    #[test]
+    fn mainnet_signed_transaction_is_rejected_on_testnet_even_with_valid_local_pow() {
+        let keypair =
+            generate_from_seed(b"atho-validation-cross-network-symmetric").expect("keypair");
+        let locking_script = public_key_digest(Network::Testnet, &keypair.public_key.0).to_vec();
+        let utxo = UtxoEntry::new(
+            Network::Testnet,
+            [0x62; 48],
+            0,
+            20_000,
+            locking_script.clone(),
+            10,
+            false,
+        );
+        let mut tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![TxInput {
+                previous_txid: utxo.txid,
+                output_index: utxo.output_index,
+                unlocking_script: locking_script,
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 19_000,
+                locking_script: vec![9; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &transaction_signing_digest(Network::Mainnet, &tx),
+        )
+        .expect("signature");
+        let signature_bytes = signature.0.clone();
+        tx.witness = TxWitness {
+            signature: signature_bytes.clone(),
+            pubkey: keypair.public_key.0.clone(),
+            input_refs: vec![WitnessInputRef {
+                input_index: 0,
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
+                witness_commit_ref: [0; 16],
+            }],
+            additional_signers: vec![],
+        }
+        .canonical_bytes();
+        let fee_atoms = utxo
+            .value_atoms
+            .checked_sub(
+                tx.checked_output_value_atoms()
+                    .expect("test transaction output total"),
+            )
+            .expect("test fee atoms");
+        solve_transaction_pow(Network::Testnet, &mut tx, fee_atoms);
+        let lookup = |txid: &[u8; 48], output_index: u32| {
+            if *txid == utxo.txid && output_index == utxo.output_index {
+                Some(utxo.clone())
+            } else {
+                None
+            }
+        };
+
+        assert_eq!(
+            validate_transaction_with_context(&tx, fee_atoms, Network::Testnet, 20, lookup),
+            Err(ValidationError::InvalidWitness)
+        );
+    }
+
+    #[test]
     fn output_total_overflow_is_rejected_during_context_validation() {
         let keypair = generate_from_seed(b"atho-validation-output-overflow").expect("keypair");
         let locking_script = public_key_digest(Network::Mainnet, &keypair.public_key.0).to_vec();
@@ -1607,7 +1752,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(&tx),
+            &transaction_signing_digest(Network::Mainnet, &tx),
         )
         .expect("signature");
         let signature_bytes = signature.0.clone();
@@ -1670,7 +1815,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &wrong.secret_key,
-            &transaction_signing_digest(&tx),
+            &transaction_signing_digest(Network::Regnet, &tx),
         )
         .expect("signature");
         let sig_bytes = signature.0.clone();
@@ -1789,7 +1934,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &funding_keypair.secret_key,
-            &transaction_signing_digest(&tx),
+            &transaction_signing_digest(Network::Mainnet, &tx),
         )
         .expect("signature");
         let signature_bytes = signature.0.clone();

@@ -28,5 +28,10 @@ pub enum RpcRequest {
     },
     GetMempoolInfo,
     GetMempoolSpentInputs,
+    RequestTestnetFaucet {
+        destination_address: String,
+        amount_atoms: u64,
+        requester_id: String,
+    },
     ExecuteCommand(CommandInvocation),
 }

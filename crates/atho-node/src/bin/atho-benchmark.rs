@@ -435,7 +435,7 @@ fn build_spend_transaction(
         .ok_or_else(|| String::from("fixture input value too small"))?;
     tx.witness.clear();
 
-    let digest = transaction_signing_digest(&tx);
+    let digest = transaction_signing_digest(network, &tx);
     let signature = sign(
         AthoSignatureDomain::Transaction,
         &keypair.secret_key,

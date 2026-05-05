@@ -301,7 +301,7 @@ fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u
     let signature = sign(
         atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
         &keypair.secret_key,
-        &transaction_signing_digest(&tx),
+        &transaction_signing_digest(Network::Mainnet, &tx),
     )
     .expect("falcon signature");
     let sig_bytes = signature.0.clone();
@@ -424,7 +424,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
     let signature = sign(
         atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
         &keypair.secret_key,
-        &transaction_signing_digest(&tx),
+        &transaction_signing_digest(Network::Mainnet, &tx),
     )
     .expect("falcon signature");
     let sig_bytes = signature.0.clone();

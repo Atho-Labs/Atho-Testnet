@@ -1,7 +1,7 @@
 //! In-memory chainstate helpers layered on top of persisted storage.
 use crate::db::{
-    BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, PeerHealthRecord,
-    PeerRecord,
+    BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, FaucetRequestRecord,
+    PeerHealthRecord, PeerRecord,
 };
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
@@ -107,11 +107,19 @@ impl Chainstate {
     }
 
     pub fn load_or_new(network: Network) -> Self {
-        Self::try_load_or_recover(network)
+        let loader = if network == Network::Testnet {
+            Self::try_load_or_recover(network)
+        } else {
+            Self::try_load_or_new(network)
+        };
+        loader
             .unwrap_or_else(|err| panic!("failed to load chainstate for {}: {}", network.id(), err))
     }
 
     pub fn try_load_or_recover(network: Network) -> Result<Self, StorageError> {
+        if network != Network::Testnet {
+            return Self::try_load_or_new(network);
+        }
         match Self::try_load_or_new(network) {
             Ok(chainstate) => Ok(chainstate),
             Err(err) if err.is_recoverable_local_state() => {
@@ -152,7 +160,13 @@ impl Chainstate {
     }
 
     pub fn next_difficulty_target(&self) -> [u8; 48] {
-        pow::target_for_next_block(self.network, &self.blocks)
+        let next_timestamp = pow::minimum_next_block_timestamp(&self.blocks)
+            .unwrap_or_else(|| genesis::genesis_state(self.network).block.header.timestamp);
+        self.next_difficulty_target_for_timestamp(next_timestamp)
+    }
+
+    pub fn next_difficulty_target_for_timestamp(&self, next_timestamp: u64) -> [u8; 48] {
+        pow::target_for_next_block_with_timestamp(self.network, &self.blocks, next_timestamp)
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
@@ -162,7 +176,7 @@ impl Chainstate {
             self.height.saturating_add(1),
             self.network,
             self.tip_hash,
-            self.next_difficulty_target(),
+            self.next_difficulty_target_for_timestamp(block.header.timestamp),
             &self.blocks,
             working_utxos,
         )?;
@@ -438,6 +452,24 @@ impl Chainstate {
             return Ok(());
         };
         storage.upsert_peer(record)
+    }
+
+    pub fn load_faucet_request(
+        &self,
+        requester_id: &str,
+        destination_address: &str,
+    ) -> Result<Option<FaucetRequestRecord>, StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_faucet_request(self.network, requester_id, destination_address)
+    }
+
+    pub fn save_faucet_request(&self, record: &FaucetRequestRecord) -> Result<(), StorageError> {
+        let Some(storage) = &self.storage else {
+            return Ok(());
+        };
+        storage.upsert_faucet_request(record)
     }
 
     pub fn canonical_blocks(&self) -> Result<Vec<Block>, StorageError> {
@@ -793,10 +825,20 @@ fn quarantine_persisted_state(
     network: Network,
     source_error: &StorageError,
 ) -> Result<(), StorageError> {
+    if network != Network::Testnet {
+        return Err(StorageError::StorageMetadataMismatch {
+            field: "automatic recovery disabled for non-testnet storage",
+        });
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let prior_metadata = Database::inspect_storage_metadata(network).ok().flatten();
+    let genesis_suffix = prior_metadata
+        .as_ref()
+        .map(|metadata| hex::encode(metadata.genesis_hash))
+        .unwrap_or_else(|| String::from("unknown"));
     let label = match source_error {
         StorageError::CorruptData => "corrupt-data",
         StorageError::PersistedGenesisMismatch => "genesis-mismatch",
@@ -804,11 +846,11 @@ fn quarantine_persisted_state(
         StorageError::IncompleteBlockHistory => "incomplete-history",
         StorageError::LegacyStorageLayout => "legacy-layout",
         StorageError::SchemaVersionMismatch { .. } => "schema-mismatch",
+        StorageError::StorageMetadataMismatch { .. } => "metadata-mismatch",
         _ => "recovery",
     };
-    let quarantine_root = crate::path::quarantine_dir()
-        .join(network.id())
-        .join(format!("{timestamp}-{label}"));
+    let quarantine_root = crate::path::testnet_storage_backup_root()
+        .join(format!("old_storage_{timestamp}_{genesis_suffix}_{label}"));
     fs::create_dir_all(&quarantine_root)?;
 
     move_if_exists(
@@ -850,6 +892,23 @@ fn quarantine_persisted_state(
     writeln!(report, "network={}", network.id())?;
     writeln!(report, "error={source_error}")?;
     writeln!(report, "timestamp={timestamp}")?;
+    if let Some(metadata) = prior_metadata {
+        writeln!(report, "prior_network_name={}", metadata.network_name)?;
+        writeln!(
+            report,
+            "prior_network_magic={}",
+            hex::encode(metadata.network_magic)
+        )?;
+        writeln!(
+            report,
+            "prior_genesis_hash={}",
+            hex::encode(metadata.genesis_hash)
+        )?;
+    }
+    fs::write(
+        crate::path::testnet_refresh_notice_path(),
+        "Testnet data was refreshed because this testnet version uses a new genesis or storage format.\n",
+    )?;
     Ok(())
 }
 
@@ -1142,6 +1201,34 @@ mod tests {
         txn.commit().expect("commit fixture");
     }
 
+    fn mutate_storage_metadata(
+        network: Network,
+        mutate: impl FnOnce(&mut crate::db::StorageMetadata),
+    ) {
+        let database = Database::open(network).expect("database");
+        let db_path = crate::path::database_dir(network);
+        let mut metadata = database
+            .load_storage_metadata()
+            .expect("load metadata")
+            .expect("metadata present");
+        drop(database);
+
+        mutate(&mut metadata);
+
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(128)
+            .set_max_dbs(10)
+            .set_map_size(1 << 30);
+        let env = builder.open(&db_path).expect("open env");
+        let meta = env.open_db(Some("meta")).expect("meta db");
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let value = bincode::serialize(&metadata).expect("serialize metadata");
+        txn.put(meta, b"storage_metadata", &value, WriteFlags::empty())
+            .expect("put metadata");
+        txn.commit().expect("commit metadata");
+    }
+
     #[test]
     fn chainstate_tracks_tip_and_height() {
         let mut state = Chainstate::new(Network::Mainnet);
@@ -1422,12 +1509,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_history_is_quarantined_and_rebuilt() {
+    fn incomplete_history_is_quarantined_and_rebuilt_for_testnet() {
         let root = temp_workspace("recover");
         fs::create_dir_all(&root).expect("root");
         let _guard = CurrentDirGuard::switch_to(&root);
         inject_snapshot_fixture(
-            Network::Mainnet,
+            Network::Testnet,
             &ChainstateSnapshot {
                 height: 1,
                 tip_hash: [9; 48],
@@ -1436,46 +1523,48 @@ mod tests {
             &[],
         );
 
-        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
         assert_eq!(recovered.height, 0);
         assert_eq!(recovered.blocks().len(), 1);
-        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
 
-        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
-        let mut entries = fs::read_dir(quarantine_root)
-            .expect("quarantine dir")
+        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+            .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
         let report = entries
             .pop()
-            .expect("quarantine entry")
+            .expect("backup entry")
             .path()
             .join("RECOVERY.txt");
         let report_text = fs::read_to_string(report).expect("report");
         assert!(report_text.contains("error=persisted block history is incomplete"));
 
-        let reloaded = Database::open(Network::Mainnet).expect("database reloaded");
+        let reloaded = Database::open(Network::Testnet).expect("database reloaded");
         let snapshot = reloaded
             .load_chainstate_snapshot()
             .expect("load snapshot")
             .expect("snapshot present");
         assert_eq!(snapshot.height, 0);
-        assert_eq!(snapshot.tip_hash, genesis::genesis_hash(Network::Mainnet));
+        assert_eq!(snapshot.tip_hash, genesis::genesis_hash(Network::Testnet));
+        let notice =
+            fs::read_to_string(crate::path::testnet_refresh_notice_path()).expect("refresh notice");
+        assert!(notice.contains("Testnet data was refreshed"));
     }
 
     #[test]
-    fn truncated_raw_block_archive_rebuilds_from_index_on_startup() {
+    fn truncated_raw_block_archive_rebuilds_from_index_on_testnet_startup() {
         let root = temp_workspace("truncated-raw-archive");
         fs::create_dir_all(&root).expect("root");
         let _guard = CurrentDirGuard::switch_to(&root);
-        let mut state = Chainstate::try_load_or_new(Network::Regnet).expect("state");
+        let mut state = Chainstate::try_load_or_new(Network::Testnet).expect("state");
         let block = build_coinbase_successor(&state);
         let tip_hash = block.header.block_hash();
         state.connect_block(&block).expect("connect block");
         drop(state);
 
-        let store = BlockFileStore::open(Network::Regnet).expect("store");
+        let store = BlockFileStore::open(Network::Testnet).expect("store");
         let raw_file = store.file_path(0);
         let original_len = fs::metadata(&raw_file).expect("raw metadata").len();
         fs::OpenOptions::new()
@@ -1485,15 +1574,15 @@ mod tests {
             .set_len(original_len.saturating_sub(1))
             .expect("truncate raw file");
 
-        let recovered = Chainstate::try_load_or_recover(Network::Regnet).expect("recovered");
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
         assert_eq!(recovered.height, 1);
         assert_eq!(recovered.tip_hash, tip_hash);
         assert_eq!(recovered.blocks().len(), 2);
-        assert!(!crate::path::quarantine_dir().exists());
+        assert!(!crate::path::testnet_storage_backup_root().exists());
     }
 
     #[test]
-    fn legacy_chain_logs_are_quarantined_during_recovery() {
+    fn legacy_chain_logs_are_quarantined_during_testnet_recovery() {
         let root = temp_workspace("legacy-recover");
         fs::create_dir_all(root.join("dev/chain")).expect("chain dir");
         let _guard = CurrentDirGuard::switch_to(&root);
@@ -1504,15 +1593,14 @@ mod tests {
         )
         .expect("blocks");
 
-        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
         assert_eq!(recovered.height, 0);
         assert_eq!(recovered.blocks().len(), 1);
-        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
         assert!(!root.join("dev/chain/blocks.tsv").exists());
 
-        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
-        let mut entries = fs::read_dir(quarantine_root)
-            .expect("quarantine dir")
+        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+            .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
@@ -1521,29 +1609,71 @@ mod tests {
     }
 
     #[test]
-    fn legacy_multi_environment_storage_is_quarantined_during_recovery() {
+    fn legacy_multi_environment_storage_is_quarantined_during_testnet_recovery() {
         let root = temp_workspace("legacy-db-recover");
-        fs::create_dir_all(root.join("dev/db/mainnet/meta")).expect("legacy meta dir");
-        fs::create_dir_all(root.join("dev/db/mainnet/blocks")).expect("legacy blocks dir");
+        fs::create_dir_all(root.join("dev/db/testnet/meta")).expect("legacy meta dir");
+        fs::create_dir_all(root.join("dev/db/testnet/blocks")).expect("legacy blocks dir");
         let _guard = CurrentDirGuard::switch_to(&root);
 
-        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
         assert_eq!(recovered.height, 0);
         assert_eq!(recovered.blocks().len(), 1);
-        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
-        assert!(root.join("dev/db/mainnet/data.mdb").exists());
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
+        assert!(root.join("dev/db/testnet/data.mdb").exists());
 
-        let quarantine_root = crate::path::quarantine_dir().join(Network::Mainnet.id());
-        let mut entries = fs::read_dir(quarantine_root)
-            .expect("quarantine dir")
+        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+            .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
         let quarantined = entries.pop().expect("entry").path();
-        assert!(quarantined.join("db/atho-mainnet/meta").exists());
+        assert!(quarantined.join("db/atho-testnet/meta").exists());
         let report_text =
             fs::read_to_string(quarantined.join("RECOVERY.txt")).expect("recovery report");
         assert!(report_text.contains("legacy multi-environment storage layout detected"));
+    }
+
+    #[test]
+    fn testnet_storage_metadata_mismatch_self_heals_and_rebuilds() {
+        let root = temp_workspace("testnet-metadata-heal");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let _ = Chainstate::try_load_or_new(Network::Testnet).expect("initial state");
+        mutate_storage_metadata(Network::Testnet, |metadata| {
+            metadata.genesis_block_id = [0x42; 48];
+        });
+
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
+
+        let mut backups = fs::read_dir(crate::path::testnet_storage_backup_root())
+            .expect("backup root")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let report = backups.pop().expect("backup").path().join("RECOVERY.txt");
+        let report_text = fs::read_to_string(report).expect("report");
+        assert!(report_text.contains("error="));
+        assert!(report_text.contains("prior_genesis_hash="));
+    }
+
+    #[test]
+    fn mainnet_storage_metadata_mismatch_fails_closed_without_self_heal() {
+        let root = temp_workspace("mainnet-metadata-fail-closed");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let _ = Chainstate::try_load_or_new(Network::Mainnet).expect("initial state");
+        mutate_storage_metadata(Network::Mainnet, |metadata| {
+            metadata.genesis_block_id = [0x24; 48];
+        });
+
+        let err = Chainstate::try_load_or_recover(Network::Mainnet).unwrap_err();
+        assert!(matches!(err, StorageError::StorageMetadataMismatch { .. }));
+        assert!(!crate::path::testnet_storage_backup_root().exists());
+        assert!(crate::path::database_dir(Network::Mainnet).exists());
     }
 
     #[test]

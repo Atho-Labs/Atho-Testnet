@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum NodeSyncError {
@@ -779,11 +780,19 @@ impl NodeSync {
     }
 
     fn buffer_peer_block(&mut self, peer: &str, block: Block) {
-        self.branch_buffers
-            .entry(peer.to_string())
-            .or_default()
-            .blocks
-            .insert(block.header.block_hash(), block);
+        let buffer = self.branch_buffers.entry(peer.to_string()).or_default();
+        buffer.blocks.insert(block.header.block_hash(), block);
+        while buffer.blocks.len() > MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER {
+            let Some(evict_hash) = buffer
+                .blocks
+                .iter()
+                .min_by_key(|(hash, block)| (block.header.height, **hash))
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+            buffer.blocks.remove(&evict_hash);
+        }
     }
 
     fn remove_buffered_block(&mut self, peer: &str, block_hash: &[u8; 48]) {
@@ -1354,7 +1363,7 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(tx),
+            &transaction_signing_digest(Network::Regnet, tx),
         )
         .expect("falcon signature")
         .0;
@@ -2707,6 +2716,27 @@ mod tests {
                 .map(|buffer| buffer.blocks.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn buffered_orphan_pool_is_bounded_per_peer() {
+        let mut sync = NodeSync::new(Network::Regnet);
+        for height in 1..=(MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER as u64 + 8) {
+            sync.buffer_peer_block(
+                "peer",
+                coinbase_block(
+                    Network::Regnet,
+                    height,
+                    [height as u8; 48],
+                    pow::initial_target_for_network(Network::Regnet),
+                    1_000 + height,
+                ),
+            );
+        }
+
+        let buffer = sync.branch_buffers.get("peer").expect("peer buffer");
+        assert_eq!(buffer.blocks.len(), MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER);
+        assert!(buffer.blocks.values().all(|block| block.header.height >= 9));
     }
 
     #[test]

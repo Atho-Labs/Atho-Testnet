@@ -382,12 +382,12 @@ mod tests {
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
 
-    fn witness_bytes_for_tx(tx: &Transaction) -> Vec<u8> {
+    fn witness_bytes_for_tx(network: Network, tx: &Transaction) -> Vec<u8> {
         let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(tx),
+            &transaction_signing_digest(network, tx),
         )
         .expect("falcon signature")
         .0;
@@ -459,7 +459,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -493,7 +493,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -529,7 +529,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Regnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -565,7 +565,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Regnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -601,7 +601,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let mut low = Transaction {
-            witness: witness_bytes_for_tx(&low),
+            witness: witness_bytes_for_tx(Network::Mainnet, &low),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..low
@@ -623,7 +623,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let mut high = Transaction {
-            witness: witness_bytes_for_tx(&high),
+            witness: witness_bytes_for_tx(Network::Mainnet, &high),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..high
@@ -697,7 +697,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(&tx),
+            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -733,7 +733,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let mut valid = Transaction {
-            witness: witness_bytes_for_tx(&valid),
+            witness: witness_bytes_for_tx(Network::Mainnet, &valid),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..valid
@@ -755,7 +755,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let invalid = Transaction {
-            witness: witness_bytes_for_tx(&invalid),
+            witness: witness_bytes_for_tx(Network::Mainnet, &invalid),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..invalid

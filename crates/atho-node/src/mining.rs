@@ -46,7 +46,7 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let (reward_address, reward_script) = reward_target_for_height(node.network(), height);
     let previous_block_hash = node.tip_hash();
     let timestamp = candidate_block_timestamp(node.blocks());
-    let difficulty_target_or_bits = node.difficulty_target_for_next_block();
+    let difficulty_target_or_bits = node.difficulty_target_for_next_block_at(timestamp);
     let header_template = BlockHeader {
         version: active_rules.block_version,
         network_id: node.network(),

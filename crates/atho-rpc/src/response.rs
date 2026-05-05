@@ -112,6 +112,14 @@ pub struct NodeStatus {
     pub network_diagnostics: NetworkDiagnostics,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaucetSubmission {
+    #[serde(with = "serde_big_array::BigArray")]
+    pub txid: [u8; 48],
+    pub accepted_height: u64,
+    pub next_eligible_height: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RpcResponse {
     BlockCount(u64),
@@ -128,6 +136,7 @@ pub enum RpcResponse {
     WalletActivity(Vec<WalletActivityEntry>),
     MempoolInfo(MempoolInfo),
     MempoolSpentInputs(Vec<MempoolSpentInput>),
+    TestnetFaucetSubmitted(FaucetSubmission),
     Command(CommandResponse),
     Error(RpcError),
 }

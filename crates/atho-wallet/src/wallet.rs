@@ -766,7 +766,8 @@ impl Wallet {
                 .iter()
                 .map(|(input_index, _)| *input_index)
                 .collect::<Vec<_>>();
-            let digest = transaction_signing_digest_for_input_indexes(&tx, &input_indexes);
+            let digest =
+                transaction_signing_digest_for_input_indexes(self.network, &tx, &input_indexes);
             let signature = sign(
                 AthoSignatureDomain::Transaction,
                 &keypair.secret_key,

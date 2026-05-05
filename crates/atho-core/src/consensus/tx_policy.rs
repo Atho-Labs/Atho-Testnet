@@ -323,6 +323,20 @@ mod tests {
     }
 
     #[test]
+    fn transaction_pow_preimage_is_network_scoped() {
+        let tx = sample_tx(2, 2_000);
+
+        assert_ne!(
+            transaction_pow_preimage(Network::Mainnet, &tx),
+            transaction_pow_preimage(Network::Testnet, &tx)
+        );
+        assert_ne!(
+            transaction_pow_preimage(Network::Mainnet, &tx),
+            transaction_pow_preimage(Network::Regnet, &tx)
+        );
+    }
+
+    #[test]
     fn block_specific_witness_refs_do_not_invalidate_transaction_pow() {
         let mut tx = sample_tx(2, 2_000);
         tx.witness = TxWitness {

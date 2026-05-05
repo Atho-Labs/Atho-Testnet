@@ -37,6 +37,8 @@ pub enum StorageError {
     LegacyStorageLayout,
     #[error("storage schema version mismatch: expected {expected}, found {found}")]
     SchemaVersionMismatch { expected: u32, found: u32 },
+    #[error("storage metadata mismatch: {field}")]
+    StorageMetadataMismatch { field: &'static str },
     #[error("no block to disconnect")]
     NoBlockToDisconnect,
     #[error("branch has no blocks")]
@@ -61,6 +63,7 @@ impl StorageError {
                 | StorageError::IncompleteBlockHistory
                 | StorageError::LegacyStorageLayout
                 | StorageError::SchemaVersionMismatch { .. }
+                | StorageError::StorageMetadataMismatch { .. }
         ) || matches!(
             self,
             StorageError::Io(error)
@@ -85,6 +88,7 @@ impl AthoErrorMeta for StorageError {
             Self::CrossNetworkReplay => &DB_CROSS_NETWORK_REPLAY,
             Self::LegacyStorageLayout => &DB_LEGACY_STORAGE_LAYOUT,
             Self::SchemaVersionMismatch { .. } => &DB_SCHEMA_VERSION_MISMATCH,
+            Self::StorageMetadataMismatch { .. } => &DB_CORRUPT_DATA,
             Self::NoBlockToDisconnect => &DB_NO_BLOCK_TO_DISCONNECT,
             Self::EmptyBranch => &DB_EMPTY_BRANCH,
             Self::ForkPointUnavailable => &DB_FORK_POINT_UNAVAILABLE,
@@ -102,6 +106,9 @@ impl AthoErrorMeta for StorageError {
         match self {
             Self::SchemaVersionMismatch { expected, found } => {
                 Some(format!("expected schema version {expected}, found {found}"))
+            }
+            Self::StorageMetadataMismatch { field } => {
+                Some(format!("storage metadata field mismatch: {field}"))
             }
             Self::Io(error) => Some(error.to_string()),
             Self::Lmdb(error) => Some(error.to_string()),

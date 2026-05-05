@@ -1151,7 +1151,7 @@ mod tests {
     use std::ffi::OsString;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1311,6 +1311,16 @@ mod tests {
 
     #[test]
     fn tcp_runtime_shared_service_keeps_status_and_tip_in_lockstep() {
+        let root = std::env::temp_dir().join(format!(
+            "atho-tcp-shared-service-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let service = Arc::new(Mutex::new(NodeService::new(NodeConfig::new(
             Network::Regnet,
         ))));

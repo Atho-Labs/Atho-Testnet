@@ -1,5 +1,7 @@
 use crate::block::Block;
 use crate::crypto::hash::sha3_384;
+use crate::genesis::genesis_hash;
+use crate::network::Network;
 use crate::transaction::Transaction;
 
 pub const ATHO_SIGNATURE_RULES_VERSION: u32 = 1;
@@ -39,17 +41,28 @@ impl AthoSignatureDomain {
 /// - canonical source: `Transaction::base_bytes()` plus the covered input set
 /// - hash function: `SHA3-384`
 /// - output size: 48 bytes
-pub fn transaction_signing_digest(tx: &Transaction) -> [u8; 48] {
-    tx.signing_digest()
+pub fn transaction_signing_digest(network: Network, tx: &Transaction) -> [u8; 48] {
+    let mut preimage = Vec::with_capacity(ATHO_TX_SIGN_V1.len() + 1 + 48 + 48);
+    preimage.extend_from_slice(ATHO_TX_SIGN_V1.as_bytes());
+    preimage.push(network.consensus_id());
+    preimage.extend_from_slice(&genesis_hash(network));
+    preimage.extend_from_slice(&tx.signing_digest());
+    sha3_384(&preimage)
 }
 
 /// Canonical grouped-signer prehash used when one transaction spends multiple
 /// wallet address groups.
 pub fn transaction_signing_digest_for_input_indexes(
+    network: Network,
     tx: &Transaction,
     input_indexes: &[u32],
 ) -> [u8; 48] {
-    tx.signing_digest_for_input_indexes(input_indexes)
+    let mut preimage = Vec::with_capacity(ATHO_TX_SIGN_V1.len() + 1 + 48 + 48);
+    preimage.extend_from_slice(ATHO_TX_SIGN_V1.as_bytes());
+    preimage.push(network.consensus_id());
+    preimage.extend_from_slice(&genesis_hash(network));
+    preimage.extend_from_slice(&tx.signing_digest_for_input_indexes(input_indexes));
+    sha3_384(&preimage)
 }
 
 /// Canonical block prehash reserved for Atho block-signature use.
@@ -103,7 +116,39 @@ mod tests {
             tx_pow_bits: 0,
         };
 
-        assert_eq!(transaction_signing_digest(&tx), tx.signing_digest());
+        assert_ne!(
+            transaction_signing_digest(Network::Mainnet, &tx),
+            tx.signing_digest()
+        );
         assert_eq!(Network::Mainnet.consensus_id(), 1);
+    }
+
+    #[test]
+    fn transaction_prehash_is_network_scoped() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [9; 48],
+                output_index: 2,
+                unlocking_script: vec![7; 32],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![8; 32],
+            }],
+            lock_time: 11,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+
+        assert_ne!(
+            transaction_signing_digest(Network::Mainnet, &tx),
+            transaction_signing_digest(Network::Testnet, &tx)
+        );
+        assert_ne!(
+            transaction_signing_digest_for_input_indexes(Network::Mainnet, &tx, &[0]),
+            transaction_signing_digest_for_input_indexes(Network::Testnet, &tx, &[0])
+        );
     }
 }

@@ -295,7 +295,9 @@ impl ReadOnlyNodeConnection {
             ConnectionBackend::Local(system) => {
                 let mut system = system.lock().expect("local node mutex poisoned");
                 let requires_mutable = match &request {
-                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => true,
+                    RpcRequest::SubmitBlock(_)
+                    | RpcRequest::SubmitTransaction { .. }
+                    | RpcRequest::RequestTestnetFaucet { .. } => true,
                     RpcRequest::ExecuteCommand(invocation) => {
                         command_requires_mutable_access(&invocation.name)
                     }
@@ -2067,8 +2069,8 @@ mod tests {
         let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_path(ATHO_QT_LOCAL_ENV, std::path::Path::new("1"));
 
-        let db = Database::open(Network::Mainnet).expect("database");
-        let db_path = database_dir(Network::Mainnet);
+        let db = Database::open(Network::Testnet).expect("database");
+        let db_path = database_dir(Network::Testnet);
         drop(db);
 
         let mut builder = Environment::new();
@@ -2089,7 +2091,7 @@ mod tests {
             .expect("put snapshot");
         txn.commit().expect("commit fixture");
 
-        let conn = ReadOnlyNodeConnection::new(Network::Mainnet);
+        let conn = ReadOnlyNodeConnection::new(Network::Testnet);
         let status = conn.status();
         assert!(status.connected);
         assert!(status.running);

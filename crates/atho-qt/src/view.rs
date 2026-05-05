@@ -96,6 +96,7 @@ impl ViewModel {
             | RpcResponse::BlockSubmitted { .. }
             | RpcResponse::Command(_)
             | RpcResponse::TransactionSubmitted(_)
+            | RpcResponse::TestnetFaucetSubmitted(_)
             | RpcResponse::Utxos(_)
             | RpcResponse::WalletActivity(_)
             | RpcResponse::MempoolInfo(_)

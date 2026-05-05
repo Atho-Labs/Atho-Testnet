@@ -44,6 +44,14 @@ pub fn quarantine_dir() -> PathBuf {
     sandbox_root().join("quarantine")
 }
 
+pub fn testnet_storage_backup_root() -> PathBuf {
+    sandbox_root().join("testnet_storage_backups")
+}
+
+pub fn testnet_refresh_notice_path() -> PathBuf {
+    sandbox_root().join("testnet-refresh-notice.txt")
+}
+
 pub fn wallet_root() -> PathBuf {
     if let Some(path) = std::env::var_os(ATHO_WALLET_DIR_ENV) {
         return PathBuf::from(path);

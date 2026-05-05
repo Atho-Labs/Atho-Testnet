@@ -283,6 +283,7 @@ pub fn verify(
 mod tests {
     use super::*;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput};
 
     #[derive(Clone, Copy)]
@@ -358,7 +359,7 @@ mod tests {
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
         };
-        let digest = transaction_signing_digest(&tx);
+        let digest = transaction_signing_digest(Network::Mainnet, &tx);
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
