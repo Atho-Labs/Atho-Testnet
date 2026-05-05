@@ -24,7 +24,8 @@ These are the primary beginner and operator entry points:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
+python runregnet.py
 ```
 
 They:
@@ -40,6 +41,8 @@ Any extra flags are forwarded to `atho-qt`, so advanced operators can still do t
 ```bash
 python runmainnet.py --peer HOST:PORT
 python runmainnet.py --data-dir /absolute/path
+python runtestnet.py --data-dir /absolute/path
+python runregnet.py --data-dir /absolute/path
 ```
 
 They are orchestration only. After startup, the Python wrapper replaces itself with the Rust desktop client and does not stay in the hot path.
@@ -50,7 +53,8 @@ The shortest useful commands are:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
+python runregnet.py
 ./target/release/athod --network regnet
 ./target/release/atho-mine --network regnet
 ./target/release/atho-cli --network regnet getblockchaininfo
@@ -198,7 +202,7 @@ Preferred production-style local commands:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
 ```
 
 Attach to an existing node:

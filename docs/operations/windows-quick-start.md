@@ -27,7 +27,7 @@ Main entry commands:
 
 ```powershell
 py -3 .\runmainnet.py
-py -3 .\runtest.py
+py -3 .\runtestnet.py
 ```
 
 The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.

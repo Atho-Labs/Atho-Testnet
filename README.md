@@ -70,7 +70,7 @@ For normal use, start Atho with one of these top-level launchers:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
 ```
 
 They:
@@ -107,7 +107,7 @@ python runmainnet.py
 For testnet:
 
 ```bash
-python runtest.py
+python runtestnet.py
 ```
 
 For repeated local launches after the first build, run the binary directly:

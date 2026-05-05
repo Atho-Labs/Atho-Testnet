@@ -80,8 +80,13 @@ def default_runtime_root() -> Path:
 
 def parse_launcher_args(network: str, argv: Sequence[str] | None = None) -> LauncherConfig:
     repo_root = Path(__file__).resolve().parent
+    wrapper_name = {
+        "mainnet": "runmainnet.py",
+        "testnet": "runtestnet.py",
+        "regnet": "runregnet.py",
+    }.get(network, f"run{network}.py")
     parser = argparse.ArgumentParser(
-        prog=f"run{network}.py",
+        prog=wrapper_name,
         description=f"Build if needed and launch Atho {network} with the desktop client and managed local node.",
     )
     parser.add_argument(

@@ -97,6 +97,14 @@ class RuntimeLauncherTests(unittest.TestCase):
         self.assertEqual(config.runtime_root, Path("/tmp/atho"))
         self.assertEqual(config.forwarded_args, ("--peer", "1.2.3.4:56000"))
 
+    def test_parse_launcher_args_supports_regnet_wrapper_name(self) -> None:
+        config = runtime_launcher.parse_launcher_args(
+            "regnet",
+            ["--data-dir", "/tmp/atho-regnet"],
+        )
+        self.assertEqual(config.network, "regnet")
+        self.assertEqual(config.runtime_root, Path("/tmp/atho-regnet"))
+
 
 if __name__ == "__main__":
     unittest.main()

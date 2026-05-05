@@ -44,7 +44,7 @@ The intended top-level user commands are:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
 ```
 
 They:
@@ -58,10 +58,10 @@ Extra flags can still be passed through when needed:
 
 ```bash
 python runmainnet.py --peer HOST:PORT
-python runtest.py --data-dir /absolute/path
+python runtestnet.py --data-dir /absolute/path
 ```
 
-If your shell exposes Python as `python3` instead of `python`, use `python3 runmainnet.py` or `python3 runtest.py`.
+If your shell exposes Python as `python3` instead of `python`, use `python3 runmainnet.py` or `python3 runtestnet.py`.
 
 Built binaries still live in `target/release/`, and the launchers reuse them when they are already current.
 
@@ -93,13 +93,13 @@ py -3 .\runmainnet.py
 For testnet:
 
 ```bash
-python runtest.py
+python runtestnet.py
 ```
 
 or on Windows:
 
 ```powershell
-py -3 .\runtest.py
+py -3 .\runtestnet.py
 ```
 
 The launchers end by executing `atho-qt --local-node`, so the client still uses the real Rust node path.
@@ -164,7 +164,7 @@ python runmainnet.py
 Testnet:
 
 ```bash
-python runtest.py
+python runtestnet.py
 ./target/release/athod --network testnet
 ./target/release/atho-qt --network testnet --local-node
 ./target/release/atho-mine --network testnet
@@ -220,7 +220,7 @@ The launchers honor the same environment variable.
 ## 11. Key Commands
 
 - `python runmainnet.py`
-- `python runtest.py`
+- `python runtestnet.py`
 - `athod --network <mainnet|testnet|regnet|prunetest>`
 - `atho-qt --network <mainnet|testnet|regnet|prunetest> --local-node`
 - `atho-mine --network <mainnet|testnet|regnet|prunetest>`

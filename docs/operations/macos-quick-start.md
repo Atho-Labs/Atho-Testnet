@@ -33,7 +33,7 @@ Main entry commands:
 
 ```bash
 python runmainnet.py
-python runtest.py
+python runtestnet.py
 ```
 
 The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.
