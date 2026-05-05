@@ -49,10 +49,17 @@ python runtestnet.py
 
 They:
 
-- build `athod` and `atho-qt` automatically if they are missing
+- try a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first if they are missing
 - rebuild them if the source tree is newer than the release binaries
 - prepare the runtime root
 - launch the desktop client in managed-local-node mode
+
+If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
+GPU-native builds typically need:
+
+- macOS: Xcode Command Line Tools
+- Linux: a C/C++ compiler plus OpenCL headers/runtime
+- Windows: Visual Studio Build Tools with C++ support plus the vendor OpenCL runtime
 
 Extra flags can still be passed through when needed:
 
@@ -65,7 +72,7 @@ If your shell exposes Python as `python3` instead of `python`, use `python3 runm
 
 Built binaries still live in `target/release/`, and the launchers reuse them when they are already current.
 
-If you want GPU mining, build the relevant binary with the native feature enabled:
+The wrappers already build with the native GPU feature enabled. If you want to build the binaries manually instead:
 
 ```bash
 cargo build --release -p atho-node --bin atho-mine --features gpu-native

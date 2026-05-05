@@ -30,11 +30,18 @@ python runregnet.py
 
 They:
 
-- build release binaries when missing or stale
+- try a GPU-enabled release build first when binaries are missing or stale
 - reuse current release binaries when they are already valid
 - prepare the runtime root
 - launch `atho-qt` in managed-local-node mode
 - keep the Rust client and Rust node as the real runtime path
+
+If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
+GPU-native builds typically need:
+
+- macOS: Xcode Command Line Tools
+- Linux: a C/C++ compiler plus OpenCL headers/runtime
+- Windows: Visual Studio Build Tools with C++ support plus the vendor OpenCL runtime
 
 Any extra flags are forwarded to `atho-qt`, so advanced operators can still do things like:
 

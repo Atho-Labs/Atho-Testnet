@@ -28,6 +28,7 @@ SOURCE_PATHS = (
 )
 
 RUNTIME_DIRS = ("db", "logs", "wallet", "audit", "quarantine")
+BUILD_STAMP = ".atho-launch-build.stamp"
 
 
 class LauncherError(RuntimeError):
@@ -55,6 +56,14 @@ class LauncherConfig:
     @property
     def node_binary(self) -> Path:
         return self.release_dir / binary_name("athod")
+
+    @property
+    def miner_binary(self) -> Path:
+        return self.release_dir / binary_name("atho-mine")
+
+    @property
+    def gpu_build_stamp(self) -> Path:
+        return self.release_dir / BUILD_STAMP
 
 
 def binary_name(base: str) -> str:
@@ -168,10 +177,16 @@ def build_reason(config: LauncherConfig) -> str | None:
         return f"missing {config.qt_binary.name}"
     if not binary_is_usable(config.node_binary):
         return f"missing {config.node_binary.name}"
+    if not binary_is_usable(config.miner_binary):
+        return f"missing {config.miner_binary.name}"
+    if not config.gpu_build_stamp.is_file():
+        return "missing launcher build stamp"
     newest_source = latest_source_mtime(config.repo_root)
     oldest_binary = min(
         config.qt_binary.stat().st_mtime,
         config.node_binary.stat().st_mtime,
+        config.miner_binary.stat().st_mtime,
+        config.gpu_build_stamp.stat().st_mtime,
     )
     if newest_source > oldest_binary:
         return "source tree is newer than release binaries"
@@ -185,9 +200,86 @@ def verify_cargo_available(cargo_bin: str) -> None:
         )
 
 
+def gpu_build_help() -> str:
+    if sys.platform == "darwin":
+        return (
+            "GPU-enabled Atho builds on macOS require Xcode Command Line Tools and the system "
+            "OpenCL framework. Run `xcode-select --install`, reopen the terminal, and rebuild."
+        )
+    if os.name == "nt":
+        return (
+            "GPU-enabled Atho builds on Windows require Visual Studio Build Tools with C++ "
+            "support and a working vendor OpenCL SDK/runtime. Install the MSVC C++ build "
+            "tools, reopen an x64 developer shell or terminal, and rebuild."
+        )
+    return (
+        "GPU-enabled Atho builds on Linux require a C/C++ toolchain plus OpenCL headers and "
+        "runtime libraries. Install a compiler such as `g++` or `clang++`, install "
+        "`opencl-headers` and `ocl-icd-opencl-dev` (package names vary by distro), install "
+        "your vendor OpenCL ICD/runtime, then rebuild."
+    )
+
+
+def run_build_command(
+    config: LauncherConfig,
+    command: list[str],
+    description: str,
+) -> subprocess.CompletedProcess[str] | None:
+    print(f"[atho-launch] {description}: {' '.join(command)}")
+    if config.dry_run:
+        return None
+    result = subprocess.run(
+        command,
+        cwd=config.repo_root,
+        text=True,
+        capture_output=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result
+
+
+def write_build_stamp(config: LauncherConfig, mode: str) -> None:
+    config.gpu_build_stamp.parent.mkdir(parents=True, exist_ok=True)
+    config.gpu_build_stamp.write_text(f"{mode}\n", encoding="utf-8")
+
+
 def build_release_binaries(config: LauncherConfig) -> None:
     verify_cargo_available(config.cargo_bin)
-    command = [
+    gpu_command = [
+        config.cargo_bin,
+        "build",
+        "--release",
+        "-p",
+        "atho-node",
+        "-p",
+        "atho-qt",
+        "--features",
+        "gpu-native",
+    ]
+    result = run_build_command(
+        config,
+        gpu_command,
+        f"building GPU-enabled release binaries for {config.network}",
+    )
+    if config.dry_run:
+        print(
+            "[atho-launch] note: if the GPU-native build fails, the launcher will warn and fall back to a CPU-only release build."
+        )
+        return
+    assert result is not None
+    if result.returncode == 0:
+        write_build_stamp(config, "gpu-native")
+        return
+
+    print(
+        "[atho-launch] warning: GPU-enabled build failed. "
+        f"{gpu_build_help()} Falling back to a CPU-only release build.",
+        file=sys.stderr,
+    )
+    cpu_command = [
         config.cargo_bin,
         "build",
         "--release",
@@ -196,10 +288,19 @@ def build_release_binaries(config: LauncherConfig) -> None:
         "-p",
         "atho-qt",
     ]
-    print(f"[atho-launch] building release binaries for {config.network}: {' '.join(command)}")
-    if config.dry_run:
-        return
-    subprocess.run(command, cwd=config.repo_root, check=True)
+    fallback = run_build_command(
+        config,
+        cpu_command,
+        f"building CPU-only fallback release binaries for {config.network}",
+    )
+    assert fallback is not None
+    if fallback.returncode != 0:
+        raise LauncherError(
+            "Atho build failed.\n"
+            "The GPU-enabled build failed, and the CPU-only fallback build also failed. "
+            "Fix the Rust/native toolchain errors above and rerun the launcher."
+        )
+    write_build_stamp(config, "cpu-only")
 
 
 def prepare_runtime_root(path: Path) -> None:
@@ -232,12 +333,23 @@ def ensure_binaries(config: LauncherConfig) -> None:
         return
     if config.no_build:
         raise LauncherError(
-            f"release binaries are not ready: {reason}. Re-run without --no-build or build with `cargo build --release -p atho-node -p atho-qt`."
+            "release binaries are not ready: "
+            f"{reason}. Re-run without --no-build or build with "
+            "`cargo build --release -p atho-node -p atho-qt --features gpu-native` "
+            "or let the launcher rebuild automatically."
         )
     build_release_binaries(config)
-    if not binary_is_usable(config.qt_binary) or not binary_is_usable(config.node_binary):
+    if config.dry_run:
+        return
+    if (
+        not binary_is_usable(config.qt_binary)
+        or not binary_is_usable(config.node_binary)
+        or not binary_is_usable(config.miner_binary)
+        or not config.gpu_build_stamp.is_file()
+    ):
         raise LauncherError(
-            f"release build finished but required binaries are still missing: {config.qt_binary} {config.node_binary}"
+            "release build finished but required GPU-enabled binaries are still missing: "
+            f"{config.qt_binary} {config.node_binary} {config.miner_binary}"
         )
 
 

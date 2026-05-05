@@ -75,11 +75,18 @@ python runtestnet.py
 
 They:
 
-- build `athod` and `atho-qt` automatically when missing or stale
+- try a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first when binaries are missing or stale
 - reuse existing release binaries when they are current
 - prepare the runtime root
 - launch `atho-qt` in managed-local-node mode
 - leave the Rust client and Rust node as the real runtime path
+
+If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
+GPU-native builds typically need:
+
+- macOS: Xcode Command Line Tools
+- Linux: a C/C++ compiler plus OpenCL headers/runtime
+- Windows: Visual Studio Build Tools with C++ support plus the vendor OpenCL runtime
 
 Because the Python wrapper replaces itself with `atho-qt`, it does not stay in the blockchain hot path.
 
