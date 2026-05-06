@@ -11,12 +11,14 @@ use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cached mempool entry with precomputed sizes and identifiers.
 #[derive(Debug, Clone)]
 pub struct MempoolEntry {
     pub transaction: Transaction,
     pub fee_atoms: u64,
+    received_at_unix: u64,
     txid: [u8; 48],
     wtxid: [u8; 48],
     base_size_bytes: usize,
@@ -35,6 +37,7 @@ impl MempoolEntry {
         Self {
             transaction,
             fee_atoms,
+            received_at_unix: unix_timestamp(),
             txid,
             wtxid,
             base_size_bytes,
@@ -70,10 +73,21 @@ impl MempoolEntry {
         self.vsize_bytes
     }
 
+    pub fn received_at_unix(&self) -> u64 {
+        self.received_at_unix
+    }
+
     /// Returns the feerate in atoms per vbyte.
     pub fn feerate_atoms_per_vbyte(&self) -> u64 {
         self.fee_atoms / self.vsize_bytes as u64
     }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// In-memory transaction pool for standard-policy transactions.

@@ -88,11 +88,14 @@ fn run() -> Result<(), String> {
 fn run_node(args: &[String]) -> Result<(), String> {
     let runtime = parse_runtime_cli(args)?;
     runtime.apply_env();
-    match runtime.network {
-        Some(network) => atho_node::runtime::run_with_config(NodeConfig::new(network))
-            .map_err(|err| err.to_string()),
+    match runtime_node_config(&runtime) {
+        Some(config) => atho_node::runtime::run_with_config(config).map_err(|err| err.to_string()),
         None => atho_node::runtime::run().map_err(|err| err.to_string()),
     }
+}
+
+fn runtime_node_config(runtime: &RuntimeCli) -> Option<NodeConfig> {
+    runtime.network.map(NodeConfig::from_env)
 }
 
 fn verify_node(args: &[String]) -> Result<(), String> {
@@ -526,9 +529,33 @@ fn print_usage() {
 mod tests {
     use super::*;
     use atho_rpc::transport::{read_message, write_message};
+    use std::ffi::OsString;
     use std::io::BufReader;
     use std::net::TcpListener;
     use std::thread;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn runtime_cli_parses_operator_flags() {
@@ -596,6 +623,20 @@ mod tests {
         let args = vec![String::from("--network"), String::from("prune-test")];
         let parsed = parse_runtime_cli(&args).expect("parse");
         assert_eq!(parsed.network, Some(Network::Prunetest));
+    }
+
+    #[test]
+    fn runtime_node_config_honors_api_env_overrides() {
+        let _port = EnvVarGuard::set("ATHO_API_PORT", "18080");
+        let _bind = EnvVarGuard::set("ATHO_API_BIND", "127.0.0.2");
+        let runtime = RuntimeCli {
+            network: Some(Network::Regnet),
+            ..RuntimeCli::default()
+        };
+        let config = runtime_node_config(&runtime).expect("config");
+        assert_eq!(config.network, Network::Regnet);
+        assert_eq!(config.api.port, 18080);
+        assert_eq!(config.api.bind, "127.0.0.2");
     }
 
     #[test]

@@ -8,11 +8,14 @@
 //! peer traffic, wallet activity views, and mining results must all be
 //! validated before they mutate chainstate.
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
+pub mod api;
 pub mod chainstate;
 pub mod config;
 pub mod dev;
 pub mod error;
+pub mod explorer;
 pub mod logging;
 pub mod mempool;
 pub mod miner;

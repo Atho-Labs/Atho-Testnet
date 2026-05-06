@@ -1,7 +1,7 @@
 //! In-memory chainstate helpers layered on top of persisted storage.
 use crate::db::{
     BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, PeerHealthRecord,
-    PeerRecord,
+    PeerRecord, TransactionArchiveRecord,
 };
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
@@ -362,6 +362,40 @@ impl Chainstate {
             return Ok(None);
         };
         storage.load_block_record_by_height(height)
+    }
+
+    pub fn transaction_record_by_txid(
+        &self,
+        txid: [u8; 48],
+    ) -> Result<Option<TransactionArchiveRecord>, StorageError> {
+        if let Some((height, block_hash, tx_index, transaction)) =
+            self.blocks.iter().find_map(|block| {
+                block
+                    .transactions
+                    .iter()
+                    .enumerate()
+                    .find_map(|(tx_index, transaction)| {
+                        (transaction.txid() == txid).then_some((
+                            block.header.height,
+                            block.header.block_hash(),
+                            tx_index as u32,
+                            transaction.clone(),
+                        ))
+                    })
+            })
+        {
+            return Ok(Some(TransactionArchiveRecord {
+                height,
+                block_hash,
+                tx_index,
+                txid,
+                transaction,
+            }));
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        storage.load_transaction(txid)
     }
 
     pub fn export_snapshot_bundle(&self) -> Result<ChainSnapshotBundle, StorageError> {

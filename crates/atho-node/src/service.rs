@@ -9,6 +9,7 @@ use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::rpc_error_from_node;
 use crate::error::NodeError;
+use crate::explorer::ExplorerIndex;
 use crate::mempool::MempoolEntry;
 #[cfg(test)]
 use crate::miner::Miner;
@@ -18,7 +19,7 @@ use crate::tcp_p2p::next_outbound_retry_delay;
 use crate::wallet_history;
 use atho_core::address::{decode_base56_address, encode_base56_address};
 use atho_core::block::{Block, BlockHeader};
-use atho_core::consensus::{pow, rules, subsidy};
+use atho_core::consensus::{params::consensus_params_for_network, pow, rules, subsidy};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -35,13 +36,24 @@ use atho_rpc::response::{
     BlockTemplate, MempoolInfo, MempoolSpentInput, NetworkDiagnostics, NetworkPeerDiagnostics,
     NetworkPeerDirection, NodeStatus, RpcResponse, WalletActivityEntry,
 };
-use atho_storage::db::PeerHealthRecord;
+use atho_storage::db::{BlockArchiveRecord, PeerHealthRecord};
+use atho_storage::path::database_dir;
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use atho_wallet::snapshot::WalletSnapshot;
 
 const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
+const EXPLORER_API_SNAPSHOT_VERSION: u32 = 1;
+const EXPLORER_API_SNAPSHOT_FILENAME: &str = "explorer-api-snapshot.bin";
+const HASHRATE_WINDOW_BLOCKS: usize = 120;
+const BLOCKTIME_WINDOW_BLOCKS: usize = 120;
+const FEE_WINDOW_BLOCKS: usize = 240;
+const FEE_WINDOW_TRANSACTIONS: u64 = 1_000;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Snapshot of the local node state used by operator interfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +84,105 @@ struct NetworkRuntimeView {
     peers: BTreeMap<String, PeerTrafficStats>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CachedPendingTransaction {
+    pub(crate) txid: [u8; 48],
+    pub(crate) fee_atoms: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) size_vbytes: u64,
+    pub(crate) feerate_atoms_per_vbyte: u64,
+    pub(crate) received_at_unix: u64,
+}
+
+impl Default for CachedPendingTransaction {
+    fn default() -> Self {
+        Self {
+            txid: [0u8; 48],
+            fee_atoms: 0,
+            size_bytes: 0,
+            size_vbytes: 0,
+            feerate_atoms_per_vbyte: 0,
+            received_at_unix: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MempoolSummaryCache {
+    pub(crate) network: Option<Network>,
+    pub(crate) fingerprint: [u8; 32],
+    pub(crate) transaction_count: usize,
+    pub(crate) mempool_size_bytes: u64,
+    pub(crate) mempool_vsize_bytes: u64,
+    pub(crate) total_fee_atoms: u64,
+    pub(crate) average_fee_atoms: u64,
+    pub(crate) highest_fee: Option<CachedPendingTransaction>,
+    pub(crate) lowest_fee: Option<CachedPendingTransaction>,
+    pub(crate) estimated_next_block_tx_count: usize,
+    pub(crate) status: &'static str,
+    pub(crate) recent_transactions: Vec<CachedPendingTransaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ChainStatsCache {
+    pub(crate) network: Option<Network>,
+    pub(crate) tip_height: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub(crate) tip_hash: [u8; 48],
+    pub(crate) total_transactions: u64,
+    pub(crate) total_blocks: u64,
+    pub(crate) hashrate_window_blocks: usize,
+    pub(crate) estimated_hashrate_hps: u64,
+    pub(crate) blocktime_window_blocks: usize,
+    pub(crate) average_block_time_millis: u64,
+    pub(crate) difficulty_ratio_scaled: u64,
+    pub(crate) current_block_reward_atoms: u64,
+    pub(crate) total_mined_supply_atoms: u128,
+    pub(crate) circulating_supply_atoms: u128,
+    pub(crate) average_confirmed_fee_atoms: u64,
+    pub(crate) average_fee_window_transactions: u64,
+    pub(crate) average_fee_window_blocks: usize,
+    pub(crate) genesis_timestamp: u64,
+}
+
+impl Default for ChainStatsCache {
+    fn default() -> Self {
+        Self {
+            network: None,
+            tip_height: 0,
+            tip_hash: [0u8; 48],
+            total_transactions: 0,
+            total_blocks: 0,
+            hashrate_window_blocks: 0,
+            estimated_hashrate_hps: 0,
+            blocktime_window_blocks: 0,
+            average_block_time_millis: 0,
+            difficulty_ratio_scaled: 0,
+            current_block_reward_atoms: 0,
+            total_mined_supply_atoms: 0,
+            circulating_supply_atoms: 0,
+            average_confirmed_fee_atoms: 0,
+            average_fee_window_transactions: 0,
+            average_fee_window_blocks: 0,
+            genesis_timestamp: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExplorerApiSnapshot {
+    version: u32,
+    network: Network,
+    #[serde(with = "serde_big_array::BigArray")]
+    genesis_hash: [u8; 48],
+    indexed_height: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    indexed_tip_hash: [u8; 48],
+    explorer_index: ExplorerIndex,
+    chain_stats: ChainStatsCache,
+    saved_at_unix: u64,
+}
+
 /// Mutable service façade around a running [`NodeOrchestrator`].
 #[derive(Debug)]
 pub struct NodeService {
@@ -79,16 +190,39 @@ pub struct NodeService {
     wallet_snapshot: WalletSnapshot,
     network_runtime: NetworkRuntimeView,
     peer_health_cache: BTreeMap<String, PeerHealthRecord>,
+    explorer_index: ExplorerIndex,
+    explorer_index_ready: bool,
+    explorer_index_source: &'static str,
+    explorer_snapshot_persisted_unix: Option<u64>,
+    explorer_snapshot_height: Option<u64>,
+    explorer_snapshot_tip_hash: Option<[u8; 48]>,
+    mempool_summary: MempoolSummaryCache,
+    chain_stats: ChainStatsCache,
 }
 
 impl NodeService {
     /// Creates a new service with a fresh orchestrator.
     pub fn new(config: NodeConfig) -> Self {
+        let network = config.network;
         Self {
             orchestrator: NodeOrchestrator::new(config),
             wallet_snapshot: WalletSnapshot::default(),
             network_runtime: NetworkRuntimeView::default(),
             peer_health_cache: BTreeMap::new(),
+            explorer_index: ExplorerIndex::default_for_network(network),
+            explorer_index_ready: false,
+            explorer_index_source: "cold",
+            explorer_snapshot_persisted_unix: None,
+            explorer_snapshot_height: None,
+            explorer_snapshot_tip_hash: None,
+            mempool_summary: MempoolSummaryCache {
+                network: Some(network),
+                ..MempoolSummaryCache::default()
+            },
+            chain_stats: ChainStatsCache {
+                network: Some(network),
+                ..ChainStatsCache::default()
+            },
         }
     }
 
@@ -104,15 +238,44 @@ impl NodeService {
             wallet_snapshot: WalletSnapshot::default(),
             network_runtime: NetworkRuntimeView::default(),
             peer_health_cache: BTreeMap::new(),
+            explorer_index: ExplorerIndex::default_for_network(network),
+            explorer_index_ready: false,
+            explorer_index_source: "cold",
+            explorer_snapshot_persisted_unix: None,
+            explorer_snapshot_height: None,
+            explorer_snapshot_tip_hash: None,
+            mempool_summary: MempoolSummaryCache {
+                network: Some(network),
+                ..MempoolSummaryCache::default()
+            },
+            chain_stats: ChainStatsCache {
+                network: Some(network),
+                ..ChainStatsCache::default()
+            },
         }
     }
 
     pub fn try_new(config: NodeConfig) -> Result<Self, NodeError> {
+        let network = config.network;
         Ok(Self {
             orchestrator: NodeOrchestrator::try_new(config)?,
             wallet_snapshot: WalletSnapshot::default(),
             network_runtime: NetworkRuntimeView::default(),
             peer_health_cache: BTreeMap::new(),
+            explorer_index: ExplorerIndex::default_for_network(network),
+            explorer_index_ready: false,
+            explorer_index_source: "cold",
+            explorer_snapshot_persisted_unix: None,
+            explorer_snapshot_height: None,
+            explorer_snapshot_tip_hash: None,
+            mempool_summary: MempoolSummaryCache {
+                network: Some(network),
+                ..MempoolSummaryCache::default()
+            },
+            chain_stats: ChainStatsCache {
+                network: Some(network),
+                ..ChainStatsCache::default()
+            },
         })
     }
 
@@ -120,6 +283,7 @@ impl NodeService {
     pub fn start(&mut self) {
         self.orchestrator.start();
         self.seed_peer_graph();
+        self.restore_api_snapshot_if_valid();
         self.refresh_runtime_views();
     }
 
@@ -858,6 +1022,414 @@ impl NodeService {
             self.orchestrator.sync.sync_state().headers_synced;
         self.orchestrator.rpc_server.sync_best_height =
             self.orchestrator.sync.sync_state().best_height;
+        self.refresh_api_views();
+    }
+
+    pub(crate) fn refresh_api_views(&mut self) {
+        self.refresh_explorer_index();
+        self.refresh_mempool_summary();
+        self.refresh_chain_stats();
+        self.persist_api_snapshot_if_enabled();
+    }
+
+    fn refresh_explorer_index(&mut self) {
+        if !self.explorer_index_enabled() {
+            self.explorer_index_ready = false;
+            self.explorer_index_source = "disabled";
+            return;
+        }
+        let node = &self.orchestrator.runtime.node;
+        let tip_height = node.height();
+        let tip_hash = node.tip_hash();
+        if !self
+            .explorer_index
+            .needs_refresh(self.network(), tip_height, tip_hash)
+        {
+            return;
+        }
+        self.rebuild_explorer_index();
+    }
+
+    fn refresh_mempool_summary(&mut self) {
+        let node = &self.orchestrator.runtime.node;
+        let network = self.network();
+        let fingerprint = node.mempool_fingerprint();
+        if self.mempool_summary.network == Some(network)
+            && self.mempool_summary.fingerprint == fingerprint
+        {
+            return;
+        }
+
+        let mut recent_transactions = node
+            .mempool_entries()
+            .into_iter()
+            .map(|entry| CachedPendingTransaction {
+                txid: entry.txid(),
+                fee_atoms: entry.fee_atoms,
+                size_bytes: entry.full_size_bytes() as u64,
+                size_vbytes: entry.vsize_bytes() as u64,
+                feerate_atoms_per_vbyte: entry.feerate_atoms_per_vbyte(),
+                received_at_unix: entry.received_at_unix(),
+            })
+            .collect::<Vec<_>>();
+        recent_transactions.sort_by(|left, right| {
+            right
+                .received_at_unix
+                .cmp(&left.received_at_unix)
+                .then(right.fee_atoms.cmp(&left.fee_atoms))
+                .then(left.txid.cmp(&right.txid))
+        });
+
+        let transaction_count = recent_transactions.len();
+        let mempool_size_bytes = recent_transactions
+            .iter()
+            .map(|entry| entry.size_bytes)
+            .sum::<u64>();
+        let mempool_vsize_bytes = recent_transactions
+            .iter()
+            .map(|entry| entry.size_vbytes)
+            .sum::<u64>();
+        let total_fee_atoms = recent_transactions
+            .iter()
+            .map(|entry| entry.fee_atoms)
+            .sum::<u64>();
+        let average_fee_atoms = if transaction_count == 0 {
+            0
+        } else {
+            total_fee_atoms / transaction_count as u64
+        };
+        let highest_fee = recent_transactions
+            .iter()
+            .max_by(|left, right| {
+                left.fee_atoms
+                    .cmp(&right.fee_atoms)
+                    .then(
+                        left.feerate_atoms_per_vbyte
+                            .cmp(&right.feerate_atoms_per_vbyte),
+                    )
+                    .then(right.received_at_unix.cmp(&left.received_at_unix))
+            })
+            .cloned();
+        let lowest_fee = recent_transactions
+            .iter()
+            .min_by(|left, right| {
+                left.fee_atoms
+                    .cmp(&right.fee_atoms)
+                    .then(
+                        left.feerate_atoms_per_vbyte
+                            .cmp(&right.feerate_atoms_per_vbyte),
+                    )
+                    .then(left.received_at_unix.cmp(&right.received_at_unix))
+            })
+            .cloned();
+
+        self.mempool_summary = MempoolSummaryCache {
+            network: Some(network),
+            fingerprint,
+            transaction_count,
+            mempool_size_bytes,
+            mempool_vsize_bytes,
+            total_fee_atoms,
+            average_fee_atoms,
+            highest_fee,
+            lowest_fee,
+            estimated_next_block_tx_count: transaction_count,
+            status: mempool_status_label(transaction_count, mempool_vsize_bytes),
+            recent_transactions: recent_transactions.into_iter().take(10).collect(),
+        };
+    }
+
+    fn refresh_chain_stats(&mut self) {
+        let node = &self.orchestrator.runtime.node;
+        let network = self.network();
+        let tip_height = node.height();
+        let tip_hash = node.tip_hash();
+        if self.chain_stats.network == Some(network)
+            && self.chain_stats.tip_height == tip_height
+            && self.chain_stats.tip_hash == tip_hash
+        {
+            return;
+        }
+
+        let tip_record = self
+            .block_record_by_height(tip_height)
+            .ok()
+            .flatten()
+            .or_else(|| node.block_record_by_hash(tip_hash));
+        let Some(tip_record) = tip_record else {
+            let _ = dev::append_log(
+                "api",
+                &format!(
+                    "chain stats refresh failed network={} height={} error=missing_tip_record",
+                    network.id(),
+                    tip_height
+                ),
+            );
+            return;
+        };
+        let recent_records = match load_recent_block_records(
+            node,
+            tip_height,
+            HASHRATE_WINDOW_BLOCKS.max(FEE_WINDOW_BLOCKS),
+        ) {
+            Some(records) => records,
+            None => {
+                let _ = dev::append_log(
+                    "api",
+                    &format!(
+                        "chain stats refresh failed network={} height={} error=missing_recent_window",
+                        network.id(),
+                        tip_height
+                    ),
+                );
+                return;
+            }
+        };
+        let total_transactions = self
+            .incremental_total_transactions(&tip_record)
+            .unwrap_or_else(|| full_transaction_count(node, tip_height).unwrap_or_default());
+        let total_blocks = tip_height.saturating_add(1);
+        let hashrate_window_blocks = recent_records.len().min(HASHRATE_WINDOW_BLOCKS);
+        let estimated_hashrate_hps =
+            estimated_hashrate_from_records(&recent_records, hashrate_window_blocks);
+
+        let blocktime_window_blocks = recent_records.len().min(BLOCKTIME_WINDOW_BLOCKS);
+        let average_block_time_millis =
+            average_block_time_from_records(&recent_records, blocktime_window_blocks);
+        let difficulty_ratio_scaled = pow::difficulty_ratio_scaled(
+            &tip_record.difficulty_target_or_bits,
+            DIFFICULTY_DISPLAY_SCALE,
+        );
+        let current_block_reward_atoms =
+            subsidy::block_subsidy_atoms_for_network(network, tip_height.saturating_add(1));
+        let total_mined_supply_atoms =
+            subsidy::cumulative_issued_through_height_for_network(network, tip_height);
+        let coinbase_maturity_blocks =
+            consensus_params_for_network(network).coinbase_maturity_blocks;
+        let circulating_supply_atoms = if tip_height.saturating_add(1) < coinbase_maturity_blocks {
+            0
+        } else {
+            let mature_height = tip_height
+                .saturating_add(1)
+                .saturating_sub(coinbase_maturity_blocks);
+            subsidy::cumulative_issued_through_height_for_network(network, mature_height)
+        };
+
+        let mut average_fee_window_transactions = 0u64;
+        let mut average_fee_window_blocks = 0usize;
+        let mut average_fee_total_atoms = 0u64;
+        for record in recent_records.iter().rev().take(FEE_WINDOW_BLOCKS) {
+            let non_coinbase_txs = record.tx_count.saturating_sub(1) as u64;
+            if non_coinbase_txs == 0 {
+                continue;
+            }
+            average_fee_total_atoms =
+                average_fee_total_atoms.saturating_add(record.fees_total_atoms);
+            average_fee_window_transactions =
+                average_fee_window_transactions.saturating_add(non_coinbase_txs);
+            average_fee_window_blocks = average_fee_window_blocks.saturating_add(1);
+            if average_fee_window_transactions >= FEE_WINDOW_TRANSACTIONS {
+                break;
+            }
+        }
+        let average_confirmed_fee_atoms = if average_fee_window_transactions == 0 {
+            0
+        } else {
+            average_fee_total_atoms / average_fee_window_transactions
+        };
+
+        let genesis_timestamp = recent_records
+            .first()
+            .map(|record| record.timestamp)
+            .unwrap_or_else(|| genesis::genesis_state(network).block.header.timestamp);
+
+        self.chain_stats = ChainStatsCache {
+            network: Some(network),
+            tip_height,
+            tip_hash,
+            total_transactions,
+            total_blocks,
+            hashrate_window_blocks,
+            estimated_hashrate_hps,
+            blocktime_window_blocks,
+            average_block_time_millis,
+            difficulty_ratio_scaled,
+            current_block_reward_atoms,
+            total_mined_supply_atoms,
+            circulating_supply_atoms,
+            average_confirmed_fee_atoms,
+            average_fee_window_transactions,
+            average_fee_window_blocks,
+            genesis_timestamp,
+        };
+    }
+
+    fn rebuild_explorer_index(&mut self) {
+        let node = &self.orchestrator.runtime.node;
+        let tip_height = node.height();
+        match ExplorerIndex::rebuild(node) {
+            Ok(index) => {
+                self.explorer_index = index;
+                self.explorer_index_ready = true;
+                self.explorer_index_source = "rebuilt";
+            }
+            Err(err) => {
+                self.explorer_index_ready = false;
+                let _ = dev::append_log(
+                    "api",
+                    &format!(
+                        "explorer index refresh failed network={} height={} error={err}",
+                        self.network().id(),
+                        tip_height
+                    ),
+                );
+            }
+        }
+    }
+
+    fn incremental_total_transactions(&self, tip_record: &BlockArchiveRecord) -> Option<u64> {
+        if self.chain_stats.network != Some(self.network()) {
+            return None;
+        }
+        if self.chain_stats.tip_height.saturating_add(1) != tip_record.height {
+            return None;
+        }
+        if self.chain_stats.tip_hash != tip_record.previous_block_hash {
+            return None;
+        }
+        Some(
+            self.chain_stats
+                .total_transactions
+                .saturating_add(tip_record.tx_count as u64),
+        )
+    }
+
+    fn restore_api_snapshot_if_valid(&mut self) {
+        if !self.explorer_index_enabled() || !self.explorer_snapshot_enabled() {
+            return;
+        }
+        let path = explorer_api_snapshot_path(self.network());
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                let _ = dev::append_log(
+                    "api",
+                    &format!(
+                        "explorer snapshot read failed network={} path={} error={err}",
+                        self.network().id(),
+                        path.display()
+                    ),
+                );
+                return;
+            }
+        };
+        let snapshot: ExplorerApiSnapshot = match bincode::deserialize(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let _ = dev::append_log(
+                    "api",
+                    &format!(
+                        "explorer snapshot decode failed network={} path={} error={err}",
+                        self.network().id(),
+                        path.display()
+                    ),
+                );
+                return;
+            }
+        };
+        if !self.snapshot_matches_current_chain(&snapshot) {
+            let _ = dev::append_log(
+                "api",
+                &format!(
+                    "explorer snapshot ignored network={} height={} reason=mismatch",
+                    self.network().id(),
+                    snapshot.indexed_height
+                ),
+            );
+            return;
+        }
+
+        self.explorer_index = snapshot.explorer_index;
+        self.chain_stats = snapshot.chain_stats;
+        self.explorer_index_ready = true;
+        self.explorer_index_source = "snapshot";
+        self.explorer_snapshot_persisted_unix = Some(snapshot.saved_at_unix);
+        self.explorer_snapshot_height = Some(snapshot.indexed_height);
+        self.explorer_snapshot_tip_hash = Some(snapshot.indexed_tip_hash);
+    }
+
+    fn persist_api_snapshot_if_enabled(&mut self) {
+        if !self.explorer_index_enabled()
+            || !self.explorer_snapshot_enabled()
+            || !self.explorer_index_ready
+        {
+            return;
+        }
+        let index_tip_height = self.explorer_index.tip_height();
+        let index_tip_hash = self.explorer_index.tip_hash();
+        if self.chain_stats.network != Some(self.network())
+            || self.chain_stats.tip_height != index_tip_height
+            || self.chain_stats.tip_hash != index_tip_hash
+        {
+            return;
+        }
+        if self.explorer_snapshot_height == Some(index_tip_height)
+            && self.explorer_snapshot_tip_hash == Some(index_tip_hash)
+        {
+            return;
+        }
+
+        let saved_at_unix = unix_timestamp();
+        let snapshot = ExplorerApiSnapshot {
+            version: EXPLORER_API_SNAPSHOT_VERSION,
+            network: self.network(),
+            genesis_hash: genesis::genesis_hash(self.network()),
+            indexed_height: index_tip_height,
+            indexed_tip_hash: index_tip_hash,
+            explorer_index: self.explorer_index.clone(),
+            chain_stats: self.chain_stats.clone(),
+            saved_at_unix,
+        };
+        let path = explorer_api_snapshot_path(self.network());
+        if let Err(err) = write_explorer_api_snapshot(&path, &snapshot) {
+            let _ = dev::append_log(
+                "api",
+                &format!(
+                    "explorer snapshot persist failed network={} path={} error={err}",
+                    self.network().id(),
+                    path.display()
+                ),
+            );
+            return;
+        }
+        self.explorer_snapshot_persisted_unix = Some(saved_at_unix);
+        self.explorer_snapshot_height = Some(index_tip_height);
+        self.explorer_snapshot_tip_hash = Some(index_tip_hash);
+    }
+
+    fn snapshot_matches_current_chain(&self, snapshot: &ExplorerApiSnapshot) -> bool {
+        if snapshot.version != EXPLORER_API_SNAPSHOT_VERSION
+            || snapshot.network != self.network()
+            || snapshot.genesis_hash != genesis::genesis_hash(self.network())
+            || snapshot.explorer_index.network() != Some(self.network())
+            || snapshot.explorer_index.tip_height() != snapshot.indexed_height
+            || snapshot.explorer_index.tip_hash() != snapshot.indexed_tip_hash
+            || snapshot.chain_stats.network != Some(self.network())
+            || snapshot.chain_stats.tip_height != snapshot.indexed_height
+            || snapshot.chain_stats.tip_hash != snapshot.indexed_tip_hash
+        {
+            return false;
+        }
+        if self.node_ref().height() != snapshot.indexed_height
+            || self.node_ref().tip_hash() != snapshot.indexed_tip_hash
+        {
+            return false;
+        }
+        self.node_ref()
+            .block_record_by_height(snapshot.indexed_height)
+            .map(|record| record.block_hash == snapshot.indexed_tip_hash)
+            .unwrap_or(false)
     }
 
     pub fn p2p_bootstrap_peers(&mut self, max: usize) -> Vec<String> {
@@ -935,8 +1507,66 @@ impl NodeService {
         self.orchestrator
             .sync
             .prime(&self.orchestrator.runtime.node);
+        self.rebuild_explorer_index();
         self.refresh_runtime_views();
         result
+    }
+
+    pub(crate) fn node_ref(&self) -> &crate::node::Node {
+        &self.orchestrator.runtime.node
+    }
+
+    pub(crate) fn explorer_index(&self) -> &ExplorerIndex {
+        &self.explorer_index
+    }
+
+    pub(crate) fn explorer_index_ready(&self) -> bool {
+        self.explorer_index_ready
+    }
+
+    pub(crate) fn explorer_index_source(&self) -> &'static str {
+        self.explorer_index_source
+    }
+
+    pub(crate) fn explorer_snapshot_persisted_unix(&self) -> Option<u64> {
+        self.explorer_snapshot_persisted_unix
+    }
+
+    pub(crate) fn explorer_index_enabled(&self) -> bool {
+        self.orchestrator
+            .runtime
+            .node
+            .config
+            .api
+            .explorer
+            .index_enabled
+    }
+
+    pub(crate) fn explorer_snapshot_enabled(&self) -> bool {
+        self.orchestrator
+            .runtime
+            .node
+            .config
+            .api
+            .explorer
+            .snapshot_enabled
+    }
+
+    pub(crate) fn mempool_summary(&self) -> &MempoolSummaryCache {
+        &self.mempool_summary
+    }
+
+    pub(crate) fn chain_stats(&self) -> &ChainStatsCache {
+        &self.chain_stats
+    }
+
+    pub(crate) fn known_node_count(&self) -> usize {
+        self.orchestrator
+            .runtime
+            .node
+            .peer_addresses()
+            .map(|peers| peers.len())
+            .unwrap_or_else(|_| self.network_diagnostics().peer_count)
     }
 
     fn command_help(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
@@ -1797,26 +2427,18 @@ impl NodeService {
                 "transaction": render_transaction_value(self.network(), 0, &tx),
             }));
         }
-        let blocks = self
+        if let Some(record) = self
             .orchestrator
             .runtime
             .node
-            .canonical_blocks()
-            .map_err(rpc_error_from_node)?;
-        for block in &blocks {
-            if let Some((tx_index, tx)) = block
-                .transactions
-                .iter()
-                .enumerate()
-                .find(|(_, tx)| tx.txid() == txid)
-            {
-                return Ok(json!({
-                    "source": "chain",
-                    "block_hash": hex::encode(block.header.block_hash()),
-                    "height": block.header.height,
-                    "transaction": render_transaction_value(block.header.network_id, tx_index, tx),
-                }));
-            }
+            .transaction_record_by_txid(txid)
+        {
+            return Ok(json!({
+                "source": "chain",
+                "block_hash": hex::encode(record.block_hash),
+                "height": record.height,
+                "transaction": render_transaction_value(self.network(), record.tx_index as usize, &record.transaction),
+            }));
         }
         Err(atho_rpc::error::RpcError::invalid_request(
             "unknown transaction txid",
@@ -2214,11 +2836,22 @@ fn render_mempool_entry_value(
         "size_bytes": entry.raw_size_bytes(),
         "vsize_bytes": entry.vsize_bytes(),
         "feerate_atoms_per_vbyte": entry.feerate_atoms_per_vbyte(),
+        "received_at_unix": entry.received_at_unix(),
         "depends": depends,
         "ancestor_count": depends.len(),
         "descendant_count": descendants.len(),
         "descendants": descendants,
     })
+}
+
+fn mempool_status_label(transaction_count: usize, mempool_vsize_bytes: u64) -> &'static str {
+    if transaction_count == 0 {
+        "Empty"
+    } else if transaction_count >= 100 || mempool_vsize_bytes >= 250_000 {
+        "Busy"
+    } else {
+        "Normal"
+    }
 }
 
 fn render_mempool_relation_value(
@@ -2390,6 +3023,69 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn explorer_snapshot_restores_cached_index_and_stats_on_restart() {
+        let root = temp_data_dir("explorer-snapshot-restore");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let miner = Miner::new(1);
+        service.sandbox_with_node_mut(|node| {
+            node.mine_and_connect_candidate_block(&miner)
+                .expect("mine cached block");
+        });
+
+        let snapshot_path = explorer_api_snapshot_path(Network::Regnet);
+        assert!(snapshot_path.exists(), "snapshot should be persisted");
+        let expected_height = service.node_ref().height();
+        let expected_tip_hash = service.node_ref().tip_hash();
+        let expected_total_transactions = service.chain_stats().total_transactions;
+
+        drop(service);
+
+        let mut restored = NodeService::new(NodeConfig::new(Network::Regnet));
+        restored.start();
+        assert!(restored.explorer_index_ready());
+        assert_eq!(restored.explorer_index_source(), "snapshot");
+        assert_eq!(restored.explorer_index().tip_height(), expected_height);
+        assert_eq!(restored.explorer_index().tip_hash(), expected_tip_hash);
+        assert_eq!(restored.chain_stats().tip_hash, expected_tip_hash);
+        assert_eq!(
+            restored.chain_stats().total_transactions,
+            expected_total_transactions
+        );
+        assert!(restored.explorer_snapshot_persisted_unix().is_some());
+    }
+
+    #[test]
+    fn invalid_explorer_snapshot_is_ignored_and_live_views_rebuild() {
+        let root = temp_data_dir("explorer-snapshot-invalid");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let miner = Miner::new(1);
+        service.sandbox_with_node_mut(|node| {
+            node.mine_and_connect_candidate_block(&miner)
+                .expect("mine cached block");
+        });
+
+        let snapshot_path = explorer_api_snapshot_path(Network::Regnet);
+        let bytes = fs::read(&snapshot_path).expect("snapshot bytes");
+        let mut snapshot: ExplorerApiSnapshot =
+            bincode::deserialize(&bytes).expect("decode snapshot");
+        snapshot.genesis_hash = [0xAA; 48];
+        write_explorer_api_snapshot(&snapshot_path, &snapshot).expect("rewrite corrupted snapshot");
+
+        drop(service);
+
+        let mut restored = NodeService::new(NodeConfig::new(Network::Regnet));
+        restored.start();
+        assert!(restored.explorer_index_ready());
+        assert_eq!(restored.explorer_index_source(), "rebuilt");
     }
 
     #[test]
@@ -2724,6 +3420,89 @@ fn sync_error_into_node(error: NodeSyncError) -> NodeError {
         NodeSyncError::Protocol(error) => NodeError::P2pProtocol(error),
         NodeSyncError::Connection(error) => NodeError::P2pConnection(error),
     }
+}
+
+fn explorer_api_snapshot_path(network: Network) -> PathBuf {
+    database_dir(network).join(EXPLORER_API_SNAPSHOT_FILENAME)
+}
+
+fn write_explorer_api_snapshot(
+    path: &Path,
+    snapshot: &ExplorerApiSnapshot,
+) -> Result<(), std::io::Error> {
+    let bytes = bincode::serialize(snapshot)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "snapshot_encode"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension("tmp");
+    let mut file = File::create(&temp_path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn load_recent_block_records(
+    node: &crate::node::Node,
+    tip_height: u64,
+    limit: usize,
+) -> Option<Vec<BlockArchiveRecord>> {
+    let span = limit.max(1) as u64;
+    let start_height = tip_height.saturating_add(1).saturating_sub(span);
+    let mut records = Vec::with_capacity((tip_height.saturating_sub(start_height) + 1) as usize);
+    for height in start_height..=tip_height {
+        records.push(node.block_record_by_height(height)?);
+    }
+    Some(records)
+}
+
+fn full_transaction_count(node: &crate::node::Node, tip_height: u64) -> Option<u64> {
+    let mut total = 0u64;
+    for height in 0..=tip_height {
+        total = total.saturating_add(node.block_record_by_height(height)?.tx_count as u64);
+    }
+    Some(total)
+}
+
+fn estimated_hashrate_from_records(records: &[BlockArchiveRecord], window_blocks: usize) -> u64 {
+    if window_blocks < 2 || records.len() < 2 {
+        return 0;
+    }
+    let start = records.len().saturating_sub(window_blocks);
+    let blocks = records[start..]
+        .iter()
+        .map(|record| Block {
+            header: record.header(),
+            transactions: Vec::new(),
+            witnesses: Default::default(),
+            fees_total_atoms: record.fees_total_atoms,
+            fees_miner_atoms: record.fees_miner_atoms,
+        })
+        .collect::<Vec<_>>();
+    pow::estimated_hashes_per_second(&blocks)
+}
+
+fn average_block_time_from_records(records: &[BlockArchiveRecord], window_blocks: usize) -> u64 {
+    if window_blocks < 2 || records.len() < 2 {
+        return 0;
+    }
+    let start = records.len().saturating_sub(window_blocks);
+    let window = &records[start..];
+    let elapsed = window
+        .last()
+        .map(|record| record.timestamp)
+        .unwrap_or_default()
+        .saturating_sub(
+            window
+                .first()
+                .map(|record| record.timestamp)
+                .unwrap_or_default(),
+        );
+    ((elapsed as u128 * 1_000) / (window.len().saturating_sub(1) as u128)) as u64
 }
 
 fn unix_timestamp() -> u64 {

@@ -18,7 +18,9 @@ use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
-use atho_storage::db::{BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord};
+use atho_storage::db::{
+    BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord, TransactionArchiveRecord,
+};
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -34,9 +36,10 @@ impl Node {
     pub fn new(config: NodeConfig) -> Self {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
+        let network = config.network;
         Self {
             config,
-            chainstate: StorageChainstate::new(config.network),
+            chainstate: StorageChainstate::new(network),
             mempool: Mempool::new(),
             #[cfg(test)]
             _test_lock: test_lock,
@@ -128,6 +131,13 @@ impl Node {
     pub fn block_record_by_height(&self, height: u64) -> Option<BlockArchiveRecord> {
         self.chainstate
             .block_record_by_height(height)
+            .ok()
+            .flatten()
+    }
+
+    pub fn transaction_record_by_txid(&self, txid: [u8; 48]) -> Option<TransactionArchiveRecord> {
+        self.chainstate
+            .transaction_record_by_txid(txid)
             .ok()
             .flatten()
     }
@@ -321,9 +331,10 @@ impl Node {
     pub fn load_or_new(config: NodeConfig) -> Self {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
+        let network = config.network;
         Self {
             config,
-            chainstate: StorageChainstate::load_or_new(config.network),
+            chainstate: StorageChainstate::load_or_new(network),
             mempool: Mempool::new(),
             #[cfg(test)]
             _test_lock: test_lock,
@@ -333,9 +344,10 @@ impl Node {
     pub fn try_load_or_new(config: NodeConfig) -> Result<Self, NodeError> {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
+        let network = config.network;
         Ok(Self {
             config,
-            chainstate: StorageChainstate::try_load_or_new(config.network)?,
+            chainstate: StorageChainstate::try_load_or_new(network)?,
             mempool: Mempool::new(),
             #[cfg(test)]
             _test_lock: test_lock,
@@ -345,9 +357,10 @@ impl Node {
     pub fn try_load_or_recover(config: NodeConfig) -> Result<Self, NodeError> {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
+        let network = config.network;
         Ok(Self {
             config,
-            chainstate: StorageChainstate::try_load_or_recover(config.network)?,
+            chainstate: StorageChainstate::try_load_or_recover(network)?,
             mempool: Mempool::new(),
             #[cfg(test)]
             _test_lock: test_lock,

@@ -38,6 +38,8 @@ pub enum RuntimeError {
     PublicRpcDenied(String),
     #[error("rpc bind failed: {0}")]
     RpcBindFailed(String),
+    #[error("api bind failed: {0}")]
+    ApiBindFailed(String),
     #[error("p2p bind failed: {0}")]
     P2pBindFailed(String),
 }
@@ -48,6 +50,7 @@ impl AthoErrorMeta for RuntimeError {
             Self::InvalidNetwork => &NET_INVALID_NETWORK_SELECTION,
             Self::PublicRpcDenied(_) => &LAUNCH_PUBLIC_RPC_DENIED,
             Self::RpcBindFailed(_) => &LAUNCH_RPC_BIND_FAILED,
+            Self::ApiBindFailed(_) => &LAUNCH_RPC_BIND_FAILED,
             Self::P2pBindFailed(_) => &LAUNCH_P2P_BIND_FAILED,
         }
     }
@@ -60,6 +63,7 @@ impl AthoErrorMeta for RuntimeError {
         match self {
             Self::PublicRpcDenied(address)
             | Self::RpcBindFailed(address)
+            | Self::ApiBindFailed(address)
             | Self::P2pBindFailed(address) => Some(address.clone()),
             Self::InvalidNetwork => None,
         }
@@ -147,7 +151,7 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
     let raw = std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet"));
     let network = Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?;
 
-    Ok(NodeConfig::new(network))
+    Ok(NodeConfig::from_env(network))
 }
 
 /// Runs the full Atho node with live RPC and P2P listeners.
@@ -155,6 +159,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
     let network = config.network;
+    let api_config = config.api.clone();
     let system = Arc::new(Mutex::new(AthoSystem::try_new(config)?));
     {
         let mut guard = system.lock().expect("node runtime mutex poisoned");
@@ -175,12 +180,12 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     for peer in initial_outbound_peers(network, bootstrap_peers) {
         p2p_runtime.maintain_outbound(peer);
     }
-    let rpc_address = rpc_bind_address(config.network);
+    let rpc_address = rpc_bind_address(network);
     validate_rpc_bind_address(&rpc_address)?;
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
-    println!("athod running on {} rpc={rpc_address}", config.network.id());
+    println!("athod running on {} rpc={rpc_address}", network.id());
     let status = {
         let guard = system.lock().expect("node runtime mutex poisoned");
         guard.status()
@@ -198,6 +203,23 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         "athod",
         &format!("runtime started rpc={rpc_address} p2p={p2p_address}"),
     );
+    if api_config.enabled {
+        let shared = Arc::clone(&system);
+        let bind = api_config.bind_address();
+        let server = crate::api::bind_http_server(&api_config)
+            .map_err(|err| NodeError::Runtime(RuntimeError::ApiBindFailed(err)))?;
+        std::thread::Builder::new()
+            .name(format!("atho-api-{}", network.domain_tag()))
+            .spawn(move || {
+                if let Err(err) = crate::api::run_http_server(server, shared, api_config) {
+                    let _ = dev::append_log(
+                        "api",
+                        &format!("http api stopped bind={} error={err}", bind),
+                    );
+                }
+            })
+            .map_err(|err| NodeError::Runtime(RuntimeError::ApiBindFailed(err.to_string())))?;
+    }
     for incoming in listener.incoming() {
         match incoming {
             Ok(mut stream) => {
@@ -244,7 +266,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                         "athod",
                         &format!(
                             "runtime shutdown requested over rpc network={}",
-                            config.network.id()
+                            network.id()
                         ),
                     );
                     break;
