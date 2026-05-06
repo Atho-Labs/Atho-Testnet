@@ -74,13 +74,16 @@ Current rules:
 
 | Parameter | Value |
 | --- | ---: |
-| Initial reward | `50 ATHO` |
+| Initial reward | `6.25 ATHO` |
 | Halving interval | `1,680,000 blocks` |
-| Maximum supply | `168,000,000 ATHO` |
+| Tail reward | `0.78125 ATHO forever` |
+| Maximum supply | none; Atho has permanent tail emission |
+| Tail starts | block `5,040,000`, around year 12 |
+| Annual tail issuance | about `328,500 ATHO/year` |
 
 Why:
 
-- explicit fixed monetary rules are easier to audit and harder to drift accidentally
+- permanent tail emission keeps a predictable proof-of-work security budget after early reward eras while fees remain low
 
 ## Fee Accounting
 

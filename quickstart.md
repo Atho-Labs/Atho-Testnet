@@ -177,6 +177,10 @@ python runtestnet.py
 ./target/release/atho-mine --network testnet
 ```
 
+Testnet ATHO is distributed manually by the Atho founders or development team. Contact the Atho team to request testnet funds.
+
+Mainnet and testnet are strictly isolated. Mainnet has no faucet, no automatic storage self-healing, and no testnet difficulty stall reset. Testnet may reset during development, may self-heal local testnet storage after configured changes, and may reset difficulty to minimum after more than 10 minutes without a block.
+
 ## 8. Know Sync Is Working
 
 Run the status command against the node:

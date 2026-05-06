@@ -9,7 +9,7 @@ It includes:
 - a consensus core
 - a full validating node
 - durable chainstate storage
-- a wallet system with HD derivation and encrypted datafiles
+- a multi-wallet system with HD derivation and encrypted datafiles
 - a local RPC interface
 - a thin desktop client
 - a developing peer-to-peer network layer
@@ -41,6 +41,47 @@ Its narrower goal is:
 - a software stack that feels closer to Bitcoin Core discipline than to application-platform sprawl
 
 ## Major Design Choices
+
+### Monetary policy
+
+Atho uses 12 decimal places:
+
+- `DECIMALS = 12`
+- `ATOMS_PER_ATHO = 1_000_000_000_000`
+- `1 ATHO = 1,000,000,000,000 atoms`
+
+There is no fixed max supply cap. Atho uses proof-of-work with a permanent tail reward so miners retain a predictable long-term security budget while user fees can remain low.
+
+Current schedule:
+
+- target block time: 75 seconds
+- initial reward: 6.25 ATHO
+- halving interval: 1,680,000 blocks
+- permanent tail reward: 0.78125 ATHO per block
+
+The official display ladder is:
+
+- 1 ATHO = 1,000 mATHO
+- 1 mATHO = 1,000 μATHO
+- 1 μATHO = 1,000 nATHO
+- 1 nATHO = 1,000 atoms
+- 1 atom = smallest network unit
+
+Consensus stores integer atoms only. Display units are UI-only.
+
+### Transaction policy
+
+Normal transactions use low atom-denominated fees plus wallet transaction proof-of-work as a spam deterrent.
+
+Current policy:
+
+- required fee: `max(500 atoms, tx_vbytes * 1 atom)`
+- minimum normal output: 1,000 atoms
+- maximum standard outputs: 64
+- normal transactions require SHA3-256 transaction PoW
+- coinbase transactions do not require wallet transaction PoW
+
+Wallets sign first, then generate the transaction send proof over the signed transaction without PoW fields. Nodes can verify that proof before expensive signature checks when possible.
 
 ### Bitcoin-style UTXO core
 
@@ -77,6 +118,18 @@ Chosen because:
 Tradeoff:
 
 - wallet history and client UX are dependent on stable backend interfaces
+
+### Multi-wallet client model
+
+The desktop client supports multiple HD wallets. Wallet creation requires a wallet name and a 12-word, 24-word, or 48-word mnemonic selection; 24 words is the default. Mnemonic import works directly and supports one-line, newline-separated, numbered, and extra-whitespace phrases.
+
+Users switch wallets from **File -> Open / Switch Wallet**. Each wallet keeps its own metadata, addresses, UTXO state, transaction history/cache, derivation indexes, and per-wallet address book.
+
+### Mainnet and testnet separation
+
+Mainnet and testnet are strictly separated. Transactions, signatures, transaction PoW preimages, addresses, peers, storage, UTXOs, mempool state, and blocks are network-scoped.
+
+Mainnet has no faucet, no automatic storage self-healing, and no testnet difficulty stall reset. Testnet may reset during development, may self-heal local testnet storage after configured network/storage changes, and may reset difficulty to minimum after more than 10 minutes without a block. Testnet ATHO is distributed manually by the Atho founders or development team.
 
 ### Explicit versioning and activation scaffolding
 

@@ -145,9 +145,10 @@ Why:
 
 Current emission model:
 
-- initial subsidy: `50 ATHO`
+- initial subsidy: `6.25 ATHO`
 - halving interval: `1,680,000 blocks`
-- total cap: `168,000,000 ATHO`
+- tail subsidy: `0.78125 ATHO` per block forever
+- fixed max supply cap: none
 
 Fees are tracked in atoms and split into explicit accounting fields on the block structure.
 

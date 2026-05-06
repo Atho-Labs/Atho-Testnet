@@ -88,9 +88,11 @@ Why:
 
 Current constants:
 
-- `1 ATHO = 100,000,000 atoms`
-- maximum supply: `168,000,000 ATHO`
-- initial block reward: `50 ATHO`
+- `1 ATHO = 1,000,000,000,000 atoms`
+- fixed max supply: none; Atho uses permanent tail emission
+- initial block reward: `6.25 ATHO`
+- tail block reward: `0.78125 ATHO forever`
+- halving interval: `1,680,000 blocks`
 - coinbase maturity: `150 blocks`
 - standard transaction confirmations: `7`
 

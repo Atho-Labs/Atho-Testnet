@@ -48,4 +48,4 @@ Wallet UI should make dangerous actions explicit:
 
 ## Policy Rule
 
-Wallet transaction construction should follow standard relay policy, including fee floors and dust avoidance, unless a dedicated expert flow says otherwise.
+Wallet transaction construction should follow standard relay policy, including fee floors and the 1,000-atom minimum output rule, unless a dedicated expert flow says otherwise.

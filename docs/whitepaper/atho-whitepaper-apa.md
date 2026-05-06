@@ -237,9 +237,11 @@ Test vector requirements should be explicit. Atho already tests frozen sizes, de
 
 # 9. Transaction Model
 
-Atho transactions use a public UTXO model. A transaction has a version, zero or more inputs, one or more outputs, a lock time, and witness bytes. Non-coinbase transactions must have at least one input and at least one output. Each input references a previous 48-byte transaction ID and an output index. Each output records a `value_atoms` integer and a locking script. One ATHO equals 100,000,000 atoms, so all accounting is integer accounting. This avoids floating-point monetary behavior in consensus code.
+Atho transactions use a public UTXO model. A transaction has a version, zero or more inputs, one or more outputs, a lock time, and witness bytes. Non-coinbase transactions must have at least one input and at least one output. Each input references a previous 48-byte transaction ID and an output index. Each output records a `value_atoms` integer and a locking script. One ATHO equals 1,000,000,000,000 atoms, so all accounting is integer accounting. This avoids floating-point monetary behavior in consensus code.
 
-Atho distinguishes base bytes, full bytes, compact bytes, transaction ID, witness transaction ID, and witness commitment hash. The base bytes exclude witness data and are the source for the txid and signing digest. The full bytes include witness data. The vsize calculation follows a witness-weighted model: base data is weighted more heavily than witness data, and vbytes are derived from total weight. Current limits are 250,000 raw bytes and 250,000 vbytes per transaction. The minimum fee policy is 1 atom per vbyte, zero-value outputs are rejected, and relay and wallet policy reject spendable outputs below 50 atoms.
+Atho distinguishes base bytes, full bytes, compact bytes, transaction ID, witness transaction ID, and witness commitment hash. The base bytes exclude witness data and are the source for the txid and signing digest. The full bytes include witness data. The vsize calculation follows a witness-weighted model: base data is weighted more heavily than witness data, and vbytes are derived from total weight. Current limits are 250,000 raw bytes and 250,000 vbytes per transaction. The required fee is `max(500 atoms, tx_vbytes * 1 atom)`, zero-value outputs are rejected, normal outputs below 1,000 atoms are rejected, and standard transactions may have at most 64 outputs.
+
+Normal non-coinbase transactions require wallet transaction proof-of-work. The wallet signs the transaction first, builds a PoW preimage from the signed transaction without PoW fields, solves a SHA3-256 nonce under the `ATHO_TX_POW_V1` domain, and includes `tx_pow_nonce` and `tx_pow_bits`. Nodes can verify this send proof before expensive signature checks when possible. Coinbase transactions do not require wallet transaction PoW.
 
 Mempool admission and block validation both enforce transaction structure. They reject unsupported versions, duplicate inputs, missing witnesses, wrong witness reference counts, missing signatures, missing public keys, invalid Falcon signatures, missing UTXOs, ownership mismatches, insufficient confirmations, and fee mismatches. A transaction becomes settled only after it is included in a valid block, the block is accepted into the best chain, and enough confirmations accumulate for the user's risk tolerance. Figure 4 describes that lifecycle.
 
@@ -303,38 +305,41 @@ Mining is implemented in `crates/atho-node/src/miner.rs`. The miner reads the cu
 
 # 13. Monetary Policy and Emissions
 
-Atho's monetary policy is defined by source constants and subsidy functions. One ATHO is 100,000,000 atoms. The maximum supply constant is 168,000,000 ATHO. The initial subsidy is 50 ATHO per block. The halving interval is 1,680,000 blocks. The target block time is 75 seconds. The current subsidy function computes integer ATHO rewards using right-shift halving: 50, 25, 12, 6, 3, 1, and then 0 after subsequent halvings. The cumulative subsidy function is bounded by the maximum supply constant, and current tests assert that cumulative issuance does not exceed the supply ceiling.
+Atho's monetary policy is defined by source constants and subsidy functions. One ATHO is 1,000,000,000,000 atoms. There is no fixed max supply cap. The initial subsidy is 6.25 ATHO per block, the halving interval is 1,680,000 blocks, the target block time is 75 seconds, and the permanent tail subsidy is 0.78125 ATHO per block forever after the third halving. This schedule keeps a predictable proof-of-work security budget instead of depending only on future fee pressure.
 
-The integer halving detail is important. A mathematical infinite geometric series beginning at 50 ATHO and halving every interval would sum to 168,000,000 ATHO over 1,680,000-block intervals. The current code halves integer ATHO values, which means fractional ATHO subsidies are not emitted after the reward reaches 1 ATHO and shifts to 0. Therefore the implemented schedule should be described as a deterministic subsidy schedule under a 168,000,000 ATHO ceiling, not as a promise that every atom of the ceiling is emitted by the current integer subsidy function.
+Atho changed from a fixed-cap model to permanent tail emission because a payment-focused proof-of-work network needs durable miner incentives while preserving low transaction fees for users. The inflation rate naturally declines as supply grows. The tail starts at block 5,040,000, around year 12. Approximate supply is 18,375,000 ATHO at tail start, 21,007,500 ATHO around year 20, and 30,862,500 ATHO around year 50. The annual tail issuance is 328,500 ATHO, about 1.56% around year 20 and about 1.06% around year 50.
 
-Nodes verify monetary policy during block validation. They calculate the expected subsidy for the block height, calculate total transaction fees, and require the coinbase output to equal subsidy plus miner fees. They also require block fee fields to add consistently. If a block overpays the coinbase, underpays fee accounting, uses unsupported versions, or violates supply bounds, validation rejects it. Table 5 lists the current monetary constants, and Figure 6 visualizes the reward and cumulative issuance path from the present source code.
+Atho is scarce at the coin level and highly divisible at the atom level. One ATHO contains one trillion atoms, allowing small payments and low fees even if ATHO becomes highly valuable. The official display ladder is ATHO, mATHO, μATHO, nATHO, and atoms: 1 ATHO equals 1,000 mATHO; 1 mATHO equals 1,000 μATHO; 1 μATHO equals 1,000 nATHO; and 1 nATHO equals 1,000 atoms. Consensus stores only integer atoms.
+
+Nodes verify monetary policy during block validation. They calculate the expected subsidy for the block height, calculate total transaction fees, and require the coinbase output to equal subsidy plus miner fees. They also require block fee fields to add consistently. If a block overpays the coinbase, underpays fee accounting, uses unsupported versions, or violates monetary policy, validation rejects it. Table 5 lists the current monetary constants, and Figure 6 visualizes the reward and cumulative issuance path from the present source code.
 
 ![Figure 6. Atho Emission Model](assets/figure_06_emission_model.png)
 
-*Figure 6. Emission schedule derived from the current source constants: 50 ATHO initial subsidy, 1,680,000-block halving intervals, and a 168,000,000 ATHO maximum supply ceiling.*
+*Figure 6. Emission schedule derived from the current source constants: 6.25 ATHO initial subsidy, 1,680,000-block halving intervals, and a permanent 0.78125 ATHO tail reward.*
 
 **Table 5**
 *Monetary Policy Constants*
 
 | Constant | Value | Source File | Purpose |
 | --- | --- | --- | --- |
-| Atoms per ATHO | 100,000,000 | `crates/atho-core/src/constants.rs` | Defines the smallest accounting unit. |
-| Maximum supply ceiling | 168,000,000 ATHO | `constants.rs`; `consensus/params.rs` | Upper bound for total issued supply. |
-| Initial block reward | 50 ATHO | `constants.rs`; `consensus/subsidy.rs` | Genesis and early-chain subsidy. |
+| Atoms per ATHO | 1,000,000,000,000 | `crates/atho-core/src/constants.rs` | Defines the smallest accounting unit. |
+| Maximum supply ceiling | None | `constants.rs`; `consensus/params.rs` | Atho uses permanent tail emission. |
+| Initial block reward | 6.25 ATHO | `constants.rs`; `consensus/subsidy.rs` | Genesis and early-chain subsidy. |
 | Halving interval | 1,680,000 blocks | `constants.rs`; `consensus/subsidy.rs` | Height interval for right-shift reward reduction. |
+| Tail block reward | 0.78125 ATHO forever | `constants.rs`; `consensus/subsidy.rs` | Long-term proof-of-work security budget. |
 | Target block time | 75 seconds | `constants.rs`; `consensus/pow.rs` | Expected spacing for difficulty adjustment. |
 | Coinbase maturity | 150 blocks | `constants.rs`; `storage/utxo.rs` | Required confirmations before mined outputs are spendable. |
 | Standard confirmations | 7 blocks | `constants.rs`; `storage/utxo.rs` | Wallet-facing settlement convention for non-coinbase outputs. |
-| Minimum fee rate | 1 atom per vbyte | `constants.rs`; `storage/validation.rs` | Baseline anti-spam policy. |
-| Dust threshold | 50 atoms | `crates/atho-core/src/constants.rs` | Relay and wallet policy floor for spendable outputs. |
+| Minimum fee | max(500 atoms, tx_vbytes) | `constants.rs`; `storage/validation.rs` | Baseline anti-spam policy. |
+| Minimum output | 1,000 atoms | `crates/atho-core/src/constants.rs` | Relay and wallet policy floor for normal outputs. |
 
 # 14. Mempool Design
 
 Atho's mempool is a validated, in-memory staging area. It is not consensus truth. It holds candidate transactions that passed local policy and contextual validation against the current UTXO view. The mempool tracks entries by txid and tracks spent inputs in a set so it can reject local conflicts before mining. It orders candidates by fee rate, then absolute fee, then txid. That ordering gives miners a deterministic local selection policy without changing consensus rules.
 
-Admission runs through `validate_transaction_with_context`. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, minimum fee, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
+Admission runs through `validate_transaction_with_context`. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, required fee, maximum standard output count, SHA3-256 transaction proof-of-work, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
 
-Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 1,000-atom relay dust floor, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
+Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 1,000-atom minimum output rule, transaction PoW, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
 
 ![Figure 7. Mempool Admission Flow](assets/figure_07_mempool_admission.png)
 
@@ -342,7 +347,7 @@ Several policies are intentionally marked as not yet active or TBD. No explicit 
 
 # 15. Consensus Validation
 
-Atho consensus validation has two major surfaces: transaction validation and block validation. Transaction validation first checks structure: non-coinbase inputs, supported version, outputs, size limits, non-zero output values, duplicate inputs, minimum fee, witness presence, witness reference count, and witness short references. It then verifies the Falcon signature. Contextual validation adds UTXO lookup, locking-script equality, standard address digest ownership, maturity, and fee calculation. This staged approach avoids expensive signature work when a transaction is structurally invalid.
+Atho consensus validation has two major surfaces: transaction validation and block validation. Transaction validation first checks structure: non-coinbase inputs, supported version, outputs, size limits, non-zero output values, duplicate inputs, required fee, output count, transaction PoW, witness presence, witness reference count, and witness short references. It then verifies the Falcon signature. Contextual validation adds UTXO lookup, locking-script equality, standard address digest ownership, maturity, and fee calculation. This staged approach avoids expensive signature work when a transaction is structurally invalid.
 
 Block validation checks non-empty body, supported block version, network ID, height, timestamp, raw size, vsize, weight, merkle root, witness root, target bounds, proof-of-work, subsidy, cumulative supply, coinbase correctness, duplicate transaction IDs, duplicate block inputs, and non-coinbase transaction structure. Contextual block validation then verifies expected parent hash, median-time behavior, expected target, proof-of-work against expected target, transaction fees, UTXO spend and creation, witness commitment references, and fee-accounting consistency.
 
@@ -375,6 +380,8 @@ The peer protocol includes `version`, `verack`, `ping`, `pong`, `getaddr`, `addr
 
 Headers-first sync begins with a block locator, requests headers, validates linkage, and requests missing blocks by inventory. Compact block reconstruction exists in protocol code, but broader compact block burst hardening remains incomplete. DNS seeds are intentionally blank, so live bootstrap currently depends on manual peers. The network layer should remain a transport and synchronization layer only. Every block and transaction received from a peer must still pass local consensus validation. Figure 8 summarizes the sync and propagation flow.
 
+Mainnet and testnet are strictly separated. Transactions, signatures, transaction PoW preimages, addresses, peers, storage, UTXOs, mempool entries, and blocks are network-scoped. A testnet transaction must not be valid on mainnet, and a mainnet transaction must not be valid on testnet. Testnet coins cannot be spent on mainnet. Testnet ATHO is distributed manually by the Atho team during testing; the production client does not include an automated faucet.
+
 ![Figure 8. Node Sync and Block Propagation Flow](assets/figure_08_node_sync.png)
 
 *Figure 8. Headers-first synchronization and block propagation ensure that network transport proposes data while local consensus remains the acceptance authority.*
@@ -385,7 +392,7 @@ Atho's storage layer owns durable local truth. It uses a hybrid model implemente
 
 The canonical chainstate snapshot contains height, tip hash, and an optional tip header. LMDB block archive records store height, block hash, parent hash, network identity, file number, offset, payload length, raw block size, weight and vsize metadata, timestamp, chainwork, validation flags, pruning state, and other header fields needed for indexed queries. Transaction archive records store height, block hash, transaction index, txid, and transaction. UTXOs are serialized by outpoint. When a new best-chain block is accepted, Atho appends the raw block bytes to the current network's flat block file, records the file pointer, and commits block metadata, transaction archive records, chainstate snapshot, and full UTXO dataset through LMDB. Figure 11 shows the commit model.
 
-Storage also participates in recovery. If persisted state is corrupt, incomplete, cross-network inconsistent, or schema mismatched, the storage layer can quarantine affected local files and rebuild from genesis. This fail-closed approach is safer than silent repair. The same per-network separation also applies to block archives: wrong-network flat block parsing fails when the wrapper magic or embedded block network identifier does not match the active network. Pruning removes old raw block archive data only after the configured retention depth, while LMDB keeps the indexed metadata and live chainstate needed for ongoing validation and restart. However, the current project documentation identifies schema migration breadth, repair tooling, pruning lifecycle coverage, and peer-served snapshot sync as incomplete areas. Production readiness depends on hardening those paths because long-lived payment infrastructure must survive more than the common full-history happy path.
+Storage also participates in recovery. If persisted state is corrupt, incomplete, cross-network inconsistent, or schema mismatched, the storage layer can quarantine affected local files and rebuild from genesis. This fail-closed approach is safer than silent repair. Mainnet must not automatically self-heal or reset production storage. Testnet may self-heal local chain storage when configured testnet genesis, network magic, storage magic, chain ID, or schema version changes. The same per-network separation also applies to block archives: wrong-network flat block parsing fails when the wrapper magic or embedded block network identifier does not match the active network. Pruning removes old raw block archive data only after the configured retention depth, while LMDB keeps the indexed metadata and live chainstate needed for ongoing validation and restart. However, the current project documentation identifies schema migration breadth, repair tooling, pruning lifecycle coverage, and peer-served snapshot sync as incomplete areas. Production readiness depends on hardening those paths because long-lived payment infrastructure must survive more than the common full-history happy path.
 
 ![Figure 11. Hybrid Storage Commit Model](assets/figure_11_storage_commit.png)
 
@@ -396,6 +403,8 @@ Storage also participates in recovery. If persisted state is corrupt, incomplete
 The wallet owns user secrets, deterministic address derivation, keypool behavior, wallet state capture, and wallet datafile encryption. It does not own consensus truth. A wallet can derive addresses and sign transactions, but balances and confirmations must come from node-validated chainstate. This separation is essential because wallet UX and chain validity have different trust boundaries.
 
 Wallets can be created from mnemonic phrases or seeds. The wallet derives a 32-byte wallet seed, tracks independent receive and change counters, and pre-fills a keypool for fast address allocation. Address derivation uses the wallet seed, network domain tag, account, address kind, and index to generate deterministic Falcon keypairs. The public key is then converted into a payment digest and visible Base56 address. The default restore gap limit is 1,000, allowing recovery scans to inspect a window of possible receive and change addresses.
+
+The client supports multiple HD wallets. Wallet creation requires a wallet name and a mnemonic word-count choice of 12, 24, or 48 words, with 24 words as the default. Mnemonic import works directly and supports one-line phrases, newline-separated phrases, numbered phrases, and extra whitespace. Each wallet keeps its own metadata, addresses, UTXO state, transaction history/cache, derivation indexes, and per-wallet address book. Users switch wallets from the File menu through Open / Switch Wallet.
 
 Wallet datafiles use a versioned binary envelope named `.datafile`. An empty password stores plaintext state explicitly. A non-empty password uses PBKDF2-HMAC-SHA256 with 600,000 iterations, a 16-byte salt, AES-256-GCM encryption, a 12-byte nonce, and authenticated additional data containing the wallet datafile scheme and version. Private keys, seeds, and passwords must never be logged or exposed through public APIs. Offline signing is a plausible future mode but is not currently documented as a complete feature. Figure 9 shows the wallet-to-node boundary.
 
@@ -561,11 +570,11 @@ What comes next is engineering completion: network soak, pruning and snapshot ma
 
 # Appendix A: Glossary
 
-UTXO: Unspent transaction output, the basic unit of spendable chain value. Chainstate: The local authoritative view of the accepted tip, UTXOs, and related metadata. Mempool: The local staging area for valid but unconfirmed transactions. Witness: Signature and reference material carried separately from transaction base bytes. Ruleset: The active consensus rule selection for a height range. Reorg: A branch switch after a higher-work branch becomes preferred. Keypool: Pre-derived wallet address paths reserved for fast allocation. Recovery window: The address discovery window used when reconstructing wallet state from seed or mnemonic material. HPK: Atho's internal hashed-public-key string. Vbyte: Virtual byte used for witness-weighted sizing. Atom: Smallest Atho monetary unit; 100,000,000 atoms equal 1 ATHO.
+UTXO: Unspent transaction output, the basic unit of spendable chain value. Chainstate: The local authoritative view of the accepted tip, UTXOs, and related metadata. Mempool: The local staging area for valid but unconfirmed transactions. Witness: Signature and reference material carried separately from transaction base bytes. Ruleset: The active consensus rule selection for a height range. Reorg: A branch switch after a higher-work branch becomes preferred. Keypool: Pre-derived wallet address paths reserved for fast allocation. Recovery window: The address discovery window used when reconstructing wallet state from seed or mnemonic material. HPK: Atho's internal hashed-public-key string. Vbyte: Virtual byte used for witness-weighted sizing. Atom: Smallest Atho monetary unit; 1,000,000,000,000 atoms equal 1 ATHO.
 
 # Appendix B: Protocol Constants
 
-The following source-derived constants are used throughout the paper: `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`; `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`; `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`; `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`; `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`; `MAX_TRANSACTION_RAW_BYTES = 250_000`; `MAX_TRANSACTION_VBYTES = 250_000`; `ADDRESS_DIGEST_BYTES = 32`; `ADDRESS_CHECKSUM_BYTES = 4`; `ADDRESS_CHECKSUM_BASE56_CHARS = 6`; `WITNESS_SIGNATURE_REFERENCE_BYTES = 16`; `PROTOCOL_VERSION = 1`; `STORAGE_SCHEMA_VERSION = 3`; and `ATHO_SIGNATURE_RULES_VERSION = 1`.
+The following source-derived constants are used throughout the paper: `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`; `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`; `TAIL_REWARD_ATOMS = 781_250_000_000`; `MIN_TX_FEE_ATOMS = 500`; `MIN_OUTPUT_AMOUNT_ATOMS = 1_000`; `MAX_STANDARD_OUTPUTS = 64`; `TX_POW_HASH = SHA3-256`; `TX_POW_MIN_BITS = 16`; `TX_POW_MAX_BITS = 28`; `TX_POW_DOMAIN = ATHO_TX_POW_V1`; `TX_SIGN_DOMAIN = ATHO_TX_SIGN_V1`; `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`; `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`; `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`; `MAX_TRANSACTION_RAW_BYTES = 250_000`; `MAX_TRANSACTION_VBYTES = 250_000`; `ADDRESS_DIGEST_BYTES = 32`; `ADDRESS_CHECKSUM_BYTES = 4`; `ADDRESS_CHECKSUM_BASE56_CHARS = 6`; `WITNESS_SIGNATURE_REFERENCE_BYTES = 16`; `PROTOCOL_VERSION = 1`; `STORAGE_SCHEMA_VERSION = 3`; and `ATHO_SIGNATURE_RULES_VERSION = 1`.
 
 Current networks are mainnet, testnet, and regnet. Their internal IDs are `atho-mainnet`, `atho-testnet`, and `atho-regnet`; consensus IDs are 1, 2, and 3; visible prefixes are `A`, `T`, and `R`; P2P ports are 56000, 9100, and 9200; RPC ports are 9010, 9110, and 9210; and wire magic values are `a7 54 48 01`, `a7 54 48 02`, and `a7 54 48 03`.
 
@@ -620,10 +629,17 @@ function validate_transaction(tx, declared_fee, spend_height, utxo_set, rules):
         return Reject("transaction too large")
     if any(output.value_atoms == 0 for output in tx.outputs):
         return Reject("zero-value output")
+    if any(output.value_atoms < MIN_OUTPUT_AMOUNT_ATOMS for output in tx.outputs):
+        return Reject("output below minimum")
+    if tx.outputs.len > MAX_STANDARD_OUTPUTS:
+        return Reject("too many outputs")
     if has_duplicate_inputs(tx.inputs):
         return Reject("duplicate input")
-    if declared_fee < tx.vsize_bytes * MIN_TX_FEE_PER_VBYTE_ATOMS:
+    required_fee = max(MIN_TX_FEE_ATOMS, tx.vsize_bytes * MIN_TX_FEE_PER_VBYTE_ATOMS)
+    if declared_fee < required_fee:
         return Reject("fee below minimum")
+    if !verify_tx_pow(ATHO_TX_POW_V1, tx):
+        return Reject("bad transaction proof")
     witness = parse_witness(tx.witness)
     if witness is missing or witness.input_refs.len != tx.inputs.len:
         return Reject("invalid witness")

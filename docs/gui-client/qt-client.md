@@ -27,6 +27,7 @@ Implemented in:
 Current major surfaces:
 
 - welcome / startup dialogs
+- File menu wallet lifecycle actions
 - overview dashboard
 - send page
 - receive page
@@ -57,9 +58,9 @@ Why:
 
 The client supports:
 
-- create wallet
-- import wallet
-- open wallet
+- New Wallet
+- Import Wallet
+- Open / Switch Wallet
 - receive-address generation
 - send submission
 - mining controls
@@ -70,6 +71,25 @@ The client supports:
 Why:
 
 - a wallet client should manage wallet lifecycle end to end, but still delegate chain truth to the backend
+
+Wallet creation requires a wallet name and a mnemonic word-count choice. Supported word counts are 12, 24, and 48 words, with 24 words as the default.
+
+Mnemonic import works directly and supports one-line, newline-separated, numbered, and extra-whitespace phrases. Imports validate word count and spelling before deriving the wallet.
+
+The File menu is the primary wallet-management surface:
+
+- New Wallet
+- Import Wallet
+- Open / Switch Wallet
+- Backup Wallet
+- Lock Wallet, if supported
+- Rename Wallet, if supported
+
+Wallet switching unloads stale send state and reloads wallet-local receive addresses, UTXOs, transaction history, balance, and address book. Address books are per-wallet and must not mix across wallets.
+
+The receive screen shows normal receive addresses, copy controls, and QR display when available. It does not include a testnet faucet. Testnet ATHO is distributed manually by the Atho founders or development team.
+
+The send flow signs the transaction, generates the SHA3-256 transaction send proof, and then broadcasts to the mempool. User-facing text should describe this as “Finalizing transaction,” “Generating send proof,” or “Preparing transaction,” not as mining.
 
 ## Sync-To-Tip Behavior
 

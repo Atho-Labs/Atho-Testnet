@@ -36,7 +36,7 @@ Atho intentionally separates relay policy from consensus where possible.
 
 Examples:
 
-- dust rejection is policy in the mempool/wallet path
+- minimum output rejection is policy in the mempool/wallet path
 - exact canonical block/transaction structure is consensus
 - fee floor checks may be policy when relaying, but fee/value underflow checks are consensus
 

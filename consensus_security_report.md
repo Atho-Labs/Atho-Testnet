@@ -14,7 +14,7 @@
 - Block time: `75 seconds`
 - Vbyte block cap: `3,000,000`
 - Raw block cap: `12,000,000 bytes`
-- Monetary policy constants: `50 ATHO` genesis reward, `1,680,000` block halving interval, `168,000,000 ATHO` max supply
+- Monetary policy constants: `6.25 ATHO` initial reward, `1,680,000` block halving interval, permanent `0.78125 ATHO` tail reward, no fixed max supply cap
 - Coinbase maturity: `150 blocks`
 - Signature scheme: `Falcon-512`
 - Hashing scheme: `SHA3-384` prehash, `SHA3-256` address digests
@@ -50,7 +50,7 @@
 | Transaction lifecycle | Pass | Valid/invalid tx admission and block inclusion paths passed |
 | Block creation and validation | Pass | Block assembly, size checks, PoW, merkle, witness, and fee checks passed |
 | Coinbase and reward logic | Pass | Coinbase reward and maturity checks passed |
-| Monetary policy | Pass | Max-supply and halving boundary checks passed |
+| Monetary policy | Pass | Halving and permanent-tail-emission boundary checks passed |
 | Signature and witness verification | Pass | Invalid signatures rejected; exact cache rules remained safe |
 | Mempool behavior | Pass | Conflict handling, revalidation, and policy checks passed |
 | P2P / sync / propagation | Pass | Handshake, relay, sync, and reorg tests passed |

@@ -75,6 +75,38 @@ Why:
 - genesis is the root of chain identity
 - every peer, wallet, and store needs an immutable origin point
 
+Mainnet genesis must not change. Testnet may receive new genesis parameters during development testing, but those changes are testnet-only and do not apply to mainnet.
+
+## Replay And Cross-Network Protection
+
+Transactions, signatures, transaction PoW preimages, addresses, peers, storage, UTXOs, mempool entries, and blocks are network-scoped.
+
+Consequences:
+
+- a testnet transaction must not be valid on mainnet
+- a mainnet transaction must not be valid on testnet
+- testnet coins cannot be spent on mainnet
+- mainnet coins cannot be spent on testnet
+- wrong-network peers are rejected during handshake
+- wrong-network addresses are rejected by wallet and send flows
+
+Mainnet has strict production behavior:
+
+- no faucet
+- no automatic storage self-healing
+- no testnet difficulty stall reset
+- no genesis changes
+- strict replay protection
+
+Testnet is for development and testing:
+
+- no faucet in the software
+- testnet ATHO is distributed manually by the Atho founders or development team
+- testnet may reset during development
+- testnet may self-heal local testnet storage after configured network or storage changes
+- testnet difficulty may reset to minimum after more than 10 minutes without a block
+- testnet coins have no mainnet value
+
 ## Protocol Versioning
 
 Current explicit version constants:

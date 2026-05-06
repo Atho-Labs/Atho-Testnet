@@ -40,6 +40,27 @@ Why:
 
 - the structure stays close to Bitcoin’s UTXO spend model while adapting to Atho’s 48-byte hash space and witness commitment model
 
+## Amount Units
+
+Consensus stores integer atoms only.
+
+Official display units:
+
+- `1 ATHO = 1,000,000,000,000 atoms`
+- `1 mATHO = 1,000,000,000 atoms`
+- `1 μATHO = 1,000,000 atoms`
+- `1 nATHO = 1,000 atoms`
+- `1 atom = 1 atom`
+
+The client may display Auto, ATHO, mATHO, μATHO, nATHO, or atoms. Fees usually display best in atoms, with optional nATHO or ATHO conversion.
+
+Examples:
+
+- `650 atoms = 0.650 nATHO`
+- `1,000 atoms = 1 nATHO`
+- `0.78125 ATHO = 781,250,000,000 atoms`
+- `6.25 ATHO = 6,250,000,000,000 atoms`
+
 ## Canonical Encoding
 
 Transactions expose several byte layouts:
@@ -148,18 +169,22 @@ Why:
 
 Current fee floor:
 
-- `1 atom / vbyte`
-- relay dust floor: `50 atoms`
+- required fee: `max(500 atoms, tx_vbytes * 1 atom)`
+- minimum relay fee rate: `1 atom / vbyte`
+- minimum normal output: `1,000 atoms`
+- maximum standard outputs: `64`
+- normal non-coinbase transactions require SHA3-256 wallet transaction PoW
 
 Constants:
 
 - `MIN_TX_FEE_PER_VBYTE_ATOMS`
 - `MIN_TX_FEE_ATOMS`
-- `DUST_RELAY_VALUE_ATOMS`
+- `MIN_OUTPUT_AMOUNT_ATOMS`
+- `MAX_STANDARD_OUTPUTS`
 
 Why:
 
-- a simple explicit fee floor is easier to reason about while the network policy layer is still early-stage
+- low integer fees plus transaction PoW give the mempool a spam deterrent without forcing high user fees
 
 ## Lifecycle Placement
 
@@ -167,10 +192,11 @@ Transaction flow today:
 
 1. wallet builds a candidate spend
 2. wallet signs the canonical digest
-3. node validates and admits to mempool
-4. miner selects by feerate
-5. block acceptance reruns validation
-6. confirmed outputs enter the UTXO set
+3. wallet finalizes the SHA3-256 send proof (`tx_pow_nonce` and `tx_pow_bits`)
+4. node validates transaction PoW, policy, witnesses, and UTXO ownership before mempool admission
+5. miner selects valid mempool transactions by policy and feerate
+6. block acceptance reruns validation
+7. confirmed outputs enter the UTXO set
 
 ## Current Limitations
 

@@ -19,10 +19,14 @@ The mempool stores unconfirmed transactions that:
 
 Current documented relay defaults include:
 
+- minimum transaction fee: `500 atoms`
 - minimum fee rate: `1 atom / vbyte`
-- dust threshold: `50 atoms`
+- required fee: `max(500 atoms, tx_vbytes)`
+- minimum normal output: `1,000 atoms`
+- maximum standard outputs: `64`
+- normal transactions must carry valid SHA3-256 transaction PoW
 
-Outputs below the dust threshold should not be created by wallet code and should be rejected for relay policy.
+Outputs below the 1,000-atom minimum should not be created by wallet code and should be rejected for relay policy.
 
 ## Important Distinction
 

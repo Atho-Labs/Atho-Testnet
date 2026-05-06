@@ -131,6 +131,16 @@ Why:
 
 - fail-closed plus quarantine is safer than silent best-effort repair
 
+Mainnet safety rule:
+
+- mainnet must not automatically self-heal or reset production storage
+
+Testnet development rule:
+
+- testnet may self-heal local chain storage when configured testnet genesis, network magic, storage magic, chain ID, or schema version changes
+
+This keeps disposable testnet data recoverable during development while keeping mainnet storage fail-closed.
+
 ## Data Roots
 
 Current data-root logic:

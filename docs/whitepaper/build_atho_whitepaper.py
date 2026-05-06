@@ -244,14 +244,14 @@ FIGURES: Dict[str, FigureSpec] = {
         "fig6",
         6,
         "Atho Emission Model",
-        "Emission schedule derived from the current source constants: 50 ATHO initial subsidy, 1,680,000-block halving intervals, and a 168,000,000 ATHO maximum supply ceiling.",
+        "Emission schedule derived from the current source constants: 6.25 ATHO initial subsidy, 1,680,000-block halving intervals, and a permanent 0.78125 ATHO tail reward.",
         dedent(
             """
             xychart-beta
                 title "Atho emission model"
-                x-axis "Height" [0, 1680000, 3360000, 5040000, 6720000, 8400000, 10080000]
-                y-axis "Reward ATHO" 0 --> 50
-                line "Subsidy" [50, 25, 12, 6, 3, 1, 0]
+                x-axis "Height" [0, 1680000, 3360000, 5040000, 6720000]
+                y-axis "Reward ATHO" 0 --> 7
+                line "Subsidy" [6.25, 3.125, 1.5625, 0.78125, 0.78125]
             """
         ),
         "figure_06_emission_model.png",
@@ -439,15 +439,16 @@ TABLES: Dict[str, TableSpec] = {
         "Monetary Policy Constants",
         ["Constant", "Value", "Source File", "Purpose"],
         [
-            ["Atoms per ATHO", "100,000,000", "`crates/atho-core/src/constants.rs`", "Defines the smallest accounting unit."],
-            ["Maximum supply ceiling", "168,000,000 ATHO", "`constants.rs`; `consensus/params.rs`", "Upper bound for total issued supply."],
-            ["Initial block reward", "50 ATHO", "`constants.rs`; `consensus/subsidy.rs`", "Genesis and early-chain subsidy."],
+            ["Atoms per ATHO", "1,000,000,000,000", "`crates/atho-core/src/constants.rs`", "Defines the smallest accounting unit."],
+            ["Maximum supply ceiling", "None", "`constants.rs`; `consensus/params.rs`", "Atho uses permanent tail emission."],
+            ["Initial block reward", "6.25 ATHO", "`constants.rs`; `consensus/subsidy.rs`", "Genesis and early-chain subsidy."],
             ["Halving interval", "1,680,000 blocks", "`constants.rs`; `consensus/subsidy.rs`", "Height interval for right-shift reward reduction."],
+            ["Tail block reward", "0.78125 ATHO forever", "`constants.rs`; `consensus/subsidy.rs`", "Long-term proof-of-work security budget."],
             ["Target block time", "75 seconds", "`constants.rs`; `consensus/pow.rs`", "Expected spacing for difficulty adjustment."],
             ["Coinbase maturity", "150 blocks", "`constants.rs`; `storage/utxo.rs`", "Required confirmations before mined outputs are spendable."],
             ["Standard confirmations", "7 blocks", "`constants.rs`; `storage/utxo.rs`", "Wallet-facing settlement convention for non-coinbase outputs."],
-            ["Minimum fee rate", "1 atom per vbyte", "`constants.rs`; `storage/validation.rs`", "Baseline anti-spam policy."],
-            ["Dust threshold", "50 atoms", "`crates/atho-core/src/constants.rs`", "Relay and wallet policy floor for spendable outputs."],
+            ["Minimum fee", "max(500 atoms, tx_vbytes)", "`constants.rs`; `storage/validation.rs`", "Baseline anti-spam policy."],
+            ["Minimum output", "1,000 atoms", "`crates/atho-core/src/constants.rs`", "Relay and wallet policy floor for normal outputs."],
         ],
     ),
     "t6": TableSpec(
@@ -989,9 +990,9 @@ SECTIONS: List[Dict[str, object]] = [
             Non-coinbase transactions must have at least one input and at least one
             output. Each input references a previous 48-byte transaction ID and an
             output index. Each output records a `value_atoms` integer and a locking
-            script. One ATHO equals 100,000,000 atoms, so all accounting is integer
-            accounting. This avoids floating-point monetary behavior in consensus
-            code.
+            script. One ATHO equals 1,000,000,000,000 atoms, so all accounting is
+            integer accounting. This avoids floating-point monetary behavior in
+            consensus code.
             """
         ),
         p(
@@ -1002,9 +1003,20 @@ SECTIONS: List[Dict[str, object]] = [
             The full bytes include witness data. The vsize calculation follows a
             witness-weighted model: base data is weighted more heavily than witness
             data, and vbytes are derived from total weight. Current limits are
-            250,000 raw bytes and 250,000 vbytes per transaction. The minimum fee
-            policy is 1 atom per vbyte, zero-value outputs are rejected, and relay
-            and wallet policy reject spendable outputs below 50 atoms.
+            250,000 raw bytes and 250,000 vbytes per transaction. The required fee
+            is `max(500 atoms, tx_vbytes * 1 atom)`, zero-value outputs are rejected,
+            normal outputs below 1,000 atoms are rejected, and standard transactions
+            may have at most 64 outputs.
+            """
+        ),
+        p(
+            """
+            Normal non-coinbase transactions require wallet transaction proof-of-work.
+            The wallet signs the transaction first, builds a PoW preimage from the
+            signed transaction without PoW fields, solves a SHA3-256 nonce under the
+            `ATHO_TX_POW_V1` domain, and includes `tx_pow_nonce` and `tx_pow_bits`.
+            Nodes can verify this send proof before expensive signature checks when
+            possible. Coinbase transactions do not require wallet transaction PoW.
             """
         ),
         p(
@@ -1142,26 +1154,34 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             Atho's monetary policy is defined by source constants and subsidy
-            functions. One ATHO is 100,000,000 atoms. The maximum supply constant is
-            168,000,000 ATHO. The initial subsidy is 50 ATHO per block. The halving
-            interval is 1,680,000 blocks. The target block time is 75 seconds. The
-            current subsidy function computes integer ATHO rewards using right-shift
-            halving: 50, 25, 12, 6, 3, 1, and then 0 after subsequent halvings. The
-            cumulative subsidy function is bounded by the maximum supply constant,
-            and current tests assert that cumulative issuance does not exceed the
-            supply ceiling.
+            functions. One ATHO is 1,000,000,000,000 atoms. There is no fixed max
+            supply cap. The initial subsidy is 6.25 ATHO per block, the halving
+            interval is 1,680,000 blocks, the target block time is 75 seconds, and
+            the permanent tail subsidy is 0.78125 ATHO per block forever after the
+            third halving. This schedule keeps a predictable proof-of-work security
+            budget instead of depending only on future fee pressure.
             """
         ),
         p(
             """
-            The integer halving detail is important. A mathematical infinite
-            geometric series beginning at 50 ATHO and halving every interval would
-            sum to 168,000,000 ATHO over 1,680,000-block intervals. The current code
-            halves integer ATHO values, which means fractional ATHO subsidies are not
-            emitted after the reward reaches 1 ATHO and shifts to 0. Therefore the
-            implemented schedule should be described as a deterministic subsidy
-            schedule under a 168,000,000 ATHO ceiling, not as a promise that every
-            atom of the ceiling is emitted by the current integer subsidy function.
+            Atho changed from a fixed-cap model to permanent tail emission because a
+            payment-focused proof-of-work network needs durable miner incentives
+            while preserving low transaction fees for users. The inflation rate
+            naturally declines as supply grows. The tail starts at block 5,040,000,
+            around year 12. Approximate supply is 18,375,000 ATHO at tail start,
+            21,007,500 ATHO around year 20, and 30,862,500 ATHO around year 50. The
+            annual tail issuance is 328,500 ATHO, about 1.56% around year 20 and
+            about 1.06% around year 50.
+            """
+        ),
+        p(
+            """
+            Atho is scarce at the coin level and highly divisible at the atom level.
+            One ATHO contains one trillion atoms, allowing small payments and low
+            fees even if ATHO becomes highly valuable. The official display ladder
+            is ATHO, mATHO, μATHO, nATHO, and atoms: 1 ATHO equals 1,000 mATHO; 1
+            mATHO equals 1,000 μATHO; 1 μATHO equals 1,000 nATHO; and 1 nATHO equals
+            1,000 atoms. Consensus stores only integer atoms.
             """
         ),
         p(
@@ -1171,7 +1191,7 @@ SECTIONS: List[Dict[str, object]] = [
             and require the coinbase output to equal subsidy plus miner fees. They
             also require block fee fields to add consistently. If a block overpays
             the coinbase, underpays fee accounting, uses unsupported versions, or
-            violates supply bounds, validation rejects it. Table 5 lists the current
+            violates monetary policy, validation rejects it. Table 5 lists the current
             monetary constants, and Figure 6 visualizes the reward and cumulative
             issuance path from the present source code.
             """
@@ -1196,7 +1216,8 @@ SECTIONS: List[Dict[str, object]] = [
             """
             Admission runs through `validate_transaction_with_context`. The checks
             include supported version, non-empty outputs, raw size, vsize, zero-value
-            outputs, duplicate inputs, minimum fee, witness shape, witness input
+            outputs, duplicate inputs, required fee, maximum standard output count,
+            SHA3-256 transaction proof-of-work, witness shape, witness input
             references, UTXO existence, ownership, maturity, and Falcon signature.
             If any check fails, the transaction is rejected. After blocks are
             accepted or reorgs occur, the mempool revalidates entries against the new
@@ -1209,10 +1230,11 @@ SECTIONS: List[Dict[str, object]] = [
             Several policies are intentionally marked as not yet active or TBD. No
             explicit mempool expiry rule, replacement-by-fee policy, or memory-size
             cap was found in the source files inspected for this paper. The current
-            fee floor, 1,000-atom relay dust floor, and size limits provide baseline
-            spam resistance, but production hardening should add explicit memory and
-            expiry behavior so long-running public nodes can bound resource use under
-            adversarial load. Figure 7 shows the current admission flow.
+            fee floor, 1,000-atom output minimum, transaction PoW, and size limits
+            provide baseline spam resistance, but production hardening should add
+            explicit memory and expiry behavior so long-running public nodes can
+            bound resource use under adversarial load. Figure 7 shows the current
+            admission flow.
             """
         ),
         fig("fig7"),
@@ -1224,9 +1246,10 @@ SECTIONS: List[Dict[str, object]] = [
             Atho consensus validation has two major surfaces: transaction validation
             and block validation. Transaction validation first checks structure:
             non-coinbase inputs, supported version, outputs, size limits, non-zero
-            output values, duplicate inputs, minimum fee, witness presence, witness
-            reference count, and witness short references. It then verifies the
-            Falcon signature. Contextual validation adds UTXO lookup, locking-script
+            output values, duplicate inputs, required fee, output count, transaction
+            PoW, witness presence, witness reference count, and witness short
+            references. It then verifies the Falcon signature. Contextual validation
+            adds UTXO lookup, locking-script
             equality, standard address digest ownership, maturity, and fee
             calculation. This staged approach avoids expensive signature work when a
             transaction is structurally invalid.
@@ -1298,6 +1321,17 @@ SECTIONS: List[Dict[str, object]] = [
             validation. Figure 8 summarizes the sync and propagation flow.
             """
         ),
+        p(
+            """
+            Mainnet and testnet are strictly separated. Transactions, signatures,
+            transaction PoW preimages, addresses, peers, storage, UTXOs, mempool
+            entries, and blocks are network-scoped. A testnet transaction must not be
+            valid on mainnet, and a mainnet transaction must not be valid on testnet.
+            Testnet coins cannot be spent on mainnet. Testnet ATHO is distributed
+            manually by the Atho team during testing; the production client does not
+            include an automated faucet.
+            """
+        ),
         fig("fig8"),
     ),
     section(
@@ -1337,9 +1371,12 @@ SECTIONS: List[Dict[str, object]] = [
             Storage also participates in recovery. If persisted state is corrupt,
             incomplete, cross-network inconsistent, or schema mismatched, the storage
             layer can quarantine affected local files and rebuild from genesis. This
-            fail-closed approach is safer than silent repair. The same per-network
-            separation also applies to block archives: wrong-network flat block
-            parsing fails when the wrapper magic or embedded block network
+            fail-closed approach is safer than silent repair. Mainnet must not
+            automatically self-heal or reset production storage. Testnet may
+            self-heal local chain storage when configured testnet genesis, network
+            magic, storage magic, chain ID, or schema version changes. The same
+            per-network separation also applies to block archives: wrong-network flat
+            block parsing fails when the wrapper magic or embedded block network
             identifier does not match the active network. Pruning removes old raw
             block archive data only after the configured retention depth, while LMDB
             keeps the indexed metadata and live chainstate needed for ongoing
@@ -1375,6 +1412,18 @@ SECTIONS: List[Dict[str, object]] = [
             converted into a payment digest and visible Base56 address. The default
             restore gap limit is 1,000, allowing recovery scans to inspect a window
             of possible receive and change addresses.
+            """
+        ),
+        p(
+            """
+            The client supports multiple HD wallets. Wallet creation requires a
+            wallet name and a mnemonic word-count choice of 12, 24, or 48 words, with
+            24 words as the default. Mnemonic import works directly and supports
+            one-line phrases, newline-separated phrases, numbered phrases, and extra
+            whitespace. Each wallet keeps its own metadata, addresses, UTXO state,
+            transaction history/cache, derivation indexes, and per-wallet address
+            book. Users switch wallets from the File menu through Open / Switch
+            Wallet.
             """
         ),
         p(
@@ -1762,7 +1811,7 @@ APPENDICES: List[Dict[str, object]] = [
             discovery window used when reconstructing wallet state from seed or
             mnemonic material. HPK: Atho's internal hashed-public-key string. Vbyte:
             Virtual byte used for witness-weighted sizing. Atom: Smallest Atho
-            monetary unit; 100,000,000 atoms equal 1 ATHO.
+            monetary unit; 1,000,000,000,000 atoms equal 1 ATHO.
             """
         ),
     ),
@@ -1773,6 +1822,10 @@ APPENDICES: List[Dict[str, object]] = [
             The following source-derived constants are used throughout the paper:
             `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`;
             `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`;
+            `TAIL_REWARD_ATOMS = 781_250_000_000`; `MIN_TX_FEE_ATOMS = 500`;
+            `MIN_OUTPUT_AMOUNT_ATOMS = 1_000`; `MAX_STANDARD_OUTPUTS = 64`;
+            `TX_POW_HASH = SHA3-256`; `TX_POW_MIN_BITS = 16`; `TX_POW_MAX_BITS = 28`;
+            `TX_POW_DOMAIN = ATHO_TX_POW_V1`; `TX_SIGN_DOMAIN = ATHO_TX_SIGN_V1`;
             `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`;
             `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`;
             `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`;
@@ -1815,10 +1868,17 @@ APPENDICES: List[Dict[str, object]] = [
                     return Reject("transaction too large")
                 if any(output.value_atoms == 0 for output in tx.outputs):
                     return Reject("zero-value output")
+                if any(output.value_atoms < MIN_OUTPUT_AMOUNT_ATOMS for output in tx.outputs):
+                    return Reject("output below minimum")
+                if tx.outputs.len > MAX_STANDARD_OUTPUTS:
+                    return Reject("too many outputs")
                 if has_duplicate_inputs(tx.inputs):
                     return Reject("duplicate input")
-                if declared_fee < tx.vsize_bytes * MIN_TX_FEE_PER_VBYTE_ATOMS:
+                required_fee = max(MIN_TX_FEE_ATOMS, tx.vsize_bytes * MIN_TX_FEE_PER_VBYTE_ATOMS)
+                if declared_fee < required_fee:
                     return Reject("fee below minimum")
+                if !verify_tx_pow(ATHO_TX_POW_V1, tx):
+                    return Reject("bad transaction proof")
                 witness = parse_witness(tx.witness)
                 if witness is missing or witness.input_refs.len != tx.inputs.len:
                     return Reject("invalid witness")
@@ -2688,7 +2748,7 @@ def write_changelog(word_count: int) -> None:
             - Rendered the PDF deliverable at `docs/whitepaper/atho-whitepaper-apa.pdf`.
             - Added APA-style title page, abstract, keywords, table of contents, list of figures, list of tables, references, and appendices.
             - Included 11 rendered figures, 11 tables, Mermaid source files, and an emission CSV/chart asset.
-            - Sourced Atho constants from Rust source files, including the 50-atom dust floor, and marked other undefined policy values, such as public API authentication, as TBD or not currently active.
+            - Sourced Atho constants from Rust source files, including E-12 atoms, the 1,000-atom output minimum, low atom-denominated fees, transaction PoW, and permanent tail emission.
             - Included code reference map and pseudocode appendices for transaction validation, block validation, mempool admission, coinbase reward validation, reorg rollback, wallet signing, and difficulty checking.
             - Added external citations for NIST PQC/FIPS status, Falcon, SHA3, Rust, proof-of-work, and quantum-signature risk.
 
