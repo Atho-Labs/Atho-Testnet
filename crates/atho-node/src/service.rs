@@ -19,15 +19,10 @@ use crate::wallet_history;
 use atho_core::address::{decode_base56_address, encode_base56_address};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::{pow, rules, subsidy};
-use atho_core::constants::{
-    DUST_RELAY_VALUE_ATOMS, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
-};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
-use atho_core::transaction::{
-    Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef, WitnessSignerGroup,
-};
+use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use atho_p2p::address_manager::format_remote_addr;
 use atho_p2p::config::network_params;
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
@@ -37,23 +32,16 @@ use atho_rpc::command::{
 };
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
-    BlockTemplate, FaucetSubmission, MempoolInfo, MempoolSpentInput, NetworkDiagnostics,
-    NetworkPeerDiagnostics, NetworkPeerDirection, NodeStatus, RpcResponse, WalletActivityEntry,
+    BlockTemplate, MempoolInfo, MempoolSpentInput, NetworkDiagnostics, NetworkPeerDiagnostics,
+    NetworkPeerDirection, NodeStatus, RpcResponse, WalletActivityEntry,
 };
-use atho_storage::db::{FaucetRequestRecord, PeerHealthRecord};
+use atho_storage::db::PeerHealthRecord;
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use atho_wallet::snapshot::WalletSnapshot;
-use atho_wallet::wallet::{Wallet, WalletSpendRequest, WalletSpendUtxo};
 
 const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-
-const FAUCET_MAX_AMOUNT_ATOMS: u64 = 100_000_000_000_000;
-const FAUCET_COOLDOWN_BLOCKS: u64 = 20;
-const TESTNET_FAUCET_WALLET_PATH_ENV: &str = "ATHO_TESTNET_FAUCET_WALLET_PATH";
-const TESTNET_FAUCET_WALLET_PASSWORD_ENV: &str = "ATHO_TESTNET_FAUCET_WALLET_PASSWORD";
 
 /// Snapshot of the local node state used by operator interfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +70,6 @@ struct NetworkRuntimeView {
     bytes_sent: u64,
     bytes_received: u64,
     peers: BTreeMap<String, PeerTrafficStats>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FaucetSpendPlan {
-    selected_utxos: Vec<WalletSpendUtxo>,
-    total_input_atoms: u64,
-    output_count: usize,
-    signer_group_count: usize,
-    estimated_fee_atoms: u64,
 }
 
 /// Mutable service façade around a running [`NodeOrchestrator`].
@@ -196,9 +175,7 @@ impl NodeService {
                     Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 }
             }
-            RpcRequest::SubmitBlock(_)
-            | RpcRequest::SubmitTransaction { .. }
-            | RpcRequest::RequestTestnetFaucet { .. } => {
+            RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => {
                 RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
                     "submit requests require mutable RPC handling",
                 ))
@@ -310,11 +287,6 @@ impl NodeService {
                 }
                 response
             }
-            RpcRequest::RequestTestnetFaucet {
-                destination_address,
-                amount_atoms,
-                requester_id,
-            } => self.request_testnet_faucet(destination_address, amount_atoms, requester_id),
             other => self.handle(other),
         }
     }
@@ -339,206 +311,6 @@ impl NodeService {
             .entries()
             .cloned()
             .collect()
-    }
-
-    fn request_testnet_faucet(
-        &mut self,
-        destination_address: String,
-        amount_atoms: u64,
-        requester_id: String,
-    ) -> RpcResponse {
-        if self.network() != Network::Testnet {
-            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
-                "testnet faucet is disabled on this network",
-            ));
-        }
-        if amount_atoms == 0 {
-            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
-                "faucet amount must be greater than zero",
-            ));
-        }
-        if amount_atoms > FAUCET_MAX_AMOUNT_ATOMS {
-            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(format!(
-                "faucet requests are limited to {} atoms (100 ATHO)",
-                FAUCET_MAX_AMOUNT_ATOMS
-            )));
-        }
-
-        let requester_id = requester_id.trim();
-        if requester_id.is_empty() {
-            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
-                "faucet requester id is required",
-            ));
-        }
-
-        let destination_address = destination_address.trim();
-        let (recipient_digest, address_network) = match decode_base56_address(destination_address) {
-            Ok(parts) => parts,
-            Err(err) => {
-                return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
-                    err.to_string(),
-                ));
-            }
-        };
-        if address_network != Network::Testnet {
-            return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(
-                "faucet destination must be a testnet Atho address",
-            ));
-        }
-        let canonical_destination = encode_base56_address(Network::Testnet, &recipient_digest);
-        let accepted_height = self.orchestrator.runtime.node.height();
-        let next_eligible_height = accepted_height.saturating_add(FAUCET_COOLDOWN_BLOCKS);
-
-        match self
-            .orchestrator
-            .runtime
-            .node
-            .load_faucet_request_record(requester_id, &canonical_destination)
-        {
-            Ok(Some(record))
-                if accepted_height.saturating_sub(record.last_request_height)
-                    < FAUCET_COOLDOWN_BLOCKS =>
-            {
-                return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(format!(
-                    "Faucet request limit reached. Try again after block {}.",
-                    record
-                        .last_request_height
-                        .saturating_add(FAUCET_COOLDOWN_BLOCKS)
-                )));
-            }
-            Ok(_) => {}
-            Err(err) => return RpcResponse::Error(rpc_error_from_node(err)),
-        }
-
-        let (transaction, fee_atoms) =
-            match self.build_testnet_faucet_transaction(recipient_digest, amount_atoms) {
-                Ok(built) => built,
-                Err(err) => {
-                    return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(err));
-                }
-            };
-
-        match self
-            .orchestrator
-            .runtime
-            .node
-            .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
-        {
-            Ok(txid) => {
-                let record = FaucetRequestRecord {
-                    network: Network::Testnet,
-                    requester_id: requester_id.to_owned(),
-                    destination_address: canonical_destination,
-                    last_request_height: accepted_height,
-                    amount_atoms,
-                    recorded_at_unix: unix_timestamp(),
-                    txid,
-                };
-                if let Err(err) = self
-                    .orchestrator
-                    .runtime
-                    .node
-                    .save_faucet_request_record(&record)
-                {
-                    return RpcResponse::Error(rpc_error_from_node(err));
-                }
-                self.refresh_runtime_views();
-                RpcResponse::TestnetFaucetSubmitted(FaucetSubmission {
-                    txid,
-                    accepted_height,
-                    next_eligible_height,
-                })
-            }
-            Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
-        }
-    }
-
-    fn build_testnet_faucet_transaction(
-        &self,
-        recipient_digest: [u8; 32],
-        amount_atoms: u64,
-    ) -> Result<(Transaction, u64), String> {
-        let wallet_path = std::env::var(TESTNET_FAUCET_WALLET_PATH_ENV).map_err(|_| {
-            format!(
-                "set {} to a funded testnet faucet wallet datafile path",
-                TESTNET_FAUCET_WALLET_PATH_ENV
-            )
-        })?;
-        let wallet_password = std::env::var(TESTNET_FAUCET_WALLET_PASSWORD_ENV).unwrap_or_default();
-        let wallet_path = PathBuf::from(wallet_path);
-        let mut wallet = Wallet::load_from_datafile(wallet_path.as_path(), &wallet_password)
-            .map_err(|err| format!("failed to load faucet wallet: {err}"))?;
-        if wallet.network != Network::Testnet {
-            return Err(String::from(
-                "configured faucet wallet does not belong to testnet",
-            ));
-        }
-
-        let current_height = self.orchestrator.runtime.node.height();
-        let reserved_inputs = self
-            .orchestrator
-            .runtime
-            .node
-            .mempool_spent_inputs()
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let owned_by_digest = wallet
-            .discovery_addresses_up_to(wallet.restore_gap_limit())
-            .into_iter()
-            .map(|address| (address.payment_digest, address))
-            .collect::<BTreeMap<_, _>>();
-
-        let selected_utxos = self
-            .orchestrator
-            .runtime
-            .node
-            .utxo_snapshot()
-            .entries()
-            .filter(|utxo| utxo.is_spendable_at(current_height))
-            .filter(|utxo| !reserved_inputs.contains(&(utxo.txid, utxo.output_index)))
-            .filter_map(|utxo| {
-                let digest: [u8; 32] = utxo.locking_script.as_slice().try_into().ok()?;
-                owned_by_digest.get(&digest)?;
-                Some(WalletSpendUtxo {
-                    previous_txid: utxo.txid,
-                    output_index: utxo.output_index,
-                    value_atoms: utxo.value_atoms,
-                    locking_script: utxo.locking_script.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if selected_utxos.is_empty() {
-            return Err(String::from(
-                "configured faucet wallet has no spendable confirmed testnet UTXOs",
-            ));
-        }
-
-        let spend_plan = select_faucet_utxos(Network::Testnet, selected_utxos, amount_atoms)?
-            .ok_or_else(|| {
-                String::from(
-                    "configured faucet wallet cannot cover the requested amount and fee with its spendable testnet UTXOs",
-                )
-            })?;
-
-        let change_address =
-            wallet.checkout_change_address_with_label(Some(String::from("Testnet faucet change")));
-        let spend_request = WalletSpendRequest {
-            selected_utxos: spend_plan.selected_utxos,
-            recipient_digest,
-            amount_atoms,
-            include_fee_in_total: false,
-            transaction_version: 1,
-            lock_time: faucet_transaction_lock_time(),
-            change_address: Some(change_address),
-        };
-        let built = wallet
-            .build_signed_payment_transaction(spend_request)
-            .map_err(|err| format!("faucet wallet cannot build a valid spend: {err}"))?;
-        wallet
-            .save_to_datafile(wallet_path.as_path(), &wallet_password)
-            .map_err(|err| format!("failed to persist faucet wallet state: {err}"))?;
-        Ok((built.transaction, built.fee_atoms))
     }
 
     fn execute_command(&self, invocation: CommandInvocation) -> RpcResponse {
@@ -2236,174 +2008,6 @@ impl NodeService {
     }
 }
 
-fn select_faucet_utxos(
-    network: Network,
-    mut candidates: Vec<WalletSpendUtxo>,
-    amount_atoms: u64,
-) -> Result<Option<FaucetSpendPlan>, String> {
-    candidates.sort_by(|left, right| {
-        right
-            .value_atoms
-            .cmp(&left.value_atoms)
-            .then(left.locking_script.cmp(&right.locking_script))
-            .then(left.previous_txid.cmp(&right.previous_txid))
-            .then(left.output_index.cmp(&right.output_index))
-    });
-
-    let mut best: Option<FaucetSpendPlan> = None;
-    let mut selected = Vec::new();
-    let mut total_input_atoms = 0u64;
-    let mut signer_groups = BTreeSet::<Vec<u8>>::new();
-
-    for candidate in candidates {
-        total_input_atoms = total_input_atoms
-            .checked_add(candidate.value_atoms)
-            .ok_or_else(|| String::from("faucet amount arithmetic overflowed"))?;
-        signer_groups.insert(candidate.locking_script.clone());
-        selected.push(candidate);
-
-        let signer_group_count = signer_groups.len();
-        let exact_fee =
-            estimate_wallet_transaction_fee(network, selected.len(), 1, signer_group_count);
-        if let Some(target_atoms) = amount_atoms.checked_add(exact_fee) {
-            if total_input_atoms >= target_atoms
-                && total_input_atoms.saturating_sub(target_atoms) < DUST_RELAY_VALUE_ATOMS
-            {
-                best = prefer_faucet_plan(
-                    best,
-                    FaucetSpendPlan {
-                        selected_utxos: selected.clone(),
-                        total_input_atoms,
-                        output_count: 1,
-                        signer_group_count,
-                        estimated_fee_atoms: exact_fee,
-                    },
-                );
-                break;
-            }
-        }
-
-        let change_fee =
-            estimate_wallet_transaction_fee(network, selected.len(), 2, signer_group_count);
-        if let Some(target_atoms) = amount_atoms.checked_add(change_fee) {
-            if total_input_atoms > target_atoms
-                && total_input_atoms.saturating_sub(target_atoms) >= DUST_RELAY_VALUE_ATOMS
-            {
-                best = prefer_faucet_plan(
-                    best,
-                    FaucetSpendPlan {
-                        selected_utxos: selected.clone(),
-                        total_input_atoms,
-                        output_count: 2,
-                        signer_group_count,
-                        estimated_fee_atoms: change_fee,
-                    },
-                );
-            }
-        }
-    }
-
-    Ok(best)
-}
-
-fn prefer_faucet_plan(
-    current: Option<FaucetSpendPlan>,
-    candidate: FaucetSpendPlan,
-) -> Option<FaucetSpendPlan> {
-    match current {
-        None => Some(candidate),
-        Some(existing) => {
-            let existing_inputs = existing.selected_utxos.len();
-            let candidate_inputs = candidate.selected_utxos.len();
-            if candidate.estimated_fee_atoms < existing.estimated_fee_atoms
-                || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
-                    && candidate_inputs < existing_inputs)
-                || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
-                    && candidate_inputs == existing_inputs
-                    && candidate.signer_group_count < existing.signer_group_count)
-                || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
-                    && candidate_inputs == existing_inputs
-                    && candidate.signer_group_count == existing.signer_group_count
-                    && candidate.output_count < existing.output_count)
-                || (candidate.estimated_fee_atoms == existing.estimated_fee_atoms
-                    && candidate_inputs == existing_inputs
-                    && candidate.signer_group_count == existing.signer_group_count
-                    && candidate.output_count == existing.output_count
-                    && candidate.total_input_atoms < existing.total_input_atoms)
-            {
-                Some(candidate)
-            } else {
-                Some(existing)
-            }
-        }
-    }
-}
-
-fn estimate_wallet_transaction_fee(
-    network: Network,
-    input_count: usize,
-    output_count: usize,
-    signer_group_count: usize,
-) -> u64 {
-    let inputs = (0..input_count)
-        .map(|index| TxInput {
-            previous_txid: [0; 48],
-            output_index: index as u32,
-            unlocking_script: vec![0; 32],
-        })
-        .collect::<Vec<_>>();
-    let outputs = (0..output_count)
-        .map(|_| TxOutput {
-            value_atoms: 1,
-            locking_script: vec![0; 32],
-        })
-        .collect::<Vec<_>>();
-
-    let signer_group_count = signer_group_count.max(1).min(input_count.max(1));
-    let mut primary_input_refs = Vec::new();
-    let mut additional_signers = Vec::new();
-    for group_index in 0..signer_group_count {
-        let input_ref = WitnessInputRef {
-            input_index: group_index as u32,
-            sig_ref_short: [0; 2],
-            witness_commit_ref: [0; 16],
-        };
-        if group_index == 0 {
-            primary_input_refs.push(input_ref);
-        } else {
-            additional_signers.push(WitnessSignerGroup {
-                signature: vec![0; FALCON_512_SIGNATURE_BYTES],
-                pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
-                input_refs: vec![input_ref],
-            });
-        }
-    }
-    for input_index in signer_group_count..input_count {
-        primary_input_refs.push(WitnessInputRef {
-            input_index: input_index as u32,
-            sig_ref_short: [0; 2],
-            witness_commit_ref: [0; 16],
-        });
-    }
-    let witness = TxWitness {
-        signature: vec![0; FALCON_512_SIGNATURE_BYTES],
-        pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
-        input_refs: primary_input_refs,
-        additional_signers,
-    }
-    .canonical_bytes();
-    let tx = Transaction {
-        version: 1,
-        inputs,
-        outputs,
-        lock_time: 0,
-        witness,
-        tx_pow_nonce: 0,
-        tx_pow_bits: 0,
-    };
-    atho_core::consensus::tx_policy::minimum_required_fee_atoms(network, &tx)
-}
-
 impl NodeService {
     fn seed_peer_graph(&mut self) {
         let network = self.network();
@@ -2741,16 +2345,11 @@ mod tests {
     use atho_core::address::encode_base56_address;
     use atho_core::network::Network;
     use atho_core::transaction::Transaction;
-    use atho_rpc::error::RpcError;
     use atho_rpc::request::RpcRequest;
     use atho_rpc::response::RpcResponse;
     use atho_storage::path::ATHO_DATA_DIR_ENV;
-    use atho_storage::utxo::UtxoEntry;
-    use atho_wallet::mnemonic::{MnemonicLength, MnemonicPhrase};
-    use atho_wallet::wallet::Wallet;
     use std::ffi::OsString;
     use std::fs;
-    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvVarGuard {
@@ -2761,17 +2360,6 @@ mod tests {
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            let lock = acquire_global_test_lock();
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key,
-                previous,
-                _lock: lock,
-            }
-        }
-
-        fn set_value(key: &'static str, value: &str) -> Self {
             let lock = acquire_global_test_lock();
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
@@ -2802,47 +2390,6 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
-    }
-
-    fn save_testnet_faucet_wallet(path: &Path) {
-        let mut wallet = Wallet::from_mnemonic(
-            MnemonicPhrase::from_entropy(&[0x91u8; 32], MnemonicLength::Words24).unwrap(),
-            "",
-            Network::Testnet,
-        );
-        let _ = wallet.checkout_receive_address();
-        wallet
-            .save_to_datafile(path, "")
-            .expect("save faucet wallet");
-    }
-
-    fn seed_wallet_owned_utxo(service: &mut NodeService, wallet: &Wallet, value_atoms: u64) {
-        seed_wallet_owned_utxos(service, wallet, &[value_atoms]);
-    }
-
-    fn seed_wallet_owned_utxos(service: &mut NodeService, wallet: &Wallet, values_atoms: &[u64]) {
-        let funding_address = wallet
-            .all_addresses()
-            .into_iter()
-            .next()
-            .expect("wallet address");
-        service.sandbox_with_node_mut(|node| {
-            let mut bundle = node.export_snapshot_bundle().expect("bundle");
-            for (index, value_atoms) in values_atoms.iter().copied().enumerate() {
-                let mut txid = [0x77; 48];
-                txid[47] = u8::try_from(index).unwrap_or(u8::MAX);
-                bundle.utxos.push(UtxoEntry::new(
-                    Network::Testnet,
-                    txid,
-                    0,
-                    value_atoms,
-                    funding_address.payment_digest.to_vec(),
-                    0,
-                    false,
-                ));
-            }
-            node.import_snapshot_bundle(bundle).expect("import bundle");
-        });
     }
 
     #[test]
@@ -3169,212 +2716,6 @@ mod tests {
         assert_eq!(command.command, "getblocktemplate");
         assert_eq!(command.data["block"]["transaction_count"], 1);
     }
-
-    #[test]
-    fn testnet_faucet_is_disabled_on_mainnet() {
-        let root = temp_data_dir("faucet-mainnet-disabled");
-        fs::create_dir_all(&root).expect("root");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-
-        let mut service = NodeService::new(NodeConfig::new(Network::Mainnet));
-        let response = service.handle_mut(RpcRequest::RequestTestnetFaucet {
-            destination_address: encode_base56_address(Network::Mainnet, &[7u8; 32]),
-            amount_atoms: 1_000_000_000_000,
-            requester_id: String::from("local-client"),
-        });
-        let RpcResponse::Error(err) = response else {
-            panic!("unexpected response: {response:?}");
-        };
-        assert_eq!(err.code, RpcError::invalid_request("").code);
-        assert!(
-            err.details
-                .as_deref()
-                .unwrap_or_default()
-                .contains("disabled on this network"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn testnet_faucet_rejects_wrong_network_address() {
-        let root = temp_data_dir("faucet-wrong-network");
-        fs::create_dir_all(&root).expect("root");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-
-        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
-        let response = service.handle_mut(RpcRequest::RequestTestnetFaucet {
-            destination_address: encode_base56_address(Network::Mainnet, &[8u8; 32]),
-            amount_atoms: 1_000_000_000_000,
-            requester_id: String::from("local-client"),
-        });
-        let RpcResponse::Error(err) = response else {
-            panic!("unexpected response: {response:?}");
-        };
-        assert!(
-            err.details
-                .as_deref()
-                .unwrap_or_default()
-                .contains("must be a testnet Atho address"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn testnet_faucet_submits_a_normal_transaction_and_enforces_block_height_cooldown() {
-        let root = temp_data_dir("faucet-success");
-        fs::create_dir_all(&root).expect("root");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-
-        let faucet_path = root.join("testnet-faucet.datafile");
-        save_testnet_faucet_wallet(&faucet_path);
-        let _faucet_path = EnvVarGuard::set_value(
-            TESTNET_FAUCET_WALLET_PATH_ENV,
-            faucet_path.to_string_lossy().as_ref(),
-        );
-        let _faucet_password = EnvVarGuard::set_value(TESTNET_FAUCET_WALLET_PASSWORD_ENV, "");
-        let faucet_wallet =
-            Wallet::load_from_datafile(&faucet_path, "").expect("load persisted faucet wallet");
-
-        let recipient_wallet = Wallet::from_mnemonic(
-            MnemonicPhrase::from_entropy(&[0x33u8; 32], MnemonicLength::Words24).unwrap(),
-            "",
-            Network::Testnet,
-        );
-        let recipient_address = recipient_wallet
-            .receive_addresses(1)
-            .into_iter()
-            .next()
-            .expect("recipient address");
-
-        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
-        seed_wallet_owned_utxo(&mut service, &faucet_wallet, 250_000_000_000_000);
-        for _ in 0..atho_core::constants::STANDARD_TX_CONFIRMATIONS.saturating_sub(1) {
-            let _ = service
-                .p2p_mine_local_block()
-                .expect("mature faucet funding");
-        }
-
-        let first = service.handle_mut(RpcRequest::RequestTestnetFaucet {
-            destination_address: recipient_address.address.clone(),
-            amount_atoms: 100_000_000_000_000,
-            requester_id: String::from("device-001"),
-        });
-        let RpcResponse::TestnetFaucetSubmitted(submission) = first else {
-            panic!("unexpected response: {first:?}");
-        };
-        assert_eq!(
-            submission.accepted_height,
-            atho_core::constants::STANDARD_TX_CONFIRMATIONS.saturating_sub(1)
-        );
-        assert_eq!(
-            submission.next_eligible_height,
-            submission.accepted_height + FAUCET_COOLDOWN_BLOCKS
-        );
-        assert_eq!(service.orchestrator.runtime.node.mempool_len(), 1);
-
-        let second = service.handle_mut(RpcRequest::RequestTestnetFaucet {
-            destination_address: recipient_address.address.clone(),
-            amount_atoms: 10_000_000_000_000,
-            requester_id: String::from("device-001"),
-        });
-        let RpcResponse::Error(cooldown_error) = second else {
-            panic!("unexpected response: {second:?}");
-        };
-        assert!(
-            cooldown_error
-                .details
-                .as_deref()
-                .unwrap_or_default()
-                .contains(&format!(
-                    "Try again after block {}",
-                    submission.next_eligible_height
-                )),
-            "unexpected cooldown error: {cooldown_error:?}"
-        );
-
-        let _ = service
-            .p2p_mine_local_block()
-            .expect("mine faucet confirmation");
-        assert_eq!(service.orchestrator.runtime.node.mempool_len(), 0);
-        let (_, recipient_network) =
-            atho_core::address::decode_base56_address(&recipient_address.address)
-                .expect("decode recipient");
-        assert_eq!(recipient_network, Network::Testnet);
-        let recipient_digest = recipient_address.payment_digest.to_vec();
-        assert!(service
-            .orchestrator
-            .runtime
-            .node
-            .utxo_snapshot()
-            .entries()
-            .any(|entry| entry.locking_script == recipient_digest
-                && entry.value_atoms == 100_000_000_000_000));
-
-        for _ in 0..FAUCET_COOLDOWN_BLOCKS {
-            let _ = service.p2p_mine_local_block().expect("advance cooldown");
-        }
-
-        let third = service.handle_mut(RpcRequest::RequestTestnetFaucet {
-            destination_address: recipient_address.address,
-            amount_atoms: 25_000_000_000_000,
-            requester_id: String::from("device-001"),
-        });
-        assert!(
-            matches!(third, RpcResponse::TestnetFaucetSubmitted(_)),
-            "expected request after cooldown to pass: {third:?}"
-        );
-    }
-
-    #[test]
-    fn faucet_builder_selects_only_inputs_needed_for_the_request() {
-        let root = temp_data_dir("faucet-utxo-selection");
-        fs::create_dir_all(&root).expect("root");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-
-        let faucet_path = root.join("testnet-faucet.datafile");
-        save_testnet_faucet_wallet(&faucet_path);
-        let _faucet_path = EnvVarGuard::set_value(
-            TESTNET_FAUCET_WALLET_PATH_ENV,
-            faucet_path.to_string_lossy().as_ref(),
-        );
-        let _faucet_password = EnvVarGuard::set_value(TESTNET_FAUCET_WALLET_PASSWORD_ENV, "");
-        let faucet_wallet =
-            Wallet::load_from_datafile(&faucet_path, "").expect("load persisted faucet wallet");
-
-        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
-        seed_wallet_owned_utxos(
-            &mut service,
-            &faucet_wallet,
-            &[
-                250_000_000_000_000,
-                125_000_000_000_000,
-                125_000_000_000_000,
-            ],
-        );
-        for _ in 0..atho_core::constants::STANDARD_TX_CONFIRMATIONS.saturating_sub(1) {
-            let _ = service
-                .p2p_mine_local_block()
-                .expect("mature faucet funding");
-        }
-
-        let recipient_wallet = Wallet::from_mnemonic(
-            MnemonicPhrase::from_entropy(&[0x52u8; 32], MnemonicLength::Words24).unwrap(),
-            "",
-            Network::Testnet,
-        );
-        let recipient_address = recipient_wallet
-            .receive_addresses(1)
-            .into_iter()
-            .next()
-            .expect("recipient address");
-
-        let (transaction, fee_atoms) = service
-            .build_testnet_faucet_transaction(recipient_address.payment_digest, 100_000_000_000_000)
-            .expect("build faucet transaction");
-
-        assert_eq!(transaction.inputs.len(), 1);
-        assert!(fee_atoms >= 500);
-    }
 }
 
 fn sync_error_into_node(error: NodeSyncError) -> NodeError {
@@ -3390,10 +2731,6 @@ fn unix_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn faucet_transaction_lock_time() -> u32 {
-    u32::try_from(unix_timestamp()).unwrap_or(u32::MAX)
 }
 
 fn parse_hash48(value: &str) -> Result<[u8; 48], atho_rpc::error::RpcError> {

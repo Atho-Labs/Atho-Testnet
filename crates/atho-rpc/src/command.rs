@@ -1142,4 +1142,11 @@ mod tests {
         let group = help_payload(Some("mining")).expect("group help");
         assert!(group["count"].as_u64().unwrap_or_default() > 0);
     }
+
+    #[test]
+    fn command_registry_has_no_faucet_command() {
+        assert!(command_definition("faucet").is_none());
+        assert!(command_definition("requesttestnetfaucet").is_none());
+        assert!(search_commands("faucet").is_empty());
+    }
 }

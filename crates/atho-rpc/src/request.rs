@@ -28,10 +28,19 @@ pub enum RpcRequest {
     },
     GetMempoolInfo,
     GetMempoolSpentInputs,
-    RequestTestnetFaucet {
-        destination_address: String,
-        amount_atoms: u64,
-        requester_id: String,
-    },
     ExecuteCommand(CommandInvocation),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_faucet_rpc_method_is_not_deserializable() {
+        assert!(serde_json::from_str::<RpcRequest>(r#""RequestTestnetFaucet""#).is_err());
+        assert!(serde_json::from_str::<RpcRequest>(
+            r#"{"RequestTestnetFaucet":{"address":"T6AD","amount_atoms":1000}}"#
+        )
+        .is_err());
+    }
 }

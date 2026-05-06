@@ -18,9 +18,7 @@ use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
     Chainstate as StorageChainstate,
 };
-use atho_storage::db::{
-    BlockArchiveRecord, BlockPruneReport, FaucetRequestRecord, PeerHealthRecord, PeerRecord,
-};
+use atho_storage::db::{BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord};
 use atho_storage::error::StorageError;
 
 #[derive(Debug)]
@@ -177,25 +175,6 @@ impl Node {
 
     pub fn save_peer_record(&self, record: &PeerRecord) -> Result<(), NodeError> {
         self.chainstate.save_peer(record).map_err(NodeError::from)
-    }
-
-    pub fn load_faucet_request_record(
-        &self,
-        requester_id: &str,
-        destination_address: &str,
-    ) -> Result<Option<FaucetRequestRecord>, NodeError> {
-        self.chainstate
-            .load_faucet_request(requester_id, destination_address)
-            .map_err(NodeError::from)
-    }
-
-    pub fn save_faucet_request_record(
-        &self,
-        record: &FaucetRequestRecord,
-    ) -> Result<(), NodeError> {
-        self.chainstate
-            .save_faucet_request(record)
-            .map_err(NodeError::from)
     }
 
     pub fn observe_peer(

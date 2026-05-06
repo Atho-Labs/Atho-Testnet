@@ -295,9 +295,7 @@ impl ReadOnlyNodeConnection {
             ConnectionBackend::Local(system) => {
                 let mut system = system.lock().expect("local node mutex poisoned");
                 let requires_mutable = match &request {
-                    RpcRequest::SubmitBlock(_)
-                    | RpcRequest::SubmitTransaction { .. }
-                    | RpcRequest::RequestTestnetFaucet { .. } => true,
+                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => true,
                     RpcRequest::ExecuteCommand(invocation) => {
                         command_requires_mutable_access(&invocation.name)
                     }

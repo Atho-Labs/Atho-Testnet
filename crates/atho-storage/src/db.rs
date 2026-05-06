@@ -191,19 +191,6 @@ pub struct PeerHealthRecord {
     pub last_success_unix: Option<u64>,
 }
 
-/// Persisted testnet faucet cooldown record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FaucetRequestRecord {
-    pub network: Network,
-    pub requester_id: String,
-    pub destination_address: String,
-    pub last_request_height: u64,
-    pub amount_atoms: u64,
-    pub recorded_at_unix: u64,
-    #[serde(with = "serde_big_array::BigArray")]
-    pub txid: [u8; 48],
-}
-
 /// Persisted storage identity and compatibility record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageMetadata {
@@ -805,29 +792,6 @@ impl Database {
         Ok(records)
     }
 
-    pub fn upsert_faucet_request(&self, record: &FaucetRequestRecord) -> Result<(), StorageError> {
-        let key = faucet_request_key(
-            record.network,
-            &record.requester_id,
-            &record.destination_address,
-        );
-        let value = bincode::serialize(record).map_err(|_| StorageError::CorruptData)?;
-        self.put(Dataset::Meta, &key, &value)
-    }
-
-    pub fn load_faucet_request(
-        &self,
-        network: Network,
-        requester_id: &str,
-        destination_address: &str,
-    ) -> Result<Option<FaucetRequestRecord>, StorageError> {
-        let key = faucet_request_key(network, requester_id, destination_address);
-        match self.get(Dataset::Meta, &key)? {
-            Some(bytes) => deserialize_record(&bytes).map(Some),
-            None => Ok(None),
-        }
-    }
-
     fn ensure_schema_version(&self) -> Result<(), StorageError> {
         match self.get(Dataset::Meta, SCHEMA_VERSION_KEY)? {
             Some(bytes) => {
@@ -1046,20 +1010,6 @@ fn expected_storage_metadata(network: Network, now: u64) -> StorageMetadata {
         created_at_unix: now,
         last_opened_unix: now,
     }
-}
-
-fn faucet_request_key(network: Network, requester_id: &str, destination_address: &str) -> Vec<u8> {
-    let mut preimage =
-        Vec::with_capacity(network.id().len() + requester_id.len() + destination_address.len() + 2);
-    preimage.extend_from_slice(network.id().as_bytes());
-    preimage.push(0);
-    preimage.extend_from_slice(requester_id.as_bytes());
-    preimage.push(0);
-    preimage.extend_from_slice(destination_address.as_bytes());
-    let digest = atho_core::crypto::hash::sha3_256(&preimage);
-    let mut key = b"faucet_request:".to_vec();
-    key.extend_from_slice(&digest);
-    key
 }
 
 fn current_unix_seconds() -> u64 {

@@ -60,7 +60,6 @@ impl RpcServer {
             | RpcRequest::GetWalletActivity { .. }
             | RpcRequest::GetMempoolInfo
             | RpcRequest::GetMempoolSpentInputs
-            | RpcRequest::RequestTestnetFaucet { .. }
             | RpcRequest::ExecuteCommand(_) => RpcResponse::Error(RpcError::invalid_request(
                 "method must be handled by the node runtime",
             )),

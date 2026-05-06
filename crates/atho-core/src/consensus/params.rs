@@ -30,8 +30,16 @@ pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
     block_time_seconds: BLOCK_TIME_SECONDS,
 };
 
-pub const fn consensus_params_for_network(_network: Network) -> ConsensusParams {
-    CONSENSUS_PARAMS
+pub const fn consensus_params_for_network(network: Network) -> ConsensusParams {
+    match network {
+        Network::Mainnet => CONSENSUS_PARAMS,
+        Network::Testnet => ConsensusParams {
+            coinbase_maturity_blocks: 2,
+            standard_tx_confirmations: 1,
+            ..CONSENSUS_PARAMS
+        },
+        Network::Regnet | Network::Prunetest => CONSENSUS_PARAMS,
+    }
 }
 
 #[cfg(test)]
@@ -53,5 +61,24 @@ mod tests {
         assert_eq!(params.standard_tx_confirmations, 7);
         assert_eq!(params.min_tx_fee_atoms, 500);
         assert_eq!(params.block_time_seconds, 75);
+    }
+
+    #[test]
+    fn testnet_uses_fast_confirmation_params_without_touching_mainnet() {
+        let mainnet = consensus_params_for_network(Network::Mainnet);
+        let testnet = consensus_params_for_network(Network::Testnet);
+
+        assert_eq!(mainnet.coinbase_maturity_blocks, COINBASE_MATURITY_BLOCKS);
+        assert_eq!(mainnet.standard_tx_confirmations, STANDARD_TX_CONFIRMATIONS);
+        assert_eq!(testnet.coinbase_maturity_blocks, 2);
+        assert_eq!(testnet.standard_tx_confirmations, 1);
+        assert_eq!(
+            testnet.initial_block_reward_atoms,
+            mainnet.initial_block_reward_atoms
+        );
+        assert_eq!(
+            testnet.halving_interval_blocks,
+            mainnet.halving_interval_blocks
+        );
     }
 }

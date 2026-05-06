@@ -1,7 +1,7 @@
 //! In-memory chainstate helpers layered on top of persisted storage.
 use crate::db::{
-    BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, FaucetRequestRecord,
-    PeerHealthRecord, PeerRecord,
+    BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, PeerHealthRecord,
+    PeerRecord,
 };
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
@@ -452,24 +452,6 @@ impl Chainstate {
             return Ok(());
         };
         storage.upsert_peer(record)
-    }
-
-    pub fn load_faucet_request(
-        &self,
-        requester_id: &str,
-        destination_address: &str,
-    ) -> Result<Option<FaucetRequestRecord>, StorageError> {
-        let Some(storage) = &self.storage else {
-            return Ok(None);
-        };
-        storage.load_faucet_request(self.network, requester_id, destination_address)
-    }
-
-    pub fn save_faucet_request(&self, record: &FaucetRequestRecord) -> Result<(), StorageError> {
-        let Some(storage) = &self.storage else {
-            return Ok(());
-        };
-        storage.upsert_faucet_request(record)
     }
 
     pub fn canonical_blocks(&self) -> Result<Vec<Block>, StorageError> {

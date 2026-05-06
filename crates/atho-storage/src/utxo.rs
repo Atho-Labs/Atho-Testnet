@@ -1,7 +1,7 @@
 //! UTXO entry types and the in-memory UTXO set representation.
 use crate::error::StorageError;
 use atho_core::block::Block;
-use atho_core::constants::{COINBASE_MATURITY_BLOCKS, STANDARD_TX_CONFIRMATIONS};
+use atho_core::consensus::params::consensus_params_for_network;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use serde::{Deserialize, Serialize};
@@ -72,10 +72,11 @@ impl UtxoEntry {
     }
 
     pub fn required_confirmations(&self) -> u64 {
+        let params = consensus_params_for_network(self.network);
         if self.is_coinbase {
-            COINBASE_MATURITY_BLOCKS
+            params.coinbase_maturity_blocks
         } else {
-            STANDARD_TX_CONFIRMATIONS
+            params.standard_tx_confirmations
         }
     }
 
@@ -408,6 +409,29 @@ mod tests {
         assert_eq!(set.len(), 2);
         set.disconnect_block(undo);
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn spendability_uses_network_specific_confirmation_params() {
+        let mainnet_coinbase = UtxoEntry::coinbase(Network::Mainnet, [1; 48], 0, 100, vec![1], 10);
+        let testnet_coinbase = UtxoEntry::coinbase(Network::Testnet, [2; 48], 0, 100, vec![2], 10);
+        let mainnet_payment = UtxoEntry::new(Network::Mainnet, [3; 48], 0, 100, vec![3], 10, false);
+        let testnet_payment = UtxoEntry::new(Network::Testnet, [4; 48], 0, 100, vec![4], 10, false);
+
+        assert_eq!(mainnet_coinbase.required_confirmations(), 150);
+        assert!(!mainnet_coinbase.is_spendable_at(10 + 148));
+        assert!(mainnet_coinbase.is_spendable_at(10 + 149));
+
+        assert_eq!(testnet_coinbase.required_confirmations(), 2);
+        assert!(!testnet_coinbase.is_spendable_at(10));
+        assert!(testnet_coinbase.is_spendable_at(11));
+
+        assert_eq!(mainnet_payment.required_confirmations(), 7);
+        assert!(!mainnet_payment.is_spendable_at(10 + 5));
+        assert!(mainnet_payment.is_spendable_at(10 + 6));
+
+        assert_eq!(testnet_payment.required_confirmations(), 1);
+        assert!(testnet_payment.is_spendable_at(10));
     }
 
     #[test]

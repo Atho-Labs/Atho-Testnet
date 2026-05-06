@@ -14,6 +14,8 @@ use crate::transaction::Transaction;
 use getrandom::getrandom;
 use sha3::{Digest, Sha3_256};
 
+const TESTNET_TX_POW_BITS: u8 = 12;
+
 fn update_tx_pow_message_hasher(hasher: &mut Sha3_256, tx: &Transaction) {
     tx.update_base_hasher(hasher);
 
@@ -63,9 +65,11 @@ pub fn maximum_standard_outputs(network: Network, tx: &Transaction) -> usize {
 }
 
 pub fn required_tx_pow_bits(network: Network, tx: &Transaction, fee_atoms: u64) -> u8 {
-    let _ = network;
     if tx.is_coinbase() {
         return 0;
+    }
+    if network == Network::Testnet {
+        return TESTNET_TX_POW_BITS;
     }
 
     let tx_vbytes = tx.vsize_bytes().max(1) as u64;
@@ -296,7 +300,18 @@ mod tests {
         let tx = sample_tx(2, 2_000);
         let fee = minimum_required_fee_atoms(Network::Mainnet, &tx);
         assert_eq!(required_tx_pow_bits(Network::Mainnet, &tx, fee), 18);
-        assert_eq!(required_tx_pow_bits(Network::Testnet, &tx, fee), 18);
+        assert_eq!(required_tx_pow_bits(Network::Testnet, &tx, fee), 12);
+    }
+
+    #[test]
+    fn testnet_transaction_pow_is_fast_but_network_scoped() {
+        let mut tx = sample_tx(2, 2_000);
+        inflate_tx_to_min_vbytes(&mut tx, 500);
+        let fee = tx.vsize_bytes() as u64;
+
+        assert_eq!(required_tx_pow_bits(Network::Testnet, &tx, fee), 12);
+        assert_eq!(required_tx_pow_bits(Network::Mainnet, &tx, fee), 19);
+        assert_eq!(required_tx_pow_bits(Network::Regnet, &tx, fee), 19);
     }
 
     #[test]

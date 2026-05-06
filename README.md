@@ -117,6 +117,8 @@ For testnet:
 python runtestnet.py
 ```
 
+Testnet ATHO is distributed manually for now. Contact the Atho founders or development team to request testnet funds.
+
 For repeated local launches after the first build, run the binary directly:
 
 ```bash
