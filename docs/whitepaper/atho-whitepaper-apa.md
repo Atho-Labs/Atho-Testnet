@@ -339,7 +339,7 @@ Atho's mempool is a validated, in-memory staging area. It is not consensus truth
 
 Admission runs through `validate_transaction_with_context`. The checks include supported version, non-empty outputs, raw size, vsize, zero-value outputs, duplicate inputs, required fee, maximum standard output count, SHA3-256 transaction proof-of-work, witness shape, witness input references, UTXO existence, ownership, maturity, and Falcon signature. If any check fails, the transaction is rejected. After blocks are accepted or reorgs occur, the mempool revalidates entries against the new spend height and UTXO state, keeping entries that remain valid and dropping invalidated entries.
 
-Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 1,000-atom minimum output rule, transaction PoW, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
+Several policies are intentionally marked as not yet active or TBD. No explicit mempool expiry rule, replacement-by-fee policy, or memory-size cap was found in the source files inspected for this paper. The current fee floor, 1,000-atom output minimum, transaction PoW, and size limits provide baseline spam resistance, but production hardening should add explicit memory and expiry behavior so long-running public nodes can bound resource use under adversarial load. Figure 7 shows the current admission flow.
 
 ![Figure 7. Mempool Admission Flow](assets/figure_07_mempool_admission.png)
 
@@ -843,9 +843,9 @@ flowchart TD
 ```mermaid
 xychart-beta
     title "Atho emission model"
-    x-axis "Height" [0, 1680000, 3360000, 5040000, 6720000, 8400000, 10080000]
-    y-axis "Reward ATHO" 0 --> 50
-    line "Subsidy" [50, 25, 12, 6, 3, 1, 0]
+    x-axis "Height" [0, 1680000, 3360000, 5040000, 6720000]
+    y-axis "Reward ATHO" 0 --> 7
+    line "Subsidy" [6.25, 3.125, 1.5625, 0.78125, 0.78125]
 ```
 
 ## Figure 7. Mempool Admission Flow
