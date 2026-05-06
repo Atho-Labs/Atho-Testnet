@@ -93,11 +93,7 @@ impl MnemonicPhrase {
     }
 
     pub fn parse(input: &str) -> Result<Self, MnemonicError> {
-        let words: Vec<String> = input
-            .split_whitespace()
-            .map(|word| word.trim().to_lowercase())
-            .filter(|word| !word.is_empty())
-            .collect();
+        let words = normalize_mnemonic_words(input);
         let length =
             MnemonicLength::from_word_count(words.len()).ok_or(MnemonicError::InvalidWordCount)?;
         validate_words(&words)?;
@@ -128,6 +124,32 @@ impl MnemonicPhrase {
         );
         seed
     }
+}
+
+pub fn normalize_mnemonic_words(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .filter_map(normalize_mnemonic_token)
+        .collect()
+}
+
+fn normalize_mnemonic_token(token: &str) -> Option<String> {
+    let mut word = token.trim().to_lowercase();
+    if word.is_empty() {
+        return None;
+    }
+
+    let stripped = word
+        .trim_start_matches(|ch: char| ch.is_ascii_digit())
+        .trim_start_matches(|ch| matches!(ch, '.' | ')' | ':' | '-' | ' '));
+    if !stripped.is_empty() && stripped.len() < word.len() {
+        word = stripped.to_owned();
+    }
+
+    let word = word
+        .trim_matches(|ch: char| matches!(ch, ',' | ';' | '.'))
+        .to_owned();
+    (!word.is_empty()).then_some(word)
 }
 
 fn validate_words(words: &[String]) -> Result<(), MnemonicError> {

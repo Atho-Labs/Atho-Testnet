@@ -174,7 +174,9 @@ pub(crate) enum LaunchPage {
 
 #[derive(Debug)]
 pub(crate) struct CreateWalletForm {
+    pub(crate) wallet_name: String,
     pub(crate) wallet_path: String,
+    pub(crate) mnemonic_word_count: usize,
     pub(crate) encrypt_wallet: bool,
     pub(crate) wallet_password: String,
     pub(crate) wallet_password_confirm: String,
@@ -187,7 +189,9 @@ pub(crate) struct CreateWalletForm {
 impl CreateWalletForm {
     pub(crate) fn new(network: Network) -> Self {
         Self {
+            wallet_name: String::new(),
             wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
+            mnemonic_word_count: DEFAULT_MNEMONIC_WORD_COUNT,
             encrypt_wallet: false,
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
@@ -199,7 +203,13 @@ impl CreateWalletForm {
     }
 
     pub(crate) fn reset_phrase(&mut self) {
-        self.mnemonic_words = vec![String::new(); DEFAULT_MNEMONIC_WORD_COUNT];
+        self.mnemonic_words = vec![String::new(); self.mnemonic_word_count];
+        self.acknowledged_backup = false;
+    }
+
+    pub(crate) fn set_mnemonic_word_count(&mut self, count: usize) {
+        self.mnemonic_word_count = count;
+        self.mnemonic_words = vec![String::new(); count];
         self.acknowledged_backup = false;
     }
 }
@@ -227,6 +237,7 @@ impl WalletManagementForm {
 
 #[derive(Debug)]
 pub(crate) struct ImportWalletForm {
+    pub(crate) wallet_name: String,
     pub(crate) wallet_path: String,
     pub(crate) encrypt_wallet: bool,
     pub(crate) wallet_password: String,
@@ -240,6 +251,7 @@ pub(crate) struct ImportWalletForm {
 impl ImportWalletForm {
     pub(crate) fn new(network: Network) -> Self {
         Self {
+            wallet_name: String::new(),
             wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
             encrypt_wallet: false,
             wallet_password: String::new(),

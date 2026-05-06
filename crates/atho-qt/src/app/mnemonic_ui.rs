@@ -1,6 +1,6 @@
 //! Shared mnemonic and recovery-phrase UI widgets.
 use super::widgets;
-use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
+use atho_wallet::mnemonic::{normalize_mnemonic_words, DEFAULT_MNEMONIC_WORD_COUNT};
 use eframe::egui;
 
 pub(crate) const SUPPORTED_MNEMONIC_WORD_COUNTS: [usize; 3] = [12, 24, 48];
@@ -10,11 +10,7 @@ pub(crate) fn empty_words(count: usize) -> Vec<String> {
 }
 
 pub(crate) fn words_from_sentence(sentence: &str) -> Vec<String> {
-    let words = sentence
-        .split_whitespace()
-        .map(normalize_word)
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
+    let words = normalize_mnemonic_words(sentence);
     if words.is_empty() {
         empty_words(DEFAULT_MNEMONIC_WORD_COUNT)
     } else {
@@ -149,15 +145,14 @@ pub(crate) fn render_word_grid(
 }
 
 fn normalized_tokens_from_input(input: &str) -> Vec<String> {
-    input
-        .split_whitespace()
-        .map(normalize_word)
-        .filter(|word| !word.is_empty())
-        .collect()
+    normalize_mnemonic_words(input)
 }
 
 fn normalize_word(word: &str) -> String {
-    word.trim().to_lowercase()
+    normalize_mnemonic_words(word)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn mnemonic_grid_columns(available_width: f32, word_count: usize) -> usize {

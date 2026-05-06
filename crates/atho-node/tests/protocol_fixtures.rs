@@ -20,7 +20,7 @@ fn signing_keypair() -> FalconKeypair {
 fn witness_bytes(tx: &Transaction) -> Vec<u8> {
     let keypair = signing_keypair();
     let txid = tx.txid();
-    let digest = transaction_signing_digest(Network::Regnet, &tx);
+    let digest = transaction_signing_digest(Network::Mainnet, &tx);
     let signature = sign(
         AthoSignatureDomain::Transaction,
         &keypair.secret_key,

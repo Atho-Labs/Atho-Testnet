@@ -1465,19 +1465,17 @@ fn node_binary_candidates_from_exe(exe: &Path) -> Vec<PathBuf> {
         push_unique_candidate(&mut candidates, candidate_dir.join(name));
     }
 
-    if cfg!(target_os = "macos") {
-        if let Some(app_root) = macos_app_bundle_root(exe) {
-            push_unique_candidate(
-                &mut candidates,
-                app_root.join("Contents").join("MacOS").join(name),
-            );
-            push_unique_candidate(
-                &mut candidates,
-                app_root.join("Contents").join("Resources").join(name),
-            );
-            if let Some(install_root) = app_root.parent() {
-                push_unique_candidate(&mut candidates, install_root.join(name));
-            }
+    if let Some(app_root) = macos_app_bundle_root(exe) {
+        push_unique_candidate(
+            &mut candidates,
+            app_root.join("Contents").join("MacOS").join(name),
+        );
+        push_unique_candidate(
+            &mut candidates,
+            app_root.join("Contents").join("Resources").join(name),
+        );
+        if let Some(install_root) = app_root.parent() {
+            push_unique_candidate(&mut candidates, install_root.join(name));
         }
     }
 
@@ -2052,6 +2050,10 @@ mod tests {
     #[test]
     fn read_only_connection_forwards_rpc_requests() {
         let _lock = acquire_global_test_lock();
+        let root = temp_data_dir("read-only-connection");
+        fs::create_dir_all(&root).expect("root");
+        let _data_dir = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
         let conn = ReadOnlyNodeConnection::new(Network::Mainnet);
         assert_eq!(
             conn.request(RpcRequest::GetNetwork),

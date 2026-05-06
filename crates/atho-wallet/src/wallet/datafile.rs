@@ -11,7 +11,8 @@ use atho_errors::{
 use getrandom::getrandom;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -232,7 +233,30 @@ fn save_impl(
         nonce,
         ciphertext,
     };
-    fs::write(path, file.to_bytes()?)?;
+    atomic_write(path, &file.to_bytes()?)?;
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WalletDatafileError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wallet.datafile");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

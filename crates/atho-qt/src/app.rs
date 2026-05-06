@@ -83,6 +83,8 @@ pub struct DesktopApp {
     pub ui_state: UiState,
     pub view_model: ViewModel,
     wallet: Option<Wallet>,
+    current_wallet_id: Option<String>,
+    current_wallet_name: Option<String>,
     wallet_path: Option<String>,
     wallet_session_password: Option<String>,
     wallet_addresses_cache: Vec<WalletAddress>,
@@ -220,6 +222,34 @@ struct WalletPreparationOutcome {
     wallet: Wallet,
     wallet_path: String,
     wallet_password: String,
+    registry_entry: Option<WalletRegistryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletRegistry {
+    entries: Vec<WalletRegistryEntry>,
+    last_opened_wallet_id: Option<String>,
+}
+
+impl Default for WalletRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            last_opened_wallet_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletRegistryEntry {
+    wallet_id: String,
+    wallet_name: String,
+    wallet_path: String,
+    network: String,
+    created_at_unix: u64,
+    updated_at_unix: u64,
+    last_opened_at_unix: Option<u64>,
+    word_count: usize,
 }
 
 #[derive(Debug)]
@@ -297,6 +327,8 @@ impl DesktopApp {
             },
             view_model: ViewModel::default(),
             wallet: None,
+            current_wallet_id: None,
+            current_wallet_name: None,
             wallet_path: None,
             wallet_session_password: None,
             wallet_addresses_cache: Vec::new(),
@@ -614,6 +646,8 @@ impl DesktopApp {
         self.mining_job = None;
         self.pending_mining_restart = None;
         self.wallet = None;
+        self.current_wallet_id = None;
+        self.current_wallet_name = None;
         self.wallet_path = None;
         self.wallet_session_password = None;
         self.wallet_addresses_cache.clear();
@@ -652,6 +686,14 @@ impl DesktopApp {
         self.wallet_management_form.restore_gap_limit_input = DEFAULT_RESTORE_GAP_LIMIT.to_string();
         self.receive_page_tab = ReceivePageTab::RequestPayment;
         self.address_pool_filter = AddressPoolFilter::Unused;
+        self.recipient_address_book.clear();
+        self.recipient_address_book_filter.clear();
+        self.recipient_address_book_open = false;
+        self.recipient_address_editor_open = false;
+        self.recipient_address_editor_id = None;
+        self.recipient_address_editor_label.clear();
+        self.recipient_address_editor_address.clear();
+        self.recipient_address_editor_notes.clear();
         self.ui_state.wallet_snapshot = Default::default();
         self.view_model.ui_state.wallet_snapshot = Default::default();
     }
