@@ -2,6 +2,7 @@ use crate::app::{widgets, AddressPoolFilter, DesktopApp, ReceivePageTab};
 use crate::resources;
 use eframe::egui;
 use qrcodegen::{QrCode, QrCodeEcc};
+use rfd::FileDialog;
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
@@ -198,14 +199,12 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Amount:").size(13.0).strong());
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [180.0, 30.0],
-                        egui::TextEdit::singleline(&mut app.receive_amount)
-                            .hint_text("Atom amount, for example 50000000"),
-                    );
-                    widgets::muted_label(ui, "atoms");
-                });
+                ui.add_sized(
+                    [320.0, 30.0],
+                    egui::TextEdit::singleline(&mut app.receive_amount)
+                        .hint_text("Amount, for example 50000000")
+                        .desired_width(f32::INFINITY),
+                );
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Message:").size(13.0).strong());
@@ -353,13 +352,6 @@ fn render_receive_detail_card(
         ui.add_space(12.0);
         ui.vertical_centered(|ui| {
             paint_qr_code(ui, address, 176.0);
-            ui.add_space(8.0);
-            let response = ui.label(
-                egui::RichText::new(widgets::elide_text(address, 42))
-                    .monospace()
-                    .color(widgets::TEXT),
-            );
-            response.on_hover_text(address);
         });
         ui.add_space(10.0);
 
@@ -367,7 +359,31 @@ fn render_receive_detail_card(
             if widgets::icon_button(ui, resources::copy_icon(15.0), "Copy address").clicked() {
                 DesktopApp::copy_text(ui, address.to_owned());
             }
-            widgets::muted_label(ui, "The QR encodes the same base56 Atho address shown below it.");
+            if ui.button("Save QR PNG").clicked() {
+                let suggested_path = app.suggested_receive_qr_export_path(address, selected_request);
+                let mut dialog = FileDialog::new().add_filter("PNG", &["png"]);
+                if let Some(file_name) = std::path::Path::new(&suggested_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                {
+                    dialog = dialog.set_file_name(file_name);
+                }
+                if let Some(parent) = std::path::Path::new(&suggested_path).parent() {
+                    dialog = dialog.set_directory(parent);
+                }
+                if let Some(path) = dialog.save_file() {
+                    let export_path = crate::app::normalize_png_export_path(&path.to_string_lossy())
+                        .to_string_lossy()
+                        .into_owned();
+                    match app.export_receive_address_qr(&export_path, address) {
+                        Ok(()) => {
+                            app.last_error = None;
+                            app.send_status = String::from("Receive QR exported");
+                        }
+                        Err(err) => app.last_error = Some(err),
+                    }
+                }
+            }
         });
     });
 }

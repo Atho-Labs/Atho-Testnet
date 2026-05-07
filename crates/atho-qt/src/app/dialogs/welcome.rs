@@ -17,7 +17,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.add_space(6.0);
             widgets::muted_label(
                 ui,
-                "Open an existing wallet or create a new Atho HD wallet to continue.",
+                "Create a new Atho HD wallet or import an existing recovery phrase to continue.",
             );
             ui.add_space(16.0);
             if ui
@@ -27,14 +27,6 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 app.create_form = super::super::CreateWalletForm::new(app.connection.network());
                 let _ = app.generate_create_mnemonic();
                 app.launch_page = LaunchPage::CreateWallet;
-            }
-            ui.add_space(8.0);
-            if ui
-                .add_sized([210.0, 34.0], egui::Button::new("Open wallet"))
-                .clicked()
-            {
-                app.open_form = super::super::OpenWalletForm::new(app.connection.network());
-                app.launch_page = LaunchPage::OpenWallet;
             }
             ui.add_space(8.0);
             if ui

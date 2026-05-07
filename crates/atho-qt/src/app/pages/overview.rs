@@ -2,6 +2,7 @@ use crate::app::amounts::DisplayUnit;
 use crate::app::{widgets, DesktopApp};
 use crate::resources;
 use eframe::egui;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let summary = app.wallet_balance_summary().clone();
@@ -87,7 +88,109 @@ fn render_balances_panel(
                 "Wallet balances may still change while Atho is synchronizing to the network tip.",
             );
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(12.0);
+        render_miner_feedback(app, ui);
     });
+}
+
+fn render_miner_feedback(app: &DesktopApp, ui: &mut egui::Ui) {
+    widgets::section_header(ui, "Miner feedback");
+    ui.add_space(8.0);
+
+    let runtime = app
+        .mining_job
+        .as_ref()
+        .map(|job| format_duration(job.started_at.elapsed().as_secs()))
+        .unwrap_or_else(|| String::from("Idle"));
+    let last_mined = match (app.last_mined_height, app.last_mined_at_unix) {
+        (Some(height), Some(at_unix)) => format!("#{} • {}", height, format_age(at_unix)),
+        (Some(height), None) => format!("#{height}"),
+        _ => String::from("No blocks yet"),
+    };
+    let last_hash = app
+        .last_mined_block_hash
+        .map(|hash| widgets::short_hash(&hash))
+        .unwrap_or_else(|| String::from("Unavailable"));
+    let hashes_per_second = format_hashrate(app.view_model.estimated_hashrate_hps);
+
+    egui::Grid::new("overview_miner_feedback")
+        .num_columns(2)
+        .spacing([18.0, 10.0])
+        .min_col_width(150.0)
+        .show(ui, |ui| {
+            widgets::row_label(ui, "Runtime:");
+            widgets::row_value(ui, &runtime);
+            ui.end_row();
+
+            widgets::row_label(ui, "Last mined:");
+            ui.label(
+                egui::RichText::new(last_mined)
+                    .size(12.0)
+                    .color(widgets::TEXT),
+            );
+            ui.end_row();
+
+            widgets::row_label(ui, "Last hash:");
+            ui.label(
+                egui::RichText::new(last_hash)
+                    .size(12.0)
+                    .monospace()
+                    .color(widgets::ACCENT),
+            );
+            ui.end_row();
+
+            widgets::row_label(ui, "Hashes/s:");
+            widgets::row_value(ui, &hashes_per_second);
+            ui.end_row();
+        });
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    if seconds < 3600 {
+        return format!("{}m {}s", seconds / 60, seconds % 60);
+    }
+    format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+}
+
+fn format_age(recorded_at_unix: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(recorded_at_unix);
+    let age = now.saturating_sub(recorded_at_unix);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else {
+        format!("{}h ago", age / 3600)
+    }
+}
+
+fn format_hashrate(hps: u64) -> String {
+    const UNITS: [&str; 5] = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s"];
+    if hps == 0 {
+        return String::from("0 H/s");
+    }
+
+    let mut value = hps as f64;
+    let mut unit = 0usize;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", value.round() as u64, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 fn render_recent_transactions(

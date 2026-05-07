@@ -3,6 +3,7 @@ use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection, StatusMonitor}
 use crate::error::QtError;
 use crate::state::UiState;
 use crate::view::ViewModel;
+use ab_glyph::{FontArc, PxScale};
 use amounts::{
     format_amount_atoms, format_amount_atoms_without_unit, format_fee_atoms, parse_amount_to_atoms,
     ClientDisplayPreferences, DisplayUnit, InputUnit,
@@ -40,6 +41,9 @@ use atho_wallet::wallet::{
 };
 use eframe::egui;
 use getrandom::getrandom;
+use image::{Rgba, RgbaImage};
+use imageproc::drawing::draw_text_mut;
+use qrcodegen::{QrCode, QrCodeEcc};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -76,6 +80,11 @@ const MAX_WALLET_DISCOVERY_SCAN_LIMIT: usize = 20_000;
 const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
 const MINING_TEMPLATE_WATCH_INTERVAL: Duration = Duration::from_millis(500);
 const MINING_TEMPLATE_WATCH_SLEEP_SLICE: Duration = Duration::from_millis(50);
+const QR_EXPORT_MODULE_BLACK: [u8; 4] = [24, 24, 24, 255];
+const QR_EXPORT_MODULE_RED: [u8; 4] = [191, 41, 48, 255];
+const QR_EXPORT_HEADER_BG: [u8; 4] = [255, 239, 240, 255];
+const QR_EXPORT_RULE_RED: [u8; 4] = [228, 92, 96, 255];
+const QR_EXPORT_TEXT_DARK: [u8; 4] = [72, 24, 24, 255];
 
 pub struct DesktopApp {
     pub connection: ReadOnlyNodeConnection,
@@ -134,7 +143,9 @@ pub struct DesktopApp {
     mining_accelerator_info: MiningAcceleratorInfo,
     mining_job: Option<MiningJob>,
     pending_mining_restart: Option<u32>,
+    last_mined_height: Option<u64>,
     last_mined_block_hash: Option<[u8; 48]>,
+    last_mined_at_unix: Option<u64>,
     requested_payments: Vec<ReceiveRequestRecord>,
     selected_receive_request: Option<usize>,
     transaction_search: String,
@@ -398,7 +409,9 @@ impl DesktopApp {
             mining_accelerator_info: MiningAcceleratorInfo::unavailable("probe pending"),
             mining_job: None,
             pending_mining_restart: None,
+            last_mined_height: None,
             last_mined_block_hash: None,
+            last_mined_at_unix: None,
             requested_payments: Vec::new(),
             selected_receive_request: None,
             transaction_search: String::new(),
@@ -473,6 +486,7 @@ impl DesktopApp {
         self.view_model.block_count = status.block_count;
         self.view_model.tip_hash = status.tip_hash;
         self.view_model.tip_timestamp = status.tip_timestamp;
+        self.view_model.estimated_hashrate_hps = status.estimated_hashrate_hps;
         self.view_model.mempool_count = status.mempool_count;
         self.view_model.mempool_total_fee_atoms = status.mempool_total_fee_atoms;
         self.view_model.mempool_fingerprint = status.mempool_fingerprint;
@@ -617,6 +631,7 @@ impl DesktopApp {
         self.open_form.wallet_path = normalized_label.clone();
         self.open_form.wallet_password.clear();
         self.last_error = None;
+        self.stop_mining_job();
 
         match metadata.encryption_mode {
             WalletEncryptionMode::Plaintext => {
@@ -892,17 +907,22 @@ impl DesktopApp {
         self.send_include_fee_in_total = false;
         self.send_status = String::from("Enter a destination address and amount.");
         self.mining_status = String::from("Idle");
+        self.last_mined_height = None;
         self.last_mined_block_hash = None;
+        self.last_mined_at_unix = None;
         self.last_error = None;
         self.wallet_management_form.backup_password.clear();
         self.wallet_management_form.backup_password_confirm.clear();
         let default_wallet_path = default_wallet_path(self.connection.network())
             .to_string_lossy()
             .into_owned();
+        self.wallet_management_form.backup_path = backup_wallet_path(&default_wallet_path);
         self.wallet_management_form.backup_json_path =
             backup_wallet_json_path(&default_wallet_path);
         self.wallet_management_form.backup_text_path =
             backup_wallet_text_path(&default_wallet_path);
+        self.wallet_management_form.backup_phrase_qr_path =
+            backup_wallet_phrase_qr_path(&default_wallet_path);
         self.wallet_management_form.restore_gap_limit_input = DEFAULT_RESTORE_GAP_LIMIT.to_string();
         self.receive_page_tab = ReceivePageTab::RequestPayment;
         self.address_pool_filter = AddressPoolFilter::Unused;
@@ -1778,6 +1798,8 @@ impl DesktopApp {
         self.wallet_management_form.backup_path = backup_wallet_path(&wallet_path);
         self.wallet_management_form.backup_json_path = backup_wallet_json_path(&wallet_path);
         self.wallet_management_form.backup_text_path = backup_wallet_text_path(&wallet_path);
+        self.wallet_management_form.backup_phrase_qr_path =
+            backup_wallet_phrase_qr_path(&wallet_path);
         self.wallet_management_form.backup_password.clear();
         self.wallet_management_form.backup_password_confirm.clear();
         self.wallet_path = Some(wallet_path);
@@ -1836,7 +1858,9 @@ impl DesktopApp {
 
         match job.receiver.try_recv() {
             Ok(MiningJobResult::Completed(outcome)) => {
+                self.last_mined_height = Some(outcome.height);
                 self.last_mined_block_hash = Some(outcome.block_hash);
+                self.last_mined_at_unix = Some(current_unix_seconds());
                 let mut backend_parts = vec![format!("backend={}", outcome.backend_used)];
                 if let Some(accelerator) = outcome.accelerator_label.as_deref() {
                     backend_parts.push(format!("device={accelerator}"));
@@ -2504,6 +2528,44 @@ impl DesktopApp {
                 .unwrap_or_else(|| String::from("Unavailable")),
         );
         fs::write(path, text).map_err(|err| err.to_string())
+    }
+
+    fn export_wallet_recovery_phrase_qr(&self, export_path: &str) -> Result<(), String> {
+        let export = self.wallet_recovery_export()?;
+        let phrase = export
+            .mnemonic_phrase
+            .clone()
+            .ok_or_else(|| String::from("No recovery phrase is loaded for this wallet"))?;
+        let subtitle = format!("Recovery phrase QR • {} words", export.mnemonic_word_count);
+        let footer = format!("{} • keep offline", export.network);
+        write_labeled_qr_png(
+            export_path,
+            &export.wallet_name,
+            &subtitle,
+            &footer,
+            &phrase,
+        )
+    }
+
+    fn export_receive_address_qr(&self, export_path: &str, address: &str) -> Result<(), String> {
+        write_basic_qr_png(export_path, address, Rgba(QR_EXPORT_MODULE_BLACK))
+    }
+
+    fn suggested_receive_qr_export_path(
+        &self,
+        detail_address: &str,
+        selected_request: Option<&ReceiveRequestRecord>,
+    ) -> String {
+        let wallet_path = self
+            .wallet_path
+            .as_deref()
+            .unwrap_or_else(|| self.open_form.wallet_path.as_str());
+        receive_address_qr_path(
+            wallet_path,
+            self.wallet_current_receive_index(),
+            detail_address,
+            selected_request,
+        )
     }
 
     fn write_wallet_backup_metadata(&self, backup_path: &str) -> Result<(), String> {
@@ -4614,6 +4676,250 @@ fn backup_wallet_text_path(wallet_path: &str) -> String {
     )
 }
 
+fn backup_wallet_phrase_qr_path(wallet_path: &str) -> String {
+    format!(
+        "{}.recovery-phrase.qr.png",
+        normalize_wallet_path_input(wallet_path).to_string_lossy()
+    )
+}
+
+pub(crate) fn normalize_png_export_path(export_path: &str) -> PathBuf {
+    let mut path = PathBuf::from(export_path.trim());
+    let is_png = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("png"))
+        .unwrap_or(false);
+    if !is_png {
+        path.set_extension("png");
+    }
+    path
+}
+
+fn receive_address_qr_path(
+    wallet_path: &str,
+    current_receive_index: Option<u32>,
+    address: &str,
+    selected_request: Option<&ReceiveRequestRecord>,
+) -> String {
+    let suffix = selected_request
+        .and_then(|request| {
+            (!request.label.trim().is_empty())
+                .then(|| sanitize_export_file_component(&request.label))
+        })
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("request-{label}"))
+        .or_else(|| current_receive_index.map(|index| format!("receive-r{index:04}")))
+        .unwrap_or_else(|| {
+            let short = sanitize_export_file_component(&widgets::elide_text(address, 16));
+            format!("receive-{short}")
+        });
+    format!(
+        "{}.{suffix}.qr.png",
+        normalize_wallet_path_input(wallet_path).to_string_lossy()
+    )
+}
+
+fn sanitize_export_file_component(input: &str) -> String {
+    let sanitized: String = input
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => ch,
+            '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect();
+    let collapsed = sanitized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        String::from("qr")
+    } else {
+        collapsed.to_ascii_lowercase()
+    }
+}
+
+fn write_basic_qr_png(export_path: &str, payload: &str, dark: Rgba<u8>) -> Result<(), String> {
+    let path = normalize_png_export_path(export_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let code = QrCode::encode_text(payload, QrCodeEcc::Medium)
+        .map_err(|_| String::from("Unable to encode QR payload"))?;
+    let module_count = code.size();
+    if module_count <= 0 {
+        return Err(String::from("QR payload produced an empty matrix"));
+    }
+
+    let quiet_zone = 4;
+    let total_modules = (module_count + quiet_zone * 2).max(1) as u32;
+    let target_qr_pixels = 520u32;
+    let module_size = (target_qr_pixels / total_modules).max(8);
+    let qr_pixels = total_modules * module_size;
+    let margin = 36u32;
+    let canvas = qr_pixels + margin * 2;
+    let mut image = RgbaImage::from_pixel(canvas, canvas, Rgba([255, 255, 255, 255]));
+
+    let qr_left = margin as i32;
+    let qr_top = margin as i32;
+    for y in 0..module_count {
+        for x in 0..module_count {
+            if !code.get_module(x, y) {
+                continue;
+            }
+            let left = qr_left + (x as i32 + quiet_zone) * module_size as i32;
+            let top = qr_top + (y as i32 + quiet_zone) * module_size as i32;
+            fill_rect(
+                &mut image,
+                left.max(0) as u32,
+                top.max(0) as u32,
+                module_size,
+                module_size,
+                dark,
+            );
+        }
+    }
+
+    image.save(&path).map_err(|err| err.to_string())
+}
+
+fn write_labeled_qr_png(
+    export_path: &str,
+    wallet_name: &str,
+    subtitle: &str,
+    footer: &str,
+    payload: &str,
+) -> Result<(), String> {
+    let path = normalize_png_export_path(export_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let code = QrCode::encode_text(payload, QrCodeEcc::Medium)
+        .map_err(|_| String::from("Unable to encode QR payload"))?;
+    let module_count = code.size();
+    if module_count <= 0 {
+        return Err(String::from("QR payload produced an empty matrix"));
+    }
+
+    let quiet_zone = 4;
+    let total_modules = (module_count + quiet_zone * 2).max(1) as u32;
+    let target_qr_pixels = 520u32;
+    let module_size = (target_qr_pixels / total_modules).max(8);
+    let qr_pixels = total_modules * module_size;
+    let horizontal_margin = 36u32;
+    let vertical_margin = 24u32;
+    let header_height = 116u32;
+    let footer_height = 72u32;
+    let width = (qr_pixels + horizontal_margin * 2).max(720);
+    let height = header_height + qr_pixels + footer_height + vertical_margin * 2;
+    let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+
+    fill_rect(
+        &mut image,
+        0,
+        0,
+        width,
+        header_height,
+        Rgba(QR_EXPORT_HEADER_BG),
+    );
+    fill_rect(
+        &mut image,
+        0,
+        header_height.saturating_sub(6),
+        width,
+        6,
+        Rgba(QR_EXPORT_RULE_RED),
+    );
+
+    let title = wallet_name.trim();
+    let title = if title.is_empty() {
+        "Atho Wallet"
+    } else {
+        title
+    };
+    let title = widgets::elide_text(title, 34);
+    let subtitle = widgets::elide_text(subtitle.trim(), 52);
+    let footer = widgets::elide_text(footer.trim(), 52);
+
+    let font = FontArc::try_from_slice(include_bytes!("../assets/fonts/RobotoMono-Bold.ttf"))
+        .map_err(|_| String::from("Failed to load QR export font"))?;
+    draw_text_mut(
+        &mut image,
+        Rgba(QR_EXPORT_TEXT_DARK),
+        28,
+        20,
+        PxScale::from(34.0),
+        &font,
+        &title,
+    );
+    draw_text_mut(
+        &mut image,
+        Rgba(QR_EXPORT_MODULE_RED),
+        30,
+        64,
+        PxScale::from(20.0),
+        &font,
+        &subtitle,
+    );
+    draw_text_mut(
+        &mut image,
+        Rgba(QR_EXPORT_TEXT_DARK),
+        30,
+        height.saturating_sub(48) as i32,
+        PxScale::from(18.0),
+        &font,
+        &footer,
+    );
+
+    let qr_left = ((width - qr_pixels) / 2) as i32;
+    let qr_top = (header_height + vertical_margin) as i32;
+    fill_rect(
+        &mut image,
+        qr_left.max(0) as u32,
+        qr_top.max(0) as u32,
+        qr_pixels,
+        qr_pixels,
+        Rgba([255, 255, 255, 255]),
+    );
+
+    for y in 0..module_count {
+        for x in 0..module_count {
+            if !code.get_module(x, y) {
+                continue;
+            }
+            let left = qr_left + (x as i32 + quiet_zone) * module_size as i32;
+            let top = qr_top + (y as i32 + quiet_zone) * module_size as i32;
+            fill_rect(
+                &mut image,
+                left.max(0) as u32,
+                top.max(0) as u32,
+                module_size,
+                module_size,
+                Rgba(QR_EXPORT_MODULE_RED),
+            );
+        }
+    }
+
+    image
+        .save(&path)
+        .map_err(|err| format!("Failed to save QR image: {err}"))
+}
+
+fn fill_rect(image: &mut RgbaImage, left: u32, top: u32, width: u32, height: u32, color: Rgba<u8>) {
+    let right = left.saturating_add(width).min(image.width());
+    let bottom = top.saturating_add(height).min(image.height());
+    for y in top..bottom {
+        for x in left..right {
+            image.put_pixel(x, y, color);
+        }
+    }
+}
+
 fn available_mining_cores() -> u32 {
     std::thread::available_parallelism()
         .map(|count| count.get() as u32)
@@ -5273,6 +5579,7 @@ mod tests {
             block_count: 12,
             tip_hash: [0x11; 48],
             tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
             mempool_count: 1,
             mempool_total_fee_atoms: 44,
             mempool_fingerprint: [0x22; 32],
@@ -5345,6 +5652,7 @@ mod tests {
             block_count: 0,
             tip_hash: [0x11; 48],
             tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0x22; 32],
@@ -5539,6 +5847,7 @@ mod tests {
             block_count: 10,
             tip_hash: [0x11; 48],
             tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0x22; 32],
@@ -5566,6 +5875,7 @@ mod tests {
             block_count: 20,
             tip_hash: [0x12; 48],
             tip_timestamp: 1_777_416_500,
+            estimated_hashrate_hps: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0x23; 32],
@@ -6205,6 +6515,210 @@ mod tests {
     }
 
     #[test]
+    fn export_wallet_recovery_phrase_qr_writes_png_file() {
+        let root = temp_sandbox_root("recovery-qr");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x63u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        let export_path = root.join("wallet.recovery-phrase.qr.png");
+        app.export_wallet_recovery_phrase_qr(export_path.to_string_lossy().as_ref())
+            .expect("export phrase qr");
+
+        let bytes = fs::read(export_path).expect("read qr");
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn export_receive_address_qr_writes_png_file() {
+        let root = temp_sandbox_root("receive-qr");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x64u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let address = wallet.checkout_receive_address();
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        let export_path = root.join("wallet.receive.qr.png");
+        app.export_receive_address_qr(export_path.to_string_lossy().as_ref(), &address.address)
+            .expect("export receive qr");
+
+        let bytes = fs::read(export_path).expect("read qr");
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn export_wallet_recovery_phrase_qr_appends_png_extension_when_missing() {
+        let root = temp_sandbox_root("recovery-qr-no-ext");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x67u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        let export_path = root.join("wallet.recovery-phrase.qr");
+        app.export_wallet_recovery_phrase_qr(export_path.to_string_lossy().as_ref())
+            .expect("export phrase qr");
+
+        let bytes = fs::read(export_path.with_extension("png")).expect("read qr");
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn export_receive_address_qr_appends_png_extension_when_missing() {
+        let root = temp_sandbox_root("receive-qr-no-ext");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x68u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let address = wallet.checkout_receive_address();
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        let export_path = root.join("wallet.receive.qr");
+        app.export_receive_address_qr(export_path.to_string_lossy().as_ref(), &address.address)
+            .expect("export receive qr");
+
+        let bytes = fs::read(export_path.with_extension("png")).expect("read qr");
+        assert!(bytes.len() > 8);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn begin_wallet_switch_requests_miner_stop_before_loading_target_wallet() {
+        let root = temp_sandbox_root("switch-wallet-stops-miner");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        let current_wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x65u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(
+            current_wallet,
+            root.join("wallet-current").to_string_lossy().into_owned(),
+        );
+
+        let target_wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x66u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        let target_path = root.join("wallet-target");
+        DesktopApp::save_wallet_to_path(&target_wallet, target_path.to_string_lossy().as_ref(), "")
+            .expect("save target wallet");
+
+        let (_sender, receiver) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let mining_stop_requested = Arc::new(AtomicBool::new(false));
+        app.mining_job = Some(MiningJob {
+            started_at: Instant::now(),
+            stop_requested: Arc::clone(&stop_requested),
+            mining_stop_requested: Arc::clone(&mining_stop_requested),
+            receiver,
+        });
+        app.ui_state.generate_coins = true;
+        app.mining_status = String::from("Running");
+
+        app.begin_wallet_switch(target_path.to_string_lossy().as_ref())
+            .expect("switch wallet");
+
+        assert!(stop_requested.load(Ordering::Acquire));
+        assert!(mining_stop_requested.load(Ordering::Acquire));
+        assert!(!app.ui_state.generate_coins);
+        assert_eq!(app.mining_status, "Stopping miner");
+    }
+
+    #[test]
+    fn receive_address_qr_path_prefers_request_label_when_present() {
+        let request = ReceiveRequestRecord {
+            sequence: 7,
+            label: String::from("Primary Miner Wallet"),
+            message: String::new(),
+            amount_atoms: None,
+            address: String::from("T8WWyujuhXSA7KWKSeVyu9SD94bx2q2FJtAsAXC6N26uT7zTenm"),
+        };
+
+        let path = receive_address_qr_path(
+            "/tmp/atho-wallet/data",
+            Some(4),
+            &request.address,
+            Some(&request),
+        );
+
+        assert!(path.ends_with(".request-primary-miner-wallet.qr.png"));
+    }
+
+    #[test]
+    fn create_receive_request_preserves_label_even_after_address_generation_clears_form() {
+        let root = temp_sandbox_root("receive-request-label");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x69u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Regnet,
+        );
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        app.receive_label = String::from("Primary payout");
+        app.receive_amount = String::from("50000000");
+        app.receive_message = String::from("Test invoice");
+
+        app.create_receive_request();
+
+        let request = app.selected_receive_request().expect("selected request");
+        assert_eq!(request.label, "Primary payout");
+        assert_eq!(request.amount_atoms, Some(50_000_000));
+        assert_eq!(request.message, "Test invoice");
+        assert_eq!(app.receive_label, "");
+    }
+
+    #[test]
     fn mining_reward_script_falls_back_to_last_receive_address() {
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
@@ -6354,6 +6868,7 @@ mod tests {
             block_count: 12,
             tip_hash: [0; 48],
             tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
             mempool_count: 0,
             mempool_total_fee_atoms: 0,
             mempool_fingerprint: [0; 32],
@@ -6391,6 +6906,7 @@ mod tests {
             block_count: 12,
             tip_hash: [0x11; 48],
             tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
             mempool_count: 3,
             mempool_total_fee_atoms: 44,
             mempool_fingerprint: [0x22; 32],

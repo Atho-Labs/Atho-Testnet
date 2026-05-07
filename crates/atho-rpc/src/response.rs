@@ -102,6 +102,7 @@ pub struct NodeStatus {
     #[serde(with = "serde_big_array::BigArray")]
     pub tip_hash: [u8; 48],
     pub tip_timestamp: u64,
+    pub estimated_hashrate_hps: u64,
     pub mempool_count: usize,
     pub mempool_total_fee_atoms: u64,
     #[serde(with = "serde_big_array::BigArray")]

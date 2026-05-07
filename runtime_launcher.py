@@ -220,6 +220,34 @@ def gpu_build_help() -> str:
     )
 
 
+def gpu_build_preflight_reason() -> str | None:
+    if sys.platform == "darwin" or os.name == "nt":
+        return None
+
+    compiler = os.environ.get("CXX")
+    if compiler:
+        compiler_available = shutil.which(compiler) is not None
+        compiler_label = compiler
+    else:
+        compiler_label = next(
+            (candidate for candidate in ("c++", "g++", "clang++") if shutil.which(candidate)),
+            "",
+        )
+        compiler_available = bool(compiler_label)
+    if not compiler_available:
+        return "no C++ compiler found for gpu-native build"
+
+    include_candidates = [
+        Path("/usr/include/CL/cl.h"),
+        Path("/usr/local/include/CL/cl.h"),
+        Path("/opt/include/CL/cl.h"),
+    ]
+    if not any(path.is_file() for path in include_candidates):
+        return "OpenCL headers not found (missing CL/cl.h)"
+
+    return None
+
+
 def run_build_command(
     config: LauncherConfig,
     command: list[str],
@@ -248,6 +276,39 @@ def write_build_stamp(config: LauncherConfig, mode: str) -> None:
 
 def build_release_binaries(config: LauncherConfig) -> None:
     verify_cargo_available(config.cargo_bin)
+    gpu_skip_reason = gpu_build_preflight_reason()
+    if gpu_skip_reason is not None:
+        print(
+            "[atho-launch] GPU-native build skipped. "
+            f"{gpu_skip_reason}. Building CPU-only release binaries instead."
+        )
+        cpu_command = [
+            config.cargo_bin,
+            "build",
+            "--release",
+            "-p",
+            "atho-node",
+            "-p",
+            "atho-qt",
+        ]
+        fallback = run_build_command(
+            config,
+            cpu_command,
+            f"building CPU-only release binaries for {config.network}",
+        )
+        if config.dry_run:
+            return
+        assert fallback is not None
+        if fallback.returncode != 0:
+            raise LauncherError(
+                "Atho build failed.\n"
+                "The launcher skipped the GPU-native build because the required native "
+                "prerequisites were not found, and the CPU-only build also failed. "
+                "Fix the Rust/toolchain errors above and rerun the launcher."
+            )
+        write_build_stamp(config, "cpu-only")
+        return
+
     gpu_command = [
         config.cargo_bin,
         "build",

@@ -140,7 +140,7 @@ fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let action_width = if compact {
         (card_width - 32.0).max(260.0)
     } else {
-        ((card_width - 56.0) / 3.0).max(180.0)
+        ((card_width - 40.0) / 2.0).max(220.0)
     };
 
     ui.add_space(10.0);
@@ -186,7 +186,7 @@ fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui,
             "First Run",
             &[
-                "Create or open a wallet.",
+                "Create or import a wallet.",
                 "Use regnet or testnet first to keep the workflow local.",
                 "Open Settings to confirm the active mining backend.",
             ],
@@ -209,7 +209,7 @@ fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 &mut columns[0],
                 "First Run",
                 &[
-                    "Create or open a wallet.",
+                    "Create or import a wallet.",
                     "Use regnet or testnet first to keep the workflow local.",
                     "Open Settings to confirm the active mining backend.",
                 ],
@@ -249,7 +249,7 @@ fn render_welcome_copy(app: &DesktopApp, ui: &mut egui::Ui, centered: bool) {
             widgets::muted_label(
                 ui,
                 &format!(
-                    "Current network target: {}. You can create, open, or restore a wallet below and move straight into the full desktop client.",
+                    "Current network target: {}. You can create a wallet or restore from a recovery phrase below and move straight into the full desktop client.",
                     network
                 ),
             );
@@ -271,7 +271,7 @@ fn render_welcome_copy(app: &DesktopApp, ui: &mut egui::Ui, centered: bool) {
         widgets::muted_label(
             ui,
             &format!(
-                "Current network target: {}. Create a new HD wallet, open an existing one, or restore from a recovery phrase.",
+                "Current network target: {}. Create a new HD wallet or restore from a recovery phrase.",
                 network
             ),
         );
@@ -305,17 +305,6 @@ fn render_action_buttons(app: &mut DesktopApp, ui: &mut egui::Ui, width: f32, co
         ui.add_space(8.0);
         if render_button(
             ui,
-            "Open Wallet",
-            "Open an existing wallet file and unlock it if required.",
-        )
-        .clicked()
-        {
-            app.open_form = super::OpenWalletForm::new(app.connection.network());
-            app.launch_page = LaunchPage::OpenWallet;
-        }
-        ui.add_space(8.0);
-        if render_button(
-            ui,
             "Import Wallet",
             "Restore a wallet from an existing recovery phrase.",
         )
@@ -336,16 +325,6 @@ fn render_action_buttons(app: &mut DesktopApp, ui: &mut egui::Ui, width: f32, co
                 app.create_form = super::CreateWalletForm::new(app.connection.network());
                 let _ = app.generate_create_mnemonic();
                 app.launch_page = LaunchPage::CreateWallet;
-            }
-            if render_button(
-                ui,
-                "Open Wallet",
-                "Open an existing wallet file and unlock it if required.",
-            )
-            .clicked()
-            {
-                app.open_form = super::OpenWalletForm::new(app.connection.network());
-                app.launch_page = LaunchPage::OpenWallet;
             }
             if render_button(
                 ui,

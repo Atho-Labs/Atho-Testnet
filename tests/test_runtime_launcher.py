@@ -153,6 +153,9 @@ class RuntimeLauncherTests(unittest.TestCase):
                 forwarded_args=config.forwarded_args,
             )
             with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
+                "runtime_launcher.gpu_build_preflight_reason",
+                return_value=None,
+            ), mock.patch(
                 "runtime_launcher.subprocess.run",
                 side_effect=[
                     subprocess.CompletedProcess(
@@ -186,6 +189,9 @@ class RuntimeLauncherTests(unittest.TestCase):
                 forwarded_args=config.forwarded_args,
             )
             with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
+                "runtime_launcher.gpu_build_preflight_reason",
+                return_value=None,
+            ), mock.patch(
                 "runtime_launcher.subprocess.run",
                 return_value=subprocess.CompletedProcess(
                     args=["cargo"], returncode=0, stdout="", stderr=""
@@ -197,6 +203,37 @@ class RuntimeLauncherTests(unittest.TestCase):
             self.assertEqual(
                 config.gpu_build_stamp.read_text(encoding="utf-8"), "gpu-native\n"
             )
+
+    def test_build_release_binaries_skips_gpu_when_prereqs_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = root / "target" / "release"
+            release_dir.mkdir(parents=True)
+            config = self.make_config(root)
+            config = runtime_launcher.LauncherConfig(
+                network=config.network,
+                repo_root=config.repo_root,
+                release_dir=release_dir,
+                runtime_root=config.runtime_root,
+                cargo_bin=config.cargo_bin,
+                rebuild=config.rebuild,
+                no_build=config.no_build,
+                dry_run=False,
+                forwarded_args=config.forwarded_args,
+            )
+            with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
+                "runtime_launcher.gpu_build_preflight_reason",
+                return_value="OpenCL headers not found (missing CL/cl.h)",
+            ), mock.patch(
+                "runtime_launcher.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=["cargo"], returncode=0, stdout="", stderr=""
+                ),
+            ) as run_mock:
+                runtime_launcher.build_release_binaries(config)
+
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(config.gpu_build_stamp.read_text(encoding="utf-8"), "cpu-only\n")
 
 
 if __name__ == "__main__":

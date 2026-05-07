@@ -9,6 +9,7 @@ default = []
 gpu-native = ["atho-node/gpu-native"]
 
 [dependencies]
+ab_glyph = "0.2"
 arboard = "3"
 atho-core = { path = "../atho-core" }
 atho-crypto = { path = "../atho-crypto" }
@@ -21,6 +22,8 @@ eframe = { version = "0.27", features = ["wgpu"] }
 egui_extras = { version = "0.27", features = ["image"] }
 getrandom = "0.2"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = "0.25"
 rayon = "1"
 qrcodegen = "1"
 rfd = "0.14"

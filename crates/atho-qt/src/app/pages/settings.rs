@@ -1,6 +1,5 @@
 use crate::app::{
     mnemonic_ui, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage,
-    OpenWalletForm,
 };
 use atho_node::mining_backend::MiningBackendKind;
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
@@ -56,11 +55,6 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.add_space(12.0);
         }
         ui.horizontal(|ui| {
-            if ui.button("Open Wallet").clicked() {
-                app.open_form = OpenWalletForm::new(app.connection.network());
-                app.launch_page = LaunchPage::OpenWallet;
-                app.clear_wallet_state();
-            }
             if ui.button("Create Wallet").clicked() {
                 app.create_form = CreateWalletForm::new(app.connection.network());
                 let _ = app.generate_create_mnemonic();
@@ -216,7 +210,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         widgets::muted_label(
             ui,
-            "Export the active wallet as an encrypted backup, or export recovery details as JSON or TXT.",
+            "Export the active wallet as an encrypted backup, or export recovery details as JSON, TXT, or QR.",
         );
         ui.add_space(12.0);
         ui.label("Encrypted backup path");
@@ -243,6 +237,14 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             Some(("Text", &["txt"])),
         );
         ui.add_space(8.0);
+        ui.label("Recovery QR PNG path");
+        render_browse_save_row(
+            ui,
+            &mut app.wallet_management_form.backup_phrase_qr_path,
+            "Save PNG as",
+            Some(("PNG", &["png"])),
+        );
+        ui.add_space(8.0);
         ui.label("Passphrase");
         ui.add(
             egui::TextEdit::singleline(&mut app.wallet_management_form.backup_password)
@@ -261,7 +263,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             "Show passphrases",
         );
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let ready = app.wallet.is_some()
                 && app.wallet_management_form.backup_password
                     == app.wallet_management_form.backup_password_confirm;
@@ -305,6 +307,20 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 }
             }
             if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Export Phrase QR"))
+                .clicked()
+            {
+                match app.export_wallet_recovery_phrase_qr(
+                    &app.wallet_management_form.backup_phrase_qr_path,
+                ) {
+                    Ok(()) => {
+                        app.last_error = None;
+                        app.send_status = String::from("Wallet recovery QR exported");
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+            if ui
                 .add_enabled(ready, egui::Button::new("Change Passphrase"))
                 .clicked()
             {
@@ -320,7 +336,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         });
         widgets::muted_label(
             ui,
-            "Backup export also writes a .meta.json companion file with the wallet's generated and reserved derivation index tips.",
+            "Backup export also writes a .meta.json companion file with the wallet's generated and reserved derivation index tips. Recovery phrase QR exports use a red label band so sensitive HD wallet material is easy to identify later.",
         );
     });
 
@@ -381,6 +397,36 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 if ui.button("Copy recovery phrase").clicked() {
                     DesktopApp::copy_text(ui, phrase.clone());
+                }
+                if ui.button("Save recovery QR").clicked() {
+                    let mut dialog = FileDialog::new().add_filter("PNG", &["png"]);
+                    if let Some(file_name) =
+                        std::path::Path::new(&app.wallet_management_form.backup_phrase_qr_path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                    {
+                        dialog = dialog.set_file_name(file_name);
+                    }
+                    if let Some(parent) =
+                        std::path::Path::new(&app.wallet_management_form.backup_phrase_qr_path)
+                            .parent()
+                    {
+                        dialog = dialog.set_directory(parent);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        let selected =
+                            crate::app::normalize_png_export_path(&path.to_string_lossy())
+                                .to_string_lossy()
+                                .into_owned();
+                        app.wallet_management_form.backup_phrase_qr_path = selected.clone();
+                        match app.export_wallet_recovery_phrase_qr(&selected) {
+                            Ok(()) => {
+                                app.last_error = None;
+                                app.send_status = String::from("Wallet recovery QR exported");
+                            }
+                            Err(err) => app.last_error = Some(err),
+                        }
+                    }
                 }
             });
         } else {

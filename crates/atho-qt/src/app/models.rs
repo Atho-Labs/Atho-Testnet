@@ -221,6 +221,7 @@ pub(crate) struct WalletManagementForm {
     pub(crate) backup_path: String,
     pub(crate) backup_json_path: String,
     pub(crate) backup_text_path: String,
+    pub(crate) backup_phrase_qr_path: String,
     pub(crate) backup_password: String,
     pub(crate) backup_password_confirm: String,
     pub(crate) restore_gap_limit_input: String,
@@ -233,6 +234,7 @@ impl WalletManagementForm {
             backup_path: default_backup_wallet_path(network),
             backup_json_path: default_backup_wallet_json_path(network),
             backup_text_path: default_backup_wallet_text_path(network),
+            backup_phrase_qr_path: default_backup_wallet_phrase_qr_path(network),
             backup_password: String::new(),
             backup_password_confirm: String::new(),
             restore_gap_limit_input: DEFAULT_RESTORE_GAP_LIMIT.to_string(),
@@ -292,6 +294,13 @@ fn default_backup_wallet_json_path(network: Network) -> String {
 fn default_backup_wallet_text_path(network: Network) -> String {
     format!(
         "{}.recovery.txt",
+        default_wallet_path(network).to_string_lossy()
+    )
+}
+
+fn default_backup_wallet_phrase_qr_path(network: Network) -> String {
+    format!(
+        "{}.recovery-phrase.qr.png",
         default_wallet_path(network).to_string_lossy()
     )
 }

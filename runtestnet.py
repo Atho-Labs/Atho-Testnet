@@ -1,4 +1,4 @@
-1   #!/usr/bin/env python3
+ #!/usr/bin/env python3
 """Launch Atho testnet with the desktop client and managed local node."""
 
 from runtime_launcher import main

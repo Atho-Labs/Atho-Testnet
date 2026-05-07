@@ -1,6 +1,6 @@
 use super::{
     pages, widgets, CreateWalletForm, DebugWindowTab, DesktopApp, ImportWalletForm, LaunchPage,
-    NavTab, OpenWalletForm,
+    NavTab,
 };
 use crate::resources;
 use eframe::egui;
@@ -36,12 +36,6 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open Wallet").clicked() {
-                        app.open_form = OpenWalletForm::new(app.connection.network());
-                        app.launch_page = LaunchPage::OpenWallet;
-                        app.clear_wallet_state();
-                        ui.close_menu();
-                    }
                     if ui.button("Create Wallet").clicked() {
                         app.create_form = CreateWalletForm::new(app.connection.network());
                         let _ = app.generate_create_mnemonic();
