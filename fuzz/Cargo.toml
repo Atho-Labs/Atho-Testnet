@@ -108,4 +108,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "address_decode"
+path = "fuzz_targets/address_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

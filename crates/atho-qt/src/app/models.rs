@@ -1,4 +1,4 @@
-use super::default_wallet_path;
+use super::{default_wallet_name, default_wallet_path, suggested_wallet_path};
 use atho_core::network::Network;
 use atho_rpc::command::{CommandGroup, CommandPermission};
 use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
@@ -189,8 +189,10 @@ pub(crate) struct CreateWalletForm {
 impl CreateWalletForm {
     pub(crate) fn new(network: Network) -> Self {
         Self {
-            wallet_name: String::new(),
-            wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
+            wallet_name: default_wallet_name(network),
+            wallet_path: suggested_wallet_path(network)
+                .to_string_lossy()
+                .into_owned(),
             mnemonic_word_count: DEFAULT_MNEMONIC_WORD_COUNT,
             encrypt_wallet: false,
             wallet_password: String::new(),
@@ -217,6 +219,8 @@ impl CreateWalletForm {
 #[derive(Debug)]
 pub(crate) struct WalletManagementForm {
     pub(crate) backup_path: String,
+    pub(crate) backup_json_path: String,
+    pub(crate) backup_text_path: String,
     pub(crate) backup_password: String,
     pub(crate) backup_password_confirm: String,
     pub(crate) restore_gap_limit_input: String,
@@ -227,6 +231,8 @@ impl WalletManagementForm {
     pub(crate) fn new(network: Network) -> Self {
         Self {
             backup_path: default_backup_wallet_path(network),
+            backup_json_path: default_backup_wallet_json_path(network),
+            backup_text_path: default_backup_wallet_text_path(network),
             backup_password: String::new(),
             backup_password_confirm: String::new(),
             restore_gap_limit_input: DEFAULT_RESTORE_GAP_LIMIT.to_string(),
@@ -251,8 +257,10 @@ pub(crate) struct ImportWalletForm {
 impl ImportWalletForm {
     pub(crate) fn new(network: Network) -> Self {
         Self {
-            wallet_name: String::new(),
-            wallet_path: default_wallet_path(network).to_string_lossy().into_owned(),
+            wallet_name: default_wallet_name(network),
+            wallet_path: suggested_wallet_path(network)
+                .to_string_lossy()
+                .into_owned(),
             encrypt_wallet: false,
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
@@ -272,6 +280,20 @@ impl ImportWalletForm {
 
 fn default_backup_wallet_path(network: Network) -> String {
     format!("{}.backup", default_wallet_path(network).to_string_lossy())
+}
+
+fn default_backup_wallet_json_path(network: Network) -> String {
+    format!(
+        "{}.recovery.json",
+        default_wallet_path(network).to_string_lossy()
+    )
+}
+
+fn default_backup_wallet_text_path(network: Network) -> String {
+    format!(
+        "{}.recovery.txt",
+        default_wallet_path(network).to_string_lossy()
+    )
 }
 
 #[derive(Debug)]

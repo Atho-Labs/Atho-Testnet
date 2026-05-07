@@ -5,12 +5,14 @@ use crate::app::{
 use atho_node::mining_backend::MiningBackendKind;
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
+use rfd::FileDialog;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         widgets::section_header(ui, "Wallet");
         ui.add_space(12.0);
+        ui.label(format!("Wallet name: {}", app.wallet_display_name()));
         ui.label(format!("Network: {}", app.view_model.network_label));
         ui.label(format!("Wallet file: {}", app.wallet_file_label()));
         ui.label(format!(
@@ -30,18 +32,37 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             app.wallet_discovery_scan_limit
         ));
         ui.add_space(12.0);
+        if app.wallet_path.is_some() {
+            ui.label("Wallet name");
+            if app.current_wallet_name.is_none() {
+                app.current_wallet_name = Some(app.wallet_display_name());
+            }
+            if let Some(wallet_name) = app.current_wallet_name.as_mut() {
+                widgets::text_input(ui, wallet_name, "Wallet 1");
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Save Wallet Name"))
+                .clicked()
+            {
+                match app.rename_current_wallet() {
+                    Ok(()) => {
+                        app.last_error = None;
+                        app.send_status = String::from("Wallet name saved");
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+            ui.add_space(12.0);
+        }
         ui.horizontal(|ui| {
             if ui.button("Open Wallet").clicked() {
                 app.open_form = OpenWalletForm::new(app.connection.network());
                 app.launch_page = LaunchPage::OpenWallet;
                 app.clear_wallet_state();
             }
-            if ui.button("Create Another Wallet").clicked() {
+            if ui.button("Create Wallet").clicked() {
                 app.create_form = CreateWalletForm::new(app.connection.network());
-                app.create_form.wallet_path =
-                    super::super::alternate_wallet_path(app.connection.network())
-                        .to_string_lossy()
-                        .into_owned();
                 let _ = app.generate_create_mnemonic();
                 app.launch_page = LaunchPage::CreateWallet;
                 app.clear_wallet_state();
@@ -61,6 +82,68 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui,
             "Off by default. The current spend path signs one wallet address at a time, so rotating every mining reward can fragment spendable balance.",
         );
+    });
+
+    ui.add_space(14.0);
+    widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Known Wallets");
+        ui.add_space(12.0);
+        let entries = app.wallet_registry_entries();
+        if entries.is_empty() {
+            widgets::muted_label(ui, "No saved wallets are registered yet.");
+        } else {
+            for entry in entries {
+                let is_current = app.wallet_path_matches(&entry.wallet_path);
+                egui::Frame::none()
+                    .fill(widgets::SHELL_BG)
+                    .stroke(egui::Stroke::new(1.0, widgets::PANEL_STROKE))
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&entry.wallet_name)
+                                        .size(14.0)
+                                        .strong()
+                                        .color(widgets::TEXT),
+                                );
+                                widgets::muted_label(
+                                    ui,
+                                    &format!(
+                                        "{} words · updated {}",
+                                        if entry.word_count > 0 {
+                                            entry.word_count.to_string()
+                                        } else {
+                                            String::from("unknown")
+                                        },
+                                        format_recent(Some(entry.updated_at_unix))
+                                    ),
+                                );
+                                widgets::muted_label(ui, &entry.wallet_path);
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Copy Path").clicked() {
+                                        DesktopApp::copy_text(ui, entry.wallet_path.clone());
+                                    }
+                                    if ui
+                                        .add_enabled(!is_current, egui::Button::new("Switch"))
+                                        .clicked()
+                                    {
+                                        if let Err(err) =
+                                            app.begin_wallet_switch(&entry.wallet_path)
+                                        {
+                                            app.last_error = Some(err);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(8.0);
+            }
+        }
     });
 
     ui.add_space(14.0);
@@ -133,11 +216,32 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         widgets::muted_label(
             ui,
-            "Export a backup copy or rotate the current wallet passphrase without leaving the app.",
+            "Export the active wallet as an encrypted backup, or export recovery details as JSON or TXT.",
         );
         ui.add_space(12.0);
-        ui.label("Backup path");
-        widgets::text_input(ui, &mut app.wallet_management_form.backup_path, "");
+        ui.label("Encrypted backup path");
+        render_browse_save_row(
+            ui,
+            &mut app.wallet_management_form.backup_path,
+            "Save backup as",
+            None,
+        );
+        ui.add_space(8.0);
+        ui.label("Recovery JSON path");
+        render_browse_save_row(
+            ui,
+            &mut app.wallet_management_form.backup_json_path,
+            "Save JSON as",
+            Some(("JSON", &["json"])),
+        );
+        ui.add_space(8.0);
+        ui.label("Recovery TXT path");
+        render_browse_save_row(
+            ui,
+            &mut app.wallet_management_form.backup_text_path,
+            "Save TXT as",
+            Some(("Text", &["txt"])),
+        );
         ui.add_space(8.0);
         ui.label("Passphrase");
         ui.add(
@@ -177,6 +281,30 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 }
             }
             if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Export JSON"))
+                .clicked()
+            {
+                match app.export_wallet_recovery_json(&app.wallet_management_form.backup_json_path) {
+                    Ok(()) => {
+                        app.last_error = None;
+                        app.send_status = String::from("Wallet recovery JSON exported");
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+            if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Export TXT"))
+                .clicked()
+            {
+                match app.export_wallet_recovery_text(&app.wallet_management_form.backup_text_path) {
+                    Ok(()) => {
+                        app.last_error = None;
+                        app.send_status = String::from("Wallet recovery TXT exported");
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+            if ui
                 .add_enabled(ready, egui::Button::new("Change Passphrase"))
                 .clicked()
             {
@@ -201,10 +329,45 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::section_header(ui, "Recovery Phrase");
         ui.add_space(12.0);
         if let Some(phrase) = app.wallet_mnemonic_sentence() {
+            let (next_receive_index, next_change_index) = app.wallet_next_indices();
+            let (highest_generated_receive_index, highest_generated_change_index) =
+                app.wallet_highest_generated_indices();
+            let (highest_reserved_receive_index, highest_reserved_change_index) =
+                app.wallet_highest_reserved_indices();
             widgets::muted_label(
                 ui,
                 "This wallet is unlocked. The recovery phrase is available for review.",
             );
+            ui.add_space(10.0);
+            if let Some(mnemonic) = app.wallet_ref().and_then(|wallet| wallet.mnemonic_phrase()) {
+                ui.label(format!("Mnemonic words: {}", mnemonic.word_count()));
+            }
+            ui.label(format!(
+                "Current receive index: {}",
+                app.wallet_current_receive_index()
+                    .map(|index| format!("R{index:04}"))
+                    .unwrap_or_else(|| String::from("Unavailable"))
+            ));
+            ui.label(format!("Next receive index: R{next_receive_index:04}"));
+            ui.label(format!("Next change index: C{next_change_index:04}"));
+            ui.label(format!(
+                "Highest generated: {} / {}",
+                highest_generated_receive_index
+                    .map(|index| format!("R{index:04}"))
+                    .unwrap_or_else(|| String::from("Unavailable")),
+                highest_generated_change_index
+                    .map(|index| format!("C{index:04}"))
+                    .unwrap_or_else(|| String::from("Unavailable")),
+            ));
+            ui.label(format!(
+                "Highest reserved: {} / {}",
+                highest_reserved_receive_index
+                    .map(|index| format!("R{index:04}"))
+                    .unwrap_or_else(|| String::from("Unavailable")),
+                highest_reserved_change_index
+                    .map(|index| format!("C{index:04}"))
+                    .unwrap_or_else(|| String::from("Unavailable")),
+            ));
             ui.add_space(10.0);
             let mut phrase_words = mnemonic_ui::words_from_sentence(&phrase);
             mnemonic_ui::render_word_grid(
@@ -580,6 +743,32 @@ fn render_copyable_path_row(ui: &mut egui::Ui, label: &str, value: &str) {
             .clicked()
         {
             DesktopApp::copy_text(ui, value.to_string());
+        }
+    });
+}
+
+fn render_browse_save_row(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    button_label: &str,
+    filter: Option<(&str, &[&str])>,
+) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width((ui.available_width() - 112.0).max(160.0)),
+        );
+        if ui
+            .add_sized([96.0, 28.0], egui::Button::new(button_label))
+            .clicked()
+        {
+            let mut dialog = FileDialog::new();
+            if let Some((name, extensions)) = filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+            if let Some(path) = dialog.save_file() {
+                *value = path.to_string_lossy().into_owned();
+            }
         }
     });
 }

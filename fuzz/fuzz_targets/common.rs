@@ -127,7 +127,7 @@ fn build_spend_transaction(
         .expect("fixture input covers fee");
     tx.witness.clear();
 
-    let digest = transaction_signing_digest(&tx);
+    let digest = transaction_signing_digest(network, &tx);
     let signature = sign(AthoSignatureDomain::Transaction, &keypair.secret_key, &digest)
         .expect("fixture signature")
         .0;

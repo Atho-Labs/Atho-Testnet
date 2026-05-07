@@ -5,7 +5,9 @@
 //!
 //! CONSENSUS: Every function here must produce identical results across nodes
 //! for the same ordered block history.
-use crate::block::{Block, BlockHeader};
+use crate::block::Block;
+#[cfg(test)]
+use crate::block::BlockHeader;
 use crate::constants::{
     POW_AVERAGING_WINDOW_BLOCKS, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
     POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_WINDOW_BLOCKS, POW_RETARGET_INTERVAL_BLOCKS,
@@ -147,12 +149,23 @@ fn median_u64(values: &[u64]) -> u64 {
     sorted[sorted.len() / 2]
 }
 
-fn median_time_past(headers: &[BlockHeader], index: usize) -> u64 {
+#[cfg(test)]
+fn median_time_past_headers(headers: &[BlockHeader], index: usize) -> u64 {
     let span = POW_PROFILE.median_window_blocks as usize;
     let start = index.saturating_add(1).saturating_sub(span);
     let timestamps: Vec<u64> = headers[start..=index]
         .iter()
         .map(|header| header.timestamp)
+        .collect();
+    median_u64(&timestamps)
+}
+
+fn median_time_past_blocks(blocks: &[Block], index: usize) -> u64 {
+    let span = POW_PROFILE.median_window_blocks as usize;
+    let start = index.saturating_add(1).saturating_sub(span);
+    let timestamps: Vec<u64> = blocks[start..=index]
+        .iter()
+        .map(|block| block.header.timestamp)
         .collect();
     median_u64(&timestamps)
 }
@@ -171,7 +184,8 @@ fn bounded_actual_timespan(actual_timespan: u64, target_timespan: u64) -> u64 {
     damped.clamp(min_actual, max_actual)
 }
 
-fn mean_target(headers: &[BlockHeader]) -> BigUint {
+#[cfg(test)]
+fn mean_target_headers(headers: &[BlockHeader]) -> BigUint {
     let mut total = BigUint::zero();
     for header in headers {
         total += target_to_biguint(&header.difficulty_target_or_bits);
@@ -179,6 +193,15 @@ fn mean_target(headers: &[BlockHeader]) -> BigUint {
     total / BigUint::from(headers.len() as u64)
 }
 
+fn mean_target_blocks(blocks: &[Block]) -> BigUint {
+    let mut total = BigUint::zero();
+    for block in blocks {
+        total += target_to_biguint(&block.header.difficulty_target_or_bits);
+    }
+    total / BigUint::from(blocks.len() as u64)
+}
+
+#[cfg(test)]
 fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 48] {
     let headers = match headers {
         [first, rest @ ..] if first.height == 0 && !rest.is_empty() => rest,
@@ -201,13 +224,45 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
             .timestamp
             .saturating_sub(headers[old_index].timestamp)
     } else {
-        let tip_mtp = median_time_past(headers, tip_index);
-        let old_mtp = median_time_past(headers, old_index);
+        let tip_mtp = median_time_past_headers(headers, tip_index);
+        let old_mtp = median_time_past_headers(headers, old_index);
         tip_mtp.saturating_sub(old_mtp)
     };
     let expected_timespan = expected_timespan_seconds_for_window(window_len);
     let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
-    let average_target = mean_target(window);
+    let average_target = mean_target_headers(window);
+    let threshold =
+        (average_target * BigUint::from(bounded_timespan)) / BigUint::from(expected_timespan);
+    clamp_target(biguint_to_target(&threshold))
+}
+
+fn next_target_from_blocks(network: Network, blocks: &[Block]) -> [u8; 48] {
+    let blocks = match blocks {
+        [first, rest @ ..] if first.header.height == 0 && !rest.is_empty() => rest,
+        _ => blocks,
+    };
+    let averaging_window = POW_PROFILE.averaging_window_blocks as usize;
+    let window_len = blocks.len().min(averaging_window);
+    if window_len < 2 {
+        return initial_target_for_network(network);
+    }
+
+    let window = &blocks[blocks.len() - window_len..];
+    let tip_index = blocks.len() - 1;
+    let old_index = blocks.len() - window_len;
+    let actual_timespan = if window_len < averaging_window {
+        blocks[tip_index]
+            .header
+            .timestamp
+            .saturating_sub(blocks[old_index].header.timestamp)
+    } else {
+        let tip_mtp = median_time_past_blocks(blocks, tip_index);
+        let old_mtp = median_time_past_blocks(blocks, old_index);
+        tip_mtp.saturating_sub(old_mtp)
+    };
+    let expected_timespan = expected_timespan_seconds_for_window(window_len);
+    let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
+    let average_target = mean_target_blocks(window);
     let threshold =
         (average_target * BigUint::from(bounded_timespan)) / BigUint::from(expected_timespan);
     clamp_target(biguint_to_target(&threshold))
@@ -243,11 +298,7 @@ pub fn target_for_next_block_with_timestamp(
             }
         }
     }
-    let headers: Vec<BlockHeader> = previous_blocks
-        .iter()
-        .map(|block| block.header.clone())
-        .collect();
-    next_target_from_headers(network, &headers)
+    next_target_from_blocks(network, previous_blocks)
 }
 
 /// Computes cumulative chainwork for a block sequence.
@@ -323,11 +374,10 @@ pub fn median_time_past_from_blocks(previous_blocks: &[Block]) -> Option<u64> {
     if previous_blocks.is_empty() {
         return None;
     }
-    let headers: Vec<BlockHeader> = previous_blocks
-        .iter()
-        .map(|block| block.header.clone())
-        .collect();
-    Some(median_time_past(&headers, headers.len() - 1))
+    Some(median_time_past_blocks(
+        previous_blocks,
+        previous_blocks.len() - 1,
+    ))
 }
 
 /// Returns the minimum valid timestamp for the next block.
@@ -485,6 +535,33 @@ mod tests {
         assert!(target_within_bounds(&on_time_target));
         assert!(target_within_bounds(&slow_target));
         assert!(slow_target > on_time_target);
+    }
+
+    #[test]
+    fn next_target_matches_clone_based_reference_path() {
+        let starting_target = DIFFICULTY_PROFILE.max_difficulty_target;
+        let mut blocks = Vec::new();
+        for height in 0..(POW_PROFILE.averaging_window_blocks + POW_PROFILE.median_window_blocks) {
+            blocks.push(Block {
+                header: BlockHeader {
+                    version: 1,
+                    network_id: Network::Mainnet,
+                    height,
+                    previous_block_hash: [0; 48],
+                    merkle_root: [0; 48],
+                    witness_root: [0; 48],
+                    timestamp: 1_000 + height.saturating_mul(77),
+                    difficulty_target_or_bits: starting_target,
+                    nonce: 0,
+                },
+                ..Block::default()
+            });
+        }
+
+        let headers: Vec<BlockHeader> = blocks.iter().map(|block| block.header.clone()).collect();
+        let reference = next_target_from_headers(Network::Mainnet, &headers);
+        let optimized = target_for_next_block_with_timestamp(Network::Mainnet, &blocks, 9_999);
+        assert_eq!(optimized, reference);
     }
 
     #[test]

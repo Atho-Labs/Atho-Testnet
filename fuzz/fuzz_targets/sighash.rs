@@ -14,7 +14,10 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let digest = tx.signing_digest();
-    let _ = atho_core::consensus::signatures::transaction_signing_digest(&tx);
+    let _ = atho_core::consensus::signatures::transaction_signing_digest(
+        atho_core::network::Network::Regnet,
+        &tx,
+    );
 
     if let Some(first_output) = tx.outputs.first() {
         let mut mutated = tx.clone();

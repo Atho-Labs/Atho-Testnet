@@ -34,7 +34,7 @@ pub const fn consensus_params_for_network(network: Network) -> ConsensusParams {
     match network {
         Network::Mainnet => CONSENSUS_PARAMS,
         Network::Testnet => ConsensusParams {
-            coinbase_maturity_blocks: 2,
+            coinbase_maturity_blocks: COINBASE_MATURITY_BLOCKS,
             standard_tx_confirmations: 1,
             ..CONSENSUS_PARAMS
         },
@@ -64,13 +64,13 @@ mod tests {
     }
 
     #[test]
-    fn testnet_uses_fast_confirmation_params_without_touching_mainnet() {
+    fn testnet_restores_mainnet_coinbase_maturity_without_touching_fast_standard_confirms() {
         let mainnet = consensus_params_for_network(Network::Mainnet);
         let testnet = consensus_params_for_network(Network::Testnet);
 
         assert_eq!(mainnet.coinbase_maturity_blocks, COINBASE_MATURITY_BLOCKS);
         assert_eq!(mainnet.standard_tx_confirmations, STANDARD_TX_CONFIRMATIONS);
-        assert_eq!(testnet.coinbase_maturity_blocks, 2);
+        assert_eq!(testnet.coinbase_maturity_blocks, COINBASE_MATURITY_BLOCKS);
         assert_eq!(testnet.standard_tx_confirmations, 1);
         assert_eq!(
             testnet.initial_block_reward_atoms,

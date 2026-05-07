@@ -13,8 +13,74 @@ use crate::network::Network;
 use crate::transaction::Transaction;
 use getrandom::getrandom;
 use sha3::{Digest, Sha3_256};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
 
 const TESTNET_TX_POW_BITS: u8 = 12;
+
+#[cfg(test)]
+static FORCE_TX_POW_SPAWN_FAILURE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxPowSolveConfig {
+    pub auto_threads: bool,
+    pub thread_percent: u8,
+    pub max_threads: Option<usize>,
+    pub min_threads: usize,
+}
+
+impl Default for TxPowSolveConfig {
+    fn default() -> Self {
+        Self {
+            auto_threads: true,
+            thread_percent: 75,
+            max_threads: None,
+            min_threads: 1,
+        }
+    }
+}
+
+impl TxPowSolveConfig {
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            auto_threads: env_bool("ATHO_TX_POW_AUTO_THREADS", default.auto_threads),
+            thread_percent: env_u8("ATHO_TX_POW_THREAD_PERCENT", default.thread_percent),
+            max_threads: env_usize_opt("ATHO_TX_POW_MAX_THREADS"),
+            min_threads: env_usize("ATHO_TX_POW_MIN_THREADS", default.min_threads),
+        }
+    }
+
+    pub fn resolved_thread_count(self) -> usize {
+        let available = thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        self.resolved_thread_count_for_available(available)
+    }
+
+    pub fn resolved_thread_count_for_available(self, available_threads: usize) -> usize {
+        let available_threads = available_threads.max(1);
+        let min_threads = self.min_threads.max(1).min(available_threads);
+        let max_threads = self
+            .max_threads
+            .unwrap_or(available_threads)
+            .max(1)
+            .min(available_threads);
+        let mut threads = if self.auto_threads {
+            let percent = self.thread_percent.clamp(1, 100) as usize;
+            available_threads.saturating_mul(percent) / 100
+        } else {
+            max_threads
+        };
+        if threads == 0 {
+            threads = 1;
+        }
+        threads.max(min_threads).min(max_threads).max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxPowCancelled;
 
 fn update_tx_pow_message_hasher(hasher: &mut Sha3_256, tx: &Transaction) {
     tx.update_base_hasher(hasher);
@@ -156,6 +222,37 @@ fn transaction_pow_nonce_start(preimage: &[u8; 32]) -> u64 {
     u64::from_be_bytes(nonce)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+fn env_u8(key: &str, default: u8) -> u8 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize_opt(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 pub fn transaction_pow_is_valid(network: Network, tx: &Transaction, fee_atoms: u64) -> bool {
     let required_bits = required_tx_pow_bits(network, tx, fee_atoms);
     transaction_pow_is_valid_for_bits(network, tx, required_bits)
@@ -177,21 +274,177 @@ pub fn transaction_pow_is_valid_for_bits(
 }
 
 pub fn solve_transaction_pow(network: Network, tx: &mut Transaction, fee_atoms: u64) -> u64 {
+    let config = TxPowSolveConfig::from_env();
+    let stop_requested = AtomicBool::new(false);
+    solve_transaction_pow_with_config_and_cancel(network, tx, fee_atoms, config, &stop_requested)
+        .expect("default tx pow solver should not be cancelled")
+}
+
+pub fn solve_transaction_pow_with_config(
+    network: Network,
+    tx: &mut Transaction,
+    fee_atoms: u64,
+    config: TxPowSolveConfig,
+) -> u64 {
+    let stop_requested = AtomicBool::new(false);
+    solve_transaction_pow_with_config_and_cancel(network, tx, fee_atoms, config, &stop_requested)
+        .expect("configured tx pow solver should not be cancelled")
+}
+
+pub fn solve_transaction_pow_with_config_and_cancel(
+    network: Network,
+    tx: &mut Transaction,
+    fee_atoms: u64,
+    config: TxPowSolveConfig,
+    stop_requested: &AtomicBool,
+) -> Result<u64, TxPowCancelled> {
     let required_bits = required_tx_pow_bits(network, tx, fee_atoms);
     tx.tx_pow_bits = required_bits;
+    tx.tx_pow_nonce = 0;
     if required_bits == 0 {
-        tx.tx_pow_nonce = 0;
-        return 0;
+        return Ok(0);
     }
     let preimage = transaction_pow_preimage(network, tx);
-    let mut nonce = transaction_pow_nonce_start(&preimage);
+    let start_nonce = transaction_pow_nonce_start(&preimage);
+    let worker_count = config.resolved_thread_count().max(1);
+    solve_transaction_pow_with_worker_count_and_cancel(
+        tx,
+        &preimage,
+        required_bits,
+        start_nonce,
+        worker_count,
+        stop_requested,
+    )
+}
+
+fn solve_transaction_pow_single_thread(
+    tx: &mut Transaction,
+    preimage: &[u8; 32],
+    required_bits: u8,
+    start_nonce: u64,
+    stop_requested: &AtomicBool,
+) -> Result<u64, TxPowCancelled> {
+    let mut nonce = start_nonce;
     loop {
-        if leading_zero_bits(&transaction_pow_hash(&preimage, nonce)) >= required_bits {
+        if stop_requested.load(Ordering::Acquire) {
+            tx.tx_pow_nonce = 0;
+            return Err(TxPowCancelled);
+        }
+        if leading_zero_bits(&transaction_pow_hash(preimage, nonce)) >= required_bits {
             tx.tx_pow_nonce = nonce;
-            return nonce;
+            return Ok(nonce);
         }
         nonce = nonce.wrapping_add(1);
     }
+}
+
+fn solve_transaction_pow_with_worker_count_and_cancel(
+    tx: &mut Transaction,
+    preimage: &[u8; 32],
+    required_bits: u8,
+    start_nonce: u64,
+    worker_count: usize,
+    stop_requested: &AtomicBool,
+) -> Result<u64, TxPowCancelled> {
+    if worker_count <= 1 {
+        return solve_transaction_pow_single_thread(
+            tx,
+            preimage,
+            required_bits,
+            start_nonce,
+            stop_requested,
+        );
+    }
+
+    let found = AtomicBool::new(false);
+    let solved_nonce = AtomicU64::new(0);
+    let parallel_abort = AtomicBool::new(false);
+    let spawn_failed = AtomicBool::new(false);
+    thread::scope(|scope| {
+        for worker_index in 1..worker_count {
+            let preimage = preimage;
+            let found = &found;
+            let solved_nonce = &solved_nonce;
+            let stop_requested = stop_requested;
+            let parallel_abort = &parallel_abort;
+            #[cfg(test)]
+            if FORCE_TX_POW_SPAWN_FAILURE.load(Ordering::Acquire) {
+                spawn_failed.store(true, Ordering::Release);
+                parallel_abort.store(true, Ordering::Release);
+                break;
+            }
+            if thread::Builder::new()
+                .name(format!("atho-txpow-{worker_index}"))
+                .spawn_scoped(scope, move || {
+                    let mut candidate = start_nonce.wrapping_add(worker_index as u64);
+                    while !found.load(Ordering::Relaxed)
+                        && !stop_requested.load(Ordering::Acquire)
+                        && !parallel_abort.load(Ordering::Acquire)
+                    {
+                        if leading_zero_bits(&transaction_pow_hash(preimage, candidate))
+                            >= required_bits
+                        {
+                            if found
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                solved_nonce.store(candidate, Ordering::Release);
+                            }
+                            break;
+                        }
+                        candidate = candidate.wrapping_add(worker_count as u64);
+                    }
+                })
+                .is_err()
+            {
+                spawn_failed.store(true, Ordering::Release);
+                parallel_abort.store(true, Ordering::Release);
+                break;
+            }
+        }
+
+        if !spawn_failed.load(Ordering::Acquire) {
+            let mut candidate = start_nonce;
+            while !found.load(Ordering::Relaxed)
+                && !stop_requested.load(Ordering::Acquire)
+                && !parallel_abort.load(Ordering::Acquire)
+            {
+                if leading_zero_bits(&transaction_pow_hash(preimage, candidate)) >= required_bits {
+                    if found
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        solved_nonce.store(candidate, Ordering::Release);
+                    }
+                    break;
+                }
+                candidate = candidate.wrapping_add(worker_count as u64);
+            }
+        }
+    });
+
+    if found.load(Ordering::Acquire) {
+        let nonce = solved_nonce.load(Ordering::Acquire);
+        tx.tx_pow_nonce = nonce;
+        return Ok(nonce);
+    }
+
+    if spawn_failed.load(Ordering::Acquire) {
+        return solve_transaction_pow_single_thread(
+            tx,
+            preimage,
+            required_bits,
+            start_nonce,
+            stop_requested,
+        );
+    }
+
+    if stop_requested.load(Ordering::Acquire) {
+        tx.tx_pow_nonce = 0;
+        return Err(TxPowCancelled);
+    }
+
+    solve_transaction_pow_single_thread(tx, preimage, required_bits, start_nonce, stop_requested)
 }
 
 #[cfg(test)]
@@ -293,6 +546,133 @@ mod tests {
         let nonce = solve_transaction_pow(Network::Regnet, &mut tx, fee);
         assert_eq!(nonce, tx.tx_pow_nonce);
         assert!(transaction_pow_is_valid(Network::Regnet, &tx, fee));
+    }
+
+    #[test]
+    fn tx_pow_thread_budget_defaults_to_seventy_five_percent() {
+        let config = TxPowSolveConfig::default();
+        assert_eq!(config.resolved_thread_count_for_available(1), 1);
+        assert_eq!(config.resolved_thread_count_for_available(2), 1);
+        assert_eq!(config.resolved_thread_count_for_available(4), 3);
+        assert_eq!(config.resolved_thread_count_for_available(8), 6);
+        assert_eq!(config.resolved_thread_count_for_available(16), 12);
+    }
+
+    #[test]
+    fn tx_pow_thread_budget_honors_caps_and_minimums() {
+        let config = TxPowSolveConfig {
+            auto_threads: true,
+            thread_percent: 75,
+            max_threads: Some(5),
+            min_threads: 2,
+        };
+        assert_eq!(config.resolved_thread_count_for_available(16), 5);
+
+        let manual = TxPowSolveConfig {
+            auto_threads: false,
+            thread_percent: 75,
+            max_threads: Some(2),
+            min_threads: 1,
+        };
+        assert_eq!(manual.resolved_thread_count_for_available(8), 2);
+    }
+
+    #[test]
+    fn tx_pow_config_reads_environment_overrides() {
+        std::env::set_var("ATHO_TX_POW_AUTO_THREADS", "false");
+        std::env::set_var("ATHO_TX_POW_THREAD_PERCENT", "60");
+        std::env::set_var("ATHO_TX_POW_MAX_THREADS", "3");
+        std::env::set_var("ATHO_TX_POW_MIN_THREADS", "2");
+        let config = TxPowSolveConfig::from_env();
+        std::env::remove_var("ATHO_TX_POW_AUTO_THREADS");
+        std::env::remove_var("ATHO_TX_POW_THREAD_PERCENT");
+        std::env::remove_var("ATHO_TX_POW_MAX_THREADS");
+        std::env::remove_var("ATHO_TX_POW_MIN_THREADS");
+
+        assert!(!config.auto_threads);
+        assert_eq!(config.thread_percent, 60);
+        assert_eq!(config.max_threads, Some(3));
+        assert_eq!(config.min_threads, 2);
+    }
+
+    #[test]
+    fn configured_solver_matches_single_threaded_validity() {
+        let mut single = sample_tx(2, 2_000);
+        let mut parallel = sample_tx(2, 2_000);
+        let fee = minimum_required_fee_atoms(Network::Regnet, &single);
+        let single_nonce = solve_transaction_pow_with_config(
+            Network::Regnet,
+            &mut single,
+            fee,
+            TxPowSolveConfig {
+                auto_threads: false,
+                thread_percent: 75,
+                max_threads: Some(1),
+                min_threads: 1,
+            },
+        );
+        let parallel_nonce = solve_transaction_pow_with_config(
+            Network::Regnet,
+            &mut parallel,
+            fee,
+            TxPowSolveConfig {
+                auto_threads: true,
+                thread_percent: 75,
+                max_threads: Some(4),
+                min_threads: 1,
+            },
+        );
+        assert_eq!(single_nonce, single.tx_pow_nonce);
+        assert_eq!(parallel_nonce, parallel.tx_pow_nonce);
+        assert!(transaction_pow_is_valid(Network::Regnet, &single, fee));
+        assert!(transaction_pow_is_valid(Network::Regnet, &parallel, fee));
+        assert_eq!(single.tx_pow_bits, parallel.tx_pow_bits);
+    }
+
+    #[test]
+    fn configured_solver_falls_back_to_single_core_when_parallel_spawn_fails() {
+        let mut tx = sample_tx(2, 2_000);
+        let fee = minimum_required_fee_atoms(Network::Regnet, &tx);
+        let required_bits = required_tx_pow_bits(Network::Regnet, &tx, fee);
+        tx.tx_pow_bits = required_bits;
+        let preimage = transaction_pow_preimage(Network::Regnet, &tx);
+        let stop_requested = AtomicBool::new(false);
+
+        FORCE_TX_POW_SPAWN_FAILURE.store(true, Ordering::Release);
+        let result = solve_transaction_pow_with_worker_count_and_cancel(
+            &mut tx,
+            &preimage,
+            required_bits,
+            transaction_pow_nonce_start(&preimage),
+            4,
+            &stop_requested,
+        );
+        FORCE_TX_POW_SPAWN_FAILURE.store(false, Ordering::Release);
+
+        let nonce = result.expect("fallback solve succeeds");
+        assert_eq!(nonce, tx.tx_pow_nonce);
+        assert!(transaction_pow_is_valid(Network::Regnet, &tx, fee));
+    }
+
+    #[test]
+    fn configured_solver_respects_cancellation() {
+        let mut tx = sample_tx(64, 1_000);
+        inflate_tx_to_min_vbytes(&mut tx, 2_000);
+        let fee = tx.vsize_bytes() as u64;
+        let stop = AtomicBool::new(true);
+        let result = solve_transaction_pow_with_config_and_cancel(
+            Network::Regnet,
+            &mut tx,
+            fee,
+            TxPowSolveConfig {
+                auto_threads: true,
+                thread_percent: 75,
+                max_threads: Some(4),
+                min_threads: 1,
+            },
+            &stop,
+        );
+        assert_eq!(result, Err(TxPowCancelled));
     }
 
     #[test]

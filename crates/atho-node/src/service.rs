@@ -1719,7 +1719,7 @@ impl NodeService {
 
     fn command_getblock(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         let block = self.parse_single_block_arg("getblock", args)?;
-        Ok(render_block_value(&block))
+        Ok(self.render_block_value_with_fees(&block))
     }
 
     fn command_getblockheader(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
@@ -2421,10 +2421,13 @@ impl NodeService {
     ) -> Result<Value, atho_rpc::error::RpcError> {
         let txid =
             parse_hash48(&self.parse_single_string_arg("getrawtransaction", args, "txid")?)?;
-        if let Some(tx) = self.orchestrator.runtime.node.mempool_transaction(&txid) {
+        if let Some(entry) = self.orchestrator.runtime.node.mempool_entry(&txid) {
+            let fee_atoms = entry.fee_atoms;
             return Ok(json!({
                 "source": "mempool",
-                "transaction": render_transaction_value(self.network(), 0, &tx),
+                "fee_atoms": fee_atoms,
+                "fee_atho": format_atoms_decimal(self.network(), fee_atoms),
+                "transaction": render_transaction_value_with_fee(self.network(), 0, &entry.transaction, Some(entry.fee_atoms)),
             }));
         }
         if let Some(record) = self
@@ -2433,16 +2436,72 @@ impl NodeService {
             .node
             .transaction_record_by_txid(txid)
         {
-            return Ok(json!({
+            let fee_atoms = self.estimate_transaction_fee_atoms(&record.transaction);
+            let mut response = json!({
                 "source": "chain",
                 "block_hash": hex::encode(record.block_hash),
                 "height": record.height,
-                "transaction": render_transaction_value(self.network(), record.tx_index as usize, &record.transaction),
-            }));
+                "transaction": render_transaction_value_with_fee(
+                    self.network(),
+                    record.tx_index as usize,
+                    &record.transaction,
+                    fee_atoms,
+                ),
+            });
+            if let Some(fee_atoms) = fee_atoms {
+                response["fee_atoms"] = json!(fee_atoms);
+                response["fee_atho"] = json!(format_atoms_decimal(self.network(), fee_atoms));
+            }
+            return Ok(response);
         }
         Err(atho_rpc::error::RpcError::invalid_request(
             "unknown transaction txid",
         ))
+    }
+
+    fn estimate_transaction_fee_atoms(&self, tx: &Transaction) -> Option<u64> {
+        if tx.is_coinbase() {
+            return Some(0);
+        }
+
+        let mut input_total_atoms = 0u128;
+        for input in &tx.inputs {
+            let previous = self
+                .orchestrator
+                .runtime
+                .node
+                .transaction_record_by_txid(input.previous_txid)?;
+            let output = previous
+                .transaction
+                .outputs
+                .get(input.output_index as usize)?;
+            input_total_atoms = input_total_atoms.checked_add(output.value_atoms as u128)?;
+        }
+
+        let output_total_atoms = tx.outputs.iter().fold(0u128, |acc, output| {
+            acc.saturating_add(output.value_atoms as u128)
+        });
+        let fee_atoms = input_total_atoms.checked_sub(output_total_atoms)?;
+        fee_atoms.try_into().ok()
+    }
+
+    fn render_block_value_with_fees(&self, block: &Block) -> Value {
+        let mut total_fee_atoms = 0u64;
+        let transactions = block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, tx)| {
+                let fee_atoms = self.estimate_transaction_fee_atoms(tx);
+                if !tx.is_coinbase() {
+                    if let Some(fee_atoms) = fee_atoms {
+                        total_fee_atoms = total_fee_atoms.saturating_add(fee_atoms);
+                    }
+                }
+                render_transaction_value_with_fee(block.header.network_id, index, tx, fee_atoms)
+            })
+            .collect::<Vec<_>>();
+        render_block_value_with_transactions(block, transactions, Some(total_fee_atoms))
     }
 
     fn command_validate_athoaddress(
@@ -2691,6 +2750,23 @@ fn render_chainwork_hex(bytes: &[u8]) -> String {
 }
 
 fn render_block_value(block: &Block) -> Value {
+    let transactions = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(index, tx)| {
+            render_transaction_value_with_fee(block.header.network_id, index, tx, None)
+        })
+        .collect::<Vec<_>>();
+    render_block_value_with_transactions(block, transactions, None)
+}
+
+fn render_block_value_with_transactions(
+    block: &Block,
+    transactions: Vec<Value>,
+    total_fee_atoms: Option<u64>,
+) -> Value {
+    let total_fee_atoms = total_fee_atoms.unwrap_or_default();
     json!({
         "hash": hex::encode(block.header.block_hash()),
         "header": render_block_header_value(&block.header),
@@ -2699,7 +2775,9 @@ fn render_block_value(block: &Block) -> Value {
         "weight_bytes": block.weight_bytes(),
         "vsize_bytes": block.vsize_bytes(),
         "coinbase_txid": block.transactions.first().map(|tx| hex::encode(tx.txid())).unwrap_or_default(),
-        "transactions": block.transactions.iter().enumerate().map(|(index, tx)| render_transaction_value(block.header.network_id, index, tx)).collect::<Vec<_>>(),
+        "fees_total_atoms": total_fee_atoms,
+        "fees_total_atho": format_atoms_decimal(block.header.network_id, total_fee_atoms),
+        "transactions": transactions,
     })
 }
 
@@ -2742,6 +2820,25 @@ fn render_transaction_value(network: Network, index: usize, tx: &Transaction) ->
             })
             .collect::<Vec<_>>(),
     })
+}
+
+fn render_transaction_value_with_fee(
+    network: Network,
+    index: usize,
+    tx: &Transaction,
+    fee_atoms: Option<u64>,
+) -> Value {
+    let mut rendered = render_transaction_value(network, index, tx);
+    if let Value::Object(ref mut object) = rendered {
+        if let Some(fee_atoms) = fee_atoms {
+            object.insert(String::from("fee_atoms"), json!(fee_atoms));
+            object.insert(
+                String::from("fee_atho"),
+                json!(format_atoms_decimal(network, fee_atoms)),
+            );
+        }
+    }
+    rendered
 }
 
 fn render_transaction_input_value(input: &TxInput) -> Value {

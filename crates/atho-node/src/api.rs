@@ -665,6 +665,8 @@ fn mempool_tx_value(
     Ok(json!({
         "source": "mempool",
         "txid": hex::encode(entry.txid()),
+        "fee_atoms": entry.fee_atoms,
+        "fee_atho": format_atoms_decimal(entry.fee_atoms),
         "received_at_unix": entry.received_at_unix(),
         "entry": render_mempool_entry_value(network, &entry, &depends, &descendants),
         "transaction": transaction,
@@ -1132,7 +1134,6 @@ fn classify_endpoint(path: &str) -> EndpointClass {
         || path.starts_with("/api/v1/tx/")
         || path.starts_with("/api/v1/mempool/tx/")
         || path == "/api/v1/mempool"
-        || path == "/api/v1/network/stats"
     {
         EndpointClass::Heavy
     } else {
@@ -1436,11 +1437,13 @@ fn paginate<T>(items: &[T], limit: usize, offset: usize) -> &[T] {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
+    use crate::dev::{seed_utxo, signed_spend_transaction};
     use crate::mempool::MempoolEntry;
     use crate::miner::Miner;
     use crate::node::Node;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::address::encode_base56_address;
+    use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
     use atho_core::genesis;
     use atho_core::transaction::Transaction;
     use atho_storage::chainstate::ChainSelectionOutcome;
@@ -1694,6 +1697,8 @@ mod tests {
         )
         .expect("mempool tx");
         assert_eq!(tx_view["source"], "mempool");
+        assert_eq!(tx_view["fee_atoms"], 1_500);
+        assert_eq!(tx_view["fee_atho"], "0.000000001500");
         assert_eq!(tx_view["transaction"]["txid"], txid);
 
         let stats = route_request(
@@ -1715,6 +1720,93 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .ends_with("ATHO"));
+    }
+
+    #[test]
+    fn confirmed_transaction_and_block_routes_expose_fee_fields() {
+        let (mut service, _guard) = test_service(Network::Testnet);
+        let config = NodeConfig::new(Network::Testnet).api;
+        let miner = Miner::new(4);
+        let (txid_hex, block_hash_hex, fee_atoms) = service.sandbox_with_node_mut(|node| {
+            let (seed_txid, _seed_value, seed_script) = seed_utxo(Network::Testnet);
+            let seed_value = 25_000u64;
+            node.dev_seed_chainstate(
+                6,
+                node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Testnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    vec![seed_script],
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed chainstate");
+
+            let tx1 =
+                signed_spend_transaction(Network::Testnet, seed_txid, seed_value, seed_script)
+                    .expect("signed first spend");
+            let tx1id = tx1.txid();
+            let tx1_fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx1);
+            let tx1_output_value = tx1.outputs[0].value_atoms;
+            node.admit_transaction(MempoolEntry::new(tx1, tx1_fee_atoms))
+                .expect("admit first tx");
+            node.mine_and_connect_candidate_block(&miner)
+                .expect("mine first block");
+
+            let tx2 = signed_spend_transaction(
+                Network::Testnet,
+                tx1id,
+                tx1_output_value,
+                seed_script.saturating_add(1),
+            )
+            .expect("signed second spend");
+            let fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx2);
+            let txid = tx2.txid();
+            node.admit_transaction(MempoolEntry::new(tx2, fee_atoms))
+                .expect("admit second tx");
+            let block = node
+                .mine_and_connect_candidate_block(&miner)
+                .expect("mine second block");
+            (
+                hex::encode(txid),
+                hex::encode(block.header.block_hash()),
+                fee_atoms,
+            )
+        });
+
+        let tx_view = route_request(
+            &config,
+            &mut service,
+            Network::Testnet,
+            &format!("/api/v1/tx/{txid_hex}"),
+            &BTreeMap::new(),
+        )
+        .expect("confirmed tx");
+        assert_eq!(tx_view["source"], "chain");
+        assert_eq!(tx_view["fee_atoms"], fee_atoms);
+        assert_eq!(tx_view["fee_atho"], format_atoms_decimal(fee_atoms));
+
+        let block_view = route_request(
+            &config,
+            &mut service,
+            Network::Testnet,
+            &format!("/api/v1/block/hash/{block_hash_hex}"),
+            &BTreeMap::new(),
+        )
+        .expect("block");
+        assert_eq!(block_view["fees_total_atoms"], fee_atoms);
+        assert_eq!(
+            block_view["fees_total_atho"],
+            format_atoms_decimal(fee_atoms)
+        );
+        assert_eq!(block_view["transactions"][1]["fee_atoms"], fee_atoms);
+        assert_eq!(
+            block_view["transactions"][1]["fee_atho"],
+            format_atoms_decimal(fee_atoms)
+        );
     }
 
     #[test]
@@ -2181,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn heavy_endpoint_classification_covers_explorer_hot_paths() {
+    fn heavy_endpoint_classification_targets_the_most_expensive_public_routes() {
         assert_eq!(
             classify_endpoint("/api/v1/address/Rabc"),
             EndpointClass::Heavy
@@ -2193,7 +2285,7 @@ mod tests {
         assert_eq!(classify_endpoint("/api/v1/mempool"), EndpointClass::Heavy);
         assert_eq!(
             classify_endpoint("/api/v1/network/stats"),
-            EndpointClass::Heavy
+            EndpointClass::Standard
         );
         assert_eq!(classify_endpoint("/api/v1/status"), EndpointClass::Standard);
     }

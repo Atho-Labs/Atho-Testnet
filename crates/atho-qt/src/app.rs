@@ -275,6 +275,26 @@ struct WalletBackupMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletRecoveryExport {
+    wallet_name: String,
+    wallet_path: String,
+    wallet_id: Option<String>,
+    network: String,
+    exported_at_unix: u64,
+    mnemonic_word_count: usize,
+    mnemonic_phrase: Option<String>,
+    configured_recovery_window: usize,
+    active_scan_window: usize,
+    current_receive_index: Option<u32>,
+    next_receive_index: u32,
+    next_change_index: u32,
+    highest_generated_receive_index: Option<u32>,
+    highest_generated_change_index: Option<u32>,
+    highest_reserved_receive_index: Option<u32>,
+    highest_reserved_change_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WalletStartupMetadata {
     wallet_path: String,
     recorded_at_unix: u64,
@@ -540,11 +560,204 @@ impl DesktopApp {
         self.wallet_path
             .as_ref()
             .and_then(|path| {
-                PathBuf::from(path)
-                    .file_name()
+                normalize_wallet_path_input(path)
+                    .parent()
+                    .and_then(Path::file_name)
                     .map(|name| name.to_string_lossy().into_owned())
             })
-            .unwrap_or_else(|| String::from("wallet.dat"))
+            .unwrap_or_else(|| String::from("wallet"))
+    }
+
+    fn wallet_display_name(&self) -> String {
+        self.current_wallet_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.wallet_path.as_deref().map(infer_wallet_name_from_path))
+            .unwrap_or_else(|| String::from("Wallet"))
+    }
+
+    fn wallet_registry_entries(&self) -> Vec<WalletRegistryEntry> {
+        let mut entries = load_wallet_registry(self.connection.network()).entries;
+        entries.sort_by(|left, right| {
+            right
+                .updated_at_unix
+                .cmp(&left.updated_at_unix)
+                .then(left.wallet_name.cmp(&right.wallet_name))
+        });
+        entries
+    }
+
+    fn wallet_path_matches(&self, wallet_path: &str) -> bool {
+        self.wallet_path
+            .as_deref()
+            .map(|current| {
+                normalize_wallet_path_input(current) == normalize_wallet_path_input(wallet_path)
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn begin_wallet_switch(&mut self, wallet_path: &str) -> Result<(), String> {
+        let normalized = normalize_wallet_path_input(wallet_path);
+        let normalized_label = normalized.to_string_lossy().into_owned();
+        if self.wallet_path_matches(&normalized_label) {
+            return Ok(());
+        }
+
+        let metadata =
+            Wallet::inspect_datafile(normalized.as_path()).map_err(|err| err.to_string())?;
+        if metadata.network != self.connection.network() {
+            return Err(format!(
+                "Selected wallet belongs to {} not {}",
+                metadata.network.id(),
+                self.connection.network().id()
+            ));
+        }
+
+        self.open_form.wallet_path = normalized_label.clone();
+        self.open_form.wallet_password.clear();
+        self.last_error = None;
+
+        match metadata.encryption_mode {
+            WalletEncryptionMode::Plaintext => {
+                self.start_open_wallet_preparation(normalized_label, String::new());
+            }
+            WalletEncryptionMode::PasswordAes256Gcm => {
+                self.launch_page = LaunchPage::OpenWallet;
+                self.send_status = String::from("Enter the wallet passphrase to switch wallets.");
+            }
+        }
+        Ok(())
+    }
+
+    fn upsert_wallet_registry_entry(
+        &mut self,
+        entry: WalletRegistryEntry,
+        mark_last_opened: bool,
+    ) -> Result<WalletRegistryEntry, String> {
+        let network = self.connection.network();
+        let mut registry = load_wallet_registry(network);
+        let now = current_unix_seconds();
+        let mut merged = entry.clone();
+
+        if let Some(existing) = registry
+            .entries
+            .iter_mut()
+            .find(|existing| existing.wallet_id == entry.wallet_id)
+        {
+            existing.wallet_name = entry.wallet_name.clone();
+            existing.wallet_path = entry.wallet_path.clone();
+            existing.network = entry.network.clone();
+            existing.word_count = entry.word_count;
+            existing.updated_at_unix = now;
+            if mark_last_opened {
+                existing.last_opened_at_unix = Some(now);
+            }
+            merged = existing.clone();
+        } else {
+            merged.updated_at_unix = now;
+            if mark_last_opened {
+                merged.last_opened_at_unix = Some(now);
+            }
+            registry.entries.push(merged.clone());
+        }
+
+        registry
+            .entries
+            .retain(|saved| PathBuf::from(&saved.wallet_path).exists());
+        registry.entries.sort_by(|left, right| {
+            right
+                .updated_at_unix
+                .cmp(&left.updated_at_unix)
+                .then(left.wallet_name.cmp(&right.wallet_name))
+        });
+        if mark_last_opened {
+            registry.last_opened_wallet_id = Some(merged.wallet_id.clone());
+        }
+        persist_wallet_registry(network, &registry)?;
+        Ok(merged)
+    }
+
+    fn rename_current_wallet(&mut self) -> Result<(), String> {
+        let wallet_id = self
+            .current_wallet_id
+            .clone()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let wallet_path = self
+            .wallet_path
+            .clone()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let wallet_name = self
+            .current_wallet_name
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if wallet_name.is_empty() {
+            return Err(String::from("Enter a wallet name"));
+        }
+        let word_count = self
+            .wallet_ref()
+            .and_then(Wallet::mnemonic_phrase)
+            .map(MnemonicPhrase::word_count)
+            .unwrap_or_default();
+        let created_at_unix = self
+            .wallet_registry_entries()
+            .into_iter()
+            .find(|entry| entry.wallet_id == wallet_id)
+            .map(|entry| entry.created_at_unix)
+            .unwrap_or_else(current_unix_seconds);
+        let entry = WalletRegistryEntry {
+            wallet_id,
+            wallet_name: wallet_name.clone(),
+            wallet_path,
+            network: self.connection.network().id().to_string(),
+            created_at_unix,
+            updated_at_unix: current_unix_seconds(),
+            last_opened_at_unix: Some(current_unix_seconds()),
+            word_count,
+        };
+        let saved = self.upsert_wallet_registry_entry(entry, true)?;
+        self.current_wallet_name = Some(saved.wallet_name);
+        Ok(())
+    }
+
+    fn wallet_recovery_export(&self) -> Result<WalletRecoveryExport, String> {
+        let wallet = self
+            .wallet_ref()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let wallet_path = self
+            .wallet_path
+            .clone()
+            .ok_or_else(|| String::from("Load or create a wallet first"))?;
+        let (highest_generated_receive_index, highest_generated_change_index) =
+            wallet.highest_generated_indices();
+        let (highest_reserved_receive_index, highest_reserved_change_index) =
+            wallet.highest_reserved_indices();
+        let (next_receive_index, next_change_index) = wallet.next_indices();
+        let mnemonic_word_count = wallet
+            .mnemonic_phrase()
+            .map(MnemonicPhrase::word_count)
+            .unwrap_or_default();
+
+        Ok(WalletRecoveryExport {
+            wallet_name: self.wallet_display_name(),
+            wallet_path: wallet_path.clone(),
+            wallet_id: self.current_wallet_id.clone(),
+            network: wallet.network.id().to_string(),
+            exported_at_unix: current_unix_seconds(),
+            mnemonic_word_count,
+            mnemonic_phrase: wallet.mnemonic_sentence(),
+            configured_recovery_window: wallet.restore_gap_limit(),
+            active_scan_window: self.wallet_discovery_scan_limit,
+            current_receive_index: self.wallet_current_receive_index(),
+            next_receive_index,
+            next_change_index,
+            highest_generated_receive_index,
+            highest_generated_change_index,
+            highest_reserved_receive_index,
+            highest_reserved_change_index,
+        })
     }
 
     fn operator_root_label(&self) -> String {
@@ -683,10 +896,16 @@ impl DesktopApp {
         self.last_error = None;
         self.wallet_management_form.backup_password.clear();
         self.wallet_management_form.backup_password_confirm.clear();
+        let default_wallet_path = default_wallet_path(self.connection.network())
+            .to_string_lossy()
+            .into_owned();
+        self.wallet_management_form.backup_json_path =
+            backup_wallet_json_path(&default_wallet_path);
+        self.wallet_management_form.backup_text_path =
+            backup_wallet_text_path(&default_wallet_path);
         self.wallet_management_form.restore_gap_limit_input = DEFAULT_RESTORE_GAP_LIMIT.to_string();
         self.receive_page_tab = ReceivePageTab::RequestPayment;
         self.address_pool_filter = AddressPoolFilter::Unused;
-        self.recipient_address_book.clear();
         self.recipient_address_book_filter.clear();
         self.recipient_address_book_open = false;
         self.recipient_address_editor_open = false;
@@ -1436,6 +1655,7 @@ impl DesktopApp {
                     outcome.wallet,
                     outcome.wallet_path,
                     outcome.wallet_password,
+                    outcome.registry_entry,
                 );
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -1556,6 +1776,8 @@ impl DesktopApp {
         }
 
         self.wallet_management_form.backup_path = backup_wallet_path(&wallet_path);
+        self.wallet_management_form.backup_json_path = backup_wallet_json_path(&wallet_path);
+        self.wallet_management_form.backup_text_path = backup_wallet_text_path(&wallet_path);
         self.wallet_management_form.backup_password.clear();
         self.wallet_management_form.backup_password_confirm.clear();
         self.wallet_path = Some(wallet_path);
@@ -2042,9 +2264,11 @@ impl DesktopApp {
     }
 
     fn generate_create_mnemonic(&mut self) -> Result<(), String> {
-        let mut entropy = [0u8; 32];
+        let mnemonic_length = MnemonicLength::from_word_count(self.create_form.mnemonic_word_count)
+            .ok_or_else(|| String::from("unsupported mnemonic word count"))?;
+        let mut entropy = vec![0u8; mnemonic_length.entropy_bytes()];
         getrandom(&mut entropy).map_err(|_| String::from("failed to gather wallet entropy"))?;
-        let mnemonic = MnemonicPhrase::from_entropy(&entropy, MnemonicLength::Words24)
+        let mnemonic = MnemonicPhrase::from_entropy(&entropy, mnemonic_length)
             .map_err(|err| err.to_string())?;
         self.create_form.mnemonic_words = mnemonic_ui::words_from_sentence(&mnemonic.as_sentence());
         self.create_form.acknowledged_backup = false;
@@ -2062,13 +2286,20 @@ impl DesktopApp {
         mnemonic_passphrase: String,
         wallet_path: String,
         wallet_password: String,
+        wallet_name: String,
+        wallet_word_count: usize,
         stage: &'static str,
     ) {
         let network = self.connection.network();
-        let wallet_path_for_job = wallet_path.clone();
+        let wallet_path_for_job = normalize_wallet_path_input(&wallet_path)
+            .to_string_lossy()
+            .into_owned();
         let wallet_password_for_job = wallet_password.clone();
+        let requested_name = wallet_name.trim().to_owned();
+        let requested_word_count = wallet_word_count;
         self.start_wallet_preparation_job(stage, move |sender| {
             let mnemonic = MnemonicPhrase::parse(&mnemonic_text).map_err(|err| err.to_string())?;
+            let now = current_unix_seconds();
             let progress_sender = sender.clone();
             let wallet = Wallet::from_mnemonic_with_progress(
                 mnemonic,
@@ -2099,15 +2330,27 @@ impl DesktopApp {
             });
             Ok(WalletPreparationOutcome {
                 wallet,
-                wallet_path: wallet_path_for_job,
+                wallet_path: wallet_path_for_job.clone(),
                 wallet_password: wallet_password_for_job,
+                registry_entry: Some(WalletRegistryEntry {
+                    wallet_id: wallet_registry_entry_id(&wallet_path_for_job, now),
+                    wallet_name: requested_name.clone(),
+                    wallet_path: wallet_path_for_job,
+                    network: network.id().to_string(),
+                    created_at_unix: now,
+                    updated_at_unix: now,
+                    last_opened_at_unix: Some(now),
+                    word_count: requested_word_count,
+                }),
             })
         });
     }
 
     fn start_open_wallet_preparation(&mut self, wallet_path: String, wallet_password: String) {
         let network = self.connection.network();
-        let wallet_path_for_job = wallet_path.clone();
+        let wallet_path_for_job = normalize_wallet_path_input(&wallet_path)
+            .to_string_lossy()
+            .into_owned();
         let wallet_password_for_job = wallet_password.clone();
         self.start_wallet_preparation_job("Loading wallet", move |sender| {
             let _ = sender.send(WalletPreparationEvent::Progress {
@@ -2136,10 +2379,25 @@ impl DesktopApp {
                     network.id()
                 ));
             }
+            let now = current_unix_seconds();
+            let existing_entry = load_wallet_registry(network)
+                .entries
+                .into_iter()
+                .find(|entry| entry.wallet_path == wallet_path_for_job);
             Ok(WalletPreparationOutcome {
                 wallet,
-                wallet_path: wallet_path_for_job,
+                wallet_path: wallet_path_for_job.clone(),
                 wallet_password: wallet_password_for_job,
+                registry_entry: Some(existing_entry.unwrap_or_else(|| WalletRegistryEntry {
+                    wallet_id: wallet_registry_entry_id(&wallet_path_for_job, now),
+                    wallet_name: infer_wallet_name_from_path(&wallet_path_for_job),
+                    wallet_path: wallet_path_for_job,
+                    network: network.id().to_string(),
+                    created_at_unix: now,
+                    updated_at_unix: now,
+                    last_opened_at_unix: Some(now),
+                    word_count: 0,
+                })),
             })
         });
     }
@@ -2149,7 +2407,7 @@ impl DesktopApp {
         wallet_path: &str,
         password: &str,
     ) -> Result<(), String> {
-        let path = PathBuf::from(wallet_path);
+        let path = normalize_wallet_path_input(wallet_path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
@@ -2170,6 +2428,82 @@ impl DesktopApp {
             .ok_or_else(|| String::from("Load or create a wallet first"))?;
         Self::save_wallet_to_path(wallet, backup_path, password)?;
         self.write_wallet_backup_metadata(backup_path)
+    }
+
+    fn export_wallet_recovery_json(&self, export_path: &str) -> Result<(), String> {
+        let export = self.wallet_recovery_export()?;
+        let path = PathBuf::from(export_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let bytes = serde_json::to_vec_pretty(&export).map_err(|err| err.to_string())?;
+        fs::write(path, bytes).map_err(|err| err.to_string())
+    }
+
+    fn export_wallet_recovery_text(&self, export_path: &str) -> Result<(), String> {
+        let export = self.wallet_recovery_export()?;
+        let path = PathBuf::from(export_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let phrase = export
+            .mnemonic_phrase
+            .clone()
+            .unwrap_or_else(|| String::from("Unavailable"));
+        let text = format!(
+            "Atho Wallet Recovery Export\n\
+            ==========================\n\
+            Wallet Name: {wallet_name}\n\
+            Wallet ID: {wallet_id}\n\
+            Network: {network}\n\
+            Wallet Path: {wallet_path}\n\
+            Exported At: {exported_at_unix}\n\
+            Mnemonic Word Count: {mnemonic_word_count}\n\
+            Recovery Phrase: {phrase}\n\
+            Configured Recovery Window: {configured_recovery_window}\n\
+            Active Scan Window: {active_scan_window}\n\
+            Current Receive Index: {current_receive_index}\n\
+            Next Receive Index: {next_receive_index}\n\
+            Next Change Index: {next_change_index}\n\
+            Highest Generated Receive Index: {highest_generated_receive_index}\n\
+            Highest Generated Change Index: {highest_generated_change_index}\n\
+            Highest Reserved Receive Index: {highest_reserved_receive_index}\n\
+            Highest Reserved Change Index: {highest_reserved_change_index}\n",
+            wallet_name = export.wallet_name,
+            wallet_id = export
+                .wallet_id
+                .unwrap_or_else(|| String::from("Unavailable")),
+            network = export.network,
+            wallet_path = export.wallet_path,
+            exported_at_unix = export.exported_at_unix,
+            mnemonic_word_count = export.mnemonic_word_count,
+            phrase = phrase,
+            configured_recovery_window = export.configured_recovery_window,
+            active_scan_window = export.active_scan_window,
+            current_receive_index = export
+                .current_receive_index
+                .map(|index| format!("R{index:04}"))
+                .unwrap_or_else(|| String::from("Unavailable")),
+            next_receive_index = format!("R{:04}", export.next_receive_index),
+            next_change_index = format!("C{:04}", export.next_change_index),
+            highest_generated_receive_index = export
+                .highest_generated_receive_index
+                .map(|index| format!("R{index:04}"))
+                .unwrap_or_else(|| String::from("Unavailable")),
+            highest_generated_change_index = export
+                .highest_generated_change_index
+                .map(|index| format!("C{index:04}"))
+                .unwrap_or_else(|| String::from("Unavailable")),
+            highest_reserved_receive_index = export
+                .highest_reserved_receive_index
+                .map(|index| format!("R{index:04}"))
+                .unwrap_or_else(|| String::from("Unavailable")),
+            highest_reserved_change_index = export
+                .highest_reserved_change_index
+                .map(|index| format!("C{index:04}"))
+                .unwrap_or_else(|| String::from("Unavailable")),
+        );
+        fs::write(path, text).map_err(|err| err.to_string())
     }
 
     fn write_wallet_backup_metadata(&self, backup_path: &str) -> Result<(), String> {
@@ -2199,7 +2533,11 @@ impl DesktopApp {
             next_receive_index,
             next_change_index,
         };
-        let metadata_path = PathBuf::from(format!("{backup_path}.meta.json"));
+        let normalized_backup_path = normalize_wallet_path_input(backup_path);
+        let metadata_path = PathBuf::from(format!(
+            "{}.meta.json",
+            normalized_backup_path.to_string_lossy()
+        ));
         let metadata_bytes = serde_json::to_vec_pretty(&metadata).map_err(|err| err.to_string())?;
         fs::write(metadata_path, metadata_bytes).map_err(|err| err.to_string())
     }
@@ -2450,12 +2788,35 @@ impl DesktopApp {
         wallet: Wallet,
         wallet_path: String,
         wallet_password: String,
+        registry_entry: Option<WalletRegistryEntry>,
     ) {
         self.clear_wallet_state();
         self.wallet_session_password = Some(wallet_password);
+        let fallback_entry = registry_entry.unwrap_or_else(|| {
+            let now = current_unix_seconds();
+            WalletRegistryEntry {
+                wallet_id: wallet_registry_entry_id(&wallet_path, now),
+                wallet_name: infer_wallet_name_from_path(&wallet_path),
+                wallet_path: wallet_path.clone(),
+                network: self.connection.network().id().to_string(),
+                created_at_unix: now,
+                updated_at_unix: now,
+                last_opened_at_unix: Some(now),
+                word_count: wallet
+                    .mnemonic_phrase()
+                    .map(MnemonicPhrase::word_count)
+                    .unwrap_or_default(),
+            }
+        });
+        self.current_wallet_id = Some(fallback_entry.wallet_id.clone());
+        self.current_wallet_name = Some(fallback_entry.wallet_name.clone());
         self.attach_wallet(wallet, wallet_path);
+        if let Err(err) = self.upsert_wallet_registry_entry(fallback_entry, true) {
+            self.last_error = Some(format!(
+                "Wallet loaded, but wallet registry save failed: {err}"
+            ));
+        }
         self.send_status = String::from("Wallet loaded");
-        self.last_error = None;
     }
 
     fn persist_loaded_wallet_state(&mut self) -> Result<(), String> {
@@ -4004,9 +4365,120 @@ impl DesktopApp {
 }
 
 fn default_wallet_path(network: Network) -> PathBuf {
-    atho_node::dev::wallet_dir()
-        .join(network.id())
+    wallet_slot_path(network, 1)
+}
+
+pub(crate) fn suggested_wallet_path(network: Network) -> PathBuf {
+    next_available_wallet_path(network)
+}
+
+pub(crate) fn default_wallet_name(network: Network) -> String {
+    next_available_wallet_name(network)
+}
+
+fn wallet_storage_root(network: Network) -> PathBuf {
+    atho_node::dev::wallet_dir().join(network.id())
+}
+
+fn wallet_registry_path(network: Network) -> PathBuf {
+    wallet_storage_root(network).join("wallet-registry.json")
+}
+
+fn wallet_slot_name(index: usize) -> String {
+    if index <= 1 {
+        String::from("wallet")
+    } else {
+        format!("wallet{index}")
+    }
+}
+
+fn wallet_slot_display_name(index: usize) -> String {
+    format!("Wallet {index}")
+}
+
+fn wallet_slot_path(network: Network, index: usize) -> PathBuf {
+    wallet_storage_root(network)
+        .join(wallet_slot_name(index))
         .join(Wallet::datafile_name())
+}
+
+fn next_available_wallet_slot(network: Network) -> usize {
+    for index in 1..10_000 {
+        if !wallet_slot_path(network, index).exists() {
+            return index;
+        }
+    }
+    10_000
+}
+
+fn next_available_wallet_path(network: Network) -> PathBuf {
+    wallet_slot_path(network, next_available_wallet_slot(network))
+}
+
+fn next_available_wallet_name(network: Network) -> String {
+    wallet_slot_display_name(next_available_wallet_slot(network))
+}
+
+fn normalize_wallet_path_input(wallet_path: &str) -> PathBuf {
+    let path = PathBuf::from(wallet_path.trim());
+    if path
+        .file_name()
+        .is_some_and(|name| name == Wallet::datafile_name())
+        || path.extension().is_some()
+    {
+        path
+    } else {
+        path.join(Wallet::datafile_name())
+    }
+}
+
+fn infer_wallet_name_from_path(wallet_path: &str) -> String {
+    let path = normalize_wallet_path_input(wallet_path);
+    let candidate = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| String::from("Wallet"));
+
+    let normalized = candidate.replace(['-', '_'], " ");
+    let mut words = Vec::new();
+    for part in normalized.split_whitespace() {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            let first_upper = first.to_uppercase().collect::<String>();
+            words.push(format!("{first_upper}{}", chars.as_str()));
+        }
+    }
+    if words.is_empty() {
+        String::from("Wallet")
+    } else {
+        words.join(" ")
+    }
+}
+
+fn wallet_registry_entry_id(wallet_path: &str, created_at_unix: u64) -> String {
+    let mut preimage = Vec::with_capacity(wallet_path.len() + core::mem::size_of::<u64>());
+    preimage.extend_from_slice(wallet_path.as_bytes());
+    preimage.extend_from_slice(&created_at_unix.to_be_bytes());
+    hex::encode(sha3_256(&preimage))
+}
+
+fn load_wallet_registry(network: Network) -> WalletRegistry {
+    let path = wallet_registry_path(network);
+    let Ok(bytes) = fs::read(path) else {
+        return WalletRegistry::default();
+    };
+    serde_json::from_slice::<WalletRegistry>(&bytes).unwrap_or_default()
+}
+
+fn persist_wallet_registry(network: Network, registry: &WalletRegistry) -> Result<(), String> {
+    let path = wallet_registry_path(network);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let bytes = serde_json::to_vec_pretty(registry).map_err(|err| err.to_string())?;
+    fs::write(path, bytes).map_err(|err| err.to_string())
 }
 
 fn legacy_wallet_root() -> PathBuf {
@@ -4020,9 +4492,7 @@ fn legacy_default_wallet_path(network: Network) -> PathBuf {
 }
 
 fn startup_wallet_metadata_path(network: Network) -> PathBuf {
-    atho_node::dev::wallet_dir()
-        .join(network.id())
-        .join("last-wallet.json")
+    wallet_storage_root(network).join("last-wallet.json")
 }
 
 fn client_display_preferences_path(network: Network) -> PathBuf {
@@ -4091,6 +4561,18 @@ fn startup_wallet_path(network: Network) -> Option<PathBuf> {
         }
     }
 
+    let registry = load_wallet_registry(network);
+    if let Some(last_id) = registry.last_opened_wallet_id.as_deref() {
+        if let Some(entry) = registry
+            .entries
+            .iter()
+            .find(|entry| entry.wallet_id == last_id)
+            .filter(|entry| PathBuf::from(&entry.wallet_path).exists())
+        {
+            return Some(PathBuf::from(&entry.wallet_path));
+        }
+    }
+
     let default = default_wallet_path(network);
     if default.exists() {
         return Some(default);
@@ -4104,13 +4586,6 @@ fn startup_wallet_path(network: Network) -> Option<PathBuf> {
     None
 }
 
-fn alternate_wallet_path(network: Network) -> PathBuf {
-    let mut path = default_wallet_path(network);
-    let file_name = format!("{}.2", Wallet::datafile_name());
-    path.set_file_name(file_name);
-    path
-}
-
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4119,7 +4594,24 @@ fn current_unix_seconds() -> u64 {
 }
 
 fn backup_wallet_path(wallet_path: &str) -> String {
-    format!("{wallet_path}.backup")
+    format!(
+        "{}.backup",
+        normalize_wallet_path_input(wallet_path).to_string_lossy()
+    )
+}
+
+fn backup_wallet_json_path(wallet_path: &str) -> String {
+    format!(
+        "{}.recovery.json",
+        normalize_wallet_path_input(wallet_path).to_string_lossy()
+    )
+}
+
+fn backup_wallet_text_path(wallet_path: &str) -> String {
+    format!(
+        "{}.recovery.txt",
+        normalize_wallet_path_input(wallet_path).to_string_lossy()
+    )
 }
 
 fn available_mining_cores() -> u32 {
@@ -5530,7 +6022,7 @@ mod tests {
             "",
             Network::Regnet,
         );
-        let wallet_path = alternate_wallet_path(Network::Regnet);
+        let wallet_path = wallet_slot_path(Network::Regnet, 2);
         DesktopApp::save_wallet_to_path(&wallet, wallet_path.to_string_lossy().as_ref(), "")
             .expect("save remembered wallet");
 

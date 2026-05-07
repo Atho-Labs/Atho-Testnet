@@ -55,6 +55,29 @@ fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                         app.clear_wallet_state();
                         ui.close_menu();
                     }
+                    let known_wallets = app.wallet_registry_entries();
+                    if !known_wallets.is_empty() {
+                        ui.separator();
+                        ui.menu_button("Switch Wallet", |ui| {
+                            for entry in known_wallets {
+                                let is_current = app.wallet_path_matches(&entry.wallet_path);
+                                let label = if is_current {
+                                    format!("{}  [current]", entry.wallet_name)
+                                } else {
+                                    entry.wallet_name.clone()
+                                };
+                                let response = ui
+                                    .add_enabled(!is_current, egui::Button::new(label))
+                                    .on_hover_text(entry.wallet_path.clone());
+                                if response.clicked() {
+                                    if let Err(err) = app.begin_wallet_switch(&entry.wallet_path) {
+                                        app.last_error = Some(err);
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);

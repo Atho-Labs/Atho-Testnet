@@ -5,8 +5,8 @@ const DEFAULT_API_BIND: &str = "127.0.0.1";
 const DEFAULT_API_PORT: u16 = 8080;
 const DEFAULT_API_MAX_RESPONSE_BYTES: usize = 1_048_576;
 const DEFAULT_ALLOWED_ORIGINS: &[&str] = &["https://atho.io", "https://www.atho.io"];
-const DEFAULT_RATE_LIMIT_RPM: u32 = 60;
-const DEFAULT_HEAVY_RATE_LIMIT_RPM: u32 = 20;
+const DEFAULT_RATE_LIMIT_RPM: u32 = 180;
+const DEFAULT_HEAVY_RATE_LIMIT_RPM: u32 = 90;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
@@ -201,8 +201,8 @@ mod tests {
                 "https://www.atho.io".to_string()
             ]
         );
-        assert_eq!(config.api.rate_limit.requests_per_minute, 60);
-        assert_eq!(config.api.rate_limit.heavy_requests_per_minute, 20);
+        assert_eq!(config.api.rate_limit.requests_per_minute, 180);
+        assert_eq!(config.api.rate_limit.heavy_requests_per_minute, 90);
         assert_eq!(config.api.bind_address(), "127.0.0.1:8080");
         assert!(config.api.explorer.index_enabled);
         assert!(config.api.explorer.snapshot_enabled);

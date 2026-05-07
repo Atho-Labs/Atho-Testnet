@@ -2,10 +2,12 @@
 use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage};
 use atho_wallet::mnemonic::MnemonicPhrase;
 use eframe::egui;
+use rfd::FileDialog;
 
 pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut create_clicked = false;
     let mut cancel_clicked = false;
+    let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
         let card_width = ui.available_width().min(700.0).max(320.0);
@@ -16,8 +18,20 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::muted_label(ui, "Create a new Atho HD wallet. Encryption is optional.");
         ui.add_space(12.0);
 
-        form_label(ui, "Wallet file");
-        widgets::text_input(ui, &mut app.create_form.wallet_path, "");
+        form_label(ui, "Wallet name");
+        widgets::text_input(ui, &mut app.create_form.wallet_name, "Wallet 1");
+        ui.add_space(10.0);
+        form_label(ui, "Wallet location");
+        render_browse_row(
+            ui,
+            &mut app.create_form.wallet_path,
+            "Choose wallet folder",
+            &mut wallet_folder_browse_clicked,
+        );
+        widgets::muted_label(
+            ui,
+            "Each wallet is stored in its own folder and uses a local .datafile inside it.",
+        );
         ui.add_space(10.0);
         ui.checkbox(
             &mut app.create_form.encrypt_wallet,
@@ -51,6 +65,17 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.checkbox(&mut app.create_form.show_passwords, "Show passphrases");
         ui.add_space(14.0);
+
+        let mut selected_word_count = app.create_form.mnemonic_word_count;
+        if let Some(changed_to) =
+            mnemonic_ui::render_word_count_picker(ui, &mut selected_word_count)
+        {
+            app.create_form.set_mnemonic_word_count(changed_to);
+            if let Err(err) = app.generate_create_mnemonic() {
+                app.last_error = Some(err);
+            }
+        }
+        ui.add_space(8.0);
 
         let create_mnemonic_sentence =
             mnemonic_ui::mnemonic_sentence_from_words(&app.create_form.mnemonic_words).ok();
@@ -95,9 +120,20 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         });
     });
 
+    if wallet_folder_browse_clicked {
+        if let Some(path) = pick_wallet_folder() {
+            app.create_form.wallet_path = path;
+        }
+    }
+
     if create_clicked {
         if app.wallet_preparation_job.is_some() {
             app.last_error = Some(String::from("wallet preparation already in progress"));
+            return;
+        }
+
+        if app.create_form.wallet_name.trim().is_empty() {
+            app.last_error = Some(String::from("Enter a wallet name"));
             return;
         }
 
@@ -132,6 +168,8 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
             app.create_form.mnemonic_passphrase.clone(),
             app.create_form.wallet_path.clone(),
             wallet_password,
+            app.create_form.wallet_name.trim().to_owned(),
+            app.create_form.mnemonic_word_count,
             "Preparing wallet",
         );
         app.create_form.wallet_password.clear();
@@ -147,6 +185,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
 pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut import_clicked = false;
     let mut cancel_clicked = false;
+    let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
         let card_width = ui.available_width().min(700.0).max(320.0);
@@ -160,8 +199,16 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(16.0);
 
-        form_label(ui, "Wallet file");
-        widgets::text_input(ui, &mut app.import_form.wallet_path, "");
+        form_label(ui, "Wallet name");
+        widgets::text_input(ui, &mut app.import_form.wallet_name, "Wallet 1");
+        ui.add_space(8.0);
+        form_label(ui, "Wallet location");
+        render_browse_row(
+            ui,
+            &mut app.import_form.wallet_path,
+            "Choose wallet folder",
+            &mut wallet_folder_browse_clicked,
+        );
         ui.add_space(8.0);
         form_label(ui, "Mnemonic phrase");
         let mut selected_word_count = app.import_form.mnemonic_word_count;
@@ -223,9 +270,20 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         });
     });
 
+    if wallet_folder_browse_clicked {
+        if let Some(path) = pick_wallet_folder() {
+            app.import_form.wallet_path = path;
+        }
+    }
+
     if import_clicked {
         if app.wallet_preparation_job.is_some() {
             app.last_error = Some(String::from("wallet preparation already in progress"));
+            return;
+        }
+
+        if app.import_form.wallet_name.trim().is_empty() {
+            app.last_error = Some(String::from("Enter a wallet name"));
             return;
         }
 
@@ -260,6 +318,8 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
             app.import_form.mnemonic_passphrase.clone(),
             app.import_form.wallet_path.clone(),
             wallet_password,
+            app.import_form.wallet_name.trim().to_owned(),
+            app.import_form.mnemonic_word_count,
             "Preparing wallet",
         );
         app.import_form.wallet_password.clear();
@@ -274,6 +334,7 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
 pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut open_clicked = false;
     let mut cancel_clicked = false;
+    let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
         let card_width = ui.available_width().min(580.0).max(320.0);
@@ -287,8 +348,17 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(16.0);
 
-        form_label(ui, "Wallet file");
-        widgets::text_input(ui, &mut app.open_form.wallet_path, "");
+        form_label(ui, "Wallet folder");
+        render_browse_row(
+            ui,
+            &mut app.open_form.wallet_path,
+            "Choose wallet folder",
+            &mut wallet_folder_browse_clicked,
+        );
+        widgets::muted_label(
+            ui,
+            "Select the wallet folder. The wallet datafile inside it is opened automatically.",
+        );
         ui.add_space(8.0);
         form_label(ui, "Wallet password");
         ui.add(
@@ -309,6 +379,12 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
         });
     });
 
+    if wallet_folder_browse_clicked {
+        if let Some(path) = pick_wallet_folder() {
+            app.open_form.wallet_path = path;
+        }
+    }
+
     if open_clicked {
         if app.wallet_preparation_job.is_some() {
             app.last_error = Some(String::from("wallet preparation already in progress"));
@@ -328,4 +404,26 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
 fn form_label(ui: &mut egui::Ui, label: &str) {
     ui.label(egui::RichText::new(label).size(16.0).strong());
+}
+
+fn render_browse_row(ui: &mut egui::Ui, text: &mut String, button_label: &str, clicked: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .desired_width((ui.available_width() - 110.0).max(140.0))
+                .hint_text("Select a wallet path"),
+        );
+        if ui
+            .add_sized([96.0, 28.0], egui::Button::new(button_label))
+            .clicked()
+        {
+            *clicked = true;
+        }
+    });
+}
+
+fn pick_wallet_folder() -> Option<String> {
+    FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned())
 }
