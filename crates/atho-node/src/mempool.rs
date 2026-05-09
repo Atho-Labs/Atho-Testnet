@@ -242,6 +242,10 @@ impl Mempool {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn transactions(&self) -> Vec<Transaction> {
         self.entries
             .values()
@@ -481,8 +485,7 @@ mod tests {
 
         let txid = mempool
             .admit(MempoolEntry::new(tx, 500), Network::Mainnet, 0, |_, _| None)
-            .err()
-            .expect("missing utxo should fail");
+            .expect_err("missing utxo should fail");
 
         assert_eq!(txid, ValidationError::MissingUtxo);
     }
@@ -517,8 +520,7 @@ mod tests {
         assert_eq!(
             mempool
                 .reserve_inputs(&tx)
-                .err()
-                .expect("conflict should fail"),
+                .expect_err("conflict should fail"),
             ValidationError::MempoolConflict
         );
     }

@@ -362,10 +362,8 @@ fn solve_transaction_pow_with_worker_count_and_cancel(
     let spawn_failed = AtomicBool::new(false);
     thread::scope(|scope| {
         for worker_index in 1..worker_count {
-            let preimage = preimage;
             let found = &found;
             let solved_nonce = &solved_nonce;
-            let stop_requested = stop_requested;
             let parallel_abort = &parallel_abort;
             #[cfg(test)]
             if FORCE_TX_POW_SPAWN_FAILURE.load(Ordering::Acquire) {
@@ -502,6 +500,35 @@ mod tests {
         let fee = tx.vsize_bytes() as u64;
         assert!(tx.vsize_bytes() > 2_000);
         assert_eq!(required_tx_pow_bits(Network::Regnet, &tx, fee), 26);
+    }
+
+    #[test]
+    fn fragmentation_spam_faces_fee_and_pow_backpressure() {
+        let compact = sample_tx(2, DUST_RELAY_VALUE_ATOMS + 1);
+        let mut fragmented = sample_tx(MAX_STANDARD_OUTPUTS, DUST_RELAY_VALUE_ATOMS + 1);
+        inflate_tx_to_min_vbytes(&mut fragmented, 2_000);
+
+        let compact_fee = minimum_required_fee_atoms(Network::Mainnet, &compact);
+        let fragmented_fee = minimum_required_fee_atoms(Network::Mainnet, &fragmented);
+
+        assert_eq!(
+            minimum_output_amount_atoms(Network::Mainnet, &compact),
+            DUST_RELAY_VALUE_ATOMS
+        );
+        assert_eq!(
+            maximum_standard_outputs(Network::Mainnet, &fragmented),
+            MAX_STANDARD_OUTPUTS
+        );
+        assert!(fragmented_fee > compact_fee);
+        assert!(
+            required_tx_pow_bits(Network::Mainnet, &fragmented, fragmented_fee)
+                > required_tx_pow_bits(Network::Mainnet, &compact, compact_fee)
+        );
+
+        let split = sample_tx(MAX_STANDARD_OUTPUTS / 4, DUST_RELAY_VALUE_ATOMS + 1);
+        let split_fee_total =
+            minimum_required_fee_atoms(Network::Mainnet, &split).saturating_mul(4);
+        assert!(split_fee_total >= compact_fee.saturating_mul(4));
     }
 
     #[test]

@@ -20,7 +20,7 @@ fn signing_keypair() -> FalconKeypair {
 fn witness_bytes(tx: &Transaction) -> Vec<u8> {
     let keypair = signing_keypair();
     let txid = tx.txid();
-    let digest = transaction_signing_digest(Network::Mainnet, &tx);
+    let digest = transaction_signing_digest(Network::Mainnet, tx);
     let signature = sign(
         AthoSignatureDomain::Transaction,
         &keypair.secret_key,
@@ -137,4 +137,44 @@ fn protocol_fixture_freezes_core_parameters_and_validation() {
         validate_block_without_pow(&fixture_block(), 0, Network::Mainnet),
         Ok(())
     );
+}
+
+#[test]
+fn golden_fixture_canonical_bytes_round_trip_exactly() {
+    let tx = fixture_transaction();
+    let tx_bytes = tx.full_bytes();
+    let decoded_tx = Transaction::from_full_bytes(&tx_bytes).expect("decode tx");
+    assert_eq!(decoded_tx.full_bytes(), tx_bytes);
+    assert_eq!(decoded_tx.txid(), tx.txid());
+    assert_eq!(decoded_tx.wtxid(), tx.wtxid());
+
+    let block = fixture_block();
+    let block_bytes = block.canonical_bytes();
+    let decoded_block = Block::from_canonical_bytes(&block_bytes).expect("decode block");
+    assert_eq!(decoded_block.canonical_bytes(), block_bytes);
+    assert_eq!(decoded_block.header.block_hash(), block.header.block_hash());
+    assert_eq!(
+        decoded_block.header.merkle_root,
+        merkle_root(&block.transactions)
+    );
+    assert_eq!(
+        decoded_block.header.witness_root,
+        witness_root(&block.transactions)
+    );
+
+    let mut trailing_tx = tx_bytes.clone();
+    trailing_tx.push(0);
+    assert!(Transaction::from_full_bytes(&trailing_tx).is_none());
+
+    let mut truncated_tx = tx_bytes;
+    truncated_tx.pop();
+    assert!(Transaction::from_full_bytes(&truncated_tx).is_none());
+
+    let mut trailing_block = block_bytes.clone();
+    trailing_block.push(0);
+    assert!(Block::from_canonical_bytes(&trailing_block).is_none());
+
+    let mut truncated_block = block_bytes;
+    truncated_block.pop();
+    assert!(Block::from_canonical_bytes(&truncated_block).is_none());
 }

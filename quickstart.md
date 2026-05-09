@@ -43,16 +43,17 @@ cd Atho-Alpha
 The intended top-level user commands are:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
+python mainnet.py
+python testnet.py
+python regnet.py
 ```
 
-They:
+The launcher:
 
-- try a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first if they are missing
+- tries a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first if they are missing
 - rebuild them if the source tree is newer than the release binaries
-- prepare the runtime root
-- launch the desktop client in managed-local-node mode
+- prepares the runtime root
+- launches the desktop client in managed-local-node mode
 
 If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
 GPU-native builds typically need:
@@ -64,15 +65,15 @@ GPU-native builds typically need:
 Extra flags can still be passed through when needed:
 
 ```bash
-python runmainnet.py --peer HOST:PORT
-python runtestnet.py --data-dir /absolute/path
+python testnet.py --peer HOST:PORT
+python testnet.py --data-dir /absolute/path
 ```
 
-If your shell exposes Python as `python3` instead of `python`, use `python3 runmainnet.py` or `python3 runtestnet.py`.
+If your shell exposes Python as `python3` instead of `python`, use `python3 testnet.py`.
 
-Built binaries still live in `target/release/`, and the launchers reuse them when they are already current.
+Built binaries still live in `target/release/`, and the launcher reuses them when they are already current.
 
-The wrappers already build with the native GPU feature enabled. If you want to build the binaries manually instead:
+The launcher already builds with the native GPU feature enabled. If you want to build the binaries manually instead:
 
 ```bash
 cargo build --release -p atho-node --bin atho-mine --features gpu-native
@@ -88,28 +89,32 @@ That feature enables the native FFI wrapper and keeps the node as the final auth
 Linux or macOS:
 
 ```bash
-python runmainnet.py
+python mainnet.py
+python testnet.py
+python regnet.py
 ```
 
 Windows PowerShell:
 
 ```powershell
-py -3 .\runmainnet.py
+py -3 .\mainnet.py
+py -3 .\testnet.py
+py -3 .\regnet.py
 ```
 
 For testnet:
 
 ```bash
-python runtestnet.py
+python testnet.py
 ```
 
 or on Windows:
 
 ```powershell
-py -3 .\runtestnet.py
+py -3 .\testnet.py
 ```
 
-The launchers end by executing `atho-qt --local-node`, so the client still uses the real Rust node path.
+The launcher ends by executing `atho-qt --local-node`, so the client still uses the real Rust node path.
 
 If you want a disposable pruning and recovery sandbox, use `--network prunetest` instead of `regnet`.
 
@@ -163,7 +168,7 @@ In Qt, open `Settings > Mining` to pick `Auto`, `GPU only`, or `CPU only` and in
 Mainnet:
 
 ```bash
-python runmainnet.py
+python mainnet.py
 ./target/release/athod --network mainnet
 ./target/release/atho-mine --network mainnet
 ```
@@ -171,7 +176,7 @@ python runmainnet.py
 Testnet:
 
 ```bash
-python runtestnet.py
+python testnet.py
 ./target/release/athod --network testnet
 ./target/release/atho-qt --network testnet --local-node
 ./target/release/atho-mine --network testnet
@@ -179,7 +184,7 @@ python runtestnet.py
 
 Testnet ATHO is distributed manually by the Atho founders or development team. Contact the Atho team to request testnet funds.
 
-Mainnet and testnet are strictly isolated. Mainnet has no faucet, no automatic storage self-healing, and no testnet difficulty stall reset. Testnet may reset during development, may self-heal local testnet storage after configured changes, and may reset difficulty to minimum after more than 10 minutes without a block.
+Mainnet and testnet are strictly isolated. Mainnet has no faucet and no testnet difficulty stall reset. Storage recovery is shared across networks but remains network-scoped: recoverable local chainstate/index issues are quarantined under that network's data directory and rebuilt without mixing data. Testnet may reset during development and may reset difficulty to minimum after more than 10 minutes without a block.
 
 ## 8. Know Sync Is Working
 
@@ -226,12 +231,13 @@ or:
 $env:ATHO_DATA_DIR = "D:\Atho"
 ```
 
-The launchers honor the same environment variable.
+The launcher honors the same environment variable.
 
 ## 11. Key Commands
 
-- `python runmainnet.py`
-- `python runtestnet.py`
+- `python mainnet.py`
+- `python testnet.py`
+- `python regnet.py`
 - `athod --network <mainnet|testnet|regnet|prunetest>`
 - `atho-qt --network <mainnet|testnet|regnet|prunetest> --local-node`
 - `atho-mine --network <mainnet|testnet|regnet|prunetest>`

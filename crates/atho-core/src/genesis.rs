@@ -239,20 +239,20 @@ fn mainnet() -> GenesisState {
     static STATE: OnceLock<GenesisState> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            genesis_state_from_parts(
-                Network::Mainnet,
-                MAINNET_GENESIS_REWARD_ADDRESS,
-                MAINNET_GENESIS_REWARD_SCRIPT,
-                MAINNET_GENESIS_BLOCK_VERSION,
-                MAINNET_GENESIS_TX_VERSION,
-                MAINNET_GENESIS_LOCK_TIME,
-                MAINNET_GENESIS_TIMESTAMP,
-                MAINNET_GENESIS_NONCE,
-                MAINNET_GENESIS_TARGET,
-                MAINNET_GENESIS_COINBASE_TXID,
-                MAINNET_GENESIS_BLOCK_HASH,
-                Network::Mainnet.utxo_flag(),
-            )
+            genesis_state_from_parts(GenesisParts {
+                network: Network::Mainnet,
+                reward_address: MAINNET_GENESIS_REWARD_ADDRESS,
+                reward_script: MAINNET_GENESIS_REWARD_SCRIPT,
+                block_version: MAINNET_GENESIS_BLOCK_VERSION,
+                tx_version: MAINNET_GENESIS_TX_VERSION,
+                lock_time: MAINNET_GENESIS_LOCK_TIME,
+                timestamp: MAINNET_GENESIS_TIMESTAMP,
+                nonce: MAINNET_GENESIS_NONCE,
+                target: MAINNET_GENESIS_TARGET,
+                expected_coinbase_txid: MAINNET_GENESIS_COINBASE_TXID,
+                expected_block_hash: MAINNET_GENESIS_BLOCK_HASH,
+                utxo_flag: Network::Mainnet.utxo_flag(),
+            })
         })
         .clone()
 }
@@ -261,20 +261,20 @@ fn testnet() -> GenesisState {
     static STATE: OnceLock<GenesisState> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            genesis_state_from_parts(
-                Network::Testnet,
-                TESTNET_GENESIS_REWARD_ADDRESS,
-                TESTNET_GENESIS_REWARD_SCRIPT,
-                TESTNET_GENESIS_BLOCK_VERSION,
-                TESTNET_GENESIS_TX_VERSION,
-                TESTNET_GENESIS_LOCK_TIME,
-                TESTNET_GENESIS_TIMESTAMP,
-                TESTNET_GENESIS_NONCE,
-                TESTNET_GENESIS_TARGET,
-                TESTNET_GENESIS_COINBASE_TXID,
-                TESTNET_GENESIS_BLOCK_HASH,
-                Network::Testnet.utxo_flag(),
-            )
+            genesis_state_from_parts(GenesisParts {
+                network: Network::Testnet,
+                reward_address: TESTNET_GENESIS_REWARD_ADDRESS,
+                reward_script: TESTNET_GENESIS_REWARD_SCRIPT,
+                block_version: TESTNET_GENESIS_BLOCK_VERSION,
+                tx_version: TESTNET_GENESIS_TX_VERSION,
+                lock_time: TESTNET_GENESIS_LOCK_TIME,
+                timestamp: TESTNET_GENESIS_TIMESTAMP,
+                nonce: TESTNET_GENESIS_NONCE,
+                target: TESTNET_GENESIS_TARGET,
+                expected_coinbase_txid: TESTNET_GENESIS_COINBASE_TXID,
+                expected_block_hash: TESTNET_GENESIS_BLOCK_HASH,
+                utxo_flag: Network::Testnet.utxo_flag(),
+            })
         })
         .clone()
 }
@@ -283,20 +283,20 @@ fn regnet() -> GenesisState {
     static STATE: OnceLock<GenesisState> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            genesis_state_from_parts(
-                Network::Regnet,
-                REGNET_GENESIS_REWARD_ADDRESS,
-                REGNET_GENESIS_REWARD_SCRIPT,
-                REGNET_GENESIS_BLOCK_VERSION,
-                REGNET_GENESIS_TX_VERSION,
-                REGNET_GENESIS_LOCK_TIME,
-                REGNET_GENESIS_TIMESTAMP,
-                REGNET_GENESIS_NONCE,
-                REGNET_GENESIS_TARGET,
-                REGNET_GENESIS_COINBASE_TXID,
-                REGNET_GENESIS_BLOCK_HASH,
-                Network::Regnet.utxo_flag(),
-            )
+            genesis_state_from_parts(GenesisParts {
+                network: Network::Regnet,
+                reward_address: REGNET_GENESIS_REWARD_ADDRESS,
+                reward_script: REGNET_GENESIS_REWARD_SCRIPT,
+                block_version: REGNET_GENESIS_BLOCK_VERSION,
+                tx_version: REGNET_GENESIS_TX_VERSION,
+                lock_time: REGNET_GENESIS_LOCK_TIME,
+                timestamp: REGNET_GENESIS_TIMESTAMP,
+                nonce: REGNET_GENESIS_NONCE,
+                target: REGNET_GENESIS_TARGET,
+                expected_coinbase_txid: REGNET_GENESIS_COINBASE_TXID,
+                expected_block_hash: REGNET_GENESIS_BLOCK_HASH,
+                utxo_flag: Network::Regnet.utxo_flag(),
+            })
         })
         .clone()
 }
@@ -305,27 +305,27 @@ fn prunetest() -> GenesisState {
     static STATE: OnceLock<GenesisState> = OnceLock::new();
     STATE
         .get_or_init(|| {
-            genesis_state_from_parts(
-                Network::Prunetest,
-                PRUNETEST_GENESIS_REWARD_ADDRESS,
-                PRUNETEST_GENESIS_REWARD_SCRIPT,
-                PRUNETEST_GENESIS_BLOCK_VERSION,
-                PRUNETEST_GENESIS_TX_VERSION,
-                PRUNETEST_GENESIS_LOCK_TIME,
-                PRUNETEST_GENESIS_TIMESTAMP,
-                PRUNETEST_GENESIS_NONCE,
-                PRUNETEST_GENESIS_TARGET,
-                PRUNETEST_GENESIS_COINBASE_TXID,
-                PRUNETEST_GENESIS_BLOCK_HASH,
-                Network::Prunetest.utxo_flag(),
-            )
+            genesis_state_from_parts(GenesisParts {
+                network: Network::Prunetest,
+                reward_address: PRUNETEST_GENESIS_REWARD_ADDRESS,
+                reward_script: PRUNETEST_GENESIS_REWARD_SCRIPT,
+                block_version: PRUNETEST_GENESIS_BLOCK_VERSION,
+                tx_version: PRUNETEST_GENESIS_TX_VERSION,
+                lock_time: PRUNETEST_GENESIS_LOCK_TIME,
+                timestamp: PRUNETEST_GENESIS_TIMESTAMP,
+                nonce: PRUNETEST_GENESIS_NONCE,
+                target: PRUNETEST_GENESIS_TARGET,
+                expected_coinbase_txid: PRUNETEST_GENESIS_COINBASE_TXID,
+                expected_block_hash: PRUNETEST_GENESIS_BLOCK_HASH,
+                utxo_flag: Network::Prunetest.utxo_flag(),
+            })
         })
         .clone()
 }
 
-fn genesis_state_from_parts(
+struct GenesisParts {
     network: Network,
-    reward_address: &str,
+    reward_address: &'static str,
     reward_script: [u8; 48],
     block_version: u16,
     tx_version: u16,
@@ -336,7 +336,24 @@ fn genesis_state_from_parts(
     expected_coinbase_txid: [u8; 48],
     expected_block_hash: [u8; 48],
     utxo_flag: &'static str,
-) -> GenesisState {
+}
+
+fn genesis_state_from_parts(parts: GenesisParts) -> GenesisState {
+    let GenesisParts {
+        network,
+        reward_address,
+        reward_script,
+        block_version,
+        tx_version,
+        lock_time,
+        timestamp,
+        nonce,
+        target,
+        expected_coinbase_txid,
+        expected_block_hash,
+        utxo_flag,
+    } = parts;
+
     let coinbase = Transaction {
         version: tx_version,
         inputs: vec![],

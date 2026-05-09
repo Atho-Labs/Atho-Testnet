@@ -12,8 +12,13 @@ from unittest import mock
 import runtime_launcher
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 class RuntimeLauncherTests(unittest.TestCase):
-    def make_config(self, root: Path, network: str = "mainnet") -> runtime_launcher.LauncherConfig:
+    def make_config(
+        self, root: Path, network: str = "mainnet"
+    ) -> runtime_launcher.LauncherConfig:
         return runtime_launcher.LauncherConfig(
             network=network,
             repo_root=root,
@@ -25,6 +30,18 @@ class RuntimeLauncherTests(unittest.TestCase):
             dry_run=True,
             forwarded_args=(),
         )
+
+    def make_release_dir(self, root: Path) -> Path:
+        release_dir = root / "release"
+        release_dir.mkdir(parents=True)
+        for name in ("atho-qt", "athod", "atho-mine"):
+            binary = release_dir / runtime_launcher.binary_name(name)
+            binary.write_text("bin", encoding="utf-8")
+            if os.name != "nt":
+                binary.chmod(0o755)
+        stamp = release_dir / runtime_launcher.BUILD_STAMP
+        stamp.write_text("gpu-native\n", encoding="utf-8")
+        return release_dir
 
     def test_default_runtime_root_honors_environment_override(self) -> None:
         with mock.patch.dict(os.environ, {"ATHO_DATA_DIR": "/tmp/atho-launch-root"}, clear=False):
@@ -109,21 +126,110 @@ class RuntimeLauncherTests(unittest.TestCase):
             self.assertEqual(command[1:4], ["--network", "testnet", "--local-node"])
             self.assertEqual(command[-2:], ["--peer", "127.0.0.1:9100"])
 
+    def test_build_launch_env_sets_active_network_and_runtime_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self.make_config(root, network="regnet")
+            env = runtime_launcher.build_launch_env(config)
+            self.assertEqual(env["ATHO_NETWORK"], "regnet")
+            self.assertEqual(env["ATHO_DATA_DIR"], str(root / "runtime"))
+
     def test_parse_launcher_args_keeps_unknown_qt_flags(self) -> None:
         config = runtime_launcher.parse_launcher_args(
             "mainnet",
             ["--data-dir", "/tmp/atho", "--peer", "1.2.3.4:56000"],
         )
         self.assertEqual(config.runtime_root, Path("/tmp/atho"))
+        self.assertEqual(config.network, "mainnet")
         self.assertEqual(config.forwarded_args, ("--peer", "1.2.3.4:56000"))
+
+    def test_parse_launcher_args_rejects_network_override(self) -> None:
+        with self.assertRaisesRegex(runtime_launcher.LauncherError, "always launches testnet"):
+            runtime_launcher.parse_launcher_args("testnet", ["mainnet"])
+
+        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the mainnet network"):
+            runtime_launcher.parse_launcher_args("mainnet", ["--network", "testnet"])
+
+        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the regnet network"):
+            runtime_launcher.parse_launcher_args("regnet", ["--network=mainnet"])
 
     def test_parse_launcher_args_supports_regnet_wrapper_name(self) -> None:
         config = runtime_launcher.parse_launcher_args(
             "regnet",
             ["--data-dir", "/tmp/atho-regnet"],
+            prog="regnet.py",
         )
         self.assertEqual(config.network, "regnet")
         self.assertEqual(config.runtime_root, Path("/tmp/atho-regnet"))
+
+    def test_startup_scripts_smoke(self) -> None:
+        cases = {
+            "mainnet": "mainnet.py",
+            "testnet": "testnet.py",
+            "regnet": "regnet.py",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = self.make_release_dir(root)
+            for network, script_name in cases.items():
+                data_dir = root / f"{network}-data"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(REPO_ROOT / script_name),
+                        "--dry-run",
+                        "--release-dir",
+                        str(release_dir),
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    msg=f"{script_name} failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn(f"[atho-launch] network={network}", result.stdout)
+                self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
+                self.assertIn(f"--network {network} --local-node", result.stdout)
+                self.assertTrue((data_dir / "db").is_dir())
+                self.assertTrue((data_dir / "logs").is_dir())
+
+    def test_compatibility_wrappers_still_launch_their_networks(self) -> None:
+        cases = {
+            "runmainnet.py": ("mainnet", "prefer mainnet.py"),
+            "runtestnet.py": ("testnet", "prefer testnet.py"),
+            "runregnet.py": ("regnet", "prefer regnet.py"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = self.make_release_dir(root)
+            for script_name, (network, note) in cases.items():
+                data_dir = root / f"legacy-{network}-data"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(REPO_ROOT / script_name),
+                        "--dry-run",
+                        "--release-dir",
+                        str(release_dir),
+                        "--data-dir",
+                        str(data_dir),
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+                self.assertIn(note, result.stdout)
+                self.assertIn(f"[atho-launch] network={network}", result.stdout)
 
     def test_gpu_build_help_mentions_host_requirements(self) -> None:
         message = runtime_launcher.gpu_build_help()

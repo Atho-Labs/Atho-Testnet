@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Launch Atho regnet with the desktop client and managed local node."""
+"""Compatibility wrapper for the clearer `regnet.py` launcher."""
 
 from runtime_launcher import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(main("regnet"))
+    raise SystemExit(
+        main(
+            "regnet",
+            prog="runregnet.py",
+            compatibility_note="runregnet.py is kept for compatibility; prefer regnet.py.",
+        )
+    )

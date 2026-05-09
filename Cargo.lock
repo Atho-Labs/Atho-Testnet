@@ -665,6 +665,7 @@ dependencies = [
  "bincode",
  "get_if_addrs",
  "hex",
+ "num-bigint",
  "rayon",
  "serde",
  "serde-big-array",

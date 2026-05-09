@@ -188,9 +188,7 @@ fn render_send_form(
             ui.add_space(8.0);
             widgets::muted_label(
                 ui,
-                &format!(
-                    "The current spend path can combine spendable wallet-owned inputs into one grouped-signature transaction. Minimum output: 1 nATHO / 1,000 atoms. “Use max spendable” fills the largest amount currently spendable in one transaction."
-                ),
+                "The current spend path can combine spendable wallet-owned inputs into one grouped-signature transaction. Minimum output: 1 nATHO / 1,000 atoms. “Use max spendable” fills the largest amount currently spendable in one transaction.",
             );
             ui.add_space(8.0);
             ui.separator();

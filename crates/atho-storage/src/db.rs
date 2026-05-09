@@ -29,6 +29,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+type RawEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 const INITIAL_MAP_SIZE: usize = 1 << 30;
 const MAX_MAP_SIZE: usize = 1 << 40;
 const MAX_DBS: u32 = 10;
@@ -882,7 +884,7 @@ impl Database {
         }
     }
 
-    fn entries(&self, dataset: Dataset) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn entries(&self, dataset: Dataset) -> Result<RawEntries, StorageError> {
         let state = self.state.lock().expect("database lock poisoned");
         let txn = state.env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(dataset.db(&state))?;
@@ -1348,8 +1350,8 @@ mod tests {
             network_id: network,
             height,
             previous_block_hash,
-            merkle_root: merkle_root(&[tx.clone()]),
-            witness_root: witness_root(&[tx.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&tx)),
+            witness_root: witness_root(std::slice::from_ref(&tx)),
             timestamp: 1_700_000_000 + height,
             difficulty_target_or_bits: [7; 48],
             nonce: 42 + height,

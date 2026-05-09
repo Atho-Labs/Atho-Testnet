@@ -52,7 +52,7 @@ If you are using a packaged release, run the native installer first:
 
 ## How To Run Atho
 
-There are four primary binaries:
+There are three primary binaries:
 
 1. `athod`
 2. `atho-mine`
@@ -66,20 +66,21 @@ Recommended roles:
 
 ### Main Entry Commands
 
-For normal use, start Atho with one of these top-level launchers:
+Choose the top-level launcher for the network you want to run:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
+python mainnet.py
+python testnet.py
+python regnet.py
 ```
 
-They:
+The launcher:
 
-- try a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first when binaries are missing or stale
-- reuse existing release binaries when they are current
-- prepare the runtime root
-- launch `atho-qt` in managed-local-node mode
-- leave the Rust client and Rust node as the real runtime path
+- tries a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first when binaries are missing or stale
+- reuses existing release binaries when they are current
+- prepares the runtime root
+- launches `atho-qt` in managed-local-node mode
+- leaves the Rust client and Rust node as the real runtime path
 
 If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
 GPU-native builds typically need:
@@ -93,28 +94,22 @@ Because the Python wrapper replaces itself with `atho-qt`, it does not stay in t
 ### Full Node
 
 ```bash
-cargo run -p atho-node --bin athod -- --network mainnet
+cargo run -p atho-node --bin athod -- --network testnet
 ```
 
-Mainnet now resolves the configured DNS seed first and keeps the static fallback peer as a last resort when no explicit peers are supplied.
+Testnet resolves the configured DNS seed first and keeps the static fallback peer as a last resort when no explicit peers are supplied.
 Use `--peer HOST:PORT` only when you want to override or add peers manually.
 
 ### Desktop Client
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network mainnet --local-node
+cargo run -p atho-qt --bin atho-qt -- --network testnet --local-node
 ```
 
-For the simplest production-style local flow, prefer the launcher:
+For the simplest production-style local flow, prefer the matching launcher:
 
 ```bash
-python runmainnet.py
-```
-
-For testnet:
-
-```bash
-python runtestnet.py
+python testnet.py
 ```
 
 Testnet ATHO is distributed manually by the Atho founders or development team. Contact the Atho team to request testnet funds.

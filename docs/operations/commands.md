@@ -20,21 +20,21 @@ Recommended roles:
 
 ## Main Entry Commands
 
-These are the primary beginner and operator entry points:
+These are the primary network entry points:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
-python runregnet.py
+python mainnet.py
+python testnet.py
+python regnet.py
 ```
 
-They:
+The launcher:
 
-- try a GPU-enabled release build first when binaries are missing or stale
-- reuse current release binaries when they are already valid
-- prepare the runtime root
-- launch `atho-qt` in managed-local-node mode
-- keep the Rust client and Rust node as the real runtime path
+- tries a GPU-enabled release build first when binaries are missing or stale
+- reuses current release binaries when they are already valid
+- prepares the runtime root
+- launches `atho-qt` in managed-local-node mode
+- keeps the Rust client and Rust node as the real runtime path
 
 If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
 GPU-native builds typically need:
@@ -46,22 +46,20 @@ GPU-native builds typically need:
 Any extra flags are forwarded to `atho-qt`, so advanced operators can still do things like:
 
 ```bash
-python runmainnet.py --peer HOST:PORT
-python runmainnet.py --data-dir /absolute/path
-python runtestnet.py --data-dir /absolute/path
-python runregnet.py --data-dir /absolute/path
+python mainnet.py --data-dir /absolute/path
+python testnet.py --peer HOST:PORT
+python testnet.py --data-dir /absolute/path
+python regnet.py --data-dir /absolute/path
 ```
 
-They are orchestration only. After startup, the Python wrapper replaces itself with the Rust desktop client and does not stay in the hot path.
+It is orchestration only. After startup, the Python wrapper replaces itself with the Rust desktop client and does not stay in the hot path.
 
 ## Quick Start
 
 The shortest useful commands are:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
-python runregnet.py
+python testnet.py
 ./target/release/athod --network regnet
 ./target/release/atho-mine --network regnet
 ./target/release/atho-cli --network regnet getblockchaininfo
@@ -208,8 +206,9 @@ Important:
 Preferred production-style local commands:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
+python mainnet.py
+python testnet.py
+python regnet.py
 ```
 
 Attach to an existing node:

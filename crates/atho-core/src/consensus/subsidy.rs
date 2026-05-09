@@ -144,4 +144,45 @@ mod tests {
         assert_eq!(max_supply_atoms_for_network(Network::Regnet), None);
         assert_eq!(max_supply_atoms_for_network(Network::Prunetest), None);
     }
+
+    #[test]
+    fn long_horizon_emission_is_monotonic_and_additive_for_every_network() {
+        let heights = [
+            0,
+            1,
+            HALVING_INTERVAL_BLOCKS - 1,
+            HALVING_INTERVAL_BLOCKS,
+            (HALVING_INTERVAL_BLOCKS * 2) - 1,
+            HALVING_INTERVAL_BLOCKS * 2,
+            TAIL_EMISSION_START_HEIGHT - 1,
+            TAIL_EMISSION_START_HEIGHT,
+            YEAR_20_HEIGHT,
+            BLOCKS_PER_YEAR * 100,
+            100_000_000,
+            1_000_000_000,
+        ];
+
+        for network in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Regnet,
+            Network::Prunetest,
+        ] {
+            let mut previous_before = 0u128;
+            for height in heights {
+                let before = cumulative_issued_before_height_for_network(network, height);
+                let through = cumulative_issued_through_height_for_network(network, height);
+                let reward = block_subsidy_atoms_for_network(network, height) as u128;
+
+                assert!(before >= previous_before);
+                assert_eq!(through, before + reward);
+                assert_eq!(
+                    cumulative_issued_before_height_for_network(network, height + 1),
+                    through
+                );
+
+                previous_before = before;
+            }
+        }
+    }
 }

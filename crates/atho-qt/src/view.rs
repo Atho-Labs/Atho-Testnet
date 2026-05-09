@@ -61,7 +61,21 @@ impl ViewModel {
     }
 
     pub fn chain_synced(&self) -> bool {
-        self.running && self.headers_synced && self.block_count >= self.sync_target_height()
+        self.running
+            && self.headers_synced
+            && self.block_count >= self.sync_target_height()
+            && self.has_required_ready_peer()
+    }
+
+    fn public_network_requires_ready_peer(&self) -> bool {
+        !matches!(
+            self.network_label.as_str(),
+            "atho-regnet" | "regnet" | "atho-prunetest" | "prunetest"
+        )
+    }
+
+    fn has_required_ready_peer(&self) -> bool {
+        !self.public_network_requires_ready_peer() || self.peer_count > 0
     }
 
     pub fn sync_progress(&self) -> f32 {
@@ -126,11 +140,15 @@ mod tests {
 
     #[test]
     fn chain_synced_requires_local_height_to_reach_sync_target() {
-        let mut view = ViewModel::default();
-        view.running = true;
-        view.headers_synced = true;
-        view.block_count = 0;
-        view.sync_best_height = 128;
+        let mut view = ViewModel {
+            network_label: String::from("atho-mainnet"),
+            running: true,
+            headers_synced: true,
+            peer_count: 1,
+            block_count: 0,
+            sync_best_height: 128,
+            ..Default::default()
+        };
         assert!(!view.chain_synced());
         assert_eq!(view.sync_target_height(), 128);
         assert_eq!(view.sync_progress(), 0.0);
@@ -141,12 +159,36 @@ mod tests {
     }
 
     #[test]
+    fn public_network_sync_requires_ready_peer() {
+        let mut view = ViewModel {
+            network_label: String::from("atho-testnet"),
+            running: true,
+            headers_synced: true,
+            block_count: 8,
+            sync_best_height: 8,
+            ..Default::default()
+        };
+
+        assert!(!view.chain_synced());
+
+        view.peer_count = 1;
+        assert!(view.chain_synced());
+
+        view.network_label = String::from("atho-regnet");
+        view.peer_count = 0;
+        assert!(view.chain_synced());
+    }
+
+    #[test]
     fn sync_progress_display_stays_below_full_while_headers_are_unsynced() {
-        let mut view = ViewModel::default();
-        view.running = true;
-        view.headers_synced = false;
-        view.block_count = 128;
-        view.sync_best_height = 128;
+        let view = ViewModel {
+            network_label: String::from("atho-regnet"),
+            running: true,
+            headers_synced: false,
+            block_count: 128,
+            sync_best_height: 128,
+            ..Default::default()
+        };
 
         assert!(!view.chain_synced());
         assert_eq!(view.sync_progress(), 1.0);

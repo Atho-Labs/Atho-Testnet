@@ -245,9 +245,13 @@ impl Node {
         });
         Ok(records
             .into_iter()
+            .filter(|record| record.network == self.network())
             .filter_map(|record| {
                 let mut address =
                     parse_remote_addr(&record.remote_addr, self.network().p2p_port())?;
+                if address.port == 0 {
+                    return None;
+                }
                 address.last_seen_unix = record.last_seen_unix;
                 Some(address)
             })
@@ -965,6 +969,36 @@ mod tests {
         assert_eq!(record.first_seen_height, 12);
         assert_eq!(record.last_seen_height, 34);
         assert_eq!(record.remote_addr, "127.0.0.1:56000");
+    }
+
+    #[test]
+    fn node_peer_addresses_filter_wrong_network_records() {
+        let root = temp_data_dir("peer-network-filter");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let node = Node::load_or_new(NodeConfig::new(Network::Mainnet));
+        node.save_peer_record(&PeerRecord {
+            network: Network::Mainnet,
+            remote_addr: String::from("8.8.8.8:56000"),
+            first_seen_height: 1,
+            last_seen_height: 1,
+            last_seen_unix: 1_700_000_100,
+        })
+        .expect("save mainnet peer");
+        node.save_peer_record(&PeerRecord {
+            network: Network::Testnet,
+            remote_addr: String::from("8.8.4.4:9100"),
+            first_seen_height: 1,
+            last_seen_height: 1,
+            last_seen_unix: 1_700_000_200,
+        })
+        .expect("save wrong-network peer");
+
+        let peers = node.peer_addresses().expect("peer addresses");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].host, "8.8.8.8");
+        assert_eq!(peers[0].port, 56000);
     }
 
     #[test]

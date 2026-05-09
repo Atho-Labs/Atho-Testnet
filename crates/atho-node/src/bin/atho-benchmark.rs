@@ -816,7 +816,7 @@ fn render_report(
     out.push_str(&format!("- Disk: {}\n", hardware.disk));
     out.push_str(&format!("- OS: {}\n", hardware.os));
     out.push_str(&format!("- Rust version: {}\n", hardware.rust_version));
-    out.push_str(&format!("- Build profile: release\n"));
+    out.push_str("- Build profile: release\n");
     out.push_str(&format!("- Commit hash: {}\n\n", hardware.commit_hash));
 
     out.push_str("## Network Parameters\n");

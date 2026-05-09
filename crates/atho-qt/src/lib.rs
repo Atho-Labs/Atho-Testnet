@@ -21,10 +21,10 @@ pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     thread_local! {
-        static TEST_LOCK_STATE: RefCell<TestLockState> = RefCell::new(TestLockState {
+        static TEST_LOCK_STATE: RefCell<TestLockState> = const { RefCell::new(TestLockState {
             depth: 0,
             guard: None,
-        });
+        }) };
     }
 
     #[derive(Debug)]

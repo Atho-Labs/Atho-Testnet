@@ -288,7 +288,8 @@ fn format_grouped_u64(value: u64) -> String {
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     let remainder = digits.len() % 3;
     for (index, ch) in digits.chars().enumerate() {
-        if index != 0 && (index == remainder || (index > remainder && (index - remainder) % 3 == 0))
+        if index != 0
+            && (index == remainder || (index > remainder && (index - remainder).is_multiple_of(3)))
         {
             grouped.push(',');
         }

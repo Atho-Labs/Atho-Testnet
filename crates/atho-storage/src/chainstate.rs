@@ -17,6 +17,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RECENT_BLOCK_RELOAD_LIMIT: usize = 27;
+
 #[derive(Debug, Clone)]
 struct ChainUndo {
     previous_tip: Option<BlockHeader>,
@@ -107,19 +109,11 @@ impl Chainstate {
     }
 
     pub fn load_or_new(network: Network) -> Self {
-        let loader = if network == Network::Testnet {
-            Self::try_load_or_recover(network)
-        } else {
-            Self::try_load_or_new(network)
-        };
-        loader
+        Self::try_load_or_recover(network)
             .unwrap_or_else(|err| panic!("failed to load chainstate for {}: {}", network.id(), err))
     }
 
     pub fn try_load_or_recover(network: Network) -> Result<Self, StorageError> {
-        if network != Network::Testnet {
-            return Self::try_load_or_new(network);
-        }
         match Self::try_load_or_new(network) {
             Ok(chainstate) => Ok(chainstate),
             Err(err) if err.is_recoverable_local_state() => {
@@ -222,23 +216,38 @@ impl Chainstate {
         }
         validate_branch_sequence(branch)?;
         let fork_hash = branch[0].header.previous_block_hash;
-        let Some(fork_index) = self
-            .blocks
-            .iter()
-            .position(|block| block.header.block_hash() == fork_hash)
-        else {
-            return Err(StorageError::ForkPointUnavailable);
-        };
-        let fork_height = self.blocks[fork_index].header.height;
+        let fork_height = self.canonical_fork_height(fork_hash)?;
         if branch[0].header.height != fork_height.saturating_add(1) {
             return Err(StorageError::InvalidBranchSequence);
         }
 
-        let disconnected = self.blocks[fork_index + 1..].to_vec();
+        let disconnected = self.canonical_branch_after(fork_height)?;
         if !disconnected.is_empty() && !pow::branch_is_preferred(branch, &disconnected) {
             return Ok(ChainSelectionResult {
                 outcome: ChainSelectionOutcome::KeptCurrent,
                 disconnected: Vec::new(),
+            });
+        }
+
+        let fork_index = self
+            .blocks
+            .iter()
+            .position(|block| block.header.block_hash() == fork_hash);
+        let can_switch_incrementally = fork_index
+            .map(|index| {
+                self.blocks[index + 1..].len() == disconnected.len()
+                    && self.undo_stack.len() >= disconnected.len()
+            })
+            .unwrap_or(false);
+        if !can_switch_incrementally {
+            self.replace_with_validated_branch(fork_height, branch)?;
+            return Ok(ChainSelectionResult {
+                outcome: if disconnected.is_empty() {
+                    ChainSelectionOutcome::Extended
+                } else {
+                    ChainSelectionOutcome::Reorged
+                },
+                disconnected,
             });
         }
 
@@ -248,21 +257,44 @@ impl Chainstate {
         let original_blocks = self.blocks.clone();
         let original_utxos = self.utxos.clone();
         let original_undo_stack = self.undo_stack.clone();
+        let original_bundle = if self.storage.is_some() {
+            Some(self.export_snapshot_bundle()?)
+        } else {
+            None
+        };
 
         for _ in 0..disconnected.len() {
-            self.disconnect_last_block()?;
+            if let Err(err) = self.disconnect_last_block() {
+                if let Some(bundle) = original_bundle.clone() {
+                    self.import_snapshot_bundle(bundle)?;
+                } else {
+                    self.restore_chainstate_state(
+                        original_tip.clone(),
+                        original_tip_hash,
+                        original_height,
+                        original_blocks.clone(),
+                        original_utxos.clone(),
+                        original_undo_stack.clone(),
+                    )?;
+                }
+                return Err(err);
+            }
         }
 
         for block in branch {
             if let Err(err) = self.connect_block(block) {
-                self.restore_chainstate_state(
-                    original_tip,
-                    original_tip_hash,
-                    original_height,
-                    original_blocks,
-                    original_utxos,
-                    original_undo_stack,
-                )?;
+                if let Some(bundle) = original_bundle.clone() {
+                    self.import_snapshot_bundle(bundle)?;
+                } else {
+                    self.restore_chainstate_state(
+                        original_tip.clone(),
+                        original_tip_hash,
+                        original_height,
+                        original_blocks.clone(),
+                        original_utxos.clone(),
+                        original_undo_stack.clone(),
+                    )?;
+                }
                 return Err(err);
             }
         }
@@ -715,7 +747,7 @@ impl Chainstate {
                 tip_header,
             };
             let utxos: Vec<_> = self.utxos.entries().cloned().collect();
-            storage.save_chainstate_snapshot(&snapshot, &utxos)?;
+            storage.commit_chainstate(&snapshot, &utxos, None)?;
         }
         Ok(())
     }
@@ -750,6 +782,78 @@ impl Chainstate {
             .as_ref()
             .and_then(|storage| storage.load_block_record(block_hash).ok().flatten())
             .map(|record| record.height)
+    }
+
+    fn canonical_fork_height(&self, fork_hash: [u8; 48]) -> Result<u64, StorageError> {
+        let Some(height) = self.known_block_height(fork_hash) else {
+            return Err(StorageError::ForkPointUnavailable);
+        };
+        let Some(canonical_block) = self.block_by_height(height)? else {
+            return Err(StorageError::IncompleteBlockHistory);
+        };
+        if canonical_block.header.block_hash() != fork_hash {
+            return Err(StorageError::ForkPointUnavailable);
+        }
+        Ok(height)
+    }
+
+    fn canonical_branch_after(&self, fork_height: u64) -> Result<Vec<Block>, StorageError> {
+        if fork_height >= self.height {
+            return Ok(Vec::new());
+        }
+        let mut branch = Vec::with_capacity(
+            self.height
+                .saturating_sub(fork_height)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
+        for height in fork_height.saturating_add(1)..=self.height {
+            let block = self
+                .block_by_height(height)?
+                .ok_or(StorageError::IncompleteBlockHistory)?;
+            branch.push(block);
+        }
+        Ok(branch)
+    }
+
+    fn canonical_prefix_through(&self, height: u64) -> Result<Vec<Block>, StorageError> {
+        let mut blocks = Vec::with_capacity(height.saturating_add(1) as usize);
+        for block_height in 0..=height {
+            let block = self
+                .block_by_height(block_height)?
+                .ok_or(StorageError::IncompleteBlockHistory)?;
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
+    fn replace_with_validated_branch(
+        &mut self,
+        fork_height: u64,
+        branch: &[Block],
+    ) -> Result<(), StorageError> {
+        let mut replacement_blocks = self.canonical_prefix_through(fork_height)?;
+        replacement_blocks.extend_from_slice(branch);
+        let validated = validate_replacement_chain(self.network, &replacement_blocks)?;
+        let snapshot = ChainstateSnapshot {
+            height: validated.height,
+            tip_hash: validated.tip_hash,
+            tip_header: validated.tip.clone(),
+        };
+        let utxos: Vec<_> = validated.utxos.entries().cloned().collect();
+
+        if let Some(storage) = &self.storage {
+            storage.replace_chainstate(&snapshot, &utxos, &replacement_blocks)?;
+        }
+
+        self.tip = validated.tip;
+        self.tip_hash = validated.tip_hash;
+        self.height = validated.height;
+        self.blocks = validated.blocks;
+        self.utxos = validated.utxos;
+        self.undo_stack = validated.undo_stack;
+        self.prune_history();
+        Ok(())
     }
 }
 
@@ -794,7 +898,8 @@ impl PersistedChainstate {
             let db = storage
                 .as_ref()
                 .ok_or(StorageError::IncompleteBlockHistory)?;
-            let blocks = load_recent_blocks_from_storage(db, self.tip_hash, 27)?;
+            let blocks =
+                load_recent_blocks_from_storage(db, self.tip_hash, RECENT_BLOCK_RELOAD_LIMIT)?;
             let Some(last) = blocks.last() else {
                 return Err(StorageError::IncompleteBlockHistory);
             };
@@ -802,6 +907,10 @@ impl PersistedChainstate {
                 return Err(StorageError::PersistedTipMismatch);
             }
             blocks
+        };
+        let undo_stack = match storage.as_ref() {
+            Some(db) => rehydrate_undo_stack_from_storage(network, db, &blocks, &utxos)?,
+            None => Vec::new(),
         };
 
         Ok(Chainstate {
@@ -811,12 +920,110 @@ impl PersistedChainstate {
             height: self.height,
             blocks,
             utxos,
-            undo_stack: Vec::new(),
+            undo_stack,
             storage,
             last_prune_report: None,
             last_prune_error: None,
         })
     }
+}
+
+fn validate_replacement_chain(
+    network: Network,
+    blocks: &[Block],
+) -> Result<Chainstate, StorageError> {
+    let Some(genesis_block) = blocks.first() else {
+        return Err(StorageError::IncompleteBlockHistory);
+    };
+    if genesis_block.header.height != 0
+        || genesis_block.header.block_hash() != genesis::genesis_hash(network)
+    {
+        return Err(StorageError::PersistedGenesisMismatch);
+    }
+
+    let mut validated = Chainstate::fresh(network);
+    if validated.blocks[0].header.block_hash() != genesis_block.header.block_hash() {
+        return Err(StorageError::PersistedGenesisMismatch);
+    }
+    for block in blocks.iter().skip(1) {
+        validated.connect_block(block)?;
+    }
+    Ok(validated)
+}
+
+fn rehydrate_undo_stack_from_storage(
+    network: Network,
+    storage: &Database,
+    blocks: &[Block],
+    tip_utxos: &UtxoSet,
+) -> Result<Vec<ChainUndo>, StorageError> {
+    if blocks.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    validate_branch_sequence(blocks)?;
+
+    let mut rollback_utxos = tip_utxos.clone();
+    let mut reversed = Vec::with_capacity(blocks.len().saturating_sub(1));
+    for index in (1..blocks.len()).rev() {
+        let block = &blocks[index];
+        let undo = reconstruct_block_undo_from_storage(network, storage, block)?;
+        rollback_utxos.disconnect_block(undo.clone());
+        let previous_tip = Some(blocks[index - 1].header.clone());
+        let previous_tip_hash = blocks[index - 1].header.block_hash();
+        reversed.push(ChainUndo {
+            previous_tip,
+            previous_tip_hash,
+            block_undo: undo,
+        });
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
+fn reconstruct_block_undo_from_storage(
+    network: Network,
+    storage: &Database,
+    block: &Block,
+) -> Result<BlockUndo, StorageError> {
+    let mut undo = BlockUndo {
+        spent: Vec::new(),
+        created: Vec::new(),
+    };
+    for transaction in &block.transactions {
+        for input in &transaction.inputs {
+            let previous = storage
+                .load_transaction(input.previous_txid)?
+                .ok_or(StorageError::IncompleteBlockHistory)?;
+            let output = previous
+                .transaction
+                .outputs
+                .get(input.output_index as usize)
+                .ok_or(StorageError::CorruptData)?;
+            undo.spent.push(UtxoEntry::new(
+                network,
+                input.previous_txid,
+                input.output_index,
+                output.value_atoms,
+                output.locking_script.clone(),
+                previous.height,
+                previous.transaction.is_coinbase(),
+            ));
+        }
+
+        let txid = transaction.txid();
+        for (output_index, output) in transaction.outputs.iter().enumerate() {
+            undo.created.push(UtxoEntry::new(
+                network,
+                txid,
+                output_index as u32,
+                output.value_atoms,
+                output.locking_script.clone(),
+                block.header.height,
+                transaction.is_coinbase(),
+            ));
+        }
+    }
+    Ok(undo)
 }
 
 fn validate_branch_sequence(branch: &[Block]) -> Result<(), StorageError> {
@@ -841,11 +1048,6 @@ fn quarantine_persisted_state(
     network: Network,
     source_error: &StorageError,
 ) -> Result<(), StorageError> {
-    if network != Network::Testnet {
-        return Err(StorageError::StorageMetadataMismatch {
-            field: "automatic recovery disabled for non-testnet storage",
-        });
-    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -865,7 +1067,7 @@ fn quarantine_persisted_state(
         StorageError::StorageMetadataMismatch { .. } => "metadata-mismatch",
         _ => "recovery",
     };
-    let quarantine_root = crate::path::testnet_storage_backup_root()
+    let quarantine_root = crate::path::storage_recovery_root(network)
         .join(format!("old_storage_{timestamp}_{genesis_suffix}_{label}"));
     fs::create_dir_all(&quarantine_root)?;
 
@@ -922,8 +1124,12 @@ fn quarantine_persisted_state(
         )?;
     }
     fs::write(
-        crate::path::testnet_refresh_notice_path(),
-        "Testnet data was refreshed because this testnet version uses a new genesis or storage format.\n",
+        crate::path::storage_recovery_notice_path(network),
+        format!(
+            "{} storage was quarantined and rebuilt because local chain data needed recovery: {source_error}. Original files are preserved under {}.\n",
+            network.id(),
+            quarantine_root.display()
+        ),
     )?;
     Ok(())
 }
@@ -1145,13 +1351,30 @@ mod tests {
     }
 
     fn build_coinbase_successor(state: &Chainstate) -> Block {
+        let previous_timestamp = state
+            .tip
+            .as_ref()
+            .map(|header| header.timestamp)
+            .unwrap_or_else(|| genesis::genesis_state(state.network).block.header.timestamp);
+        build_coinbase_successor_with_script(
+            state,
+            vec![state.height.saturating_add(1) as u8],
+            previous_timestamp.saturating_add(1),
+        )
+    }
+
+    fn build_coinbase_successor_with_script(
+        state: &Chainstate,
+        locking_script: Vec<u8>,
+        timestamp: u64,
+    ) -> Block {
         let height = state.height.saturating_add(1);
         let coinbase = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms_for_network(state.network, height),
-                locking_script: vec![height as u8],
+                locking_script,
             }],
             lock_time: u32::try_from(height).unwrap_or(u32::MAX),
             witness: vec![],
@@ -1159,11 +1382,6 @@ mod tests {
             tx_pow_bits: 0,
         };
         let transactions = vec![coinbase];
-        let previous_timestamp = state
-            .tip
-            .as_ref()
-            .map(|header| header.timestamp)
-            .unwrap_or_else(|| genesis::genesis_state(state.network).block.header.timestamp);
         solve_block(Block::new(
             BlockHeader {
                 version: 1,
@@ -1172,8 +1390,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
-                timestamp: previous_timestamp.saturating_add(1),
-                difficulty_target_or_bits: state.next_difficulty_target(),
+                timestamp,
+                difficulty_target_or_bits: state.next_difficulty_target_for_timestamp(timestamp),
                 nonce: 0,
             },
             transactions,
@@ -1544,7 +1762,7 @@ mod tests {
         assert_eq!(recovered.blocks().len(), 1);
         assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
 
-        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+        let mut entries = fs::read_dir(crate::path::storage_recovery_root(Network::Testnet))
             .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
@@ -1565,8 +1783,9 @@ mod tests {
         assert_eq!(snapshot.height, 0);
         assert_eq!(snapshot.tip_hash, genesis::genesis_hash(Network::Testnet));
         let notice =
-            fs::read_to_string(crate::path::testnet_refresh_notice_path()).expect("refresh notice");
-        assert!(notice.contains("Testnet data was refreshed"));
+            fs::read_to_string(crate::path::storage_recovery_notice_path(Network::Testnet))
+                .expect("refresh notice");
+        assert!(notice.contains("atho-testnet storage was quarantined and rebuilt"));
     }
 
     #[test]
@@ -1594,7 +1813,7 @@ mod tests {
         assert_eq!(recovered.height, 1);
         assert_eq!(recovered.tip_hash, tip_hash);
         assert_eq!(recovered.blocks().len(), 2);
-        assert!(!crate::path::testnet_storage_backup_root().exists());
+        assert!(!crate::path::storage_recovery_root(Network::Testnet).exists());
     }
 
     #[test]
@@ -1615,7 +1834,7 @@ mod tests {
         assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
         assert!(!root.join("dev/chain/blocks.tsv").exists());
 
-        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+        let mut entries = fs::read_dir(crate::path::storage_recovery_root(Network::Testnet))
             .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
@@ -1637,7 +1856,7 @@ mod tests {
         assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
         assert!(root.join("dev/db/testnet/data.mdb").exists());
 
-        let mut entries = fs::read_dir(crate::path::testnet_storage_backup_root())
+        let mut entries = fs::read_dir(crate::path::storage_recovery_root(Network::Testnet))
             .expect("backup dir")
             .flatten()
             .collect::<Vec<_>>();
@@ -1664,7 +1883,7 @@ mod tests {
         assert_eq!(recovered.height, 0);
         assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
 
-        let mut backups = fs::read_dir(crate::path::testnet_storage_backup_root())
+        let mut backups = fs::read_dir(crate::path::storage_recovery_root(Network::Testnet))
             .expect("backup root")
             .flatten()
             .collect::<Vec<_>>();
@@ -1676,8 +1895,8 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_storage_metadata_mismatch_fails_closed_without_self_heal() {
-        let root = temp_workspace("mainnet-metadata-fail-closed");
+    fn mainnet_storage_metadata_mismatch_is_quarantined_and_rebuilt() {
+        let root = temp_workspace("mainnet-metadata-heal");
         fs::create_dir_all(&root).expect("root");
         let _guard = CurrentDirGuard::switch_to(&root);
 
@@ -1686,9 +1905,16 @@ mod tests {
             metadata.genesis_block_id = [0x24; 48];
         });
 
-        let err = Chainstate::try_load_or_recover(Network::Mainnet).unwrap_err();
-        assert!(matches!(err, StorageError::StorageMetadataMismatch { .. }));
-        assert!(!crate::path::testnet_storage_backup_root().exists());
+        let recovered = Chainstate::try_load_or_recover(Network::Mainnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Mainnet));
+
+        let backups = fs::read_dir(crate::path::storage_recovery_root(Network::Mainnet))
+            .expect("mainnet recovery root")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert!(crate::path::storage_recovery_notice_path(Network::Mainnet).exists());
         assert!(crate::path::database_dir(Network::Mainnet).exists());
     }
 
@@ -1865,7 +2091,7 @@ mod tests {
         assert_eq!(persisted.height, 1);
         assert_eq!(persisted.tip_hash, tip_hash);
         assert_eq!(
-            load_recent_blocks_from_storage(&db, tip_hash, 27)
+            load_recent_blocks_from_storage(&db, tip_hash, RECENT_BLOCK_RELOAD_LIMIT)
                 .unwrap()
                 .len(),
             2
@@ -1874,6 +2100,95 @@ mod tests {
         let reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
         assert_eq!(reloaded.height, 1);
         assert_eq!(reloaded.tip_hash, tip_hash);
+    }
+
+    #[test]
+    fn reloaded_chainstate_rolls_back_recent_tip_without_database_wipe() {
+        let root = temp_workspace("reload-undo");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+        let main_1 = build_coinbase_successor(&state);
+        state.connect_block(&main_1).expect("connect main one");
+        let main_2 = build_coinbase_successor(&state);
+        state.connect_block(&main_2).expect("connect main two");
+        drop(state);
+
+        let mut reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
+        assert_eq!(reloaded.height, 2);
+        assert_eq!(
+            reloaded.undo_stack.len(),
+            reloaded.blocks().len().saturating_sub(1)
+        );
+
+        reloaded.disconnect_last_block().expect("disconnect tip");
+        assert_eq!(reloaded.height, 1);
+        assert_eq!(reloaded.tip_hash, main_1.header.block_hash());
+    }
+
+    #[test]
+    fn reloaded_chainstate_reorgs_without_wiping_database() {
+        let root = temp_workspace("reload-reorg");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+        let main_1 = build_coinbase_successor_with_script(
+            &state,
+            vec![1],
+            genesis_timestamp.saturating_add(1),
+        );
+        state.connect_block(&main_1).expect("connect main one");
+        let main_2 = build_coinbase_successor_with_script(
+            &state,
+            vec![2],
+            genesis_timestamp.saturating_add(10_000),
+        );
+        state.connect_block(&main_2).expect("connect main two");
+        let old_tip = state.tip_hash;
+        drop(state);
+
+        let mut fork_state = Chainstate::new(Network::Mainnet);
+        fork_state
+            .connect_block(&main_1)
+            .expect("connect fork anchor");
+        let fork_2 = build_coinbase_successor_with_script(
+            &fork_state,
+            vec![22],
+            genesis_timestamp.saturating_add(10),
+        );
+        fork_state.connect_block(&fork_2).expect("connect fork two");
+        let fork_3 = build_coinbase_successor_with_script(
+            &fork_state,
+            vec![33],
+            genesis_timestamp.saturating_add(11),
+        );
+
+        assert!(atho_core::consensus::pow::branch_is_preferred(
+            &[fork_2.clone(), fork_3.clone()],
+            std::slice::from_ref(&main_2)
+        ));
+
+        let mut reloaded = Chainstate::try_load_or_new(Network::Mainnet).expect("reload");
+        let result = reloaded
+            .select_branch(&[fork_2.clone(), fork_3.clone()])
+            .expect("select fork after reload");
+
+        assert_eq!(result.outcome, ChainSelectionOutcome::Reorged);
+        assert_eq!(result.disconnected.len(), 1);
+        assert_eq!(result.disconnected[0].header.block_hash(), old_tip);
+        assert_eq!(reloaded.height, 3);
+        assert_eq!(reloaded.tip_hash, fork_3.header.block_hash());
+        drop(reloaded);
+
+        let reopened = Chainstate::try_load_or_new(Network::Mainnet).expect("reopen");
+        assert_eq!(reopened.height, 3);
+        assert_eq!(reopened.tip_hash, fork_3.header.block_hash());
     }
 
     #[test]

@@ -355,19 +355,19 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
             false,
         )],
     )
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     let tx = signed_spend_transaction(network, seed_txid, seed_value, seed_script)?;
     let tx_fee = minimum_required_fee_atoms(network, &tx);
 
     let txid = node
         .admit_transaction(MempoolEntry::new(tx, tx_fee))
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     let miner = Miner::new(4);
     let block = node
         .mine_and_connect_candidate_block(&miner)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     let mut relay = RelayLoop::new(network);
     relay.prime(node.blocks());
@@ -419,10 +419,7 @@ pub(crate) fn signed_spend_transaction(
             &digest,
         )
         .map_err(|err: atho_crypto::error::CryptoError| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("falcon-512 rs sign failed: {err:?}"),
-            )
+            std::io::Error::other(format!("falcon-512 rs sign failed: {err:?}"))
         })?;
         let txid = tx.txid();
         let sig_bytes = signature.0.clone();
@@ -452,10 +449,7 @@ pub(crate) fn signed_spend_transaction(
         let fee = minimum_required_fee_atoms(network, &tx);
         if fee == last_fee {
             if seed_value < fee {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "seed utxo too small for fee",
-                ));
+                return Err(std::io::Error::other("seed utxo too small for fee"));
             }
             tx.outputs[0].value_atoms = seed_value - fee;
             solve_transaction_pow(network, &mut tx, fee);
@@ -463,17 +457,11 @@ pub(crate) fn signed_spend_transaction(
         }
         last_fee = fee;
         if seed_value < fee {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "seed utxo too small for fee",
-            ));
+            return Err(std::io::Error::other("seed utxo too small for fee"));
         }
         output_atoms = seed_value - fee;
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        "failed to stabilize dev spend fee",
-    ))
+    Err(std::io::Error::other("failed to stabilize dev spend fee"))
 }
 
 fn signing_keypair(
@@ -485,12 +473,8 @@ fn signing_keypair(
     seed.extend_from_slice(network.id().as_bytes());
     seed.extend_from_slice(&seed_txid);
     seed.push(seed_script);
-    generate_from_seed(&seed).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("falcon-512 rs keygen failed: {err:?}"),
-        )
-    })
+    generate_from_seed(&seed)
+        .map_err(|err| std::io::Error::other(format!("falcon-512 rs keygen failed: {err:?}")))
 }
 
 pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {

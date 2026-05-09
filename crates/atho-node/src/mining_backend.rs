@@ -25,10 +25,11 @@ const MAX_GPU_BATCH_SIZE: u64 = 2_000_000;
 #[cfg(test)]
 const HASH_BYTES: usize = 48;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MiningBackendKind {
     Cpu,
     Gpu,
+    #[default]
     Auto,
 }
 
@@ -58,12 +59,6 @@ impl MiningBackendKind {
 
     pub fn variants() -> [Self; 3] {
         [Self::Auto, Self::Gpu, Self::Cpu]
-    }
-}
-
-impl Default for MiningBackendKind {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 

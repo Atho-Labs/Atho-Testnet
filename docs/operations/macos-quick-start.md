@@ -32,11 +32,10 @@ cd Atho-Alpha
 Main entry commands:
 
 ```bash
-python runmainnet.py
-python runtestnet.py
+python testnet.py
 ```
 
-The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.
+The launcher builds the release binaries automatically when needed and then exec into `atho-qt --local-node`.
 
 Built binaries still land in:
 
@@ -91,7 +90,7 @@ What to look for:
 Use the simplest desktop path first:
 
 ```bash
-python runmainnet.py
+python testnet.py
 ```
 
 If you want the client to connect to an already-running node instead:
@@ -103,7 +102,7 @@ If you want the client to connect to an already-running node instead:
 The managed local-node path uses the same DNS-seed-first bootstrap flow on mainnet:
 
 ```bash
-python runmainnet.py
+python testnet.py
 ```
 
 The settings page includes a local-only diagnostics section with peer counts, byte counters, and per-peer transport details.

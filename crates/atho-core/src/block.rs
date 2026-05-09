@@ -355,7 +355,7 @@ pub fn merkle_root(transactions: &[Transaction]) -> [u8; 48] {
 
     let mut layer: Vec<[u8; 48]> = transactions.iter().map(Transaction::txid).collect();
     while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
         for chunk in layer.chunks(2) {
             let mut bytes = [0u8; 96];
             bytes[..48].copy_from_slice(&chunk[0]);
@@ -378,7 +378,7 @@ pub fn witness_root(transactions: &[Transaction]) -> [u8; 48] {
         .map(Transaction::witness_commitment_hash)
         .collect();
     while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
         for chunk in layer.chunks(2) {
             let mut bytes = [0u8; 96];
             bytes[..48].copy_from_slice(&chunk[0]);
@@ -461,8 +461,8 @@ mod tests {
             network_id: crate::network::Network::Mainnet,
             height: 1,
             previous_block_hash: [2; 48],
-            merkle_root: merkle_root(&[tx.clone()]),
-            witness_root: witness_root(&[tx.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&tx)),
+            witness_root: witness_root(std::slice::from_ref(&tx)),
             timestamp: 75,
             difficulty_target_or_bits: [5; 48],
             nonce: 42,
@@ -495,8 +495,8 @@ mod tests {
             network_id: crate::network::Network::Mainnet,
             height: 7,
             previous_block_hash: [2; 48],
-            merkle_root: merkle_root(&[tx.clone()]),
-            witness_root: witness_root(&[tx.clone()]),
+            merkle_root: merkle_root(std::slice::from_ref(&tx)),
+            witness_root: witness_root(std::slice::from_ref(&tx)),
             timestamp: 75,
             difficulty_target_or_bits: [5; 48],
             nonce: 42,

@@ -428,10 +428,7 @@ fn prepare_transaction_validation(
             signer_group_by_input[input_index] = group_index;
         }
     }
-    if signer_group_by_input
-        .iter()
-        .any(|group_index| *group_index == usize::MAX)
-    {
+    if signer_group_by_input.contains(&usize::MAX) {
         return Err(ValidationError::WitnessInputReferenceMismatch);
     }
     Ok(PreparedTransactionValidation {
@@ -931,27 +928,43 @@ pub fn validate_block_with_context(
 ) -> Result<(), ValidationError> {
     validate_block_with_context_and_schedule(
         block,
-        height,
-        network,
-        expected_previous_hash,
-        expected_target,
-        previous_blocks,
-        utxos,
+        BlockValidationContext {
+            height,
+            network,
+            expected_previous_hash,
+            expected_target,
+            previous_blocks,
+            utxos,
+        },
         &rules::SCHEDULED_ACTIVATIONS,
     )
+}
+
+/// Context needed to validate a candidate block against one active chain tip.
+pub struct BlockValidationContext<'a> {
+    pub height: u64,
+    pub network: Network,
+    pub expected_previous_hash: [u8; 48],
+    pub expected_target: [u8; 48],
+    pub previous_blocks: &'a [Block],
+    pub utxos: UtxoSet,
 }
 
 /// Validates a block against chain context and an explicit activation schedule.
 pub fn validate_block_with_context_and_schedule(
     block: &Block,
-    height: u64,
-    network: Network,
-    expected_previous_hash: [u8; 48],
-    expected_target: [u8; 48],
-    previous_blocks: &[Block],
-    mut utxos: UtxoSet,
+    context: BlockValidationContext<'_>,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
+    let BlockValidationContext {
+        height,
+        network,
+        expected_previous_hash,
+        expected_target,
+        previous_blocks,
+        mut utxos,
+    } = context;
+
     validate_block_impl_with_schedule(block, height, network, false, schedule)?;
     // CONSENSUS: The parent hash check binds this block to one exact chain tip.
     if block.header.previous_block_hash != expected_previous_hash {

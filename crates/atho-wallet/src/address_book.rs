@@ -32,6 +32,10 @@ impl AddressBook {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn last(&self) -> Option<&AddressRecord> {
         self.entries.last()
     }

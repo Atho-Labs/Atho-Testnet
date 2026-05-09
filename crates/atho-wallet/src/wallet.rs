@@ -16,7 +16,10 @@ use atho_core::consensus::signatures::{
     transaction_signing_digest_for_input_indexes, AthoSignatureDomain,
 };
 use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
-use atho_core::constants::{DUST_RELAY_VALUE_ATOMS, MIN_TX_FEE_ATOMS};
+use atho_core::constants::{
+    DUST_RELAY_VALUE_ATOMS, FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES,
+    MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES, MIN_TX_FEE_ATOMS,
+};
 use atho_core::crypto::hash::{sha3_256, sha3_384};
 use atho_core::network::Network;
 use atho_core::transaction::{
@@ -102,6 +105,15 @@ pub enum WalletSpendBuildError {
     MissingChangeAddress,
     #[error("transaction fee calculation did not converge")]
     FeeLoopDidNotConverge,
+    #[error(
+        "transaction too large before signing: raw {raw_size_bytes}/{max_raw_size_bytes} bytes, virtual {vsize_bytes}/{max_vsize_bytes} vbytes"
+    )]
+    TransactionTooLarge {
+        raw_size_bytes: usize,
+        max_raw_size_bytes: usize,
+        vsize_bytes: usize,
+        max_vsize_bytes: usize,
+    },
     #[error("amount arithmetic overflowed")]
     AmountOverflow,
     #[error("wallet signing failed: {0}")]
@@ -118,6 +130,12 @@ pub struct Wallet {
     pub address_book: AddressBook,
     pub snapshot: WalletSnapshot,
     pub restore_gap_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WalletSignerInputGroup {
+    address: WalletAddress,
+    input_indexes: Vec<u32>,
 }
 
 impl Wallet {
@@ -348,8 +366,7 @@ impl Wallet {
                 request.include_fee_in_total,
                 min_output,
             )?;
-            progress(WalletSpendProgressStage::Signing);
-            let transaction = self.build_signed_spend_transaction_from_parts(
+            let transaction = self.build_placeholder_spend_transaction_from_parts(
                 &request.selected_utxos,
                 request.transaction_version,
                 request.recipient_digest,
@@ -361,6 +378,7 @@ impl Wallet {
                 },
                 request.lock_time,
             )?;
+            Self::ensure_standard_transaction_size(&transaction)?;
             let actual_fee = minimum_required_fee_atoms(self.network, &transaction);
             if actual_fee == fee_atoms {
                 progress(WalletSpendProgressStage::Signing);
@@ -384,6 +402,7 @@ impl Wallet {
                     },
                     request.lock_time,
                 )?;
+                Self::ensure_standard_transaction_size(&transaction)?;
                 let final_fee = total_input_atoms
                     .checked_sub(
                         transaction
@@ -411,13 +430,18 @@ impl Wallet {
         Err(WalletSpendBuildError::FeeLoopDidNotConverge)
     }
 
-    fn address_for_locking_script(&self, locking_script: &[u8]) -> Option<WalletAddress> {
-        if locking_script.len() != 32 {
-            return None;
+    fn ensure_standard_transaction_size(tx: &Transaction) -> Result<(), WalletSpendBuildError> {
+        let raw_size_bytes = tx.full_size_bytes();
+        let vsize_bytes = tx.vsize_bytes();
+        if raw_size_bytes > MAX_TRANSACTION_RAW_BYTES || vsize_bytes > MAX_TRANSACTION_VBYTES {
+            return Err(WalletSpendBuildError::TransactionTooLarge {
+                raw_size_bytes,
+                max_raw_size_bytes: MAX_TRANSACTION_RAW_BYTES,
+                vsize_bytes,
+                max_vsize_bytes: MAX_TRANSACTION_VBYTES,
+            });
         }
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(locking_script);
-        self.address_for_payment_digest(&digest)
+        Ok(())
     }
 
     pub fn address_for_payment_digest(&self, digest: &[u8; 32]) -> Option<WalletAddress> {
@@ -708,15 +732,14 @@ fn recipient_and_change_amounts(
 }
 
 impl Wallet {
-    fn build_signed_spend_transaction_from_parts(
-        &self,
+    fn build_spend_transaction_from_parts(
         selected_utxos: &[WalletSpendUtxo],
         version: u16,
         recipient_digest: [u8; 32],
         recipient_atoms: u64,
         change_output: Option<(u64, Vec<u8>)>,
         lock_time: u32,
-    ) -> Result<Transaction, WalletSpendBuildError> {
+    ) -> Transaction {
         let mut outputs = vec![TxOutput {
             value_atoms: recipient_atoms,
             locking_script: recipient_digest.to_vec(),
@@ -737,7 +760,7 @@ impl Wallet {
             })
             .collect::<Vec<_>>();
 
-        let mut tx = Transaction {
+        Transaction {
             version,
             inputs,
             outputs,
@@ -745,29 +768,122 @@ impl Wallet {
             witness: vec![],
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
-        };
-        let txid = tx.txid();
+        }
+    }
 
-        let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<(u32, &WalletSpendUtxo)>>::new();
+    fn signer_input_groups(
+        &self,
+        selected_utxos: &[WalletSpendUtxo],
+    ) -> Result<Vec<WalletSignerInputGroup>, WalletSpendBuildError> {
+        let known_addresses = self
+            .all_addresses()
+            .into_iter()
+            .map(|address| (address.payment_digest.to_vec(), address))
+            .collect::<BTreeMap<_, _>>();
+        let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<u32>>::new();
         for (input_index, utxo) in selected_utxos.iter().enumerate() {
             grouped_inputs
                 .entry(utxo.locking_script.clone())
                 .or_default()
-                .push((input_index as u32, utxo));
+                .push(input_index as u32);
         }
 
-        let mut signer_groups = Vec::with_capacity(grouped_inputs.len());
-        for (locking_script, group_utxos) in grouped_inputs {
-            let address = self
-                .address_for_locking_script(&locking_script)
+        let mut groups = Vec::with_capacity(grouped_inputs.len());
+        for (locking_script, input_indexes) in grouped_inputs {
+            let address = known_addresses
+                .get(&locking_script)
+                .cloned()
                 .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
-            let keypair = self.keypair_for_path(address.path);
-            let input_indexes = group_utxos
-                .iter()
-                .map(|(input_index, _)| *input_index)
-                .collect::<Vec<_>>();
-            let digest =
-                transaction_signing_digest_for_input_indexes(self.network, &tx, &input_indexes);
+            groups.push(WalletSignerInputGroup {
+                address,
+                input_indexes,
+            });
+        }
+        groups.sort_by_key(|group| group.input_indexes.first().copied().unwrap_or(u32::MAX));
+        Ok(groups)
+    }
+
+    fn placeholder_witness_for_groups(
+        groups: &[WalletSignerInputGroup],
+    ) -> Result<Vec<u8>, WalletSpendBuildError> {
+        let mut signer_groups = groups
+            .iter()
+            .map(|group| WitnessSignerGroup {
+                signature: vec![0; FALCON_512_SIGNATURE_BYTES],
+                pubkey: vec![0; FALCON_512_PUBLIC_KEY_BYTES],
+                input_refs: group
+                    .input_indexes
+                    .iter()
+                    .map(|input_index| WitnessInputRef {
+                        input_index: *input_index,
+                        sig_ref_short: [0; 2],
+                        witness_commit_ref: [0; 16],
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        if signer_groups.is_empty() {
+            return Err(WalletSpendBuildError::InputOwnershipMismatch);
+        }
+        let primary_group = signer_groups.remove(0);
+        Ok(TxWitness {
+            signature: primary_group.signature,
+            pubkey: primary_group.pubkey,
+            input_refs: primary_group.input_refs,
+            additional_signers: signer_groups,
+        }
+        .canonical_bytes())
+    }
+
+    fn build_placeholder_spend_transaction_from_parts(
+        &self,
+        selected_utxos: &[WalletSpendUtxo],
+        version: u16,
+        recipient_digest: [u8; 32],
+        recipient_atoms: u64,
+        change_output: Option<(u64, Vec<u8>)>,
+        lock_time: u32,
+    ) -> Result<Transaction, WalletSpendBuildError> {
+        let mut tx = Self::build_spend_transaction_from_parts(
+            selected_utxos,
+            version,
+            recipient_digest,
+            recipient_atoms,
+            change_output,
+            lock_time,
+        );
+        let signer_groups = self.signer_input_groups(selected_utxos)?;
+        tx.witness = Self::placeholder_witness_for_groups(&signer_groups)?;
+        Ok(tx)
+    }
+
+    fn build_signed_spend_transaction_from_parts(
+        &self,
+        selected_utxos: &[WalletSpendUtxo],
+        version: u16,
+        recipient_digest: [u8; 32],
+        recipient_atoms: u64,
+        change_output: Option<(u64, Vec<u8>)>,
+        lock_time: u32,
+    ) -> Result<Transaction, WalletSpendBuildError> {
+        let mut tx = Self::build_spend_transaction_from_parts(
+            selected_utxos,
+            version,
+            recipient_digest,
+            recipient_atoms,
+            change_output,
+            lock_time,
+        );
+        let txid = tx.txid();
+        let signer_input_groups = self.signer_input_groups(selected_utxos)?;
+        let mut signer_groups = Vec::with_capacity(signer_input_groups.len());
+        for group in signer_input_groups {
+            let keypair = self.keypair_for_path(group.address.path);
+            let digest = transaction_signing_digest_for_input_indexes(
+                self.network,
+                &tx,
+                &group.input_indexes,
+            );
             let signature = sign(
                 AthoSignatureDomain::Transaction,
                 &keypair.secret_key,
@@ -778,9 +894,10 @@ impl Wallet {
             signer_groups.push(WitnessSignerGroup {
                 signature: sig_bytes.clone(),
                 pubkey: keypair.public_key.0.clone(),
-                input_refs: group_utxos
+                input_refs: group
+                    .input_indexes
                     .iter()
-                    .map(|(input_index, _)| WitnessInputRef {
+                    .map(|input_index| WitnessInputRef {
                         input_index: *input_index,
                         sig_ref_short: derive_sig_ref_short(&txid, &sig_bytes, *input_index),
                         witness_commit_ref: [0; 16],
@@ -1063,5 +1180,44 @@ mod tests {
         let b =
             Wallet::from_mnemonic(phrase(), "secret", Network::Regnet).checkout_receive_address();
         assert_ne!(a.payment_digest, b.payment_digest);
+    }
+
+    #[test]
+    fn oversized_wallet_spend_is_rejected_before_signing_or_pow() {
+        let mut wallet = Wallet::from_seed(WalletSeed([0x44; 32]), Network::Regnet);
+        let spend_address = wallet.checkout_receive_address();
+        let change_address = wallet.checkout_change_address();
+        let input_count = 3_000usize;
+        let selected_utxos = (0..input_count)
+            .map(|index| WalletSpendUtxo {
+                previous_txid: [0x44; 48],
+                output_index: index as u32,
+                value_atoms: 1_000_000,
+                locking_script: spend_address.payment_digest.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let request = WalletSpendRequest {
+            selected_utxos,
+            recipient_digest: [0x55; 32],
+            amount_atoms: 2_900_000_000,
+            include_fee_in_total: false,
+            transaction_version: 1,
+            lock_time: 0,
+            change_address: Some(change_address),
+        };
+        let mut stages = Vec::new();
+
+        let result = wallet
+            .build_signed_payment_transaction_with_progress(request, |stage| stages.push(stage));
+
+        assert!(matches!(
+            result,
+            Err(WalletSpendBuildError::TransactionTooLarge {
+                raw_size_bytes,
+                max_raw_size_bytes: MAX_TRANSACTION_RAW_BYTES,
+                ..
+            }) if raw_size_bytes > MAX_TRANSACTION_RAW_BYTES
+        ));
+        assert_eq!(stages, vec![WalletSpendProgressStage::Preparing]);
     }
 }

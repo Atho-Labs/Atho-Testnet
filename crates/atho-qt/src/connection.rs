@@ -583,7 +583,7 @@ fn collect_rpc_status(
     let rpc_reachable = network_replied || block_count_reply.is_some() || mempool_reply.is_some();
 
     if managed_node.is_some() || (rpc_reachable && last_known.is_some()) {
-        return degrade_rpc_status(
+        return degrade_rpc_status(DegradedRpcStatusInput {
             network,
             rpc_address,
             block_count_reply,
@@ -592,7 +592,7 @@ fn collect_rpc_status(
             rpc_reachable,
             managed_local,
             last_known,
-        );
+        });
     }
 
     ConnectionStatus {
@@ -689,16 +689,28 @@ fn connection_status_from_node_status(
     }
 }
 
-fn degrade_rpc_status(
+struct DegradedRpcStatusInput<'a> {
     network: Network,
-    rpc_address: &str,
+    rpc_address: &'a str,
     block_count_reply: Option<u64>,
     mempool_reply: Option<(usize, u64)>,
     network_ok: bool,
     rpc_reachable: bool,
     managed_local: bool,
-    last_known: Option<&ConnectionStatus>,
-) -> ConnectionStatus {
+    last_known: Option<&'a ConnectionStatus>,
+}
+
+fn degrade_rpc_status(input: DegradedRpcStatusInput<'_>) -> ConnectionStatus {
+    let DegradedRpcStatusInput {
+        network,
+        rpc_address,
+        block_count_reply,
+        mempool_reply,
+        network_ok,
+        rpc_reachable,
+        managed_local,
+        last_known,
+    } = input;
     let mut status = last_known.cloned().unwrap_or(ConnectionStatus {
         network,
         rpc_address: rpc_address.to_string(),
@@ -1674,6 +1686,7 @@ mod tests {
                                 consecutive_failures: Some(0),
                             }],
                             connecting_peers: Vec::new(),
+                            ..NetworkDiagnostics::default()
                         },
                     }),
                     RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
@@ -1984,6 +1997,7 @@ mod tests {
                                 consecutive_failures: Some(0),
                             }],
                             connecting_peers: Vec::new(),
+                            ..NetworkDiagnostics::default()
                         },
                     }),
                     RpcRequest::GetNetwork => RpcResponse::Network(network.id().to_string()),
@@ -2160,15 +2174,15 @@ mod tests {
 
     #[test]
     fn managed_local_node_status_degrades_without_zeroing_last_known_sync_target() {
-        let degraded = degrade_rpc_status(
-            Network::Mainnet,
-            "127.0.0.1:9010",
-            Some(0),
-            Some((0, 0)),
-            true,
-            true,
-            true,
-            Some(&ConnectionStatus {
+        let degraded = degrade_rpc_status(DegradedRpcStatusInput {
+            network: Network::Mainnet,
+            rpc_address: "127.0.0.1:9010",
+            block_count_reply: Some(0),
+            mempool_reply: Some((0, 0)),
+            network_ok: true,
+            rpc_reachable: true,
+            managed_local: true,
+            last_known: Some(&ConnectionStatus {
                 network: Network::Mainnet,
                 rpc_address: String::from("127.0.0.1:9010"),
                 block_count: 42,
@@ -2192,7 +2206,7 @@ mod tests {
                 connected: true,
                 startup_error: None,
             }),
-        );
+        });
         assert!(degraded.connected);
         assert!(degraded.running);
         assert_eq!(degraded.block_count, 0);
@@ -2228,15 +2242,15 @@ mod tests {
             .expect("put snapshot");
         txn.commit().expect("commit fixture");
 
-        let degraded = degrade_rpc_status(
-            Network::Mainnet,
-            "127.0.0.1:9010",
-            None,
-            None,
-            false,
-            false,
-            true,
-            Some(&ConnectionStatus {
+        let degraded = degrade_rpc_status(DegradedRpcStatusInput {
+            network: Network::Mainnet,
+            rpc_address: "127.0.0.1:9010",
+            block_count_reply: None,
+            mempool_reply: None,
+            network_ok: false,
+            rpc_reachable: false,
+            managed_local: true,
+            last_known: Some(&ConnectionStatus {
                 network: Network::Mainnet,
                 rpc_address: String::from("127.0.0.1:9010"),
                 block_count: 42,
@@ -2260,7 +2274,7 @@ mod tests {
                 connected: true,
                 startup_error: None,
             }),
-        );
+        });
 
         assert_eq!(degraded.block_count, 7);
         assert_eq!(degraded.tip_hash, [9; 48]);

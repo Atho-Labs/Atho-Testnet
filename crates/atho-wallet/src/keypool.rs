@@ -90,14 +90,14 @@ impl Keypool {
             self.receive
                 .push_back(wallet.next_path(AddressKind::Receive));
             completed = completed.saturating_add(1);
-            if completed % PREFILL_PROGRESS_BATCH == 0 || completed == total {
+            if completed.is_multiple_of(PREFILL_PROGRESS_BATCH) || completed == total {
                 progress(completed, total);
             }
         }
         while self.change.len() < KEYPOOL_TARGET_SIZE {
             self.change.push_back(wallet.next_path(AddressKind::Change));
             completed = completed.saturating_add(1);
-            if completed % PREFILL_PROGRESS_BATCH == 0 || completed == total {
+            if completed.is_multiple_of(PREFILL_PROGRESS_BATCH) || completed == total {
                 progress(completed, total);
             }
         }

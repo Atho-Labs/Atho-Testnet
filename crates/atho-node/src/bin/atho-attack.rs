@@ -305,16 +305,16 @@ fn block_case(
     expected: Result<(), ValidationError>,
 ) -> Result<bool, String> {
     let mut node = seeded_node(network);
-    let should_mine = match &expected {
-        Ok(()) => true,
-        Err(ValidationError::CoinbaseRewardMismatch)
-        | Err(ValidationError::BlockParentHashMismatch)
-        | Err(ValidationError::NoInputs)
-        | Err(ValidationError::MempoolConflict)
-        | Err(ValidationError::MissingUtxo)
-        | Err(ValidationError::InvalidBlockTimestamp) => true,
-        _ => false,
-    };
+    let should_mine = matches!(
+        &expected,
+        Ok(())
+            | Err(ValidationError::CoinbaseRewardMismatch)
+            | Err(ValidationError::BlockParentHashMismatch)
+            | Err(ValidationError::NoInputs)
+            | Err(ValidationError::MempoolConflict)
+            | Err(ValidationError::MissingUtxo)
+            | Err(ValidationError::InvalidBlockTimestamp)
+    );
     let mined = if should_mine {
         miner.solve_block(block)
     } else {

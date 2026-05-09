@@ -26,11 +26,10 @@ cd Atho-Alpha
 Main entry commands:
 
 ```powershell
-py -3 .\runmainnet.py
-py -3 .\runtestnet.py
+py -3 .\testnet.py
 ```
 
-The launchers build the release binaries automatically when needed and then exec into `atho-qt --local-node`.
+The launcher builds the release binaries automatically when needed and then exec into `atho-qt --local-node`.
 
 Built binaries still land in:
 
@@ -83,7 +82,7 @@ Check status:
 Use the simplest desktop path first:
 
 ```powershell
-py -3 .\runmainnet.py
+py -3 .\testnet.py
 ```
 
 If you installed the packaged Windows release, launch `Atho.exe` from the Start Menu or Desktop shortcut instead of the raw `atho-qt.exe` binary.
@@ -97,7 +96,7 @@ If you want the client to connect to an already-running node instead:
 The managed local-node path uses the same DNS-seed-first bootstrap flow on mainnet:
 
 ```powershell
-py -3 .\runmainnet.py
+py -3 .\testnet.py
 ```
 
 Renderer note:

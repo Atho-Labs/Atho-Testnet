@@ -93,7 +93,6 @@ Consequences:
 Mainnet has strict production behavior:
 
 - no faucet
-- no automatic storage self-healing
 - no testnet difficulty stall reset
 - no genesis changes
 - strict replay protection
@@ -103,9 +102,10 @@ Testnet is for development and testing:
 - no faucet in the software
 - testnet ATHO is distributed manually by the Atho founders or development team
 - testnet may reset during development
-- testnet may self-heal local testnet storage after configured network or storage changes
 - testnet difficulty may reset to minimum after more than 10 minutes without a block
 - testnet coins have no mainnet value
+
+Recoverable local storage repair is shared core behavior across networks. It is still network-scoped: the node quarantines recoverable chainstate/index damage under the active network's data directory, rebuilds from that network's genesis/configuration, and never mixes peers, blocks, wallets, mempools, or UTXOs across networks.
 
 ## Protocol Versioning
 

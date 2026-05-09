@@ -131,15 +131,18 @@ Why:
 
 - fail-closed plus quarantine is safer than silent best-effort repair
 
-Mainnet safety rule:
+Production recovery rule:
 
-- mainnet must not automatically self-heal or reset production storage
+- all networks use the same recovery code path
+- recoverable local chainstate/index damage is quarantined under the active network's data root
+- rebuilt state always starts from the active network's genesis and configuration
+- unrecoverable corruption still fails closed with a clear error
 
 Testnet development rule:
 
-- testnet may self-heal local chain storage when configured testnet genesis, network magic, storage magic, chain ID, or schema version changes
+- testnet may reset during development
 
-This keeps disposable testnet data recoverable during development while keeping mainnet storage fail-closed.
+This keeps recovery network-aware without making mainnet, testnet, and regnet drift into separate storage behavior.
 
 ## Data Roots
 

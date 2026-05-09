@@ -107,11 +107,13 @@ impl ExplorerIndex {
                     &mut known_outputs,
                     network,
                     tx,
-                    Some(block.header.height),
-                    Some(block.header.block_hash()),
-                    Some(block.header.timestamp),
-                    if tx.is_coinbase() { Some(0) } else { None },
-                    "chain",
+                    TransactionIndexContext {
+                        height: Some(block.header.height),
+                        block_hash: Some(block.header.block_hash()),
+                        timestamp: Some(block.header.timestamp),
+                        fee_atoms: if tx.is_coinbase() { Some(0) } else { None },
+                        source: "chain",
+                    },
                 );
             }
         }
@@ -237,17 +239,29 @@ impl ExplorerIndex {
     }
 }
 
-fn index_transaction(
-    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
-    known_outputs: &mut BTreeMap<([u8; 48], u32), KnownOutput>,
-    network: Network,
-    tx: &Transaction,
+#[derive(Debug, Clone, Copy)]
+struct TransactionIndexContext {
     height: Option<u64>,
     block_hash: Option<[u8; 48]>,
     timestamp: Option<u64>,
     fee_atoms: Option<u64>,
     source: &'static str,
+}
+
+fn index_transaction(
+    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
+    known_outputs: &mut BTreeMap<([u8; 48], u32), KnownOutput>,
+    network: Network,
+    tx: &Transaction,
+    context: TransactionIndexContext,
 ) {
+    let TransactionIndexContext {
+        height,
+        block_hash,
+        timestamp,
+        fee_atoms,
+        source,
+    } = context;
     let txid = tx.txid();
     let mut per_address = BTreeMap::<String, AddressTxAccumulator>::new();
 

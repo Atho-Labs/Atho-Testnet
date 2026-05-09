@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn wipe_flags_parse_explicit_sandbox_guard() {
-        let args = vec![
+        let args = [
             String::from("wipe"),
             String::from("--network"),
             String::from("regnet"),

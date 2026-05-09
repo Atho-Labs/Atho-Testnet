@@ -1,5 +1,5 @@
 //! Wallet creation, import, and recovery dialogs.
-use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage};
+use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage, MnemonicWalletPreparationRequest};
 use atho_wallet::mnemonic::MnemonicPhrase;
 use eframe::egui;
 use rfd::FileDialog;
@@ -10,7 +10,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().min(700.0).max(320.0);
+        let card_width = ui.available_width().clamp(320.0, 700.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Create Wallet").size(22.0).strong());
@@ -163,15 +163,15 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         } else {
             String::new()
         };
-        app.start_wallet_from_mnemonic_preparation(
-            mnemonic_sentence,
-            app.create_form.mnemonic_passphrase.clone(),
-            app.create_form.wallet_path.clone(),
+        app.start_wallet_from_mnemonic_preparation(MnemonicWalletPreparationRequest {
+            mnemonic_text: mnemonic_sentence,
+            mnemonic_passphrase: app.create_form.mnemonic_passphrase.clone(),
+            wallet_path: app.create_form.wallet_path.clone(),
             wallet_password,
-            app.create_form.wallet_name.trim().to_owned(),
-            app.create_form.mnemonic_word_count,
-            "Preparing wallet",
-        );
+            wallet_name: app.create_form.wallet_name.trim().to_owned(),
+            wallet_word_count: app.create_form.mnemonic_word_count,
+            stage: "Preparing wallet",
+        });
         app.create_form.wallet_password.clear();
         app.create_form.wallet_password_confirm.clear();
     }
@@ -188,7 +188,7 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().min(700.0).max(320.0);
+        let card_width = ui.available_width().clamp(320.0, 700.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Import Wallet").size(22.0).strong());
@@ -313,15 +313,15 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         } else {
             String::new()
         };
-        app.start_wallet_from_mnemonic_preparation(
-            mnemonic.as_sentence(),
-            app.import_form.mnemonic_passphrase.clone(),
-            app.import_form.wallet_path.clone(),
+        app.start_wallet_from_mnemonic_preparation(MnemonicWalletPreparationRequest {
+            mnemonic_text: mnemonic.as_sentence(),
+            mnemonic_passphrase: app.import_form.mnemonic_passphrase.clone(),
+            wallet_path: app.import_form.wallet_path.clone(),
             wallet_password,
-            app.import_form.wallet_name.trim().to_owned(),
-            app.import_form.mnemonic_word_count,
-            "Preparing wallet",
-        );
+            wallet_name: app.import_form.wallet_name.trim().to_owned(),
+            wallet_word_count: app.import_form.mnemonic_word_count,
+            stage: "Preparing wallet",
+        });
         app.import_form.wallet_password.clear();
         app.import_form.wallet_password_confirm.clear();
     }
@@ -337,7 +337,7 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().min(580.0).max(320.0);
+        let card_width = ui.available_width().clamp(320.0, 580.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Open Wallet").size(22.0).strong());

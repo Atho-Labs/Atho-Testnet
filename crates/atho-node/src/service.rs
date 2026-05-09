@@ -25,7 +25,7 @@ use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use atho_p2p::address_manager::format_remote_addr;
-use atho_p2p::config::network_params;
+use atho_p2p::config::{default_bootstrap_peers, network_params};
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
 use atho_p2p::protocol::NetworkMessage;
 use atho_rpc::command::{
@@ -42,7 +42,7 @@ use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use atho_wallet::snapshot::WalletSnapshot;
 
 const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
-const EXPLORER_API_SNAPSHOT_VERSION: u32 = 1;
+const EXPLORER_API_SNAPSHOT_VERSION: u32 = 2;
 const EXPLORER_API_SNAPSHOT_FILENAME: &str = "explorer-api-snapshot.bin";
 const HASHRATE_WINDOW_BLOCKS: usize = 120;
 const BLOCKTIME_WINDOW_BLOCKS: usize = 120;
@@ -356,18 +356,24 @@ impl NodeService {
                 fee_atoms,
             } => {
                 let tx_summary = dev::summarize_transaction(&transaction, Some(fee_atoms));
-                let response = match self
-                    .orchestrator
-                    .runtime
-                    .node
-                    .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
-                {
-                    Ok(txid) => {
-                        self.refresh_runtime_views();
-                        RpcResponse::TransactionSubmitted(txid)
-                    }
-                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
-                };
+                let status = self.node_status();
+                let response =
+                    if let Some(reason) = Self::transaction_submission_sync_block_reason(&status) {
+                        RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(reason))
+                    } else {
+                        match self
+                            .orchestrator
+                            .runtime
+                            .node
+                            .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
+                        {
+                            Ok(txid) => {
+                                self.refresh_runtime_views();
+                                RpcResponse::TransactionSubmitted(txid)
+                            }
+                            Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                        }
+                    };
                 match &response {
                     RpcResponse::TransactionSubmitted(_) => {
                         let _ = dev::append_log(
@@ -678,7 +684,43 @@ impl NodeService {
     }
 
     fn chain_synced(status: &NodeStatus) -> bool {
-        status.running && status.headers_synced && status.block_count >= status.sync_best_height
+        status.running
+            && status.headers_synced
+            && status.block_count >= status.sync_best_height
+            && Self::has_required_ready_peer(status)
+    }
+
+    fn public_network_requires_ready_peer(network: Network) -> bool {
+        !matches!(network, Network::Regnet | Network::Prunetest)
+    }
+
+    fn has_required_ready_peer(status: &NodeStatus) -> bool {
+        !Self::public_network_requires_ready_peer(status.network)
+            || status.network_diagnostics.peer_count > 0
+    }
+
+    fn transaction_submission_sync_block_reason(status: &NodeStatus) -> Option<String> {
+        if Self::chain_synced(status) {
+            return None;
+        }
+
+        let state = if !status.running {
+            "node is not running"
+        } else if !status.headers_synced {
+            "headers are still synchronizing"
+        } else if !Self::has_required_ready_peer(status) {
+            "no ready network peers are connected"
+        } else {
+            "local chain tip is behind the advertised network target"
+        };
+        Some(format!(
+            "transaction submission is paused until the node is synced ({state}; local_height={} sync_target_height={} headers_synced={} running={} peer_count={})",
+            status.block_count,
+            status.sync_best_height,
+            status.headers_synced,
+            status.running,
+            status.network_diagnostics.peer_count
+        ))
     }
 
     fn render_status_value(status: &NodeStatus) -> Value {
@@ -695,6 +737,14 @@ impl NodeService {
             "tip_timestamp": status.tip_timestamp,
             "peer_count": status.network_diagnostics.peer_count,
             "connecting_peer_count": status.network_diagnostics.connecting_peer_count,
+            "known_peer_count": status.network_diagnostics.known_peer_count,
+            "healthy_peer_count": status.network_diagnostics.healthy_peer_count,
+            "stale_peer_count": status.network_diagnostics.stale_peer_count,
+            "banned_peer_count": status.network_diagnostics.banned_peer_count,
+            "peer_discovery_status": status.network_diagnostics.peer_discovery_status,
+            "last_getaddr_time_unix": status.network_diagnostics.last_getaddr_time_unix,
+            "last_addr_received_time_unix": status.network_diagnostics.last_addr_received_time_unix,
+            "peer_db_path": status.network_diagnostics.peer_db_path,
             "mempool_count": status.mempool_count,
             "mempool_total_fee_atoms": status.mempool_total_fee_atoms,
         })
@@ -708,12 +758,12 @@ impl NodeService {
         }
         if !status.headers_synced {
             warnings.push("headers are not fully synced");
+        } else if !Self::has_required_ready_peer(status) {
+            warnings.push("no peers are connected");
         } else if !chain_synced {
             warnings.push("local chain tip is behind the advertised network target");
         }
-        if status.network_diagnostics.peer_count == 0
-            && !matches!(status.network, Network::Regnet | Network::Prunetest)
-        {
+        if !Self::has_required_ready_peer(status) && !warnings.contains(&"no peers are connected") {
             warnings.push("no peers are connected");
         }
         warnings
@@ -769,6 +819,24 @@ impl NodeService {
             inbound_peer_count,
             outbound_peer_count,
             connecting_peer_count: connecting_peers.len(),
+            known_peer_count: self.orchestrator.sync.known_peer_count(),
+            healthy_peer_count: self.orchestrator.sync.fresh_peer_count().max(peer_count),
+            stale_peer_count: self.orchestrator.sync.stale_peer_count(),
+            banned_peer_count: self.orchestrator.sync.banned_peer_count(),
+            dns_seed_status: if network_params(self.network()).dns_seeds.is_empty() {
+                String::from("none")
+            } else {
+                String::from("configured")
+            },
+            bootstrap_status: if default_bootstrap_peers(self.network()).is_empty() {
+                String::from("none")
+            } else {
+                String::from("configured")
+            },
+            peer_discovery_status: self.peer_discovery_status(peer_count),
+            last_getaddr_time_unix: self.orchestrator.sync.last_getaddr_time_unix(),
+            last_addr_received_time_unix: self.orchestrator.sync.last_addr_received_unix(),
+            peer_db_path: database_dir(self.network()).display().to_string(),
             bytes_sent: self.network_runtime.bytes_sent,
             bytes_received: self.network_runtime.bytes_received,
             peers,
@@ -778,6 +846,23 @@ impl NodeService {
 
     pub fn wallet_snapshot(&self) -> &WalletSnapshot {
         &self.wallet_snapshot
+    }
+
+    fn peer_discovery_status(&self, ready_peer_count: usize) -> String {
+        if ready_peer_count > 0 {
+            return String::from("connected");
+        }
+        if self.orchestrator.sync.known_peer_count() > 0 {
+            return String::from("trying-known-peers");
+        }
+        let params = network_params(self.network());
+        if !params.dns_seeds.is_empty() {
+            return String::from("dns-seed-bootstrap");
+        }
+        if !default_bootstrap_peers(self.network()).is_empty() {
+            return String::from("static-bootstrap");
+        }
+        String::from("manual-or-local")
     }
 
     pub fn is_running(&self) -> bool {
@@ -806,6 +891,18 @@ impl NodeService {
 
     pub fn p2p_headers_synced(&self) -> bool {
         self.orchestrator.sync.sync_state().headers_synced
+    }
+
+    pub fn p2p_transaction_relay_ready(&self) -> bool {
+        Self::chain_synced(&self.node_status())
+    }
+
+    pub fn p2p_block_relay_ready(&self) -> bool {
+        Self::chain_synced(&self.node_status())
+    }
+
+    pub fn p2p_mempool_fingerprint(&self) -> [u8; 32] {
+        self.orchestrator.runtime.node.mempool_fingerprint()
     }
 
     pub fn p2p_mempool_txids(&self) -> Vec<[u8; 48]> {
@@ -1190,11 +1287,12 @@ impl NodeService {
             .incremental_total_transactions(&tip_record)
             .unwrap_or_else(|| full_transaction_count(node, tip_height).unwrap_or_default());
         let total_blocks = tip_height.saturating_add(1);
-        let hashrate_window_blocks = recent_records.len().min(HASHRATE_WINDOW_BLOCKS);
+        let available_block_intervals = recent_records.len().saturating_sub(1);
+        let hashrate_window_blocks = available_block_intervals.min(HASHRATE_WINDOW_BLOCKS);
         let estimated_hashrate_hps =
             estimated_hashrate_from_records(&recent_records, hashrate_window_blocks);
 
-        let blocktime_window_blocks = recent_records.len().min(BLOCKTIME_WINDOW_BLOCKS);
+        let blocktime_window_blocks = available_block_intervals.min(BLOCKTIME_WINDOW_BLOCKS);
         let average_block_time_millis =
             average_block_time_from_records(&recent_records, blocktime_window_blocks);
         let difficulty_ratio_scaled = pow::difficulty_ratio_scaled(
@@ -1233,15 +1331,19 @@ impl NodeService {
                 break;
             }
         }
-        let average_confirmed_fee_atoms = if average_fee_window_transactions == 0 {
-            0
-        } else {
-            average_fee_total_atoms / average_fee_window_transactions
-        };
+        let average_confirmed_fee_atoms = average_fee_total_atoms
+            .checked_div(average_fee_window_transactions)
+            .unwrap_or(0);
 
-        let genesis_timestamp = recent_records
-            .first()
+        let genesis_timestamp = node
+            .block_record_by_height(0)
             .map(|record| record.timestamp)
+            .or_else(|| {
+                node.blocks()
+                    .first()
+                    .filter(|block| block.header.height == 0)
+                    .map(|block| block.header.timestamp)
+            })
             .unwrap_or_else(|| genesis::genesis_state(network).block.header.timestamp);
 
         self.chain_stats = ChainStatsCache {
@@ -1789,11 +1891,7 @@ impl NodeService {
             ),
             "fees_atoms": block.fees_total_atoms,
             "total_output_atoms": total_output_atoms,
-            "avg_tx_size_bytes": if transaction_count == 0 {
-                0
-            } else {
-                block.size_bytes() / transaction_count
-            },
+            "avg_tx_size_bytes": block.size_bytes().checked_div(transaction_count).unwrap_or(0),
         }))
     }
 
@@ -2058,6 +2156,16 @@ impl NodeService {
             "inbound_peer_count": status.network_diagnostics.inbound_peer_count,
             "outbound_peer_count": status.network_diagnostics.outbound_peer_count,
             "connecting_peer_count": status.network_diagnostics.connecting_peer_count,
+            "known_peer_count": status.network_diagnostics.known_peer_count,
+            "healthy_peer_count": status.network_diagnostics.healthy_peer_count,
+            "stale_peer_count": status.network_diagnostics.stale_peer_count,
+            "banned_peer_count": status.network_diagnostics.banned_peer_count,
+            "dns_seed_status": status.network_diagnostics.dns_seed_status,
+            "bootstrap_status": status.network_diagnostics.bootstrap_status,
+            "peer_discovery_status": status.network_diagnostics.peer_discovery_status,
+            "last_getaddr_time_unix": status.network_diagnostics.last_getaddr_time_unix,
+            "last_addr_received_time_unix": status.network_diagnostics.last_addr_received_time_unix,
+            "peer_db_path": status.network_diagnostics.peer_db_path,
             "bytes_sent": status.network_diagnostics.bytes_sent,
             "bytes_received": status.network_diagnostics.bytes_received,
             "dns_seeds": params.dns_seeds,
@@ -3069,6 +3177,7 @@ impl Drop for NodeService {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::mempool::MempoolEntry;
@@ -3121,6 +3230,62 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn synthetic_block_record(height: u64, timestamp: u64) -> BlockArchiveRecord {
+        BlockArchiveRecord {
+            height,
+            block_hash: [height as u8; 48],
+            previous_block_hash: [height.saturating_sub(1) as u8; 48],
+            network: Network::Mainnet,
+            version: 1,
+            merkle_root: [0; 48],
+            witness_root: [0; 48],
+            timestamp,
+            difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+            nonce: height,
+            file_number: 0,
+            record_offset: 0,
+            payload_length: 0,
+            raw_block_size: 0,
+            weight_bytes: 0,
+            vsize_bytes: 0,
+            tx_count: 1,
+            fees_total_atoms: 0,
+            fees_miner_atoms: 0,
+            chainwork: Vec::new(),
+            fully_validated: true,
+            main_chain: true,
+            pruned: false,
+            persisted_unix: timestamp,
+        }
+    }
+
+    #[test]
+    fn chain_stats_hashrate_uses_completed_block_intervals() {
+        let records = vec![
+            synthetic_block_record(0, 1_000),
+            synthetic_block_record(1, 1_010),
+            synthetic_block_record(2, 1_020),
+        ];
+        let mined_blocks = records[1..]
+            .iter()
+            .map(|record| Block {
+                header: record.header(),
+                transactions: Vec::new(),
+                witnesses: Default::default(),
+                fees_total_atoms: 0,
+                fees_miner_atoms: 0,
+            })
+            .collect::<Vec<_>>();
+        let expected =
+            pow::accumulated_chain_work(&mined_blocks) / num_bigint::BigUint::from(20u64);
+
+        assert_eq!(
+            estimated_hashrate_from_records(&records, 2),
+            u64::try_from(expected).unwrap_or(u64::MAX)
+        );
+        assert_eq!(average_block_time_from_records(&records, 2), 10_000);
     }
 
     #[test]
@@ -3373,7 +3538,10 @@ mod tests {
             running: true,
             headers_synced: true,
             sync_best_height: 128,
-            network_diagnostics: NetworkDiagnostics::default(),
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                ..NetworkDiagnostics::default()
+            },
         };
 
         let rendered = NodeService::render_status_value(&status);
@@ -3381,6 +3549,67 @@ mod tests {
         assert_eq!(rendered["sync_target_height"], 128);
         assert_eq!(rendered["chain_synced"], false);
         assert_eq!(rendered["headers_synced"], true);
+    }
+
+    #[test]
+    fn transaction_submission_is_paused_until_chain_is_synced() {
+        let mut status = NodeStatus {
+            network: Network::Mainnet,
+            block_count: 7,
+            tip_hash: [0x21; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x55; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 9,
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                ..NetworkDiagnostics::default()
+            },
+        };
+
+        let reason = NodeService::transaction_submission_sync_block_reason(&status)
+            .expect("stale node should block tx submission");
+        assert!(reason.contains("local_height=7"));
+        assert!(reason.contains("sync_target_height=9"));
+
+        status.block_count = 9;
+        assert!(NodeService::transaction_submission_sync_block_reason(&status).is_none());
+
+        status.headers_synced = false;
+        let reason = NodeService::transaction_submission_sync_block_reason(&status)
+            .expect("header sync should block tx submission");
+        assert!(reason.contains("headers are still synchronizing"));
+    }
+
+    #[test]
+    fn transaction_submission_requires_ready_peer_on_public_networks() {
+        let status = NodeStatus {
+            network: Network::Testnet,
+            block_count: 9,
+            tip_hash: [0x25; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x57; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 9,
+            network_diagnostics: NetworkDiagnostics::default(),
+        };
+
+        let reason = NodeService::transaction_submission_sync_block_reason(&status)
+            .expect("public network without ready peers should block tx submission");
+        assert!(reason.contains("no ready network peers"));
+        assert!(reason.contains("peer_count=0"));
+
+        let mut regnet = status;
+        regnet.network = Network::Regnet;
+        assert!(NodeService::transaction_submission_sync_block_reason(&regnet).is_none());
     }
 
     #[test]
@@ -3397,16 +3626,16 @@ mod tests {
             running: true,
             headers_synced: true,
             sync_best_height: 128,
-            network_diagnostics: NetworkDiagnostics::default(),
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                ..NetworkDiagnostics::default()
+            },
         };
         assert!(!NodeService::chain_synced(&status));
         let warnings = NodeService::health_warnings(&status);
         assert_eq!(
             warnings,
-            vec![
-                "local chain tip is behind the advertised network target",
-                "no peers are connected",
-            ]
+            vec!["local chain tip is behind the advertised network target"]
         );
     }
 
@@ -3569,29 +3798,16 @@ fn full_transaction_count(node: &crate::node::Node, tip_height: u64) -> Option<u
 }
 
 fn estimated_hashrate_from_records(records: &[BlockArchiveRecord], window_blocks: usize) -> u64 {
-    if window_blocks < 2 || records.len() < 2 {
+    if window_blocks == 0 || records.len() < 2 {
         return 0;
     }
-    let start = records.len().saturating_sub(window_blocks);
-    let blocks = records[start..]
-        .iter()
-        .map(|record| Block {
-            header: record.header(),
-            transactions: Vec::new(),
-            witnesses: Default::default(),
-            fees_total_atoms: record.fees_total_atoms,
-            fees_miner_atoms: record.fees_miner_atoms,
-        })
-        .collect::<Vec<_>>();
-    pow::estimated_hashes_per_second(&blocks)
-}
-
-fn average_block_time_from_records(records: &[BlockArchiveRecord], window_blocks: usize) -> u64 {
-    if window_blocks < 2 || records.len() < 2 {
-        return 0;
-    }
-    let start = records.len().saturating_sub(window_blocks);
+    let start = records
+        .len()
+        .saturating_sub(window_blocks.saturating_add(1));
     let window = &records[start..];
+    if window.len() < 2 {
+        return 0;
+    }
     let elapsed = window
         .last()
         .map(|record| record.timestamp)
@@ -3602,7 +3818,46 @@ fn average_block_time_from_records(records: &[BlockArchiveRecord], window_blocks
                 .map(|record| record.timestamp)
                 .unwrap_or_default(),
         );
-    ((elapsed as u128 * 1_000) / (window.len().saturating_sub(1) as u128)) as u64
+    if elapsed == 0 {
+        return 0;
+    }
+    let blocks = window
+        .iter()
+        .skip(1)
+        .map(|record| Block {
+            header: record.header(),
+            transactions: Vec::new(),
+            witnesses: Default::default(),
+            fees_total_atoms: record.fees_total_atoms,
+            fees_miner_atoms: record.fees_miner_atoms,
+        })
+        .collect::<Vec<_>>();
+    let work_per_second = pow::accumulated_chain_work(&blocks) / num_bigint::BigUint::from(elapsed);
+    u64::try_from(work_per_second).unwrap_or(u64::MAX)
+}
+
+fn average_block_time_from_records(records: &[BlockArchiveRecord], window_blocks: usize) -> u64 {
+    if window_blocks == 0 || records.len() < 2 {
+        return 0;
+    }
+    let start = records
+        .len()
+        .saturating_sub(window_blocks.saturating_add(1));
+    let window = &records[start..];
+    if window.len() < 2 {
+        return 0;
+    }
+    let elapsed = window
+        .last()
+        .map(|record| record.timestamp)
+        .unwrap_or_default()
+        .saturating_sub(
+            window
+                .first()
+                .map(|record| record.timestamp)
+                .unwrap_or_default(),
+        );
+    ((elapsed as u128 * 1_000) / (window_blocks as u128)) as u64
 }
 
 fn unix_timestamp() -> u64 {

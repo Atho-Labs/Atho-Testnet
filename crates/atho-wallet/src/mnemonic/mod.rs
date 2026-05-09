@@ -141,7 +141,7 @@ fn normalize_mnemonic_token(token: &str) -> Option<String> {
 
     let stripped = word
         .trim_start_matches(|ch: char| ch.is_ascii_digit())
-        .trim_start_matches(|ch| matches!(ch, '.' | ')' | ':' | '-' | ' '));
+        .trim_start_matches(['.', ')', ':', '-', ' ']);
     if !stripped.is_empty() && stripped.len() < word.len() {
         word = stripped.to_owned();
     }

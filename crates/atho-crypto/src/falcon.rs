@@ -459,4 +459,49 @@ mod tests {
         assert_eq!(max_len, FALCON_512_SIGNATURE_BYTES);
         assert_eq!(avg_len, FALCON_512_SIGNATURE_BYTES);
     }
+
+    #[test]
+    fn concurrent_falcon_verification_is_deterministic() {
+        let keypair = generate_from_seed(b"atho-falcon-concurrent-verify").unwrap();
+        let message = b"atho concurrent falcon verification";
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            message,
+        )
+        .unwrap();
+        let wrong_message = b"atho concurrent falcon mutation";
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let public_key = keypair.public_key.clone();
+                let signature = signature.clone();
+                scope.spawn(move || {
+                    for _ in 0..128 {
+                        assert!(verify(
+                            AthoSignatureDomain::Transaction,
+                            &public_key,
+                            message,
+                            &signature,
+                        )
+                        .unwrap());
+                        assert!(!verify(
+                            AthoSignatureDomain::Transaction,
+                            &public_key,
+                            wrong_message,
+                            &signature,
+                        )
+                        .unwrap());
+                        assert!(!verify(
+                            AthoSignatureDomain::Block,
+                            &public_key,
+                            message,
+                            &signature,
+                        )
+                        .unwrap());
+                    }
+                });
+            }
+        });
+    }
 }

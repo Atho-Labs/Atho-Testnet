@@ -129,7 +129,7 @@ Users switch wallets from **File -> Open / Switch Wallet**. Each wallet keeps it
 
 Mainnet and testnet are strictly separated. Transactions, signatures, transaction PoW preimages, addresses, peers, storage, UTXOs, mempool state, and blocks are network-scoped.
 
-Mainnet has no faucet, no automatic storage self-healing, and no testnet difficulty stall reset. Testnet may reset during development, may self-heal local testnet storage after configured network/storage changes, and may reset difficulty to minimum after more than 10 minutes without a block. Testnet ATHO is distributed manually by the Atho founders or development team.
+Mainnet has no faucet and no testnet difficulty stall reset. Recoverable storage repair is shared across networks but remains network-scoped: damaged local chainstate/index data is quarantined under the active network and rebuilt from that network's configuration. Testnet may reset during development and may reset difficulty to minimum after more than 10 minutes without a block. Testnet ATHO is distributed manually by the Atho founders or development team.
 
 ### Explicit versioning and activation scaffolding
 

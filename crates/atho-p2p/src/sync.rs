@@ -238,8 +238,10 @@ mod tests {
 
     #[test]
     fn headers_must_continue_from_requested_locator() {
-        let mut state = SyncState::default();
-        state.requested_locator_hashes = vec![Hash48::from([1; 48])];
+        let mut state = SyncState {
+            requested_locator_hashes: vec![Hash48::from([1; 48])],
+            ..Default::default()
+        };
         let header = BlockHeader {
             version: 1,
             network_id: Network::Mainnet,

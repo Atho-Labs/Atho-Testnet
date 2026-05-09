@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Top-level Atho runtime launcher orchestration.
+"""Shared Atho startup launcher.
 
 This module is startup-only glue. It never proxies consensus, validation,
-networking, or mining hot paths. After it verifies the environment and builds
-the required release binaries when needed, it replaces itself with `atho-qt`
-running in managed-local-node mode.
+networking, wallet, API, explorer, or mining hot paths. The public entry
+scripts choose a network, then this module verifies/builds release binaries
+when needed and replaces itself with `atho-qt` in managed-local-node mode.
 """
 
 from __future__ import annotations
@@ -29,6 +29,32 @@ SOURCE_PATHS = (
 
 RUNTIME_DIRS = ("db", "logs", "wallet", "audit", "quarantine")
 BUILD_STAMP = ".atho-launch-build.stamp"
+ENTRY_SCRIPT_NAMES = {
+    "mainnet": "mainnet.py",
+    "testnet": "testnet.py",
+    "regnet": "regnet.py",
+}
+SUPPORTED_ENTRY_NETWORKS = frozenset(ENTRY_SCRIPT_NAMES)
+RESERVED_FORWARDED_FLAGS = {
+    "--network",
+    "-n",
+    "--local-node",
+    "--embedded-node",
+    "--data-dir",
+}
+NETWORK_TOKENS = {
+    "mainnet",
+    "atho-mainnet",
+    "testnet",
+    "atho-testnet",
+    "regnet",
+    "regtest",
+    "atho-regnet",
+    "prunetest",
+    "prune-test",
+    "prune_test",
+    "atho-prunetest",
+}
 
 
 class LauncherError(RuntimeError):
@@ -87,16 +113,29 @@ def default_runtime_root() -> Path:
     return Path.home() / ".local" / "share" / "Atho"
 
 
-def parse_launcher_args(network: str, argv: Sequence[str] | None = None) -> LauncherConfig:
+def normalize_entry_network(network: str) -> str:
+    network = network.strip().lower()
+    if network not in SUPPORTED_ENTRY_NETWORKS:
+        allowed = ", ".join(sorted(SUPPORTED_ENTRY_NETWORKS))
+        raise LauncherError(f"unsupported launcher network {network!r}; use one of {allowed}")
+    return network
+
+
+def parse_launcher_args(
+    network: str,
+    argv: Sequence[str] | None = None,
+    *,
+    prog: str | None = None,
+) -> LauncherConfig:
+    network = normalize_entry_network(network)
     repo_root = Path(__file__).resolve().parent
-    wrapper_name = {
-        "mainnet": "runmainnet.py",
-        "testnet": "runtestnet.py",
-        "regnet": "runregnet.py",
-    }.get(network, f"run{network}.py")
+    wrapper_name = prog or ENTRY_SCRIPT_NAMES[network]
     parser = argparse.ArgumentParser(
         prog=wrapper_name,
-        description=f"Build if needed and launch Atho {network} with the desktop client and managed local node.",
+        description=(
+            f"Build if needed and launch Atho {network} with the desktop client "
+            "and managed local node."
+        ),
     )
     parser.add_argument(
         "--data-dir",
@@ -128,6 +167,7 @@ def parse_launcher_args(network: str, argv: Sequence[str] | None = None) -> Laun
         help="Print the resolved build and launch commands without executing them.",
     )
     args, forwarded = parser.parse_known_args(argv)
+    validate_forwarded_args(network, wrapper_name, forwarded)
     runtime_root = Path(args.data_dir).expanduser() if args.data_dir else default_runtime_root()
     return LauncherConfig(
         network=network,
@@ -140,6 +180,20 @@ def parse_launcher_args(network: str, argv: Sequence[str] | None = None) -> Laun
         dry_run=args.dry_run,
         forwarded_args=tuple(forwarded),
     )
+
+
+def validate_forwarded_args(network: str, prog: str, forwarded: Sequence[str]) -> None:
+    for value in forwarded:
+        flag = value.split("=", 1)[0]
+        if flag in RESERVED_FORWARDED_FLAGS:
+            raise LauncherError(
+                f"{prog} owns the {network} network, data directory, and managed local-node "
+                f"mode; remove forwarded argument {value!r} or use the launcher's --data-dir option."
+            )
+        if value.lower() in NETWORK_TOKENS:
+            raise LauncherError(
+                f"{prog} always launches {network}; remove forwarded network argument {value!r}."
+            )
 
 
 def iter_source_files(repo_root: Path) -> Iterable[Path]:
@@ -409,21 +463,30 @@ def ensure_binaries(config: LauncherConfig) -> None:
         or not config.gpu_build_stamp.is_file()
     ):
         raise LauncherError(
-            "release build finished but required GPU-enabled binaries are still missing: "
+            "release build finished but required Atho binaries are still missing: "
             f"{config.qt_binary} {config.node_binary} {config.miner_binary}"
         )
 
 
-def run_launcher(network: str, argv: Sequence[str] | None = None) -> int:
-    config = parse_launcher_args(network, argv)
+def run_launcher(
+    network: str,
+    argv: Sequence[str] | None = None,
+    *,
+    prog: str | None = None,
+    compatibility_note: str | None = None,
+) -> int:
+    config = parse_launcher_args(network, argv, prog=prog)
     prepare_runtime_root(config.runtime_root)
     ensure_binaries(config)
     command = build_client_command(config)
     env = build_launch_env(config)
+    if compatibility_note:
+        print(f"[atho-launch] {compatibility_note}")
     print(f"[atho-launch] network={config.network}")
     print(f"[atho-launch] runtime_root={config.runtime_root}")
     print(f"[atho-launch] qt_binary={config.qt_binary}")
     print(f"[atho-launch] node_binary={config.node_binary}")
+    print(f"[atho-launch] env ATHO_NETWORK={env['ATHO_NETWORK']}")
     print(f"[atho-launch] launching: {' '.join(command)}")
     if config.dry_run:
         return 0
@@ -433,9 +496,20 @@ def run_launcher(network: str, argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def main(network: str, argv: Sequence[str] | None = None) -> int:
+def main(
+    network: str,
+    argv: Sequence[str] | None = None,
+    *,
+    prog: str | None = None,
+    compatibility_note: str | None = None,
+) -> int:
     try:
-        return run_launcher(network, argv)
+        return run_launcher(
+            network,
+            argv,
+            prog=prog,
+            compatibility_note=compatibility_note,
+        )
     except subprocess.CalledProcessError as exc:
         print(
             f"[atho-launch] build failed with exit code {exc.returncode}. "
@@ -449,4 +523,4 @@ def main(network: str, argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main("mainnet"))
+    raise SystemExit(main("mainnet", sys.argv[1:], prog="runtime_launcher.py"))

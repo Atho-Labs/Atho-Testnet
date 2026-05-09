@@ -607,7 +607,7 @@ fn spawn_peer_thread(
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.tip_hash()
             };
-            let mut last_announced_mempool = Vec::<[u8; 48]>::new();
+            let mut last_announced_mempool = None;
             let mut last_activity = SystemTime::now();
             let peer_network = {
                 let state = state.lock().expect("p2p runtime state poisoned");
@@ -808,6 +808,10 @@ fn poll_tip_announcements(
 ) -> Option<Vec<NetworkMessage>> {
     let state = state.lock().expect("p2p runtime state poisoned");
     let tip_hash = state.tip_hash();
+    if !state.p2p_block_relay_ready() {
+        *last_announced_tip = tip_hash;
+        return None;
+    }
     if tip_hash == *last_announced_tip {
         return None;
     }
@@ -818,16 +822,21 @@ fn poll_tip_announcements(
 
 fn poll_mempool_announcements(
     state: &Arc<Mutex<NodeService>>,
-    last_announced_txids: &mut Vec<[u8; 48]>,
+    last_announced_fingerprint: &mut Option<[u8; 32]>,
 ) -> Option<Vec<NetworkMessage>> {
-    let (network, txids) = {
+    let (network, txids, fingerprint) = {
         let state = state.lock().expect("p2p runtime state poisoned");
-        (state.network(), state.p2p_mempool_txids())
+        if !state.p2p_transaction_relay_ready() {
+            *last_announced_fingerprint = None;
+            return None;
+        }
+        let fingerprint = state.p2p_mempool_fingerprint();
+        if *last_announced_fingerprint == Some(fingerprint) {
+            return None;
+        }
+        (state.network(), state.p2p_mempool_txids(), fingerprint)
     };
-    if txids == *last_announced_txids {
-        return None;
-    }
-    *last_announced_txids = txids.clone();
+    *last_announced_fingerprint = Some(fingerprint);
     if txids.is_empty() {
         return None;
     }
@@ -1842,6 +1851,76 @@ mod tests {
         eprintln!(
             "tcp_transaction_relay_ms={}",
             relayed_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn mempool_announcements_wait_until_public_node_has_ready_peer() {
+        let service = Arc::new(Mutex::new(NodeService::new_ephemeral(NodeConfig::new(
+            Network::Testnet,
+        ))));
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Testnet);
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Testnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed transaction");
+        let txid = transaction.txid();
+        let fee_atoms = minimum_required_fee_atoms(Network::Testnet, &transaction);
+        {
+            let mut state = service.lock().expect("service lock");
+            state.start();
+            state.sandbox_with_node_mut(|node| {
+                node.dev_seed_chainstate(
+                    6,
+                    node.tip_hash(),
+                    [UtxoEntry::new(
+                        Network::Testnet,
+                        seed_txid,
+                        0,
+                        seed_value,
+                        vec![seed_script],
+                        0,
+                        false,
+                    )],
+                )
+                .expect("seed chainstate");
+                node.submit_transaction(crate::mempool::MempoolEntry::new(transaction, fee_atoms))
+                    .expect("submit tx");
+            });
+            assert!(state.p2p_mempool_txids().contains(&txid));
+            assert!(!state.p2p_transaction_relay_ready());
+        }
+
+        let mut last_announced_fingerprint = {
+            let state = service.lock().expect("service lock");
+            Some(state.p2p_mempool_fingerprint())
+        };
+        assert!(poll_mempool_announcements(&service, &mut last_announced_fingerprint).is_none());
+        assert!(
+            last_announced_fingerprint.is_none(),
+            "stale announcement cache must clear so txids rebroadcast after sync catches up"
+        );
+    }
+
+    #[test]
+    fn tip_announcements_wait_until_public_node_has_ready_peer() {
+        let service = Arc::new(Mutex::new(NodeService::new_ephemeral(NodeConfig::new(
+            Network::Testnet,
+        ))));
+        let tip_hash = {
+            let mut state = service.lock().expect("service lock");
+            state.start();
+            state.tip_hash()
+        };
+        let mut last_announced_tip = [0x99; 48];
+
+        assert!(poll_tip_announcements(&service, &mut last_announced_tip).is_none());
+        assert_eq!(
+            last_announced_tip, tip_hash,
+            "catch-up tips should be marked seen without relaying stale intermediate blocks"
         );
     }
 

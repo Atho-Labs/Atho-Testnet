@@ -36,6 +36,17 @@ impl BanList {
         self.entries.get(peer).map(|entry| entry.score).unwrap_or(0)
     }
 
+    pub fn banned_count(&self, now_unix: u64) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .banned_until_unix
+                    .is_some_and(|banned_until| banned_until > now_unix)
+            })
+            .count()
+    }
+
     pub fn record(&mut self, peer: impl Into<String>, points: u32) -> bool {
         let now = unix_timestamp();
         self.record_at(peer, points, now)

@@ -1213,7 +1213,7 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
             code: "invalid_input",
         });
     }
-    if path.as_bytes().iter().any(|byte| *byte == 0) {
+    if path.as_bytes().contains(&0) {
         return Err(ApiError {
             status: 400,
             code: "invalid_input",

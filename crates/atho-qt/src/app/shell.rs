@@ -10,7 +10,7 @@ pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
     render_toolbar(app, ctx);
     render_status_bar(app, ctx);
     render_sync_status_window(app, ctx);
-    render_testnet_refresh_notice_window(app, ctx);
+    render_storage_recovery_notice_window(app, ctx);
     render_about_window(app, ctx);
     pages::console::render_window(app, ctx);
 
@@ -213,9 +213,9 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             let status_text = if app.ui_state.connected && app.view_model.chain_synced() {
                 String::from("Synced")
-            } else if app.ui_state.connected && app.view_model.running {
-                String::from("Synchronizing with network...")
-            } else if app.connection.has_local_node() {
+            } else if (app.ui_state.connected && app.view_model.running)
+                || app.connection.has_local_node()
+            {
                 String::from("Synchronizing with network...")
             } else {
                 String::from("Disconnected")
@@ -338,17 +338,17 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
         });
 }
 
-fn render_testnet_refresh_notice_window(app: &mut DesktopApp, ctx: &egui::Context) {
-    if !app.show_testnet_refresh_notice_dialog {
+fn render_storage_recovery_notice_window(app: &mut DesktopApp, ctx: &egui::Context) {
+    if !app.show_storage_recovery_notice_dialog {
         return;
     }
-    let Some(notice) = app.testnet_refresh_notice.clone() else {
-        app.show_testnet_refresh_notice_dialog = false;
+    let Some(notice) = app.storage_recovery_notice.clone() else {
+        app.show_storage_recovery_notice_dialog = false;
         return;
     };
 
     let mut open = true;
-    egui::Window::new("Testnet Data Refreshed")
+    egui::Window::new("Storage Recovered")
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
@@ -357,12 +357,12 @@ fn render_testnet_refresh_notice_window(app: &mut DesktopApp, ctx: &egui::Contex
             ui.label(egui::RichText::new(&notice).color(widgets::TEXT).size(14.0));
             ui.add_space(12.0);
             if ui.button("OK").clicked() {
-                app.dismiss_testnet_refresh_notice();
+                app.dismiss_storage_recovery_notice();
             }
         });
 
     if !open {
-        app.dismiss_testnet_refresh_notice();
+        app.dismiss_storage_recovery_notice();
     }
 }
 

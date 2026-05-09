@@ -43,7 +43,7 @@ Typical causes:
 Try the managed local-node path first:
 
 ```bash
-python runmainnet.py
+python testnet.py
 ```
 
 Then inspect:
@@ -65,7 +65,7 @@ the Windows default has already been changed to use `wgpu` instead of the failin
 If you still need to override the renderer manually:
 
 ```powershell
-py -3 .\runmainnet.py --renderer wgpu
+py -3 .\testnet.py --renderer wgpu
 ```
 
 or for the raw binary:
@@ -85,13 +85,13 @@ Current likely cause:
 Fix:
 
 ```bash
-python runmainnet.py
+python testnet.py
 ```
 
 For the desktop client:
 
 ```bash
-python runmainnet.py
+python testnet.py
 ```
 
 What to check after that:
@@ -117,7 +117,7 @@ Why:
 Use an explicit root:
 
 ```bash
-python runmainnet.py --data-dir /absolute/path
+python testnet.py --data-dir /absolute/path
 ```
 
 or:

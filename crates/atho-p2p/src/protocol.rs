@@ -464,7 +464,7 @@ impl NetworkMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactBlockReconstruction {
-    Complete(Block),
+    Complete(Box<Block>),
     Missing {
         block_hash: [u8; 48],
         indexes: Vec<u32>,
@@ -558,13 +558,13 @@ where
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or(ProtocolError::InvalidCompactBlock)?;
-    Ok(CompactBlockReconstruction::Complete(Block {
+    Ok(CompactBlockReconstruction::Complete(Box::new(Block {
         header: message.header.clone(),
         transactions,
         witnesses: Default::default(),
         fees_total_atoms: message.fees_total_atoms,
         fees_miner_atoms: message.fees_miner_atoms,
-    }))
+    })))
 }
 
 pub fn validate_version_message(
@@ -753,6 +753,33 @@ mod tests {
     }
 
     #[test]
+    fn malformed_and_oversized_peer_discovery_payloads_are_rejected() {
+        let limit = network_params(Network::Mainnet).limits.max_addr_per_message;
+        let addresses = (0..=limit)
+            .map(|index| PeerAddress {
+                host: format!("203.0.113.{}", index % 255),
+                port: 56000,
+                services: 0,
+                last_seen_unix: 1_700_000_000,
+            })
+            .collect::<Vec<_>>();
+        let payload = serialize(&addresses).expect("serialize oversized addr payload");
+
+        assert_eq!(
+            NetworkMessage::decode(Network::Mainnet, MessageCommand::Addr, &payload),
+            Err(ProtocolError::TooManyPeerAddresses)
+        );
+        assert_eq!(
+            NetworkMessage::decode(Network::Mainnet, MessageCommand::GetAddr, &[1]),
+            Err(ProtocolError::UnexpectedPayload)
+        );
+        assert_eq!(
+            NetworkMessage::decode(Network::Mainnet, MessageCommand::Ping, &[]),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
     fn compact_block_round_trips_through_prefill_and_short_ids() {
         let coinbase = Transaction {
             version: 1,
@@ -802,7 +829,10 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("reconstruct");
-        assert_eq!(reconstructed, CompactBlockReconstruction::Complete(block));
+        assert_eq!(
+            reconstructed,
+            CompactBlockReconstruction::Complete(Box::new(block))
+        );
     }
 
     #[test]

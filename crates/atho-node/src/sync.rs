@@ -24,6 +24,10 @@ use thiserror::Error;
 
 const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER: usize = 256;
+const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
+const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
+const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum NodeSyncError {
@@ -50,17 +54,26 @@ pub struct NodeSync {
     mempool_snapshot_peers: BTreeSet<String>,
     branch_buffers: BTreeMap<String, BufferedBranch>,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
+    addr_rate_windows: BTreeMap<String, AddrRateWindow>,
+    last_addr_received_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 struct PendingCompactBlock {
     message: CompactBlockMessage,
     overrides: BTreeMap<u32, atho_core::transaction::Transaction>,
+    received_at: SystemTime,
 }
 
 #[derive(Debug, Clone, Default)]
 struct BufferedBranch {
     blocks: BTreeMap<[u8; 48], Block>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AddrRateWindow {
+    window_start_unix: u64,
+    messages: u32,
 }
 
 impl NodeSync {
@@ -73,6 +86,8 @@ impl NodeSync {
             mempool_snapshot_peers: BTreeSet::new(),
             branch_buffers: BTreeMap::new(),
             pending_compact_blocks: BTreeMap::new(),
+            addr_rate_windows: BTreeMap::new(),
+            last_addr_received_unix: None,
         }
     }
 
@@ -86,6 +101,30 @@ impl NodeSync {
 
     pub fn connections(&self) -> &ConnectionManager {
         &self.connections
+    }
+
+    pub fn last_addr_received_unix(&self) -> Option<u64> {
+        self.last_addr_received_unix
+    }
+
+    pub fn last_getaddr_time_unix(&self) -> Option<u64> {
+        self.connections.last_getaddr_time_unix()
+    }
+
+    pub fn known_peer_count(&self) -> usize {
+        self.connections.known_peer_count()
+    }
+
+    pub fn fresh_peer_count(&self) -> usize {
+        self.connections.fresh_peer_count()
+    }
+
+    pub fn stale_peer_count(&self) -> usize {
+        self.connections.stale_peer_count()
+    }
+
+    pub fn banned_peer_count(&self) -> usize {
+        self.connections.banned_count()
     }
 
     pub fn has_peer(&self, remote_addr: &str) -> bool {
@@ -145,7 +184,24 @@ impl NodeSync {
             }
             Err(error) => return Err(error.into()),
         };
-        self.expand_events(events, node)
+        match self.expand_events(events, node) {
+            Ok(result) => Ok(result),
+            Err(NodeSyncError::Protocol(error)) => {
+                let banned = self.connections.record_misbehavior(
+                    remote_addr.to_string(),
+                    POST_HANDSHAKE_PROTOCOL_ERROR_SCORE,
+                );
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "post-handshake protocol error peer={} banned={} error={}",
+                        remote_addr, banned, error
+                    ),
+                );
+                Err(NodeSyncError::Protocol(error))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn relay_block_message(&self, block: &Block) -> NetworkMessage {
@@ -186,6 +242,7 @@ impl NodeSync {
         node: &Node,
     ) -> Result<Vec<ConnectionEvent>, NodeSyncError> {
         let mut outbound = Vec::new();
+        self.prune_pending_compact_blocks();
         self.refresh_sync_target_from_live_peers(node);
         let requeued = self
             .downloader
@@ -474,6 +531,18 @@ impl NodeSync {
                 }
             }
             MessagePayload::MemPool => {
+                if !self.chain_synced(node) {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "ignoring mempool snapshot request during catch-up peer={} local_height={} target_height={}",
+                            peer,
+                            node.height(),
+                            self.sync_state().best_height
+                        ),
+                    );
+                    return Ok(());
+                }
                 let inventory = node
                     .mempool_transactions()
                     .into_iter()
@@ -510,9 +579,29 @@ impl NodeSync {
                 return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
             }
             MessagePayload::Addr { addresses } => {
+                if !self.allow_addr_message(peer) {
+                    let banned = self
+                        .connections
+                        .record_misbehavior(peer.to_string(), ADDR_SPAM_MISBEHAVIOR_SCORE);
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "addr relay rate-limited peer={} banned={} count={}",
+                            peer,
+                            banned,
+                            addresses.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                self.last_addr_received_unix = Some(now_unix());
                 let accepted = self
                     .connections
-                    .note_gossip_addresses(&addresses, !matches!(self.network, Network::Regnet))
+                    .note_gossip_addresses_from_source(
+                        peer,
+                        &addresses,
+                        !matches!(self.network, Network::Regnet),
+                    )
                     .map_err(NodeSyncError::from)?;
                 let observed_height = self
                     .connections
@@ -520,12 +609,39 @@ impl NodeSync {
                     .unwrap_or_else(|| node.height());
                 let observed_unix = now_unix();
                 node.observe_peer(peer.to_string(), observed_height, observed_unix)?;
+                let accepted_count = accepted.len();
                 for address in accepted {
                     node.observe_peer_address(&address, observed_height, observed_unix)?;
+                }
+                if accepted_count > 0 {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "addr accepted peer={} count={} known_peers={}",
+                            peer,
+                            accepted_count,
+                            self.known_peer_count()
+                        ),
+                    );
                 }
             }
         }
         Ok(())
+    }
+
+    fn allow_addr_message(&mut self, peer: &str) -> bool {
+        let now = now_unix();
+        let limits = network_params(self.network).limits;
+        let window = self.addr_rate_windows.entry(peer.to_string()).or_default();
+        if now.saturating_sub(window.window_start_unix) >= limits.addr_rate_limit_window_secs {
+            window.window_start_unix = now;
+            window.messages = 0;
+        }
+        if window.messages >= limits.max_addr_messages_per_window {
+            return false;
+        }
+        window.messages = window.messages.saturating_add(1);
+        true
     }
 
     fn note_observed_peer_tip(&mut self, peer: &str, header: &BlockHeader, node: &Node) {
@@ -948,6 +1064,7 @@ impl NodeSync {
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<(), NodeSyncError> {
+        self.prune_pending_compact_blocks();
         let block_hash = message.header.block_hash();
         let mempool_by_short_id = node
             .mempool_transactions()
@@ -960,7 +1077,7 @@ impl NodeSync {
             &BTreeMap::new(),
         )? {
             CompactBlockReconstruction::Complete(block) => {
-                let block = finalize_compact_block_witness_refs(block);
+                let block = finalize_compact_block_witness_refs(*block);
                 self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
@@ -970,8 +1087,10 @@ impl NodeSync {
                     PendingCompactBlock {
                         message,
                         overrides: BTreeMap::new(),
+                        received_at: SystemTime::now(),
                     },
                 );
+                self.prune_pending_compact_blocks();
                 outbound.push(ConnectionEvent::Send {
                     peer: peer.to_string(),
                     message: NetworkMessage::new(
@@ -1043,6 +1162,7 @@ impl NodeSync {
         if response.indexes.len() != response.transactions.len() {
             return Err(NodeSyncError::Protocol(ProtocolError::InvalidCompactBlock));
         }
+        self.prune_pending_compact_blocks();
         let block_hash = response.block_hash.into_inner();
         let Some(pending) = self.pending_compact_blocks.get_mut(&block_hash) else {
             return Err(NodeSyncError::Protocol(ProtocolError::UnexpectedPayload));
@@ -1062,7 +1182,7 @@ impl NodeSync {
         )? {
             CompactBlockReconstruction::Complete(block) => {
                 self.pending_compact_blocks.remove(&block_hash);
-                let block = finalize_compact_block_witness_refs(block);
+                let block = finalize_compact_block_witness_refs(*block);
                 self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
@@ -1079,6 +1199,25 @@ impl NodeSync {
             }
         }
         Ok(())
+    }
+
+    fn prune_pending_compact_blocks(&mut self) {
+        let now = SystemTime::now();
+        self.pending_compact_blocks.retain(|_, pending| {
+            now.duration_since(pending.received_at).unwrap_or_default()
+                < PENDING_COMPACT_BLOCK_TIMEOUT
+        });
+        while self.pending_compact_blocks.len() > MAX_PENDING_COMPACT_BLOCKS {
+            let Some(oldest) = self
+                .pending_compact_blocks
+                .iter()
+                .min_by_key(|(_, pending)| pending.received_at)
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+            self.pending_compact_blocks.remove(&oldest);
+        }
     }
 
     fn missing_inventory_requests(
@@ -1152,6 +1291,7 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) {
         let mut not_found = Vec::new();
+        let chain_synced = self.chain_synced(node);
         for vector in inventory
             .iter()
             .take(network_params(self.network).limits.max_requests_per_peer)
@@ -1180,6 +1320,10 @@ impl NodeSync {
                     }
                 }
                 InventoryKind::Transaction => {
+                    if !chain_synced {
+                        not_found.push(vector.clone());
+                        continue;
+                    }
                     if let Some(transaction) = node.mempool_transaction(&vector.hash.into_inner()) {
                         outbound.push(ConnectionEvent::Send {
                             peer: peer.to_string(),
@@ -1710,6 +1854,56 @@ mod tests {
     }
 
     #[test]
+    fn repeated_post_handshake_protocol_errors_ban_peer() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let jumped = coinbase_block(
+            Network::Regnet,
+            5,
+            left.node.tip_hash(),
+            target,
+            1_700_000_005,
+        )
+        .header;
+
+        for _ in 0..2 {
+            let err = left
+                .sync
+                .receive(
+                    &right.id,
+                    NetworkMessage::new(
+                        Network::Regnet,
+                        MessagePayload::Headers {
+                            headers: vec![jumped.clone()],
+                        },
+                    ),
+                    &mut left.node,
+                )
+                .expect_err("invalid headers should score peer");
+            assert!(matches!(
+                err,
+                NodeSyncError::Protocol(ProtocolError::InvalidHeadersSequence)
+            ));
+        }
+
+        let err = left
+            .sync
+            .receive(
+                &right.id,
+                NetworkMessage::new(Network::Regnet, MessagePayload::Ping { nonce: 1 }),
+                &mut left.node,
+            )
+            .expect_err("repeat offender should be banned");
+        assert!(matches!(
+            err,
+            NodeSyncError::Connection(atho_p2p::connection::ConnectionError::BannedPeer)
+        ));
+    }
+
+    #[test]
     fn buffered_out_of_order_block_frees_download_slot() {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
@@ -1877,6 +2071,65 @@ mod tests {
         assert!(addresses
             .iter()
             .any(|address| address.host == "9.9.9.9" && address.port == 9200));
+    }
+
+    #[test]
+    fn addr_messages_are_rate_limited_per_peer() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+        let limit = network_params(Network::Regnet)
+            .limits
+            .max_addr_messages_per_window;
+
+        for index in 0..limit {
+            let (events, notices) = left
+                .sync
+                .receive(
+                    &right.id,
+                    NetworkMessage::new(
+                        Network::Regnet,
+                        MessagePayload::Addr {
+                            addresses: vec![PeerAddress {
+                                host: format!("127.0.0.{}", index + 2),
+                                port: 18445,
+                                services: 0,
+                                last_seen_unix: 1_700_000_000 + u64::from(index),
+                            }],
+                        },
+                    ),
+                    &mut left.node,
+                )
+                .expect("addr gossip");
+            assert!(events.is_empty());
+            assert!(notices.is_empty());
+        }
+
+        let (events, notices) = left
+            .sync
+            .receive(
+                &right.id,
+                NetworkMessage::new(
+                    Network::Regnet,
+                    MessagePayload::Addr {
+                        addresses: vec![PeerAddress {
+                            host: String::from("127.0.0.250"),
+                            port: 18445,
+                            services: 0,
+                            last_seen_unix: 1_700_000_999,
+                        }],
+                    },
+                ),
+                &mut left.node,
+            )
+            .expect("rate-limited addr gossip");
+
+        assert!(events.is_empty());
+        assert!(notices.is_empty());
+        assert!(
+            left.sync.connections().ban_score(&right.id) >= ADDR_SPAM_MISBEHAVIOR_SCORE,
+            "addr spam should penalize the peer"
+        );
     }
 
     #[test]
@@ -2253,6 +2506,149 @@ mod tests {
     }
 
     #[test]
+    fn mempool_snapshot_requests_are_ignored_while_chain_sync_is_incomplete() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+        left.node
+            .dev_seed_chainstate(
+                6,
+                left.node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    vec![seed_script],
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed utxo");
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed transaction");
+        let txid = transaction.txid();
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &transaction);
+        left.node
+            .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
+            .expect("submit tx");
+        left.sync.prime(&left.node);
+
+        let future_header = coinbase_block(
+            Network::Regnet,
+            left.node.height() + 2,
+            left.node.tip_hash(),
+            pow::initial_target_for_network(Network::Regnet),
+            1_700_001_000,
+        )
+        .header;
+        left.sync
+            .note_observed_peer_tip(&right.id, &future_header, &left.node);
+        assert!(!left.sync.chain_synced(&left.node));
+        assert!(left.node.mempool_contains(&txid));
+
+        let (events, notices) = left
+            .sync
+            .receive(
+                &right.id,
+                NetworkMessage::new(Network::Regnet, MessagePayload::MemPool),
+                &mut left.node,
+            )
+            .expect("mempool request while behind should be ignored");
+
+        assert!(events.is_empty());
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn getdata_transaction_requests_return_notfound_while_chain_sync_is_incomplete() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(
+                6,
+                peer.node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    vec![seed_script],
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed utxo");
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed transaction");
+        let txid = transaction.txid();
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &transaction);
+        peer.node
+            .submit_transaction(MempoolEntry::new(transaction, fee_atoms))
+            .expect("submit tx");
+
+        let future_header = coinbase_block(
+            Network::Regnet,
+            peer.node.height() + 2,
+            peer.node.tip_hash(),
+            pow::initial_target_for_network(Network::Regnet),
+            1_700_000_999,
+        )
+        .header;
+        peer.sync
+            .note_observed_peer_tip("remote", &future_header, &peer.node);
+        assert!(!peer.sync.chain_synced(&peer.node));
+
+        let mut outbound = Vec::new();
+        peer.sync.serve_getdata(
+            "remote",
+            &[InventoryVector {
+                kind: InventoryKind::Transaction,
+                hash: Hash48::from(txid),
+            }],
+            &peer.node,
+            &mut outbound,
+        );
+
+        assert!(outbound.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message:
+                    NetworkMessage {
+                        payload: MessagePayload::NotFound { inventory },
+                        ..
+                    },
+                ..
+            } if inventory == &[InventoryVector {
+                kind: InventoryKind::Transaction,
+                hash: Hash48::from(txid),
+            }]
+        )));
+        assert!(!outbound.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message: NetworkMessage {
+                    payload: MessagePayload::Tx(_),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn sandbox_transaction_inventory_relays_to_mempool() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
@@ -2378,7 +2774,7 @@ mod tests {
 
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), blocks[2].header.block_hash());
-        assert!(peer.sync.branch_buffers.get("remote").is_none());
+        assert!(!peer.sync.branch_buffers.contains_key("remote"));
     }
 
     #[test]
@@ -2565,6 +2961,61 @@ mod tests {
     }
 
     #[test]
+    fn pending_compact_blocks_are_bounded_and_stale_entries_are_pruned() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let now = SystemTime::now();
+
+        for index in 0..(MAX_PENDING_COMPACT_BLOCKS + 8) {
+            let height = index as u64 + 1;
+            let mut block = coinbase_block(
+                Network::Regnet,
+                height,
+                [index as u8; 48],
+                target,
+                1_700_100_000 + height,
+            );
+            block.transactions.push(Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    previous_txid: [height as u8; 48],
+                    output_index: 0,
+                    unlocking_script: vec![1],
+                }],
+                outputs: vec![TxOutput {
+                    value_atoms: 1_000,
+                    locking_script: vec![2],
+                }],
+                lock_time: height as u32,
+                witness: Vec::new(),
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            });
+            block.header.merkle_root = merkle_root(&block.transactions);
+            block.header.witness_root = witness_root(&block.transactions);
+
+            let mut outbound = Vec::new();
+            left.sync
+                .handle_compact_block(
+                    &right.id,
+                    compact_block_from_block(&block),
+                    &mut left.node,
+                    &mut outbound,
+                )
+                .expect("buffer missing compact block");
+        }
+
+        assert!(left.sync.pending_compact_blocks.len() <= MAX_PENDING_COMPACT_BLOCKS);
+        for pending in left.sync.pending_compact_blocks.values_mut() {
+            pending.received_at = now - PENDING_COMPACT_BLOCK_TIMEOUT - Duration::from_secs(1);
+        }
+        left.sync.prune_pending_compact_blocks();
+        assert!(left.sync.pending_compact_blocks.is_empty());
+    }
+
+    #[test]
     fn sandbox_longer_branch_reorgs_to_the_preferred_tip() {
         let mut canonical = SandboxPeer::new("canonical", Network::Regnet);
         let mut fork = SandboxPeer::new("fork", Network::Regnet);
@@ -2649,7 +3100,7 @@ mod tests {
         assert!(err.to_string().contains("block network mismatch"));
         assert_eq!(peer.node.height(), 0);
         assert_eq!(peer.sync.sync_state().best_height, 0);
-        assert!(peer.sync.branch_buffers.get("remote").is_none());
+        assert!(!peer.sync.branch_buffers.contains_key("remote"));
         assert!(outbound.is_empty());
     }
 
@@ -2684,7 +3135,7 @@ mod tests {
                 .block_hash()
         );
         assert_eq!(peer.sync.sync_state().best_height, 4);
-        assert!(peer.sync.branch_buffers.get("remote").is_none());
+        assert!(!peer.sync.branch_buffers.contains_key("remote"));
     }
 
     #[test]
@@ -2781,7 +3232,7 @@ mod tests {
         assert!(outbound.is_empty());
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
-        assert!(peer.sync.branch_buffers.get("peer").is_none());
+        assert!(!peer.sync.branch_buffers.contains_key("peer"));
     }
 
     #[test]
@@ -2828,7 +3279,7 @@ mod tests {
 
         assert_eq!(left.node.height(), 3);
         assert_eq!(left.node.tip_hash(), blocks[2].header.block_hash());
-        assert!(left.sync.branch_buffers.get(&right.id).is_none());
+        assert!(!left.sync.branch_buffers.contains_key(&right.id));
     }
 
     #[test]
@@ -2873,7 +3324,7 @@ mod tests {
         assert!(outbound.is_empty());
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
-        assert!(peer.sync.branch_buffers.get("peer-a").is_none());
-        assert!(peer.sync.branch_buffers.get("peer-b").is_none());
+        assert!(!peer.sync.branch_buffers.contains_key("peer-a"));
+        assert!(!peer.sync.branch_buffers.contains_key("peer-b"));
     }
 }

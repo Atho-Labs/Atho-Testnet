@@ -44,12 +44,12 @@ pub fn quarantine_dir() -> PathBuf {
     sandbox_root().join("quarantine")
 }
 
-pub fn testnet_storage_backup_root() -> PathBuf {
-    sandbox_root().join("testnet_storage_backups")
+pub fn storage_recovery_root(network: Network) -> PathBuf {
+    quarantine_dir().join(data_dir(network)).join("storage")
 }
 
-pub fn testnet_refresh_notice_path() -> PathBuf {
-    sandbox_root().join("testnet-refresh-notice.txt")
+pub fn storage_recovery_notice_path(network: Network) -> PathBuf {
+    sandbox_root().join(format!("{}-storage-recovery-notice.txt", data_dir(network)))
 }
 
 pub fn wallet_root() -> PathBuf {
@@ -59,7 +59,7 @@ pub fn wallet_root() -> PathBuf {
 
     #[cfg(test)]
     {
-        return sandbox_root().join("wallet");
+        sandbox_root().join("wallet")
     }
 
     #[cfg(not(test))]
@@ -73,9 +73,9 @@ pub fn wallet_root() -> PathBuf {
 fn default_operator_root() -> PathBuf {
     #[cfg(test)]
     {
-        return std::env::current_dir()
+        std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join("dev");
+            .join("dev")
     }
 
     #[cfg(not(test))]

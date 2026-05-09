@@ -22,7 +22,7 @@ pub mod transaction;
 mod tests {
     use super::constants::*;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     #[test]
     fn carries_forward_protocol_basics() {
@@ -96,7 +96,7 @@ mod tests {
         }
     }
 
-    fn assert_no_forbidden_amount_math(path: &PathBuf, contents: &str, forbidden: &[&str]) {
+    fn assert_no_forbidden_amount_math(path: &Path, contents: &str, forbidden: &[&str]) {
         for (index, line) in contents.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {

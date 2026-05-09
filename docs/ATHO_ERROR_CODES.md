@@ -424,11 +424,11 @@ This registry is generated from `crates/atho-errors` and is the canonical source
 
 ## ATHO-MEM-002
 - Category: `MEM`
-- Title: Output Below Minimum Rejected
+- Title: Dust Output Rejected
 - Severity: `error`
 - User Facing: `true`
 - Consensus Critical: `false`
-- Explanation: The transaction creates an output below Atho's 1,000-atom minimum output rule.
+- Explanation: The transaction creates an output below Atho's relay dust floor.
 - Common Cause: A wallet or sender attempted to create an output smaller than the 1,000-atom relay minimum.
 - Suggested Fix: Raise every spendable output to at least 1,000 atoms or combine the value into fees.
 

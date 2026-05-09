@@ -100,6 +100,7 @@ pub struct ConnectionManager {
     address_manager: AddressManager,
     banlist: BanList,
     sessions: BTreeMap<String, PeerSession>,
+    getaddr_last_response_unix: BTreeMap<String, u64>,
 }
 
 impl ConnectionManager {
@@ -109,6 +110,7 @@ impl ConnectionManager {
             address_manager: AddressManager::new(network),
             banlist: BanList::new(network),
             sessions: BTreeMap::new(),
+            getaddr_last_response_unix: BTreeMap::new(),
         }
     }
 
@@ -123,6 +125,17 @@ impl ConnectionManager {
     ) -> Result<Vec<PeerAddress>, ConnectionError> {
         self.address_manager
             .note_gossip_addresses(addresses, public_source)
+            .map_err(ConnectionError::Protocol)
+    }
+
+    pub fn note_gossip_addresses_from_source(
+        &mut self,
+        source_peer: &str,
+        addresses: &[PeerAddress],
+        public_source: bool,
+    ) -> Result<Vec<PeerAddress>, ConnectionError> {
+        self.address_manager
+            .note_gossip_addresses_from_source(Some(source_peer), addresses, public_source)
             .map_err(ConnectionError::Protocol)
     }
 
@@ -179,7 +192,7 @@ impl ConnectionManager {
             .map(|action| match action {
                 HandshakeAction::Send(message) => ConnectionEvent::Send {
                     peer: remote_addr.clone(),
-                    message,
+                    message: *message,
                 },
                 HandshakeAction::Ready { best_height } => ConnectionEvent::Ready {
                     peer: remote_addr.clone(),
@@ -215,7 +228,7 @@ impl ConnectionManager {
                         .map(|action| match action {
                             HandshakeAction::Send(message) => ConnectionEvent::Send {
                                 peer: remote_addr.to_string(),
-                                message,
+                                message: *message,
                             },
                             HandshakeAction::Ready { best_height } => ConnectionEvent::Ready {
                                 peer: remote_addr.to_string(),
@@ -244,27 +257,46 @@ impl ConnectionManager {
                 peer: remote_addr.to_string(),
                 message: NetworkMessage::new(self.network, MessagePayload::Pong { nonce: *nonce }),
             }]),
-            MessagePayload::GetAddr => Ok(vec![ConnectionEvent::Send {
-                peer: remote_addr.to_string(),
-                message: NetworkMessage::new(
-                    self.network,
-                    MessagePayload::Addr {
-                        addresses: {
-                            let limits = network_params(self.network).limits;
-                            let share_limit = limits
-                                .max_outbound_peers
-                                .saturating_mul(8)
-                                .max(8)
-                                .min(limits.max_addr_per_message);
-                            self.address_manager
-                                .advertisable_addresses(share_limit)
-                                .into_iter()
-                                .filter(|address| format_remote_addr(address) != remote_addr)
-                                .collect()
+            MessagePayload::GetAddr => {
+                let now = now_unix();
+                let cooldown = network_params(self.network)
+                    .limits
+                    .getaddr_response_cooldown_secs;
+                if self
+                    .getaddr_last_response_unix
+                    .get(remote_addr)
+                    .is_some_and(|last| now.saturating_sub(*last) < cooldown)
+                {
+                    return Ok(Vec::new());
+                }
+                self.getaddr_last_response_unix
+                    .insert(remote_addr.to_string(), now);
+                Ok(vec![ConnectionEvent::Send {
+                    peer: remote_addr.to_string(),
+                    message: NetworkMessage::new(
+                        self.network,
+                        MessagePayload::Addr {
+                            addresses: {
+                                let limits = network_params(self.network).limits;
+                                let share_limit = limits
+                                    .max_outbound_peers
+                                    .saturating_mul(8)
+                                    .max(8)
+                                    .min(limits.max_addr_per_message);
+                                self.address_manager
+                                    .relay_addresses(share_limit)
+                                    .into_iter()
+                                    .filter(|address| {
+                                        let remote = format_remote_addr(address);
+                                        remote != remote_addr
+                                            && !self.banlist.is_banned(&remote, now)
+                                    })
+                                    .collect()
+                            },
                         },
-                    },
-                ),
-            }]),
+                    ),
+                }])
+            }
             _ => Ok(vec![ConnectionEvent::Message {
                 peer: remote_addr.to_string(),
                 message,
@@ -301,6 +333,34 @@ impl ConnectionManager {
 
     pub fn has_peer(&self, remote_addr: &str) -> bool {
         self.sessions.contains_key(remote_addr)
+    }
+
+    pub fn record_misbehavior(&mut self, remote_addr: impl Into<String>, points: u32) -> bool {
+        self.banlist.record(remote_addr, points)
+    }
+
+    pub fn ban_score(&self, remote_addr: &str) -> u32 {
+        self.banlist.score(remote_addr)
+    }
+
+    pub fn banned_count(&self) -> usize {
+        self.banlist.banned_count(now_unix())
+    }
+
+    pub fn known_peer_count(&self) -> usize {
+        self.address_manager.peer_count()
+    }
+
+    pub fn fresh_peer_count(&self) -> usize {
+        self.address_manager.fresh_peer_count()
+    }
+
+    pub fn stale_peer_count(&self) -> usize {
+        self.address_manager.stale_peer_count()
+    }
+
+    pub fn last_getaddr_time_unix(&self) -> Option<u64> {
+        self.getaddr_last_response_unix.values().copied().max()
     }
 
     pub fn disconnect(&mut self, remote_addr: &str) -> bool {
@@ -453,5 +513,125 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn getaddr_responses_are_rate_limited_per_peer() {
+        let mut manager = ConnectionManager::new(Network::Mainnet);
+        manager.accept_inbound("left").expect("inbound");
+        manager
+            .address_manager
+            .note_gossip_addresses(
+                &[crate::protocol::PeerAddress {
+                    host: String::from("8.8.8.8"),
+                    port: 56000,
+                    services: 0,
+                    last_seen_unix: 0,
+                }],
+                false,
+            )
+            .expect("note");
+        let _ = manager
+            .receive(
+                "left",
+                version_message(Network::Mainnet, 1),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("version");
+        let _ = manager
+            .receive(
+                "left",
+                NetworkMessage::new(Network::Mainnet, MessagePayload::Verack),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("verack");
+
+        let first = manager
+            .receive(
+                "left",
+                NetworkMessage::new(Network::Mainnet, MessagePayload::GetAddr),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("first getaddr");
+        assert_eq!(first.len(), 1);
+
+        let second = manager
+            .receive(
+                "left",
+                NetworkMessage::new(Network::Mainnet, MessagePayload::GetAddr),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("second getaddr");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn getaddr_does_not_share_banned_peers() {
+        let mut manager = ConnectionManager::new(Network::Mainnet);
+        manager.accept_inbound("left").expect("inbound");
+        manager
+            .address_manager
+            .note_gossip_addresses(
+                &[crate::protocol::PeerAddress {
+                    host: String::from("8.8.8.8"),
+                    port: 56000,
+                    services: 0,
+                    last_seen_unix: 0,
+                }],
+                false,
+            )
+            .expect("note");
+        assert!(manager.record_misbehavior("8.8.8.8:56000", 100));
+        let _ = manager
+            .receive(
+                "left",
+                version_message(Network::Mainnet, 1),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("version");
+        let _ = manager
+            .receive(
+                "left",
+                NetworkMessage::new(Network::Mainnet, MessagePayload::Verack),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("verack");
+
+        let actions = manager
+            .receive(
+                "left",
+                NetworkMessage::new(Network::Mainnet, MessagePayload::GetAddr),
+                &version_message(Network::Mainnet, 1),
+            )
+            .expect("getaddr");
+        let addresses = actions
+            .into_iter()
+            .find_map(|event| match event {
+                ConnectionEvent::Send {
+                    message:
+                        NetworkMessage {
+                            payload: MessagePayload::Addr { addresses },
+                            ..
+                        },
+                    ..
+                } => Some(addresses),
+                _ => None,
+            })
+            .expect("addr response");
+        assert!(addresses.is_empty());
+    }
+
+    #[test]
+    fn repeated_post_handshake_misbehavior_bans_peer() {
+        let mut manager = ConnectionManager::new(Network::Mainnet);
+
+        assert!(!manager.record_misbehavior("left", 50));
+        assert_eq!(manager.ban_score("left"), 50);
+        assert!(manager.record_misbehavior("left", 50));
+
+        assert_eq!(
+            manager.accept_inbound("left"),
+            Err(ConnectionError::BannedPeer)
+        );
     }
 }

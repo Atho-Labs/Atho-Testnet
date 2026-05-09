@@ -431,7 +431,7 @@ impl SendProgressStage {
             Self::Preparing => "Preparing transaction…",
             Self::Signing => "Signing transaction…",
             Self::FinalizingProof => "Finalizing anti-spam proof…",
-            Self::Broadcasting => "Broadcasting transaction…",
+            Self::Broadcasting => "Submitting transaction to node…",
         }
     }
 }

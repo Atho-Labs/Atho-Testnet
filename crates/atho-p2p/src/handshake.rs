@@ -18,7 +18,7 @@ pub enum HandshakeDirection {
 /// Action requested by the handshake state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeAction {
-    Send(NetworkMessage),
+    Send(Box<NetworkMessage>),
     Ready { best_height: u64 },
 }
 
@@ -66,7 +66,7 @@ impl HandshakeState {
                 remote_verack_seen: false,
                 ready: false,
             },
-            vec![HandshakeAction::Send(local_version)],
+            vec![HandshakeAction::Send(Box::new(local_version))],
         ))
     }
 
@@ -112,14 +112,14 @@ impl HandshakeState {
                 crate::protocol::validate_version_message(version, self.network)?;
                 self.remote_version = Some(version.clone());
                 if !self.local_version_sent {
-                    actions.push(HandshakeAction::Send(local_version.clone()));
+                    actions.push(HandshakeAction::Send(Box::new(local_version.clone())));
                     self.local_version_sent = true;
                 }
                 if !self.local_verack_sent {
-                    actions.push(HandshakeAction::Send(NetworkMessage::new(
+                    actions.push(HandshakeAction::Send(Box::new(NetworkMessage::new(
                         self.network,
                         MessagePayload::Verack,
-                    )));
+                    ))));
                     self.local_verack_sent = true;
                 }
             }
@@ -215,7 +215,7 @@ mod tests {
     impl IntoSendMessage for HandshakeAction {
         fn into_send(self) -> NetworkMessage {
             match self {
-                HandshakeAction::Send(message) => message,
+                HandshakeAction::Send(message) => *message,
                 HandshakeAction::Ready { .. } => panic!("expected send action"),
             }
         }

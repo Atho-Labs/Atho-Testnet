@@ -2,10 +2,10 @@ use atho_core::address::{
     address_parts_from_public_key, decode_base56_address, internal_hpk_bytes,
 };
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
-use atho_core::consensus::pow;
 use atho_core::consensus::signatures::transaction_signing_digest;
 use atho_core::consensus::subsidy;
 use atho_core::consensus::tx_policy::solve_transaction_pow;
+use atho_core::consensus::{pow, rules};
 use atho_core::constants::{
     COINBASE_MATURITY_BLOCKS, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
     STANDARD_TX_CONFIRMATIONS,
@@ -23,11 +23,18 @@ use atho_node::validation::{
     validate_block_without_pow, validate_transaction, validate_transaction_with_context,
     ValidationError,
 };
+use atho_p2p::config::{network_params as p2p_network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
+use atho_p2p::protocol::{
+    validate_version_message, CompactBlockMessage, GetHeadersMessage, Hash48 as P2pHash48,
+    MessageCommand, MessagePayload, NetworkMessage, PeerAddress as P2pPeerAddress, ProtocolError,
+    VersionMessage as P2pVersionMessage, LOCAL_NODE_SERVICES,
+};
 use atho_storage::chainstate::Chainstate as StorageChainstate;
 use atho_storage::db::{ChainstateSnapshot, Database};
 use atho_storage::error::StorageError;
 use atho_storage::path::ATHO_DATA_DIR_ENV;
 use atho_storage::utxo::{UtxoEntry, UtxoSet};
+use bincode::Options;
 use std::ffi::OsString;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -74,6 +81,7 @@ fn run() -> Result<(), String> {
         genesis_attack(light_cases, seed ^ 0x0b)?,
         persistence_attack(light_cases, seed ^ 0x0c)?,
         determinism_attack(heavy_cases, seed ^ 0x0d)?,
+        network_protocol_attack(light_cases, seed ^ 0x0e)?,
     ];
 
     for report in &reports {
@@ -596,7 +604,7 @@ fn serialization_attack(cases: usize, seed: u64) -> Result<CategoryReport, Strin
     let base_block = valid_block(Network::Mainnet, 1, vec![coinbase.clone(), base_tx.clone()]);
     for i in 0..cases {
         report.cases += 1;
-        let kind = hash_seed(seed, i as u64) as usize % 10;
+        let kind = hash_seed(seed, i as u64) as usize % 14;
         let outcome = catch_unwind(AssertUnwindSafe(|| match kind {
             0 => {
                 let encoded = serde_json::to_string(&base_tx).unwrap();
@@ -655,6 +663,29 @@ fn serialization_attack(cases: usize, seed: u64) -> Result<CategoryReport, Strin
                 let bytes = serde_json::to_vec(&base_tx).unwrap();
                 let decoded: Transaction = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(decoded.full_bytes(), base_tx.full_bytes());
+            }
+            10 => {
+                let encoded = base_tx.full_bytes();
+                let decoded = Transaction::from_full_bytes(&encoded).unwrap();
+                assert_eq!(decoded.full_bytes(), encoded);
+                assert_eq!(decoded.txid(), base_tx.txid());
+                assert_eq!(decoded.wtxid(), base_tx.wtxid());
+            }
+            11 => {
+                let mut encoded = base_tx.full_bytes();
+                encoded.push(0);
+                assert!(Transaction::from_full_bytes(&encoded).is_none());
+            }
+            12 => {
+                let encoded = base_block.canonical_bytes();
+                let decoded = Block::from_canonical_bytes(&encoded).unwrap();
+                assert_eq!(decoded.canonical_bytes(), encoded);
+                assert_eq!(decoded.header.block_hash(), base_block.header.block_hash());
+            }
+            13 => {
+                let mut encoded = base_block.canonical_bytes();
+                encoded.truncate(encoded.len().saturating_sub(1));
+                assert!(Block::from_canonical_bytes(&encoded).is_none());
             }
             _ => unreachable!(),
         }));
@@ -1533,7 +1564,7 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                     Ok(())
                 }
             }));
-            if let Err(_) = outcome {
+            if outcome.is_err() {
                 report.fail_panic(format!("case={i} kind={kind} panic in persistence attack"));
             }
         }
@@ -1612,7 +1643,7 @@ fn determinism_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                     address_parts_from_public_key(Network::Mainnet, &[1u8; 32]).base56_address;
                 let (digest, network) = decode_base56_address(&address).unwrap();
                 assert_eq!(network, Network::Mainnet);
-                assert_eq!(address.len() > 10, true);
+                assert!(address.len() > 10);
                 assert_eq!(digest.len(), 32);
             }
             _ => {
@@ -1629,6 +1660,154 @@ fn determinism_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
             Err(_) => {
                 report.fail_panic(format!("case={i} kind={kind} panic in determinism attack"))
             }
+        }
+    }
+    Ok(report)
+}
+
+fn network_protocol_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
+    let mut report = CategoryReport::new("network_protocol_chaos");
+    for i in 0..cases {
+        report.cases += 1;
+        let kind = hash_seed(seed, i as u64) as usize % 8;
+        let outcome = catch_unwind(AssertUnwindSafe(|| match kind {
+            0 => {
+                assert_eq!(
+                    NetworkMessage::decode(Network::Mainnet, MessageCommand::GetAddr, &[1]),
+                    Err(ProtocolError::UnexpectedPayload)
+                );
+            }
+            1 => {
+                let addresses = (0..=p2p_network_params(Network::Mainnet)
+                    .limits
+                    .max_addr_per_message)
+                    .map(|index| P2pPeerAddress {
+                        host: format!("203.0.113.{}", index % 255),
+                        port: 56000,
+                        services: 0,
+                        last_seen_unix: 1_700_000_000,
+                    })
+                    .collect::<Vec<_>>();
+                let payload = bincode::DefaultOptions::new()
+                    .serialize(&addresses)
+                    .expect("serialize addr mutation");
+                assert_eq!(
+                    NetworkMessage::decode(Network::Mainnet, MessageCommand::Addr, &payload),
+                    Err(ProtocolError::TooManyPeerAddresses)
+                );
+            }
+            2 => {
+                let message = NetworkMessage::new(
+                    Network::Mainnet,
+                    MessagePayload::GetHeaders(GetHeadersMessage {
+                        locator_hashes: vec![P2pHash48::ZERO; 33],
+                        stop_hash: P2pHash48::ZERO,
+                    }),
+                );
+                assert_eq!(
+                    message.encode_payload(),
+                    Err(ProtocolError::TooManyLocatorHashes)
+                );
+            }
+            3 => {
+                let block = valid_block(
+                    Network::Mainnet,
+                    1,
+                    vec![valid_coinbase(Network::Mainnet, 1, 0)],
+                );
+                let message = NetworkMessage::new(
+                    Network::Mainnet,
+                    MessagePayload::CompactBlock(CompactBlockMessage {
+                        header: block.header,
+                        tx_count: 0,
+                        short_ids: Vec::new(),
+                        prefilled_transactions: Vec::new(),
+                        fees_total_atoms: 0,
+                        fees_miner_atoms: 0,
+                    }),
+                );
+                assert_eq!(
+                    message.encode_payload(),
+                    Err(ProtocolError::InvalidCompactBlock)
+                );
+            }
+            4 => {
+                let version = P2pVersionMessage {
+                    protocol_version: rules::PROTOCOL_VERSION,
+                    min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                    services: LOCAL_NODE_SERVICES,
+                    timestamp_unix: 1_700_000_000,
+                    network: Network::Testnet,
+                    user_agent: String::from("/Atho:0.1.0/"),
+                    best_height: 0,
+                    ruleset_version: rules::RULESET_VERSION_V1,
+                    relay: true,
+                    genesis_hash: P2pHash48::from(genesis::genesis_hash(Network::Testnet)),
+                    tip_hash: P2pHash48::ZERO,
+                    chainwork: P2pHash48::ZERO,
+                };
+                assert_eq!(
+                    validate_version_message(&version, Network::Mainnet),
+                    Err(ProtocolError::UnsupportedNetwork)
+                );
+            }
+            5 => {
+                let version = P2pVersionMessage {
+                    protocol_version: 0,
+                    min_protocol_version: 0,
+                    services: LOCAL_NODE_SERVICES,
+                    timestamp_unix: 1_700_000_000,
+                    network: Network::Mainnet,
+                    user_agent: String::from("/Atho:0.1.0/"),
+                    best_height: 0,
+                    ruleset_version: rules::RULESET_VERSION_V1,
+                    relay: true,
+                    genesis_hash: P2pHash48::from(genesis::genesis_hash(Network::Mainnet)),
+                    tip_hash: P2pHash48::ZERO,
+                    chainwork: P2pHash48::ZERO,
+                };
+                assert_eq!(
+                    validate_version_message(&version, Network::Mainnet),
+                    Err(ProtocolError::UnsupportedProtocolVersion)
+                );
+            }
+            6 => {
+                let version = P2pVersionMessage {
+                    protocol_version: rules::PROTOCOL_VERSION,
+                    min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                    services: LOCAL_NODE_SERVICES,
+                    timestamp_unix: 1_700_000_000,
+                    network: Network::Mainnet,
+                    user_agent: "A".repeat(
+                        p2p_network_params(Network::Mainnet)
+                            .limits
+                            .max_user_agent_bytes
+                            + 1,
+                    ),
+                    best_height: 0,
+                    ruleset_version: rules::RULESET_VERSION_V1,
+                    relay: true,
+                    genesis_hash: P2pHash48::from(genesis::genesis_hash(Network::Mainnet)),
+                    tip_hash: P2pHash48::ZERO,
+                    chainwork: P2pHash48::ZERO,
+                };
+                assert_eq!(
+                    validate_version_message(&version, Network::Mainnet),
+                    Err(ProtocolError::UserAgentTooLong)
+                );
+            }
+            _ => {
+                assert_eq!(
+                    NetworkMessage::decode(Network::Mainnet, MessageCommand::Ping, &[]),
+                    Err(ProtocolError::MalformedPayload)
+                );
+            }
+        }));
+        match outcome {
+            Ok(()) => report.pass(),
+            Err(_) => report.fail_panic(format!(
+                "case={i} kind={kind} panic in network protocol chaos"
+            )),
         }
     }
     Ok(report)
@@ -1675,7 +1854,7 @@ fn cleanup_dev_layout() {
 }
 
 fn write_legacy_snapshot_files(
-    root: &PathBuf,
+    root: &Path,
     valid_state: bool,
     malformed_utxo: bool,
 ) -> Result<(), String> {

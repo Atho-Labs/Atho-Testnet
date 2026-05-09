@@ -210,6 +210,9 @@ pub fn render_markdown_registry() -> String {
             descriptor.suggested_fix
         ));
     }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
     out
 }
 

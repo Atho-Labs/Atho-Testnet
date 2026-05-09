@@ -121,11 +121,12 @@ pub(crate) fn render_word_grid(
                     if tokens.len() <= 1 {
                         words[start_index] = tokens.into_iter().next().unwrap_or_default();
                     } else {
-                        if auto_resize_on_paste && start_index == 0 {
-                            if SUPPORTED_MNEMONIC_WORD_COUNTS.contains(&tokens.len()) {
-                                words.resize_with(tokens.len(), String::new);
-                                words.truncate(tokens.len());
-                            }
+                        if auto_resize_on_paste
+                            && start_index == 0
+                            && SUPPORTED_MNEMONIC_WORD_COUNTS.contains(&tokens.len())
+                        {
+                            words.resize_with(tokens.len(), String::new);
+                            words.truncate(tokens.len());
                         }
                         for (offset, token) in tokens.into_iter().enumerate() {
                             let target = start_index + offset;
