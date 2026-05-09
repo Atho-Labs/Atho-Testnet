@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const FRAME_HEADER_BYTES: usize = 24;
@@ -30,6 +30,7 @@ const OUTBOUND_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(32);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FRAME_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
@@ -967,7 +968,7 @@ fn read_message(
     expected_network: Network,
 ) -> Result<Option<(NetworkMessage, usize)>, TcpP2pError> {
     let mut header = [0u8; FRAME_HEADER_BYTES];
-    if !read_exact_with_timeouts(stream, &mut header)? {
+    if !read_exact_with_timeouts(stream, &mut header, true, FRAME_READ_STALL_TIMEOUT)? {
         return Ok(None);
     }
 
@@ -975,7 +976,17 @@ fn read_message(
     let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + payload_len);
     frame.extend_from_slice(&header);
     frame.resize(FRAME_HEADER_BYTES + payload_len, 0);
-    read_exact_with_timeouts(stream, &mut frame[FRAME_HEADER_BYTES..])?;
+    if !read_exact_with_timeouts(
+        stream,
+        &mut frame[FRAME_HEADER_BYTES..],
+        false,
+        FRAME_READ_STALL_TIMEOUT,
+    )? {
+        return Err(TcpP2pError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "peer stalled before frame payload",
+        )));
+    }
     let frame_len = frame.len();
     Ok(Some((WireCodec::decode(&frame)?, frame_len)))
 }
@@ -996,8 +1007,14 @@ fn validated_payload_len(
     Ok(payload_len)
 }
 
-fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bool, TcpP2pError> {
+fn read_exact_with_timeouts(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    idle_means_no_message: bool,
+    stall_timeout: Duration,
+) -> Result<bool, TcpP2pError> {
     let mut read = 0usize;
+    let mut last_progress = Instant::now();
     while read < buf.len() {
         match stream.read(&mut buf[read..]) {
             Ok(0) if read == 0 => {
@@ -1012,14 +1029,18 @@ fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bo
                     "peer closed connection mid-frame",
                 )));
             }
-            Ok(count) => read = read.saturating_add(count),
+            Ok(count) => {
+                read = read.saturating_add(count);
+                last_progress = Instant::now();
+            }
             Err(err)
                 if matches!(
                     err.kind(),
                     io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
-                ) && read == 0 =>
+                ) && read == 0
+                    && idle_means_no_message =>
             {
                 return Ok(false);
             }
@@ -1031,6 +1052,12 @@ fn read_exact_with_timeouts(stream: &mut TcpStream, buf: &mut [u8]) -> Result<bo
                         | io::ErrorKind::Interrupted
                 ) =>
             {
+                if last_progress.elapsed() >= stall_timeout {
+                    return Err(TcpP2pError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "peer stalled while sending frame",
+                    )));
+                }
                 continue;
             }
             Err(err) => return Err(TcpP2pError::Io(err)),
@@ -1691,6 +1718,41 @@ mod tests {
         assert!(matches!(
             validated_payload_len(&header, Network::Mainnet),
             Err(TcpP2pError::Codec(CodecError::PayloadTooLarge))
+        ));
+    }
+
+    #[test]
+    fn read_message_waits_for_slow_payload_after_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener addr");
+        let message = NetworkMessage::new(Network::Regnet, MessagePayload::Ping { nonce: 42 });
+        let frame = WireCodec::encode(&message).expect("encode ping");
+        let expected_len = frame.len();
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            configure_stream(&stream).expect("configure sender");
+            stream
+                .write_all(&frame[..FRAME_HEADER_BYTES])
+                .expect("write header");
+            stream.flush().expect("flush header");
+            thread::sleep(PEER_IO_POLL_INTERVAL + Duration::from_millis(50));
+            stream
+                .write_all(&frame[FRAME_HEADER_BYTES..])
+                .expect("write payload");
+            stream.flush().expect("flush payload");
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        configure_stream(&stream).expect("configure receiver");
+
+        let (received, bytes) = read_message(&mut stream, Network::Regnet)
+            .expect("read message")
+            .expect("message");
+
+        sender.join().expect("sender join");
+        assert_eq!(bytes, expected_len);
+        assert!(matches!(
+            received.payload,
+            MessagePayload::Ping { nonce: 42 }
         ));
     }
 
