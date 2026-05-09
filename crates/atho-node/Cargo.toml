@@ -1,0 +1,49 @@
+[package]
+name = "atho-node"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[features]
+default = []
+gpu-native = ["dep:atho-gpu-native", "atho-gpu-native/gpu-native"]
+
+[dependencies]
+atho-core = { path = "../atho-core" }
+atho-crypto = { path = "../atho-crypto" }
+atho-errors = { path = "../atho-errors" }
+atho-gpu-native = { path = "../atho-gpu-native", optional = true }
+atho-p2p = { path = "../atho-p2p" }
+atho-rpc = { path = "../atho-rpc" }
+atho-storage = { path = "../atho-storage" }
+atho-wallet = { path = "../atho-wallet" }
+rayon = "1"
+hex = "0.4"
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-big-array = "0.5"
+bincode = "1"
+thiserror = "1"
+get_if_addrs = "0.5"
+tiny_http = "0.12"
+
+[[bin]]
+name = "athod"
+path = "src/bin/athod.rs"
+
+[[bin]]
+name = "atho-mine"
+path = "src/bin/atho-mine.rs"
+
+[[bin]]
+name = "atho-attack"
+path = "src/bin/atho-attack.rs"
+
+[[bin]]
+name = "atho-adversarial"
+path = "src/bin/atho-adversarial.rs"
+
+[[bin]]
+name = "atho-cli"
+path = "src/bin/atho-cli.rs"

@@ -1,0 +1,27 @@
+[package]
+name = "fn-dsa-kgen"
+version = "0.3.0"
+authors = ["Thomas Pornin <thomas.pornin@nccgroup.com>"]
+categories = ["cryptography", "no-std"]
+description = "FN-DSA signature scheme"
+edition = "2021"
+keywords = ["cryptography", "fn-dsa", "falcon"]
+license = "Unlicense"
+readme = "../../docs/reference/vendor/fn-dsa-rust-readme.md"
+repository = "https://github.com/pornin/rust-fn-dsa"
+rust-version = "1.82"
+
+[dependencies]
+fn-dsa-comm = { version = "0.3", path = "../fn-dsa-comm" }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+sha2 = "0.10"
+hex = "0.4.3"
+num-bigint = "0.4.3"
+num-traits = "0.2"
+
+[features]
+default = []
+no_avx2 = []
+shake256x4 = []

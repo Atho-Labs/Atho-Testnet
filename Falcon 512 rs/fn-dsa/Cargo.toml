@@ -1,0 +1,41 @@
+[package]
+name = "fn-dsa"
+version = "0.3.0"
+authors = ["Thomas Pornin <thomas.pornin@nccgroup.com>"]
+categories = ["cryptography", "no-std"]
+description = "FN-DSA signature scheme"
+edition = "2021"
+keywords = ["cryptography", "fn-dsa", "falcon"]
+license = "Unlicense"
+readme = "../../docs/reference/vendor/fn-dsa-rust-readme.md"
+repository = "https://github.com/pornin/rust-fn-dsa"
+rust-version = "1.82"
+
+[dependencies]
+fn-dsa-comm = { version = "0.3", path = "../fn-dsa-comm" }
+fn-dsa-kgen = { version = "0.3", path = "../fn-dsa-kgen" }
+fn-dsa-sign = { version = "0.3", path = "../fn-dsa-sign" }
+fn-dsa-vrfy = { version = "0.3", path = "../fn-dsa-vrfy" }
+
+[dev-dependencies]
+hex = "0.4.3"
+
+[features]
+default = []
+no_avx2 = []
+shake256x4 = [ "fn-dsa-comm/shake256x4", "fn-dsa-kgen/shake256x4", "fn-dsa-sign/shake256x4" ]
+
+[[bench]]
+name = "keygen"
+path = "benches/keygen.rs"
+harness = false
+
+[[bench]]
+name = "sign"
+path = "benches/sign.rs"
+harness = false
+
+[[bench]]
+name = "verify"
+path = "benches/verify.rs"
+harness = false

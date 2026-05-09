@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "crates/atho-errors",
+  "crates/atho-core",
+  "crates/atho-crypto",
+  "crates/atho-storage",
+  "crates/atho-wallet",
+  "crates/atho-p2p",
+  "crates/atho-rpc",
+  "crates/atho-gpu-native",
+  "crates/atho-node",
+  "crates/atho-qt",
+  "crates/atho-installer",
+]
+resolver = "2"

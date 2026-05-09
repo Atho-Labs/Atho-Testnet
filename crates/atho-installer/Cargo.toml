@@ -1,0 +1,16 @@
+[package]
+name = "atho-installer"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+eframe = "0.27"
+rfd = "0.15"
+sha2 = "0.10"
+tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[[bin]]
+name = "atho-setup"
+path = "src/main.rs"

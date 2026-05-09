@@ -1,0 +1,66 @@
+# Build artifacts
+target/
+**/target/
+
+# Logs
+*.log
+**/logs/
+
+# IDE and editor files
+.idea/
+*.iml
+.vscode/
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Git metadata backups created while repairing downloaded archives
+.git.empty-backup-*/
+
+# Miscellaneous
+tmp/
+**/tmp/
+*~
+#*#
+wallet.data
+wallet.data.bak
+wallet.data.old
+wallet.data.backup
+wallet.data.*   
+wallet.dat
+**/wallet.dat
+
+blockchain.data
+blockchain.data.bak
+blockchain.data.old
+blockchain.data.backup  
+
+# Local runtime output
+node.output
+node_output.txt
+# Ignore dev directories and their contents
+**/dev/
+
+# Ignore document files that are not needed in the repo
+*.pdf
+
+# Ignore specific directories that are not part of the source
+dist/
+desktop/
+build/
+target/
+dev/logs
+fuzz/Cargo.lock
+
+
+
+
+# Ignore lock files if you don't want to track them (optional, but common for Cargo)
+# Cargo.lock

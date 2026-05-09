@@ -1,0 +1,118 @@
+[package]
+name = "atho-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+atho-core = { path = "../crates/atho-core" }
+atho-crypto = { path = "../crates/atho-crypto" }
+atho-node = { path = "../crates/atho-node" }
+atho-storage = { path = "../crates/atho-storage" }
+atho-p2p = { path = "../crates/atho-p2p" }
+atho-rpc = { path = "../crates/atho-rpc" }
+bincode = "1"
+
+[[bin]]
+name = "p2p_frame_decode"
+path = "fuzz_targets/p2p_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_message_roundtrip"
+path = "fuzz_targets/p2p_message_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_witness_parse"
+path = "fuzz_targets/tx_witness_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_decode"
+path = "fuzz_targets/tx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_roundtrip"
+path = "fuzz_targets/tx_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sighash"
+path = "fuzz_targets/sighash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_template_decode"
+path = "fuzz_targets/block_template_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_validate"
+path = "fuzz_targets/block_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mempool_admission"
+path = "fuzz_targets/mempool_admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compact_block_reconstruct"
+path = "fuzz_targets/compact_block_reconstruct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network_message_decode"
+path = "fuzz_targets/network_message_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_request_decode"
+path = "fuzz_targets/rpc_request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address_decode"
+path = "fuzz_targets/address_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -1,0 +1,20 @@
+[package]
+name = "atho-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+atho-core = { path = "../atho-core" }
+atho-errors = { path = "../atho-errors" }
+fn-dsa = { path = "../../Falcon 512 rs/fn-dsa" }
+getrandom = "0.2"
+thiserror = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "falcon_hot_paths"
+harness = false
