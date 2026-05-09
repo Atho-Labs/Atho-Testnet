@@ -59,10 +59,8 @@ fuzz_target!(|data: &[u8]| {
             .iter()
             .map(|tx| finalize_witness_commit_refs(tx, witness_root))
             .collect::<Vec<_>>();
-        let reconstructed_block = atho_core::block::Block {
-            transactions: finalized_transactions,
-            ..block
-        };
+        let mut reconstructed_block = *block;
+        reconstructed_block.transactions = finalized_transactions;
         let _ = reconstructed_block.merkle_root();
         let _ = reconstructed_block.compute_witness_root();
     }

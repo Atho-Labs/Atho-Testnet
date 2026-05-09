@@ -24,4 +24,3 @@
 - `crates/atho-storage/src/validation.rs`
 - `crates/atho-node/src/bin/atho-attack.rs`
 - `crates/atho-node/src/bin/atho-adversarial.rs`
-

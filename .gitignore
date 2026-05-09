@@ -34,11 +34,17 @@ wallet.data.bak
 wallet.data.old
 wallet.data.backup
 wallet.data.*   
+wallet.dat
+**/wallet.dat
 
 blockchain.data
 blockchain.data.bak
 blockchain.data.old
 blockchain.data.backup  
+
+# Local runtime output
+node.output
+node_output.txt
 # Ignore dev directories and their contents
 **/dev/
 
