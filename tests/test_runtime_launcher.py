@@ -275,6 +275,9 @@ class RuntimeLauncherTests(unittest.TestCase):
                 runtime_launcher.build_release_binaries(config)
 
             self.assertEqual(run_mock.call_count, 2)
+            self.assertFalse(
+                any("capture_output" in call.kwargs for call in run_mock.call_args_list)
+            )
             self.assertEqual(config.gpu_build_stamp.read_text(encoding="utf-8"), "cpu-only\n")
 
     def test_build_release_binaries_marks_gpu_native_success(self) -> None:
@@ -306,6 +309,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 runtime_launcher.build_release_binaries(config)
 
             self.assertEqual(run_mock.call_count, 1)
+            self.assertNotIn("capture_output", run_mock.call_args.kwargs)
             self.assertEqual(
                 config.gpu_build_stamp.read_text(encoding="utf-8"), "gpu-native\n"
             )
@@ -339,6 +343,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 runtime_launcher.build_release_binaries(config)
 
             self.assertEqual(run_mock.call_count, 1)
+            self.assertNotIn("capture_output", run_mock.call_args.kwargs)
             self.assertEqual(config.gpu_build_stamp.read_text(encoding="utf-8"), "cpu-only\n")
 
 

@@ -515,24 +515,45 @@ impl Wallet {
             }
         }
 
-        let receive_preview = self.receive_addresses(limit);
-        let change_preview = self.change_addresses(limit);
-        let preview_len = receive_preview.len().max(change_preview.len());
-
-        for index in 0..preview_len {
-            if let Some(address) = receive_preview.get(index) {
+        for index in 0..limit {
+            let Ok(index) = u32::try_from(index) else {
+                break;
+            };
+            for kind in [AddressKind::Receive, AddressKind::Change] {
+                let address = self.derive_address(DerivationPath {
+                    account: 0,
+                    kind,
+                    index,
+                });
                 if seen.insert(address.payment_digest) {
-                    addresses.push(address.clone());
-                }
-            }
-            if let Some(address) = change_preview.get(index) {
-                if seen.insert(address.payment_digest) {
-                    addresses.push(address.clone());
+                    addresses.push(address);
                 }
             }
         }
 
         addresses
+    }
+
+    fn discovered_address_for_payment_digest(&self, digest: &[u8]) -> Option<WalletAddress> {
+        if digest.len() != 32 {
+            return None;
+        }
+        for index in 0..self.restore_gap_limit {
+            let Ok(index) = u32::try_from(index) else {
+                break;
+            };
+            for kind in [AddressKind::Receive, AddressKind::Change] {
+                let address = self.derive_address(DerivationPath {
+                    account: 0,
+                    kind,
+                    index,
+                });
+                if address.payment_digest.as_slice() == digest {
+                    return Some(address);
+                }
+            }
+        }
+        None
     }
 
     pub fn generated_receive_addresses(&self, limit: usize) -> Vec<WalletAddress> {
@@ -793,6 +814,7 @@ impl Wallet {
             let address = known_addresses
                 .get(&locking_script)
                 .cloned()
+                .or_else(|| self.discovered_address_for_payment_digest(&locking_script))
                 .ok_or(WalletSpendBuildError::InputOwnershipMismatch)?;
             groups.push(WalletSignerInputGroup {
                 address,
@@ -1162,6 +1184,31 @@ mod tests {
             .map(|_| restored.checkout_change_address().address)
             .collect();
         assert_eq!(original_change, restored_change);
+    }
+
+    #[test]
+    fn restored_discovered_utxo_maps_to_signer_without_checked_out_address() {
+        let phrase = phrase();
+        let mut original = Wallet::from_mnemonic(phrase.clone(), "", Network::Regnet);
+        let funded_address = original.checkout_receive_address();
+        let restored =
+            Wallet::restore_from_phrase(&phrase.as_sentence(), "", Network::Regnet).unwrap();
+
+        assert!(restored.all_addresses().is_empty());
+
+        let selected_utxos = vec![WalletSpendUtxo {
+            previous_txid: [0x77; 48],
+            output_index: 0,
+            value_atoms: 10_000,
+            locking_script: funded_address.payment_digest.to_vec(),
+        }];
+
+        let groups = restored
+            .signer_input_groups(&selected_utxos)
+            .expect("restored discovered address should map to signer");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].address.path, funded_address.path);
+        assert_eq!(groups[0].input_indexes, vec![0]);
     }
 
     #[test]

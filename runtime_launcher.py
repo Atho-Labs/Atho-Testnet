@@ -310,17 +310,7 @@ def run_build_command(
     print(f"[atho-launch] {description}: {' '.join(command)}")
     if config.dry_run:
         return None
-    result = subprocess.run(
-        command,
-        cwd=config.repo_root,
-        text=True,
-        capture_output=True,
-    )
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
-    return result
+    return subprocess.run(command, cwd=config.repo_root, text=True)
 
 
 def write_build_stamp(config: LauncherConfig, mode: str) -> None:
