@@ -72,6 +72,7 @@ class LauncherConfig:
     cargo_bin: str
     rebuild: bool
     no_build: bool
+    network_overrides_local: bool
     dry_run: bool
     forwarded_args: tuple[str, ...]
 
@@ -113,6 +114,39 @@ def default_runtime_root() -> Path:
     return Path.home() / ".local" / "share" / "Atho"
 
 
+def binary_dir_is_usable(path: Path) -> bool:
+    return all(
+        binary_is_usable(path / binary_name(name))
+        for name in ("atho-qt", "athod", "atho-mine")
+    )
+
+
+def release_binary_dir_is_ready(repo_root: Path, release_dir: Path) -> bool:
+    if not binary_dir_is_usable(release_dir):
+        return False
+    stamp = release_dir / BUILD_STAMP
+    if not stamp.is_file():
+        return False
+    newest_source = latest_source_mtime(repo_root)
+    oldest_release_file = min(
+        (release_dir / binary_name("atho-qt")).stat().st_mtime,
+        (release_dir / binary_name("athod")).stat().st_mtime,
+        (release_dir / binary_name("atho-mine")).stat().st_mtime,
+        stamp.stat().st_mtime,
+    )
+    return newest_source <= oldest_release_file
+
+
+def default_binary_dir(repo_root: Path) -> Path:
+    release_dir = repo_root / "target" / "release"
+    debug_dir = repo_root / "target" / "debug"
+    if release_binary_dir_is_ready(repo_root, release_dir):
+        return release_dir
+    if binary_dir_is_usable(debug_dir):
+        return debug_dir
+    return release_dir
+
+
 def normalize_entry_network(network: str) -> str:
     network = network.strip().lower()
     if network not in SUPPORTED_ENTRY_NETWORKS:
@@ -132,6 +166,7 @@ def parse_launcher_args(
     wrapper_name = prog or ENTRY_SCRIPT_NAMES[network]
     parser = argparse.ArgumentParser(
         prog=wrapper_name,
+        allow_abbrev=False,
         description=(
             f"Build if needed and launch Atho {network} with the desktop client "
             "and managed local node."
@@ -143,7 +178,6 @@ def parse_launcher_args(
     )
     parser.add_argument(
         "--release-dir",
-        default=str(repo_root / "target" / "release"),
         help="Directory containing atho-qt and athod release binaries.",
     )
     parser.add_argument(
@@ -162,6 +196,14 @@ def parse_launcher_args(
         help="Refuse to build missing or stale binaries.",
     )
     parser.add_argument(
+        "--network-overrides-local",
+        action="store_true",
+        help=(
+            "Force the next launch to discard local chain databases before syncing, "
+            "so network state wins over local state. Wallet files are preserved."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the resolved build and launch commands without executing them.",
@@ -169,14 +211,20 @@ def parse_launcher_args(
     args, forwarded = parser.parse_known_args(argv)
     validate_forwarded_args(network, wrapper_name, forwarded)
     runtime_root = Path(args.data_dir).expanduser() if args.data_dir else default_runtime_root()
+    binary_dir = (
+        Path(args.release_dir).expanduser()
+        if args.release_dir
+        else default_binary_dir(repo_root)
+    )
     return LauncherConfig(
         network=network,
         repo_root=repo_root,
-        release_dir=Path(args.release_dir).expanduser(),
+        release_dir=binary_dir,
         runtime_root=runtime_root,
         cargo_bin=args.cargo,
         rebuild=args.rebuild,
         no_build=args.no_build,
+        network_overrides_local=args.network_overrides_local,
         dry_run=args.dry_run,
         forwarded_args=tuple(forwarded),
     )
@@ -233,6 +281,8 @@ def build_reason(config: LauncherConfig) -> str | None:
         return f"missing {config.node_binary.name}"
     if not binary_is_usable(config.miner_binary):
         return f"missing {config.miner_binary.name}"
+    if config.release_dir.name == "debug":
+        return None
     if not config.gpu_build_stamp.is_file():
         return "missing launcher build stamp"
     newest_source = latest_source_mtime(config.repo_root)
@@ -320,6 +370,29 @@ def write_build_stamp(config: LauncherConfig, mode: str) -> None:
 
 def build_release_binaries(config: LauncherConfig) -> None:
     verify_cargo_available(config.cargo_bin)
+    if config.release_dir.name == "debug":
+        command = [
+            config.cargo_bin,
+            "build",
+            "-p",
+            "atho-node",
+            "-p",
+            "atho-qt",
+        ]
+        result = run_build_command(
+            config,
+            command,
+            f"building debug binaries for {config.network}",
+        )
+        if config.dry_run:
+            return
+        assert result is not None
+        if result.returncode != 0:
+            raise LauncherError(
+                "Atho debug build failed. Fix the Rust/toolchain errors above and rerun the launcher."
+            )
+        return
+
     gpu_skip_reason = gpu_build_preflight_reason()
     if gpu_skip_reason is not None:
         print(
@@ -429,6 +502,8 @@ def build_launch_env(config: LauncherConfig) -> dict[str, str]:
     env = os.environ.copy()
     env["ATHO_DATA_DIR"] = str(config.runtime_root)
     env["ATHO_NETWORK"] = config.network
+    if config.network_overrides_local:
+        env["ATHO_NETWORK_OVERRIDES_LOCAL"] = "1"
     return env
 
 
@@ -438,7 +513,7 @@ def ensure_binaries(config: LauncherConfig) -> None:
         return
     if config.no_build:
         raise LauncherError(
-            "release binaries are not ready: "
+            "binaries are not ready: "
             f"{reason}. Re-run without --no-build or build with "
             "`cargo build --release -p atho-node -p atho-qt --features gpu-native` "
             "or let the launcher rebuild automatically."
@@ -450,10 +525,10 @@ def ensure_binaries(config: LauncherConfig) -> None:
         not binary_is_usable(config.qt_binary)
         or not binary_is_usable(config.node_binary)
         or not binary_is_usable(config.miner_binary)
-        or not config.gpu_build_stamp.is_file()
+        or (config.release_dir.name != "debug" and not config.gpu_build_stamp.is_file())
     ):
         raise LauncherError(
-            "release build finished but required Atho binaries are still missing: "
+            "release build finished but required binaries are still missing: "
             f"{config.qt_binary} {config.node_binary} {config.miner_binary}"
         )
 
@@ -477,6 +552,8 @@ def run_launcher(
     print(f"[atho-launch] qt_binary={config.qt_binary}")
     print(f"[atho-launch] node_binary={config.node_binary}")
     print(f"[atho-launch] env ATHO_NETWORK={env['ATHO_NETWORK']}")
+    if config.network_overrides_local:
+        print("[atho-launch] network_overrides_local=true")
     print(f"[atho-launch] launching: {' '.join(command)}")
     if config.dry_run:
         return 0

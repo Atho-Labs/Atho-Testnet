@@ -146,6 +146,17 @@ impl Network {
             Self::Prunetest => "PRUNE-UTXO",
         }
     }
+
+    /// Returns whether this repository may launch operator-facing runtime flows.
+    pub fn operator_launch_allowed(self) -> Result<(), &'static str> {
+        let _ = self;
+        Ok(())
+    }
+
+    /// Returns the default operator network for this repository.
+    pub fn operator_default() -> Self {
+        Self::Mainnet
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +188,7 @@ mod tests {
         assert_eq!(Network::Testnet.utxo_flag(), "TEST-UTXO");
         assert_eq!(Network::Regnet.utxo_flag(), "REG-UTXO");
         assert_eq!(Network::Prunetest.utxo_flag(), "PRUNE-UTXO");
+        assert_eq!(Network::Mainnet.operator_launch_allowed(), Ok(()));
+        assert_eq!(Network::operator_default(), Network::Mainnet);
     }
 }

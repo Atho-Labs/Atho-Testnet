@@ -27,6 +27,7 @@ class RuntimeLauncherTests(unittest.TestCase):
             cargo_bin="cargo",
             rebuild=False,
             no_build=False,
+            network_overrides_local=False,
             dry_run=True,
             forwarded_args=(),
         )
@@ -119,6 +120,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 cargo_bin="cargo",
                 rebuild=False,
                 no_build=False,
+                network_overrides_local=False,
                 dry_run=True,
                 forwarded_args=("--peer", "127.0.0.1:9100"),
             )
@@ -133,6 +135,15 @@ class RuntimeLauncherTests(unittest.TestCase):
             env = runtime_launcher.build_launch_env(config)
             self.assertEqual(env["ATHO_NETWORK"], "regnet")
             self.assertEqual(env["ATHO_DATA_DIR"], str(root / "runtime"))
+
+    def test_network_override_flag_sets_launch_env(self) -> None:
+        config = runtime_launcher.parse_launcher_args(
+            "testnet",
+            ["--data-dir", "/tmp/atho", "--network-overrides-local"],
+        )
+        env = runtime_launcher.build_launch_env(config)
+        self.assertTrue(config.network_overrides_local)
+        self.assertEqual(env["ATHO_NETWORK_OVERRIDES_LOCAL"], "1")
 
     def test_parse_launcher_args_keeps_unknown_qt_flags(self) -> None:
         config = runtime_launcher.parse_launcher_args(
@@ -255,6 +266,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 cargo_bin=config.cargo_bin,
                 rebuild=config.rebuild,
                 no_build=config.no_build,
+                network_overrides_local=config.network_overrides_local,
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )
@@ -294,6 +306,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 cargo_bin=config.cargo_bin,
                 rebuild=config.rebuild,
                 no_build=config.no_build,
+                network_overrides_local=config.network_overrides_local,
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )
@@ -328,6 +341,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 cargo_bin=config.cargo_bin,
                 rebuild=config.rebuild,
                 no_build=config.no_build,
+                network_overrides_local=config.network_overrides_local,
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )

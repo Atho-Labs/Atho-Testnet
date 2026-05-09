@@ -63,6 +63,10 @@ fn main() {
         std::process::exit(1);
     });
     let network = cli.network.unwrap_or_else(default_network);
+    if let Err(err) = network.operator_launch_allowed() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
     if should_auto_launch_local_node(&cli) {
         cli.local_node = true;
     }
@@ -227,8 +231,10 @@ fn parse_args_from(args: Vec<String>) -> Result<QtCli, String> {
 }
 
 fn default_network() -> Network {
-    Network::parse(&std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet")))
-        .unwrap_or(Network::Mainnet)
+    std::env::var("ATHO_NETWORK")
+        .ok()
+        .and_then(|raw| Network::parse(&raw))
+        .unwrap_or_else(Network::operator_default)
 }
 
 fn default_renderer_choice(is_windows: bool) -> RendererChoice {

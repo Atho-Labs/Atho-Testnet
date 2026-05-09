@@ -148,8 +148,10 @@ impl NodeRuntime {
 
 /// Loads the node configuration from environment variables.
 pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
-    let raw = std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet"));
-    let network = Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?;
+    let network = match std::env::var("ATHO_NETWORK") {
+        Ok(raw) => Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?,
+        Err(_) => Network::operator_default(),
+    };
 
     Ok(NodeConfig::from_env(network))
 }
@@ -404,7 +406,8 @@ mod tests {
 
     #[test]
     fn config_loader_defaults_to_mainnet() {
-        let config = NodeConfig::new(Network::Mainnet);
+        std::env::remove_var("ATHO_NETWORK");
+        let config = load_config_from_env().expect("config");
         assert_eq!(config.network, Network::Mainnet);
     }
 

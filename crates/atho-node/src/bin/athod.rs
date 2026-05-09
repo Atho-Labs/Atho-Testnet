@@ -13,6 +13,7 @@ struct RuntimeCli {
     data_dir: Option<String>,
     peers: Vec<String>,
     public_rpc: bool,
+    network_overrides_local: bool,
     all: bool,
     include_wallets: bool,
     dangerously_allow_mainnet: bool,
@@ -88,14 +89,26 @@ fn run() -> Result<(), String> {
 fn run_node(args: &[String]) -> Result<(), String> {
     let runtime = parse_runtime_cli(args)?;
     runtime.apply_env();
-    match runtime_node_config(&runtime) {
-        Some(config) => atho_node::runtime::run_with_config(config).map_err(|err| err.to_string()),
-        None => atho_node::runtime::run().map_err(|err| err.to_string()),
-    }
+    let config = runtime_node_config(&runtime)?;
+    config
+        .network
+        .operator_launch_allowed()
+        .map_err(str::to_string)?;
+    apply_network_override_if_requested(&runtime, config.network)?;
+    start_managed_parent_monitor();
+    atho_node::runtime::run_with_config(config).map_err(|err| err.to_string())
 }
 
-fn runtime_node_config(runtime: &RuntimeCli) -> Option<NodeConfig> {
-    runtime.network.map(NodeConfig::from_env)
+fn runtime_node_config(runtime: &RuntimeCli) -> Result<NodeConfig, String> {
+    let network = match runtime.network {
+        Some(network) => network,
+        None => {
+            atho_node::runtime::load_config_from_env()
+                .map_err(|err| err.to_string())?
+                .network
+        }
+    };
+    Ok(NodeConfig::from_env(network))
 }
 
 fn verify_node(args: &[String]) -> Result<(), String> {
@@ -109,6 +122,7 @@ fn verify_node(args: &[String]) -> Result<(), String> {
                 .network
         }
     };
+    network.operator_launch_allowed().map_err(str::to_string)?;
     let config = NodeConfig::new(network);
     let node = atho_node::node::Node::new(config);
     let genesis = genesis::genesis_state(network);
@@ -157,6 +171,7 @@ fn show_status(args: &[String]) -> Result<(), String> {
                 .network
         }
     };
+    network.operator_launch_allowed().map_err(str::to_string)?;
     let rpc_address = status_cli
         .rpc_addr
         .unwrap_or_else(|| atho_node::runtime::rpc_bind_address(network));
@@ -240,7 +255,8 @@ fn run_dev(args: &[String]) -> Result<(), String> {
         Some("genesis") => {
             let runtime = parse_runtime_cli(&args[1..])?;
             runtime.apply_env();
-            let network = runtime.network.unwrap_or(Network::Mainnet);
+            let network = runtime.network.unwrap_or_else(Network::operator_default);
+            network.operator_launch_allowed().map_err(str::to_string)?;
             let profile = genesis::regenerate_genesis_profile(network);
             println!("network={}", profile.network.id());
             println!("reward_address={}", profile.reward_address);
@@ -258,7 +274,8 @@ fn run_dev(args: &[String]) -> Result<(), String> {
         Some("reset") => {
             let runtime = parse_runtime_cli(&args[1..])?;
             runtime.apply_env();
-            let network = runtime.network.unwrap_or(Network::Mainnet);
+            let network = runtime.network.unwrap_or_else(Network::operator_default);
+            network.operator_launch_allowed().map_err(str::to_string)?;
             let _ = atho_node::dev::append_log(
                 "athod",
                 &format!("dev reset requested network={}", network.id()),
@@ -304,7 +321,8 @@ fn run_dev(args: &[String]) -> Result<(), String> {
         Some("mine") => {
             let runtime = parse_runtime_cli(&args[1..])?;
             runtime.apply_env();
-            let network = runtime.network.unwrap_or(Network::Mainnet);
+            let network = runtime.network.unwrap_or_else(Network::operator_default);
+            network.operator_launch_allowed().map_err(str::to_string)?;
             let path = atho_node::dev::mine_once(network).map_err(|err| err.to_string())?;
             println!("{}", path.display());
             Ok(())
@@ -391,6 +409,92 @@ fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Re
     }
 }
 
+fn apply_network_override_if_requested(
+    runtime: &RuntimeCli,
+    network: Network,
+) -> Result<(), String> {
+    if !network_override_requested(runtime) {
+        return Ok(());
+    }
+
+    let root = atho_storage::path::sandbox_root();
+    atho_node::dev::wipe_root(&root).map_err(|err| err.to_string())?;
+    let _ = atho_node::dev::append_log(
+        "athod",
+        &format!(
+            "network override resync wiped local chain databases network={} root={}",
+            network.id(),
+            root.display()
+        ),
+    );
+    Ok(())
+}
+
+fn network_override_requested(runtime: &RuntimeCli) -> bool {
+    runtime.network_overrides_local
+        || std::env::var("ATHO_NETWORK_OVERRIDES_LOCAL")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn start_managed_parent_monitor() {
+    let Some(parent_pid) = std::env::var("ATHO_MANAGED_PARENT_PID")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return;
+    };
+
+    std::thread::Builder::new()
+        .name(String::from("atho-managed-parent-monitor"))
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if managed_parent_is_alive(parent_pid) {
+                continue;
+            }
+            let _ = atho_node::dev::append_log(
+                "athod",
+                &format!(
+                    "managed parent pid={} exited; shutting down athod",
+                    parent_pid
+                ),
+            );
+            std::process::exit(0);
+        })
+        .ok();
+}
+
+fn managed_parent_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().any(|part| part == pid.to_string())),
+            _ => false,
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
     let mut runtime = RuntimeCli::default();
     let mut i = 0usize;
@@ -444,6 +548,10 @@ fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
             }
             "--public-rpc" => {
                 runtime.public_rpc = true;
+                i += 1;
+            }
+            "--network-overrides-local" | "--force-network-resync" => {
+                runtime.network_overrides_local = true;
                 i += 1;
             }
             "--all" => {
@@ -515,7 +623,7 @@ fn parse_network(value: &str) -> Option<Network> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc]");
+    eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");
     eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets] [--dangerously-allow-mainnet]");
     eprintln!("  athod status [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
     eprintln!("  athod verify [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH]");
@@ -626,6 +734,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_cli_accepts_network_override_resync() {
+        let args = vec![
+            String::from("--network"),
+            String::from("testnet"),
+            String::from("--network-overrides-local"),
+        ];
+        let parsed = parse_runtime_cli(&args).expect("parse");
+        assert_eq!(parsed.network, Some(Network::Testnet));
+        assert!(parsed.network_overrides_local);
+    }
+
+    #[test]
+    fn network_override_resync_wipes_chain_dbs_but_keeps_wallets() {
+        let root =
+            std::env::temp_dir().join(format!("atho-network-override-{}", std::process::id()));
+        let _data_dir = EnvVarGuard::set(
+            atho_storage::path::ATHO_DATA_DIR_ENV,
+            root.to_str().expect("utf8 temp path"),
+        );
+        let _env_override = EnvVarGuard::set("ATHO_NETWORK_OVERRIDES_LOCAL", "0");
+        std::fs::create_dir_all(root.join("db").join("testnet")).expect("db dir");
+        std::fs::write(root.join("db").join("testnet").join("data.mdb"), "db").expect("db");
+        std::fs::create_dir_all(root.join("testnet")).expect("direct network dir");
+        std::fs::write(root.join("testnet").join("data.mdb"), "db").expect("direct db");
+        std::fs::create_dir_all(root.join("wallet")).expect("wallet dir");
+        std::fs::write(root.join("wallet").join("wallet.dat"), "wallet").expect("wallet");
+
+        let runtime = RuntimeCli {
+            network_overrides_local: true,
+            ..RuntimeCli::default()
+        };
+        apply_network_override_if_requested(&runtime, Network::Testnet).expect("wipe override");
+
+        assert!(!root.join("db").join("testnet").join("data.mdb").exists());
+        assert!(!root.join("testnet").exists());
+        assert!(root.join("wallet").join("wallet.dat").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_node_config_honors_api_env_overrides() {
         let _port = EnvVarGuard::set("ATHO_API_PORT", "18080");
         let _bind = EnvVarGuard::set("ATHO_API_BIND", "127.0.0.2");
@@ -637,6 +785,11 @@ mod tests {
         assert_eq!(config.network, Network::Regnet);
         assert_eq!(config.api.port, 18080);
         assert_eq!(config.api.bind, "127.0.0.2");
+    }
+
+    #[test]
+    fn managed_parent_probe_recognizes_current_process() {
+        assert!(managed_parent_is_alive(std::process::id()));
     }
 
     #[test]
