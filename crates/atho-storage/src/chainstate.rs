@@ -577,15 +577,6 @@ impl Chainstate {
             return Ok(Vec::new());
         }
 
-        let start_height = match locator_hashes.iter().find_map(|hash| {
-            self.known_block_height(*hash)
-                .map(|height| height.saturating_add(1))
-        }) {
-            Some(height) => height,
-            None if locator_hashes.is_empty() => 0,
-            None => return Ok(Vec::new()),
-        };
-
         let Some(storage) = &self.storage else {
             let blocks = &self.blocks;
             if blocks.is_empty() {
@@ -615,6 +606,17 @@ impl Chainstate {
             return Ok(headers);
         };
 
+        let start_height = match locator_hashes.iter().find_map(|hash| {
+            self.canonical_locator_height(*hash)
+                .ok()
+                .flatten()
+                .map(|height| height.saturating_add(1))
+        }) {
+            Some(height) => height,
+            None if locator_hashes.is_empty() => 0,
+            None => return Ok(Vec::new()),
+        };
+
         let mut headers = Vec::new();
         let mut next_height = start_height;
         while headers.len() < max_headers && next_height <= self.height {
@@ -628,6 +630,26 @@ impl Chainstate {
             next_height = next_height.saturating_add(1);
         }
         Ok(headers)
+    }
+
+    fn canonical_locator_height(&self, block_hash: [u8; 48]) -> Result<Option<u64>, StorageError> {
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.block_hash() == block_hash)
+        {
+            return Ok(Some(block.header.height));
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let Some(record) = storage.load_block_record(block_hash)? else {
+            return Ok(None);
+        };
+        let Some(canonical_hash) = storage.load_block_hash_by_height(record.height)? else {
+            return Ok(None);
+        };
+        Ok((canonical_hash == block_hash).then_some(record.height))
     }
 
     pub fn prune_depth(&self) -> u64 {
@@ -2258,6 +2280,71 @@ mod tests {
             .headers_after_locator(&[[9; 48]], [0; 48], 64)
             .expect("unknown locator headers");
         assert!(unknown_locator_headers.is_empty());
+    }
+
+    #[test]
+    fn headers_after_locator_ignores_archived_noncanonical_blocks() {
+        let root = temp_workspace("headers-noncanonical-locator");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let genesis_hash = genesis::genesis_hash(Network::Prunetest);
+        let genesis_timestamp = genesis::genesis_state(Network::Prunetest)
+            .block
+            .header
+            .timestamp;
+
+        let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("state");
+        let old_1 = build_coinbase_successor_with_script(
+            &state,
+            vec![11],
+            genesis_timestamp.saturating_add(1),
+        );
+        state.connect_block(&old_1).expect("connect old one");
+        let old_2 = build_coinbase_successor_with_script(
+            &state,
+            vec![12],
+            genesis_timestamp.saturating_add(2),
+        );
+        let old_2_hash = old_2.header.block_hash();
+        state.connect_block(&old_2).expect("connect old two");
+
+        let mut fork_state = Chainstate::new(Network::Prunetest);
+        let new_1 = build_coinbase_successor_with_script(
+            &fork_state,
+            vec![21],
+            genesis_timestamp.saturating_add(3),
+        );
+        fork_state.connect_block(&new_1).expect("connect new one");
+        let new_2 = build_coinbase_successor_with_script(
+            &fork_state,
+            vec![22],
+            genesis_timestamp.saturating_add(4),
+        );
+        fork_state.connect_block(&new_2).expect("connect new two");
+        let new_3 = build_coinbase_successor_with_script(
+            &fork_state,
+            vec![23],
+            genesis_timestamp.saturating_add(5),
+        );
+        state
+            .select_branch(&[new_1.clone(), new_2.clone(), new_3.clone()])
+            .expect("select new branch");
+        drop(state);
+
+        let reloaded = Chainstate::try_load_or_new(Network::Prunetest).expect("reload");
+        let side_only_headers = reloaded
+            .headers_after_locator(&[old_2_hash], [0; 48], 64)
+            .expect("side-only locator headers");
+        assert!(side_only_headers.is_empty());
+
+        let headers = reloaded
+            .headers_after_locator(&[old_2_hash, genesis_hash], [0; 48], 64)
+            .expect("headers");
+        assert_eq!(headers.first().map(|header| header.height), Some(1));
+        assert_eq!(
+            headers.first().map(|header| header.block_hash()),
+            Some(new_1.header.block_hash())
+        );
     }
 
     #[test]
