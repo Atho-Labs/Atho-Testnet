@@ -608,6 +608,7 @@ fn spawn_peer_thread(
                 state.tip_hash()
             };
             let mut last_announced_mempool = None;
+            let mut announced_mempool_txids = BTreeSet::new();
             let mut last_activity = SystemTime::now();
             let peer_network = {
                 let state = state.lock().expect("p2p runtime state poisoned");
@@ -661,9 +662,11 @@ fn spawn_peer_thread(
                                 }
                             }
                         }
-                        if let Some(messages) =
-                            poll_mempool_announcements(&state, &mut last_announced_mempool)
-                        {
+                        if let Some(messages) = poll_mempool_announcements(
+                            &state,
+                            &mut last_announced_mempool,
+                            &mut announced_mempool_txids,
+                        ) {
                             for message in messages {
                                 let bytes_sent = match write_message(&mut stream, &message) {
                                     Ok(bytes_sent) => bytes_sent,
@@ -828,11 +831,13 @@ fn poll_tip_announcements(
 fn poll_mempool_announcements(
     state: &Arc<Mutex<NodeService>>,
     last_announced_fingerprint: &mut Option<[u8; 32]>,
+    announced_txids: &mut BTreeSet<[u8; 48]>,
 ) -> Option<Vec<NetworkMessage>> {
     let (network, txids, fingerprint) = {
         let state = state.lock().expect("p2p runtime state poisoned");
         if !state.p2p_transaction_relay_ready() {
             *last_announced_fingerprint = None;
+            announced_txids.clear();
             return None;
         }
         let fingerprint = state.p2p_mempool_fingerprint();
@@ -842,12 +847,18 @@ fn poll_mempool_announcements(
         (state.network(), state.p2p_mempool_txids(), fingerprint)
     };
     *last_announced_fingerprint = Some(fingerprint);
-    if txids.is_empty() {
+    let current_txids = txids.into_iter().collect::<BTreeSet<_>>();
+    let new_txids = current_txids
+        .difference(announced_txids)
+        .copied()
+        .collect::<Vec<_>>();
+    *announced_txids = current_txids;
+    if new_txids.is_empty() {
         return None;
     }
 
     let max_inventory = network_params(network).limits.max_inv_per_message.max(1);
-    let messages = txids
+    let messages = new_txids
         .chunks(max_inventory)
         .map(|chunk| {
             NetworkMessage::new(
@@ -1989,11 +2000,127 @@ mod tests {
             let state = service.lock().expect("service lock");
             Some(state.p2p_mempool_fingerprint())
         };
-        assert!(poll_mempool_announcements(&service, &mut last_announced_fingerprint).is_none());
+        let mut announced_txids = BTreeSet::from([txid]);
+        assert!(poll_mempool_announcements(
+            &service,
+            &mut last_announced_fingerprint,
+            &mut announced_txids,
+        )
+        .is_none());
         assert!(
             last_announced_fingerprint.is_none(),
             "stale announcement cache must clear so txids rebroadcast after sync catches up"
         );
+        assert!(
+            announced_txids.is_empty(),
+            "stale per-peer tx relay cache must clear while relay is gated"
+        );
+    }
+
+    #[test]
+    fn mempool_announcements_send_only_new_txids_after_first_inventory() {
+        let service = Arc::new(Mutex::new(NodeService::new_ephemeral(NodeConfig::new(
+            Network::Regnet,
+        ))));
+        let first_seed = crate::dev::seed_utxo(Network::Regnet);
+        let second_seed = ([0x34; 48], first_seed.1, 0x34);
+        let first_tx = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            first_seed.0,
+            first_seed.1,
+            first_seed.2,
+        )
+        .expect("first signed transaction");
+        let second_tx = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            second_seed.0,
+            second_seed.1,
+            second_seed.2,
+        )
+        .expect("second signed transaction");
+        let first_txid = first_tx.txid();
+        let second_txid = second_tx.txid();
+        let first_fee = minimum_required_fee_atoms(Network::Regnet, &first_tx);
+        let second_fee = minimum_required_fee_atoms(Network::Regnet, &second_tx);
+        {
+            let mut state = service.lock().expect("service lock");
+            state.start();
+            state.sandbox_with_node_mut(|node| {
+                node.dev_seed_chainstate(
+                    6,
+                    node.tip_hash(),
+                    [
+                        UtxoEntry::new(
+                            Network::Regnet,
+                            first_seed.0,
+                            0,
+                            first_seed.1,
+                            vec![first_seed.2],
+                            0,
+                            false,
+                        ),
+                        UtxoEntry::new(
+                            Network::Regnet,
+                            second_seed.0,
+                            0,
+                            second_seed.1,
+                            vec![second_seed.2],
+                            0,
+                            false,
+                        ),
+                    ],
+                )
+                .expect("seed chainstate");
+                node.submit_transaction(crate::mempool::MempoolEntry::new(first_tx, first_fee))
+                    .expect("submit first tx");
+            });
+        }
+
+        let mut last_announced_fingerprint = None;
+        let mut announced_txids = BTreeSet::new();
+        let first_messages = poll_mempool_announcements(
+            &service,
+            &mut last_announced_fingerprint,
+            &mut announced_txids,
+        )
+        .expect("first inventory");
+        assert_eq!(inventory_txids(&first_messages), vec![first_txid]);
+
+        {
+            let mut state = service.lock().expect("service lock");
+            state.sandbox_with_node_mut(|node| {
+                node.submit_transaction(crate::mempool::MempoolEntry::new(second_tx, second_fee))
+                    .expect("submit second tx");
+            });
+        }
+
+        let second_messages = poll_mempool_announcements(
+            &service,
+            &mut last_announced_fingerprint,
+            &mut announced_txids,
+        )
+        .expect("second inventory");
+        assert_eq!(inventory_txids(&second_messages), vec![second_txid]);
+        assert!(poll_mempool_announcements(
+            &service,
+            &mut last_announced_fingerprint,
+            &mut announced_txids,
+        )
+        .is_none());
+    }
+
+    fn inventory_txids(messages: &[NetworkMessage]) -> Vec<[u8; 48]> {
+        messages
+            .iter()
+            .flat_map(|message| match &message.payload {
+                MessagePayload::Inv { inventory } => inventory
+                    .iter()
+                    .filter(|item| item.kind == InventoryKind::Transaction)
+                    .map(|item| item.hash.0)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     #[test]

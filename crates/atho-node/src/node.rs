@@ -10,14 +10,13 @@ use crate::validation::ValidationError;
 use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
-use atho_core::crypto::hash::sha3_256;
 use atho_core::genesis;
 use atho_core::transaction::Transaction;
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
 use atho_p2p::protocol::PeerAddress;
 use atho_storage::chainstate::{
     ChainSelectionOutcome, ChainSelectionResult, ChainSnapshotBundle,
-    Chainstate as StorageChainstate,
+    Chainstate as StorageChainstate, FinalizedCheckpoint,
 };
 use atho_storage::db::{
     BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord, TransactionArchiveRecord,
@@ -147,12 +146,7 @@ impl Node {
         self.chainstate
             .import_snapshot_bundle(bundle)
             .map_err(NodeError::from)?;
-        let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool.revalidate(
-            self.network(),
-            self.chainstate.height,
-            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
-        );
+        self.revalidate_mempool_if_needed();
         Ok(())
     }
 
@@ -228,6 +222,16 @@ impl Node {
 
     pub fn prune_depth(&self) -> u64 {
         self.chainstate.prune_depth()
+    }
+
+    pub fn max_reorg_depth(&self) -> u64 {
+        self.chainstate.max_reorg_depth()
+    }
+
+    pub fn finalized_checkpoint(&self) -> Result<Option<FinalizedCheckpoint>, NodeError> {
+        self.chainstate
+            .finalized_checkpoint()
+            .map_err(NodeError::from)
     }
 
     pub fn last_prune_report(&self) -> Option<&BlockPruneReport> {
@@ -363,18 +367,7 @@ impl Node {
     }
 
     pub fn mempool_fingerprint(&self) -> [u8; 32] {
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(self.network().id().as_bytes());
-        preimage.extend_from_slice(&(self.mempool.len() as u64).to_be_bytes());
-        preimage.extend_from_slice(&self.mempool.total_fee_atoms().to_be_bytes());
-        for txid in self.mempool_txids() {
-            preimage.extend_from_slice(&txid);
-        }
-        for (txid, output_index) in self.mempool_spent_inputs() {
-            preimage.extend_from_slice(&txid);
-            preimage.extend_from_slice(&output_index.to_be_bytes());
-        }
-        sha3_256(&preimage)
+        self.mempool.fingerprint(self.network())
     }
 
     pub fn mempool_contains(&self, txid: &[u8; 48]) -> bool {
@@ -472,12 +465,7 @@ impl Node {
             });
         }
         self.mempool.remove_block_transactions(block);
-        let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool.revalidate(
-            self.network(),
-            self.chainstate.height,
-            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
-        );
+        self.revalidate_mempool_if_needed();
         let mempool_count = self.mempool.len();
         let _ = dev::record_block(self.chainstate.height, block);
         let _ = dev::append_log(
@@ -533,7 +521,31 @@ impl Node {
     }
 
     pub fn consider_branch(&mut self, branch: &[Block]) -> Result<ChainSelectionResult, NodeError> {
-        let selection = self.chainstate.select_branch(branch)?;
+        let selection = match self.chainstate.select_branch(branch) {
+            Ok(selection) => selection,
+            Err(StorageError::ReorgTooDeep {
+                depth,
+                max_depth,
+                fork_height,
+                current_height,
+            }) => {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "deep reorg rejected depth={} max_depth={} fork_height={} current_height={}",
+                        depth, max_depth, fork_height, current_height
+                    ),
+                );
+                return Err(StorageError::ReorgTooDeep {
+                    depth,
+                    max_depth,
+                    fork_height,
+                    current_height,
+                }
+                .into());
+            }
+            Err(err) => return Err(err.into()),
+        };
         match selection.outcome {
             ChainSelectionOutcome::KeptCurrent => return Ok(selection),
             ChainSelectionOutcome::Extended | ChainSelectionOutcome::Reorged => {}
@@ -562,12 +574,7 @@ impl Node {
             }
         }
 
-        let updated_utxos = self.chainstate.utxo_snapshot();
-        self.mempool.revalidate(
-            self.network(),
-            self.chainstate.height,
-            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
-        );
+        self.revalidate_mempool_if_needed();
         Ok(selection)
     }
 
@@ -597,6 +604,18 @@ impl Node {
         self.chainstate
             .headers_after_locator(locator_hashes, stop_hash, max_headers)
             .unwrap_or_default()
+    }
+
+    fn revalidate_mempool_if_needed(&mut self) {
+        if self.mempool.is_empty() {
+            return;
+        }
+        let updated_utxos = self.chainstate.utxo_snapshot();
+        self.mempool.revalidate(
+            self.network(),
+            self.chainstate.height,
+            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
+        );
     }
 }
 

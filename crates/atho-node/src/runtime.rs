@@ -351,9 +351,9 @@ fn initial_outbound_peers(
     discovered_bootstrap_peers: Vec<String>,
 ) -> Vec<String> {
     let mut seen = BTreeSet::new();
-    configured_bootstrap_peers(network)
+    discovered_bootstrap_peers
         .into_iter()
-        .chain(discovered_bootstrap_peers)
+        .chain(configured_bootstrap_peers(network))
         .filter(|peer| seen.insert(outbound_target_dedup_key(peer)))
         .collect()
 }
@@ -440,6 +440,18 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert!(peers.iter().any(|peer| peer == "localhost:9200"));
         assert!(peers.iter().any(|peer| peer == "127.0.0.1:9201"));
+    }
+
+    #[test]
+    fn initial_outbound_peers_try_discovered_anchors_before_static_bootstrap() {
+        std::env::remove_var("ATHO_P2P_PEERS");
+
+        let peers = initial_outbound_peers(Network::Testnet, vec![String::from("8.8.8.8:9100")]);
+
+        assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:9100"));
+        assert!(peers
+            .iter()
+            .any(|peer| peer == "testnet-node1.atho.io:9100"));
     }
 
     #[test]

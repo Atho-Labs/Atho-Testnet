@@ -27,7 +27,7 @@ use atho_core::transaction::{Transaction, TxInput, TxOutput};
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
 use atho_p2p::config::{configured_bootstrap_peers, default_bootstrap_peers, network_params};
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
-use atho_p2p::protocol::NetworkMessage;
+use atho_p2p::protocol::{NetworkMessage, NODE_NETWORK};
 use atho_rpc::command::{
     command_definition, help_payload, CommandDefinition, CommandInvocation, CommandResponse,
 };
@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 /// Snapshot of the local node state used by operator interfaces.
@@ -684,10 +685,16 @@ impl NodeService {
     }
 
     fn chain_synced(status: &NodeStatus) -> bool {
+        let validation_safe = status
+            .network_diagnostics
+            .chain_validation_status
+            .is_empty()
+            || status.network_diagnostics.safe_to_serve;
         status.running
             && status.headers_synced
             && status.block_count >= status.sync_best_height
             && Self::has_required_ready_peer(status)
+            && validation_safe
     }
 
     fn public_network_requires_ready_peer(network: Network) -> bool {
@@ -741,6 +748,30 @@ impl NodeService {
             "healthy_peer_count": status.network_diagnostics.healthy_peer_count,
             "stale_peer_count": status.network_diagnostics.stale_peer_count,
             "banned_peer_count": status.network_diagnostics.banned_peer_count,
+            "full_relay_peer_count": status.network_diagnostics.full_relay_peer_count,
+            "block_relay_peer_count": status.network_diagnostics.block_relay_peer_count,
+            "sync_peer_count": status.network_diagnostics.sync_peer_count,
+            "tx_relay_peer_count": status.network_diagnostics.tx_relay_peer_count,
+            "addr_relay_peer_count": status.network_diagnostics.addr_relay_peer_count,
+            "topology_health_score": status.network_diagnostics.topology_health_score,
+            "topology_warnings": status.network_diagnostics.topology_warnings.clone(),
+            "best_header_height": status.network_diagnostics.best_header_height,
+            "best_downloaded_body_height": status.network_diagnostics.best_downloaded_body_height,
+            "best_validated_height": status.network_diagnostics.best_validated_height,
+            "best_connected_height": status.network_diagnostics.best_connected_height,
+            "latest_finalized_height": status.network_diagnostics.latest_finalized_height,
+            "latest_finalized_hash": hex::encode(status.network_diagnostics.latest_finalized_hash),
+            "pending_validation_blocks": status.network_diagnostics.pending_validation_blocks,
+            "untrusted_downloaded_blocks": status.network_diagnostics.untrusted_downloaded_blocks,
+            "untrusted_downloaded_bytes": status.network_diagnostics.untrusted_downloaded_bytes,
+            "fast_download_enabled": status.network_diagnostics.fast_download_enabled,
+            "checkpoint_anchored_sync_enabled": status.network_diagnostics.checkpoint_anchored_sync_enabled,
+            "background_validation_enabled": status.network_diagnostics.background_validation_enabled,
+            "chain_validation_status": status.network_diagnostics.chain_validation_status.clone(),
+            "sync_mode": status.network_diagnostics.sync_mode.clone(),
+            "safe_to_mine": status.network_diagnostics.safe_to_mine,
+            "safe_to_serve": status.network_diagnostics.safe_to_serve,
+            "validation_lag_blocks": status.network_diagnostics.validation_lag_blocks,
             "peer_discovery_status": status.network_diagnostics.peer_discovery_status,
             "last_getaddr_time_unix": status.network_diagnostics.last_getaddr_time_unix,
             "last_addr_received_time_unix": status.network_diagnostics.last_addr_received_time_unix,
@@ -766,28 +797,60 @@ impl NodeService {
         if !Self::has_required_ready_peer(status) && !warnings.contains(&"no peers are connected") {
             warnings.push("no peers are connected");
         }
+        if status.network_diagnostics.topology_health_score < 60
+            && !status.network_diagnostics.topology_warnings.is_empty()
+        {
+            warnings.push("p2p topology health is weak");
+        }
+        if !status.network_diagnostics.safe_to_mine
+            && !status
+                .network_diagnostics
+                .chain_validation_status
+                .is_empty()
+            && status.network_diagnostics.validation_lag_blocks > 0
+        {
+            warnings.push("block bodies are downloaded ahead of validation");
+        }
         warnings
     }
 
     pub fn network_diagnostics(&self) -> NetworkDiagnostics {
         let connections = self.orchestrator.sync.connections();
+        let local_height = self.node_ref().height();
+        let sync_target_height = self.orchestrator.sync.sync_state().best_height;
+        let configured_bootstrap = configured_bootstrap_peers(self.network())
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let (peers, connecting_peers): (Vec<_>, Vec<_>) = connections
             .peer_snapshots()
             .into_iter()
             .map(|peer| {
+                let remote_addr = peer.remote_addr.clone();
                 let traffic = self
                     .network_runtime
                     .peers
-                    .get(&peer.remote_addr)
+                    .get(&remote_addr)
                     .cloned()
                     .unwrap_or_default();
-                let health = self.peer_health_cache.get(&peer.remote_addr);
+                let health = self.peer_health_cache.get(&remote_addr);
+                let direction = match peer.direction {
+                    ConnectionDirection::Inbound => NetworkPeerDirection::Inbound,
+                    ConnectionDirection::Outbound => NetworkPeerDirection::Outbound,
+                };
+                let roles = Self::classify_peer_roles(
+                    direction,
+                    peer.handshake_ready,
+                    peer.best_height,
+                    peer.services,
+                    health,
+                    local_height,
+                    sync_target_height,
+                    configured_bootstrap.contains(&remote_addr),
+                );
                 NetworkPeerDiagnostics {
-                    remote_addr: peer.remote_addr,
-                    direction: match peer.direction {
-                        ConnectionDirection::Inbound => NetworkPeerDirection::Inbound,
-                        ConnectionDirection::Outbound => NetworkPeerDirection::Outbound,
-                    },
+                    remote_addr,
+                    direction,
+                    roles,
                     handshake_ready: peer.handshake_ready,
                     best_height: peer.best_height,
                     protocol_version: peer.protocol_version,
@@ -813,16 +876,50 @@ impl NodeService {
             .iter()
             .filter(|peer| peer.direction == NetworkPeerDirection::Outbound)
             .count();
+        let full_relay_peer_count = Self::count_peers_with_role(&peers, "FULL_RELAY_PEER");
+        let block_relay_peer_count = Self::count_peers_with_role(&peers, "BLOCK_RELAY_PEER");
+        let sync_peer_count = Self::count_peers_with_role(&peers, "SYNC_PEER");
+        let tx_relay_peer_count = Self::count_peers_with_role(&peers, "TX_RELAY_PEER");
+        let addr_relay_peer_count = Self::count_peers_with_role(&peers, "ADDR_RELAY_PEER");
+        let known_peer_count = self.orchestrator.sync.known_peer_count();
+        let healthy_peer_count = self.orchestrator.sync.fresh_peer_count().max(peer_count);
+        let stale_peer_count = self.orchestrator.sync.stale_peer_count();
+        let banned_peer_count = self.orchestrator.sync.banned_peer_count();
+        let last_addr_received_time_unix = self.orchestrator.sync.last_addr_received_unix();
+        let fast_download = self
+            .orchestrator
+            .sync
+            .fast_download_diagnostics(&self.orchestrator.runtime.node);
+        let (topology_health_score, topology_warnings) = Self::topology_health(
+            self.network(),
+            &peers,
+            known_peer_count,
+            healthy_peer_count,
+            stale_peer_count,
+            banned_peer_count,
+            outbound_peer_count,
+            full_relay_peer_count,
+            block_relay_peer_count,
+            sync_peer_count,
+            tx_relay_peer_count,
+            addr_relay_peer_count,
+            last_addr_received_time_unix,
+        );
 
         NetworkDiagnostics {
             peer_count,
             inbound_peer_count,
             outbound_peer_count,
+            full_relay_peer_count,
+            block_relay_peer_count,
+            sync_peer_count,
+            tx_relay_peer_count,
+            addr_relay_peer_count,
             connecting_peer_count: connecting_peers.len(),
-            known_peer_count: self.orchestrator.sync.known_peer_count(),
-            healthy_peer_count: self.orchestrator.sync.fresh_peer_count().max(peer_count),
-            stale_peer_count: self.orchestrator.sync.stale_peer_count(),
-            banned_peer_count: self.orchestrator.sync.banned_peer_count(),
+            known_peer_count,
+            healthy_peer_count,
+            stale_peer_count,
+            banned_peer_count,
             dns_seed_status: if network_params(self.network()).dns_seeds.is_empty() {
                 String::from("none")
             } else {
@@ -835,13 +932,200 @@ impl NodeService {
             },
             peer_discovery_status: self.peer_discovery_status(peer_count),
             last_getaddr_time_unix: self.orchestrator.sync.last_getaddr_time_unix(),
-            last_addr_received_time_unix: self.orchestrator.sync.last_addr_received_unix(),
+            last_addr_received_time_unix,
             peer_db_path: database_dir(self.network()).display().to_string(),
+            topology_health_score,
+            topology_warnings,
+            best_header_height: fast_download.best_header_height,
+            best_downloaded_body_height: fast_download.best_downloaded_body_height,
+            best_validated_height: fast_download.best_validated_height,
+            best_connected_height: fast_download.best_connected_height,
+            latest_finalized_height: fast_download.latest_finalized_height,
+            latest_finalized_hash: fast_download.latest_finalized_hash,
+            pending_validation_blocks: fast_download.pending_validation_blocks,
+            untrusted_downloaded_blocks: fast_download.untrusted_downloaded_blocks,
+            untrusted_downloaded_bytes: fast_download.untrusted_downloaded_bytes,
+            fast_download_enabled: fast_download.fast_download_enabled,
+            checkpoint_anchored_sync_enabled: fast_download.checkpoint_anchored_sync_enabled,
+            background_validation_enabled: fast_download.background_validation_enabled,
+            chain_validation_status: fast_download.chain_validation_status,
+            sync_mode: fast_download.sync_mode,
+            safe_to_mine: fast_download.safe_to_mine,
+            safe_to_serve: fast_download.safe_to_serve,
+            validation_lag_blocks: fast_download.validation_lag_blocks,
+            max_fast_download_ahead: fast_download.max_fast_download_ahead,
+            max_untrusted_block_cache: fast_download.max_untrusted_block_cache,
+            max_pending_validation_blocks: fast_download.max_pending_validation_blocks,
             bytes_sent: self.network_runtime.bytes_sent,
             bytes_received: self.network_runtime.bytes_received,
             peers,
             connecting_peers,
         }
+    }
+
+    fn classify_peer_roles(
+        direction: NetworkPeerDirection,
+        handshake_ready: bool,
+        best_height: Option<u64>,
+        services: Option<u64>,
+        health: Option<&PeerHealthRecord>,
+        local_height: u64,
+        sync_target_height: u64,
+        is_bootstrap: bool,
+    ) -> Vec<String> {
+        let mut roles = Vec::new();
+        roles.push(match direction {
+            NetworkPeerDirection::Inbound => String::from("INBOUND_PEER"),
+            NetworkPeerDirection::Outbound => String::from("OUTBOUND_PEER"),
+        });
+        if is_bootstrap {
+            roles.push(String::from("BOOTSTRAP_PEER"));
+        }
+        if !handshake_ready {
+            return roles;
+        }
+
+        let supports_network = services.is_none_or(|services| services & NODE_NETWORK != 0);
+        let quality = health.map(|record| record.quality_score).unwrap_or(100);
+        let failures = health
+            .map(|record| record.consecutive_failures)
+            .unwrap_or_default();
+        let usable = quality >= 50 && failures <= 3;
+        let good = quality >= 70 && failures <= 1;
+        let peer_height = best_height.unwrap_or_default();
+
+        if supports_network && usable {
+            roles.push(String::from("FULL_RELAY_PEER"));
+        }
+        if supports_network && usable && peer_height >= local_height {
+            roles.push(String::from("SYNC_PEER"));
+        }
+        if supports_network && good && peer_height >= local_height {
+            roles.push(String::from("BLOCK_RELAY_PEER"));
+        }
+        if usable {
+            roles.push(String::from("TX_RELAY_PEER"));
+            roles.push(String::from("ADDR_RELAY_PEER"));
+        }
+        if peer_height < sync_target_height.saturating_sub(16) || quality < 50 || failures > 3 {
+            roles.push(String::from("DISCOURAGED_PEER"));
+        }
+        roles
+    }
+
+    fn count_peers_with_role(peers: &[NetworkPeerDiagnostics], role: &str) -> usize {
+        peers
+            .iter()
+            .filter(|peer| peer.roles.iter().any(|value| value == role))
+            .count()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn topology_health(
+        network: Network,
+        peers: &[NetworkPeerDiagnostics],
+        known_peer_count: usize,
+        healthy_peer_count: usize,
+        stale_peer_count: usize,
+        banned_peer_count: usize,
+        outbound_peer_count: usize,
+        _full_relay_peer_count: usize,
+        block_relay_peer_count: usize,
+        sync_peer_count: usize,
+        tx_relay_peer_count: usize,
+        addr_relay_peer_count: usize,
+        last_addr_received_time_unix: Option<u64>,
+    ) -> (u8, Vec<String>) {
+        let limits = network_params(network).limits;
+        let outbound_target = limits.max_outbound_peers.min(8).max(1);
+        let block_relay_target = limits.target_block_relay_peers.min(outbound_target).max(1);
+        let sync_target = limits.target_sync_peers.min(outbound_target).max(1);
+        let tx_target = limits.target_tx_relay_peers.min(outbound_target).max(1);
+        let addr_target = limits.target_addr_relay_peers.min(outbound_target).max(1);
+        let mut score = 0u8;
+        let mut warnings = Vec::new();
+
+        if outbound_peer_count >= outbound_target {
+            score = score.saturating_add(15);
+        } else {
+            warnings.push(format!(
+                "low outbound peer count: {outbound_peer_count}/{outbound_target}"
+            ));
+        }
+        if block_relay_peer_count >= block_relay_target {
+            score = score.saturating_add(15);
+        } else {
+            warnings.push(format!(
+                "low block-relay peer count: {block_relay_peer_count}/{block_relay_target}"
+            ));
+        }
+        if sync_peer_count >= sync_target {
+            score = score.saturating_add(15);
+        } else {
+            warnings.push(format!(
+                "low sync peer count: {sync_peer_count}/{sync_target}"
+            ));
+        }
+        if tx_relay_peer_count >= tx_target {
+            score = score.saturating_add(10);
+        } else {
+            warnings.push(format!(
+                "low tx-relay peer count: {tx_relay_peer_count}/{tx_target}"
+            ));
+        }
+        if addr_relay_peer_count >= addr_target {
+            score = score.saturating_add(5);
+        } else {
+            warnings.push(format!(
+                "low address-relay peer count: {addr_relay_peer_count}/{addr_target}"
+            ));
+        }
+
+        let subnet_groups = peers
+            .iter()
+            .map(|peer| diagnostic_peer_group(&peer.remote_addr, network.p2p_port()))
+            .collect::<BTreeSet<_>>();
+        if peers.len() <= 1 || subnet_groups.len() >= peers.len().min(3) {
+            score = score.saturating_add(10);
+        } else {
+            warnings.push(String::from("weak peer subnet diversity"));
+        }
+
+        let bootstrap_peers = peers
+            .iter()
+            .filter(|peer| peer.roles.iter().any(|role| role == "BOOTSTRAP_PEER"))
+            .count();
+        if peers.is_empty()
+            || bootstrap_peers < peers.len()
+            || last_addr_received_time_unix.is_some()
+        {
+            score = score.saturating_add(10);
+        } else {
+            warnings.push(String::from("topology depends only on bootstrap peers"));
+        }
+
+        let high_failure_peers = peers
+            .iter()
+            .filter(|peer| peer.consecutive_failures.unwrap_or_default() > 2)
+            .count();
+        if high_failure_peers == 0 {
+            score = score.saturating_add(10);
+        } else {
+            warnings.push(format!("high failure peers: {high_failure_peers}"));
+        }
+
+        if banned_peer_count == 0 {
+            score = score.saturating_add(5);
+        } else {
+            warnings.push(format!("banned peers observed: {banned_peer_count}"));
+        }
+        if known_peer_count > 0 && healthy_peer_count > stale_peer_count {
+            score = score.saturating_add(5);
+        } else {
+            warnings.push(String::from("peer database is weak or stale"));
+        }
+
+        (score.min(100), warnings)
     }
 
     pub fn wallet_snapshot(&self) -> &WalletSnapshot {
@@ -1001,7 +1285,7 @@ impl NodeService {
             .sync
             .accept_inbound(remote_addr)
             .map_err(sync_error_into_node)?;
-        self.refresh_runtime_views();
+        self.refresh_runtime_status_views();
         Ok(())
     }
 
@@ -1014,7 +1298,7 @@ impl NodeService {
             .sync
             .open_outbound(remote_addr, &self.orchestrator.runtime.node)
             .map_err(sync_error_into_node)?;
-        self.refresh_runtime_views();
+        self.refresh_runtime_status_views();
         Ok(events)
     }
 
@@ -1028,7 +1312,7 @@ impl NodeService {
             .sync
             .receive(remote_addr, message, &mut self.orchestrator.runtime.node)
             .map_err(sync_error_into_node)?;
-        self.refresh_runtime_views();
+        self.refresh_runtime_status_views();
         Ok(result)
     }
 
@@ -1041,7 +1325,7 @@ impl NodeService {
             .sync
             .maintain_peer_sync(remote_addr, &self.orchestrator.runtime.node)
             .map_err(sync_error_into_node)?;
-        self.refresh_runtime_views();
+        self.refresh_runtime_status_views();
         Ok(events)
     }
 
@@ -1083,7 +1367,7 @@ impl NodeService {
                 ),
             );
         }
-        self.refresh_runtime_views();
+        self.refresh_runtime_status_views();
         notice
     }
 
@@ -1109,7 +1393,7 @@ impl NodeService {
         Ok(block.header.block_hash())
     }
 
-    fn refresh_runtime_views(&mut self) {
+    fn refresh_runtime_status_views(&mut self) {
         self.orchestrator.rpc_server.block_count = self.orchestrator.runtime.node.height();
         self.orchestrator.rpc_server.tip_hash = self.orchestrator.runtime.node.tip_hash();
         self.orchestrator.rpc_server.mempool_count = self.orchestrator.runtime.node.mempool_len();
@@ -1120,6 +1404,10 @@ impl NodeService {
             self.orchestrator.sync.sync_state().headers_synced;
         self.orchestrator.rpc_server.sync_best_height =
             self.orchestrator.sync.sync_state().best_height;
+    }
+
+    fn refresh_runtime_views(&mut self) {
+        self.refresh_runtime_status_views();
         self.refresh_api_views();
     }
 
@@ -1590,7 +1878,21 @@ impl NodeService {
         });
 
         let mut seen = BTreeSet::new();
+        let mut seen_groups = BTreeSet::new();
         let mut peers = Vec::new();
+
+        for (_, remote_addr, _) in &scored {
+            let group = diagnostic_peer_group(remote_addr, self.network().p2p_port());
+            if !seen_groups.insert(group) {
+                continue;
+            }
+            if seen.insert(remote_addr.clone()) {
+                peers.push(remote_addr.clone());
+            }
+            if peers.len() >= max {
+                return peers;
+            }
+        }
 
         for (_, remote_addr, _) in scored {
             if seen.insert(remote_addr.clone()) {
@@ -2155,6 +2457,11 @@ impl NodeService {
             "peer_count": status.network_diagnostics.peer_count,
             "inbound_peer_count": status.network_diagnostics.inbound_peer_count,
             "outbound_peer_count": status.network_diagnostics.outbound_peer_count,
+            "full_relay_peer_count": status.network_diagnostics.full_relay_peer_count,
+            "block_relay_peer_count": status.network_diagnostics.block_relay_peer_count,
+            "sync_peer_count": status.network_diagnostics.sync_peer_count,
+            "tx_relay_peer_count": status.network_diagnostics.tx_relay_peer_count,
+            "addr_relay_peer_count": status.network_diagnostics.addr_relay_peer_count,
             "connecting_peer_count": status.network_diagnostics.connecting_peer_count,
             "known_peer_count": status.network_diagnostics.known_peer_count,
             "healthy_peer_count": status.network_diagnostics.healthy_peer_count,
@@ -2166,6 +2473,28 @@ impl NodeService {
             "last_getaddr_time_unix": status.network_diagnostics.last_getaddr_time_unix,
             "last_addr_received_time_unix": status.network_diagnostics.last_addr_received_time_unix,
             "peer_db_path": status.network_diagnostics.peer_db_path,
+            "topology_health_score": status.network_diagnostics.topology_health_score,
+            "topology_warnings": status.network_diagnostics.topology_warnings.clone(),
+            "sync_mode": status.network_diagnostics.sync_mode.clone(),
+            "chain_validation_status": status.network_diagnostics.chain_validation_status.clone(),
+            "best_header_height": status.network_diagnostics.best_header_height,
+            "best_downloaded_body_height": status.network_diagnostics.best_downloaded_body_height,
+            "best_validated_height": status.network_diagnostics.best_validated_height,
+            "best_connected_height": status.network_diagnostics.best_connected_height,
+            "latest_finalized_height": status.network_diagnostics.latest_finalized_height,
+            "latest_finalized_hash": hex::encode(status.network_diagnostics.latest_finalized_hash),
+            "pending_validation_blocks": status.network_diagnostics.pending_validation_blocks,
+            "untrusted_downloaded_blocks": status.network_diagnostics.untrusted_downloaded_blocks,
+            "untrusted_downloaded_bytes": status.network_diagnostics.untrusted_downloaded_bytes,
+            "fast_download_enabled": status.network_diagnostics.fast_download_enabled,
+            "checkpoint_anchored_sync_enabled": status.network_diagnostics.checkpoint_anchored_sync_enabled,
+            "background_validation_enabled": status.network_diagnostics.background_validation_enabled,
+            "safe_to_mine": status.network_diagnostics.safe_to_mine,
+            "safe_to_serve": status.network_diagnostics.safe_to_serve,
+            "validation_lag_blocks": status.network_diagnostics.validation_lag_blocks,
+            "max_fast_download_ahead": status.network_diagnostics.max_fast_download_ahead,
+            "max_untrusted_block_cache": status.network_diagnostics.max_untrusted_block_cache,
+            "max_pending_validation_blocks": status.network_diagnostics.max_pending_validation_blocks,
             "bytes_sent": status.network_diagnostics.bytes_sent,
             "bytes_received": status.network_diagnostics.bytes_received,
             "dns_seeds": params.dns_seeds,
@@ -2422,6 +2751,7 @@ impl NodeService {
     fn command_getmininginfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getmininginfo", args)?;
         let node = &self.orchestrator.runtime.node;
+        let fast = self.orchestrator.sync.fast_download_diagnostics(node);
         Ok(json!({
             "network": self.network().id(),
             "height": node.height(),
@@ -2430,6 +2760,13 @@ impl NodeService {
             "mempool_transaction_count": node.mempool_len(),
             "mempool_total_fee_atoms": node.mempool_total_fee_atoms(),
             "headers_synced": self.orchestrator.sync.sync_state().headers_synced,
+            "safe_to_mine": fast.safe_to_mine,
+            "chain_validation_status": fast.chain_validation_status,
+            "sync_mode": fast.sync_mode,
+            "validation_lag_blocks": fast.validation_lag_blocks,
+            "pending_validation_blocks": fast.pending_validation_blocks,
+            "best_downloaded_body_height": fast.best_downloaded_body_height,
+            "best_validated_height": fast.best_validated_height,
         }))
     }
 
@@ -3386,6 +3723,39 @@ mod tests {
     }
 
     #[test]
+    fn p2p_status_refresh_does_not_rebuild_explorer_index_on_hot_path() {
+        let root = temp_data_dir("p2p-status-refresh-no-explorer-rebuild");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.refresh_api_views();
+        assert!(service.explorer_index_ready());
+        assert_eq!(service.explorer_index_source(), "rebuilt");
+        let indexed_tip = service.explorer_index().tip_hash();
+
+        service
+            .orchestrator
+            .runtime
+            .node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine block without API refresh");
+        let new_tip = service.orchestrator.runtime.node.tip_hash();
+        assert_ne!(indexed_tip, new_tip);
+
+        service.refresh_runtime_status_views();
+        assert_eq!(
+            service.explorer_index().tip_hash(),
+            indexed_tip,
+            "P2P status refresh must not rebuild the full explorer index"
+        );
+        assert_eq!(service.orchestrator.rpc_server.block_count, 1);
+
+        service.refresh_api_views();
+        assert_eq!(service.explorer_index().tip_hash(), new_tip);
+    }
+
+    #[test]
     fn bootstrap_peers_include_persisted_peer_records() {
         let root = temp_data_dir("bootstrap-peers");
         fs::create_dir_all(&root).expect("root");
@@ -3469,6 +3839,86 @@ mod tests {
         assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:9200"));
         assert!(peers.iter().any(|peer| peer == "9.9.9.9:9200"));
         assert!(!peers.iter().any(|peer| peer == "7.7.7.7:9200"));
+    }
+
+    #[test]
+    fn bootstrap_peers_prefer_subnet_diversity_before_same_subnet_fill() {
+        let root = temp_data_dir("bootstrap-subnet-diversity");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.sandbox_with_node_mut(|node| {
+            node.observe_peer("8.8.1.1:9200", 12, 1_700_000_010)
+                .expect("peer observation");
+            node.observe_peer("8.8.1.2:9200", 12, 1_700_000_009)
+                .expect("peer observation");
+            node.observe_peer("9.9.9.9:9200", 12, 1_700_000_008)
+                .expect("peer observation");
+        });
+
+        let now = unix_timestamp();
+        for (remote_addr, quality_score) in [
+            ("8.8.1.1:9200", 100),
+            ("8.8.1.2:9200", 99),
+            ("9.9.9.9:9200", 80),
+        ] {
+            service.p2p_save_peer_health(&PeerHealthRecord {
+                network: Network::Regnet,
+                remote_addr: String::from(remote_addr),
+                quality_score,
+                consecutive_failures: 0,
+                backoff_until_unix: 0,
+                last_failure_unix: None,
+                last_success_unix: Some(now),
+            });
+        }
+
+        service.p2p_prime();
+
+        let peers = service.p2p_bootstrap_peers(3);
+        assert_eq!(peers.first().map(String::as_str), Some("8.8.1.1:9200"));
+        assert_eq!(peers.get(1).map(String::as_str), Some("9.9.9.9:9200"));
+        assert_eq!(peers.get(2).map(String::as_str), Some("8.8.1.2:9200"));
+    }
+
+    #[test]
+    fn topology_roles_classify_fast_ready_outbound_peer() {
+        let roles = NodeService::classify_peer_roles(
+            NetworkPeerDirection::Outbound,
+            true,
+            Some(128),
+            Some(NODE_NETWORK),
+            None,
+            64,
+            128,
+            false,
+        );
+
+        for role in [
+            "OUTBOUND_PEER",
+            "FULL_RELAY_PEER",
+            "SYNC_PEER",
+            "BLOCK_RELAY_PEER",
+            "TX_RELAY_PEER",
+            "ADDR_RELAY_PEER",
+        ] {
+            assert!(roles.iter().any(|value| value == role), "missing {role}");
+        }
+    }
+
+    #[test]
+    fn topology_health_score_warns_on_weak_peer_shape() {
+        let (score, warnings) =
+            NodeService::topology_health(Network::Mainnet, &[], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None);
+
+        assert!(score < 60);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("low outbound peer count")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("peer database")));
     }
 
     #[test]
@@ -3599,6 +4049,48 @@ mod tests {
         assert_eq!(rendered["sync_target_height"], 128);
         assert_eq!(rendered["chain_synced"], false);
         assert_eq!(rendered["headers_synced"], true);
+    }
+
+    #[test]
+    fn rendered_status_marks_validation_lag_as_not_synced_or_safe_to_mine() {
+        let status = NodeStatus {
+            network: Network::Mainnet,
+            block_count: 128,
+            tip_hash: [0x12; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x23; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 128,
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                best_header_height: 130,
+                best_downloaded_body_height: 130,
+                best_validated_height: 128,
+                best_connected_height: 128,
+                pending_validation_blocks: 2,
+                untrusted_downloaded_blocks: 2,
+                chain_validation_status: String::from("body_download_ahead"),
+                sync_mode: String::from("checkpoint_anchored_downloading"),
+                safe_to_mine: false,
+                safe_to_serve: false,
+                validation_lag_blocks: 2,
+                ..NetworkDiagnostics::default()
+            },
+        };
+
+        let rendered = NodeService::render_status_value(&status);
+
+        assert_eq!(rendered["chain_synced"], false);
+        assert_eq!(rendered["safe_to_mine"], false);
+        assert_eq!(rendered["safe_to_serve"], false);
+        assert_eq!(rendered["chain_validation_status"], "body_download_ahead");
+        assert_eq!(rendered["validation_lag_blocks"], 2);
+        assert!(NodeService::health_warnings(&status)
+            .contains(&"block bodies are downloaded ahead of validation"));
     }
 
     #[test]
@@ -3908,6 +4400,26 @@ fn average_block_time_from_records(records: &[BlockArchiveRecord], window_blocks
                 .unwrap_or_default(),
         );
     ((elapsed as u128 * 1_000) / (window_blocks as u128)) as u64
+}
+
+fn diagnostic_peer_group(remote_addr: &str, default_port: u16) -> String {
+    let Some(address) = parse_remote_addr(remote_addr, default_port) else {
+        return remote_addr.to_ascii_lowercase();
+    };
+    let host = address.host.to_ascii_lowercase();
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return host;
+    };
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("{}.{}.0.0/16", octets[0], octets[1])
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            format!("{:x}:{:x}::/32", segments[0], segments[1])
+        }
+    }
 }
 
 fn unix_timestamp() -> u64 {

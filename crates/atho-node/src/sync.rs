@@ -31,6 +31,75 @@ const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
 const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
 const ADDR_RELAY_INTERVAL_SECS: u64 = 5 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BlockValidationState {
+    HeaderSeen,
+    HeaderValidated,
+    CheckpointAnchored,
+    BodyRequested,
+    BodyDownloaded,
+    TempStoredUntrusted,
+    ValidationQueued,
+    FullyValidated,
+    Connected,
+    Finalized,
+    Invalid,
+}
+
+impl BlockValidationState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::HeaderSeen => "HEADER_SEEN",
+            Self::HeaderValidated => "HEADER_VALIDATED",
+            Self::CheckpointAnchored => "CHECKPOINT_ANCHORED",
+            Self::BodyRequested => "BODY_REQUESTED",
+            Self::BodyDownloaded => "BODY_DOWNLOADED",
+            Self::TempStoredUntrusted => "TEMP_STORED_UNTRUSTED",
+            Self::ValidationQueued => "VALIDATION_QUEUED",
+            Self::FullyValidated => "FULLY_VALIDATED",
+            Self::Connected => "CONNECTED",
+            Self::Finalized => "FINALIZED",
+            Self::Invalid => "INVALID",
+        }
+    }
+
+    fn is_body_downloaded(self) -> bool {
+        matches!(
+            self,
+            Self::BodyDownloaded
+                | Self::TempStoredUntrusted
+                | Self::ValidationQueued
+                | Self::FullyValidated
+                | Self::Connected
+                | Self::Finalized
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastDownloadDiagnostics {
+    pub best_header_height: u64,
+    pub best_downloaded_body_height: u64,
+    pub best_validated_height: u64,
+    pub best_connected_height: u64,
+    pub latest_finalized_height: u64,
+    pub latest_finalized_hash: [u8; 48],
+    pub pending_validation_blocks: usize,
+    pub untrusted_downloaded_blocks: usize,
+    pub untrusted_downloaded_bytes: usize,
+    pub fast_download_enabled: bool,
+    pub checkpoint_anchored_sync_enabled: bool,
+    pub background_validation_enabled: bool,
+    pub chain_validation_status: String,
+    pub sync_mode: String,
+    pub safe_to_mine: bool,
+    pub safe_to_serve: bool,
+    pub validation_lag_blocks: u64,
+    pub max_fast_download_ahead: u64,
+    pub max_untrusted_block_cache: usize,
+    pub max_pending_validation_blocks: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum NodeSyncError {
     #[error(transparent)]
@@ -67,6 +136,8 @@ pub struct NodeSync {
     last_sync_metrics_log_unix: u64,
     last_stale_recovery_unix: u64,
     stale_recovery_count: u64,
+    block_validation_states: BTreeMap<[u8; 48], BlockValidationState>,
+    block_validation_heights: BTreeMap<[u8; 48], u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,13 +218,26 @@ impl SideBranchPool {
         self.blocks.get(block_hash).map(|entry| &entry.block)
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.blocks.len()
     }
 
     fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    fn total_size_bytes(&self) -> usize {
+        self.blocks
+            .values()
+            .map(|entry| entry.block.full_size_bytes())
+            .sum()
+    }
+
+    fn max_height(&self) -> Option<u64> {
+        self.blocks
+            .values()
+            .map(|entry| entry.block.header.height)
+            .max()
     }
 
     fn block_hashes(&self) -> Vec<[u8; 48]> {
@@ -253,6 +337,8 @@ impl NodeSync {
             last_sync_metrics_log_unix: 0,
             last_stale_recovery_unix: 0,
             stale_recovery_count: 0,
+            block_validation_states: BTreeMap::new(),
+            block_validation_heights: BTreeMap::new(),
         }
     }
 
@@ -291,6 +377,90 @@ impl NodeSync {
 
     pub fn banned_peer_count(&self) -> usize {
         self.connections.banned_count()
+    }
+
+    pub fn fast_download_diagnostics(&self, node: &Node) -> FastDownloadDiagnostics {
+        let limits = network_params(self.network).limits;
+        let finalized_checkpoint = node.finalized_checkpoint().ok().flatten();
+        let latest_finalized_height = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.height)
+            .unwrap_or(0);
+        let latest_finalized_hash = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.block_hash)
+            .unwrap_or([0; 48]);
+        let best_connected_height = node.height();
+        let best_downloaded_body_height = self
+            .block_validation_states
+            .iter()
+            .filter(|(_, state)| state.is_body_downloaded())
+            .filter_map(|(hash, _)| self.block_validation_heights.get(hash).copied())
+            .max()
+            .unwrap_or(best_connected_height)
+            .max(
+                self.side_branches
+                    .max_height()
+                    .unwrap_or(best_connected_height),
+            )
+            .max(best_connected_height);
+        let pending_validation_blocks = self.pending_untrusted_validation_blocks();
+        let validation_lag_blocks =
+            best_downloaded_body_height.saturating_sub(best_connected_height);
+        let fast_download_enabled =
+            limits.enable_fast_body_download && limits.enable_checkpoint_anchored_sync;
+        let background_validation_enabled = limits.enable_background_validation;
+        let safe_to_serve = self.chain_synced(node) && pending_validation_blocks == 0;
+        let safe_to_mine = if limits.require_full_validation_before_mining {
+            safe_to_serve
+        } else {
+            self.chain_synced(node)
+        };
+        let chain_validation_status = if !self.sync_state().headers_synced {
+            String::from("headers_syncing")
+        } else if pending_validation_blocks > 0 && validation_lag_blocks > 0 {
+            String::from("body_download_ahead")
+        } else if best_connected_height < self.sync_state().best_height {
+            String::from("validating_local_blocks")
+        } else if safe_to_serve {
+            String::from("synced")
+        } else if !self.checkpoint_anchor_allows_fast_download(node) {
+            String::from("checkpoint_anchor_wait")
+        } else {
+            String::from("partially_validated")
+        };
+        let sync_mode = if !fast_download_enabled {
+            String::from("standard")
+        } else if pending_validation_blocks > 0 {
+            String::from("checkpoint_anchored_downloading")
+        } else if best_connected_height < self.sync_state().best_height {
+            String::from("checkpoint_anchored_validating")
+        } else {
+            String::from("near_tip")
+        };
+
+        FastDownloadDiagnostics {
+            best_header_height: self.sync_state().best_height,
+            best_downloaded_body_height,
+            best_validated_height: best_connected_height,
+            best_connected_height,
+            latest_finalized_height,
+            latest_finalized_hash,
+            pending_validation_blocks,
+            untrusted_downloaded_blocks: self.side_branches.len(),
+            untrusted_downloaded_bytes: self.side_branches.total_size_bytes(),
+            fast_download_enabled,
+            checkpoint_anchored_sync_enabled: limits.enable_checkpoint_anchored_sync,
+            background_validation_enabled,
+            chain_validation_status,
+            sync_mode,
+            safe_to_mine,
+            safe_to_serve,
+            validation_lag_blocks,
+            max_fast_download_ahead: limits.max_fast_download_ahead,
+            max_untrusted_block_cache: limits.max_untrusted_block_cache,
+            max_pending_validation_blocks: limits.max_pending_validation_blocks,
+        }
     }
 
     pub fn has_peer(&self, remote_addr: &str) -> bool {
@@ -603,6 +773,12 @@ impl NodeSync {
             Some(Hash48::from(node.tip_hash())),
             peer_best_height,
         );
+        self.mark_block_state(
+            node.tip_hash(),
+            node.height(),
+            BlockValidationState::Connected,
+        );
+        self.mark_finalized_boundary(node);
         self.update_sync_progress_watchdog(node);
     }
 
@@ -634,10 +810,20 @@ impl NodeSync {
 
         self.last_sync_metrics_log_unix = now;
         let progress_age = now.saturating_sub(self.last_block_progress_unix);
+        let finalized_checkpoint = node.finalized_checkpoint().ok().flatten();
+        let finalized_height = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.height)
+            .unwrap_or(0);
+        let finalized_hash = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| short_hash(&checkpoint.block_hash))
+            .unwrap_or_else(|| String::from("<none>"));
+        let fast = self.fast_download_diagnostics(node);
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "sync metrics local_height={} target_height={} headers_synced={} ready_peers={} pending_blocks={} inflight_blocks={} pending_header_heights={} side_branch_blocks={} pending_compact={} penalized_peers={} stale_recoveries={} last_progress_age_secs={}",
+                "sync metrics local_height={} target_height={} headers_synced={} ready_peers={} pending_blocks={} inflight_blocks={} pending_header_heights={} side_branch_blocks={} pending_compact={} penalized_peers={} stale_recoveries={} last_progress_age_secs={} max_reorg_depth={} finalized_height={} finalized_hash={} sync_mode={} validation_status={} downloaded_body_height={} validation_lag={} pending_validation={} untrusted_bytes={} safe_to_mine={}",
                 node.height(),
                 self.sync_state().best_height,
                 self.sync_state().headers_synced,
@@ -650,6 +836,16 @@ impl NodeSync {
                 stats.penalized_peers,
                 self.stale_recovery_count,
                 progress_age,
+                node.max_reorg_depth(),
+                finalized_height,
+                finalized_hash,
+                fast.sync_mode,
+                fast.chain_validation_status,
+                fast.best_downloaded_body_height,
+                fast.validation_lag_blocks,
+                fast.pending_validation_blocks,
+                fast.untrusted_downloaded_bytes,
+                fast.safe_to_mine,
             ),
         );
     }
@@ -697,10 +893,19 @@ impl NodeSync {
             .first()
             .map(|download| short_hash(&download.hash.into_inner()))
             .unwrap_or_else(|| String::from("<none>"));
+        let finalized_checkpoint = node.finalized_checkpoint().ok().flatten();
+        let finalized_height = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.height)
+            .unwrap_or(0);
+        let finalized_hash = finalized_checkpoint
+            .as_ref()
+            .map(|checkpoint| short_hash(&checkpoint.block_hash))
+            .unwrap_or_else(|| String::from("<none>"));
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "sync stale recovery peer={} local_height={} target_height={} requeued={} first_hash={} pending_blocks={} inflight_blocks={} pending_header_heights={} ready_peers={} last_progress_age_secs={}",
+                "sync stale recovery peer={} local_height={} target_height={} requeued={} first_hash={} pending_blocks={} inflight_blocks={} pending_header_heights={} ready_peers={} last_progress_age_secs={} finalized_height={} finalized_hash={}",
                 remote_addr,
                 node.height(),
                 target_height,
@@ -711,6 +916,8 @@ impl NodeSync {
                 self.pending_header_blocks.len(),
                 stats.ready_peers,
                 now.saturating_sub(self.last_block_progress_unix),
+                finalized_height,
+                finalized_hash,
             ),
         );
 
@@ -1204,7 +1411,7 @@ impl NodeSync {
     }
 
     fn push_download_assignment(
-        &self,
+        &mut self,
         assignment: DownloadAssignment,
         outbound: &mut Vec<ConnectionEvent>,
     ) {
@@ -1222,6 +1429,17 @@ impl NodeSync {
                 requested.join(",")
             ),
         );
+        for item in &assignment.inventory {
+            if item.kind == InventoryKind::Block {
+                let hash = item.hash.into_inner();
+                let height = self
+                    .block_validation_heights
+                    .get(&hash)
+                    .copied()
+                    .unwrap_or_default();
+                self.mark_block_state(hash, height, BlockValidationState::BodyRequested);
+            }
+        }
         outbound.push(ConnectionEvent::Send {
             peer: assignment.peer,
             message: NetworkMessage::new(
@@ -1376,9 +1594,15 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         let block_hash = block.header.block_hash();
         let block_height = block.header.height;
+        self.mark_block_state(
+            block_hash,
+            block_height,
+            BlockValidationState::BodyDownloaded,
+        );
         if let Err(validation) =
             crate::validation::validate_block(&block, block.header.height, self.network)
         {
+            self.mark_block_state(block_hash, block_height, BlockValidationState::Invalid);
             let _ = dev::append_log(
                 "p2p",
                 &format!(
@@ -1417,16 +1641,33 @@ impl NodeSync {
             self.pending_compact_blocks.remove(&block_hash);
             self.side_branches.remove(&block_hash);
             self.remove_pending_header_block(block.header.height, &block_hash);
+            self.mark_block_state(block_hash, block_height, BlockValidationState::Connected);
             self.push_block_download_work_for_peer(peer, node, outbound);
             self.process_buffered_branches(Some(peer), node, outbound)?;
             return Ok(());
         }
 
         if block.header.previous_block_hash == node.tip_hash() {
+            self.mark_block_state(
+                block_hash,
+                block_height,
+                BlockValidationState::ValidationQueued,
+            );
             match node.submit_block(&block) {
                 Ok(()) => {
                     self.note_observed_peer_tip(peer, &block.header, node);
                     self.note_local_chain_progress(node);
+                    self.mark_block_state(
+                        block_hash,
+                        block_height,
+                        BlockValidationState::FullyValidated,
+                    );
+                    self.mark_block_state(
+                        block_hash,
+                        block_height,
+                        BlockValidationState::Connected,
+                    );
+                    self.mark_finalized_boundary(node);
                     let _ = dev::append_log(
                         "p2p",
                         &format!(
@@ -1462,8 +1703,14 @@ impl NodeSync {
                     );
                     // Keep the block buffered so fork-choice can re-evaluate it once the
                     // branch is complete enough to compare by cumulative work.
+                    self.mark_block_state(
+                        block_hash,
+                        block_height,
+                        BlockValidationState::TempStoredUntrusted,
+                    );
                 }
                 Err(err) => {
+                    self.mark_block_state(block_hash, block_height, BlockValidationState::Invalid);
                     let _ = dev::append_log(
                         "p2p",
                         &format!(
@@ -1493,6 +1740,11 @@ impl NodeSync {
             ),
         );
         self.buffer_peer_block_with_known_ancestors(peer, block, node);
+        self.mark_block_state(
+            block_hash,
+            block_height,
+            BlockValidationState::TempStoredUntrusted,
+        );
         self.downloader.note_block_received(block_hash);
         self.pending_compact_blocks.remove(&block_hash);
         self.remove_pending_header_block(block_height, &block_hash);
@@ -1597,6 +1849,7 @@ impl NodeSync {
     }
 
     fn note_pending_header_block(&mut self, peer: &str, height: u64, hash: [u8; 48]) {
+        self.mark_block_state(hash, height, BlockValidationState::HeaderSeen);
         self.pending_header_blocks
             .entry(height)
             .or_default()
@@ -1634,9 +1887,25 @@ impl NodeSync {
     }
 
     fn stage_header_blocks_near_tip(&mut self, node: &Node) {
+        if self.fast_body_download_backpressure_active(node) {
+            let limits = network_params(self.network).limits;
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "fast body download paused by backpressure pending_validation={} untrusted_blocks={} untrusted_bytes={} max_pending={} max_untrusted={} max_untrusted_bytes={}",
+                    self.pending_untrusted_validation_blocks(),
+                    self.side_branches.len(),
+                    self.side_branches.total_size_bytes(),
+                    limits.max_pending_validation_blocks,
+                    limits.max_untrusted_block_cache,
+                    limits.max_untrusted_block_cache_bytes,
+                ),
+            );
+            return;
+        }
         let max_height = node
             .height()
-            .saturating_add(self.block_download_lookahead());
+            .saturating_add(self.block_download_stage_lookahead(node));
         let heights = self
             .pending_header_blocks
             .range(..=max_height)
@@ -1647,14 +1916,61 @@ impl NodeSync {
                 continue;
             };
             for (hash, peers) in blocks_at_height {
+                if self.header_conflicts_with_finalized_checkpoint(node, height, &hash) {
+                    self.mark_block_state(hash, height, BlockValidationState::Invalid);
+                    for peer in peers {
+                        let banned = self.connections.record_misbehavior(peer.clone(), 40);
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "rejecting checkpoint-conflicting header peer={} banned={} height={} hash={} finalized_height={}",
+                                peer,
+                                banned,
+                                height,
+                                short_hash(&hash),
+                                node.finalized_checkpoint()
+                                    .ok()
+                                    .flatten()
+                                    .map(|checkpoint| checkpoint.height)
+                                    .unwrap_or(0)
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 if node.is_canonical_block(&hash) || node.block_by_hash(hash).is_some() {
+                    self.mark_block_state(hash, height, BlockValidationState::Connected);
                     self.downloader.note_block_received(hash);
                     continue;
                 }
+                let state = if self.checkpoint_anchor_allows_fast_download(node) {
+                    BlockValidationState::CheckpointAnchored
+                } else {
+                    BlockValidationState::HeaderValidated
+                };
+                self.mark_block_state(hash, height, state);
                 for peer in self.block_source_peers_for_height(height, peers) {
                     self.downloader.note_headers(&peer, [hash]);
                 }
             }
+        }
+    }
+
+    fn header_conflicts_with_finalized_checkpoint(
+        &self,
+        node: &Node,
+        height: u64,
+        hash: &[u8; 48],
+    ) -> bool {
+        let Some(finalized_checkpoint) = node.finalized_checkpoint().ok().flatten() else {
+            return false;
+        };
+        if height > finalized_checkpoint.height {
+            return false;
+        }
+        match node.block_record_by_height(height) {
+            Some(record) => record.block_hash != *hash,
+            None => true,
         }
     }
 
@@ -1742,10 +2058,22 @@ impl NodeSync {
                 Ok(selection) if selection.outcome != ChainSelectionOutcome::KeptCurrent => {
                     self.note_local_chain_progress(node);
                     for hash in candidate_hashes {
+                        let height = self
+                            .block_validation_heights
+                            .get(&hash)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                node.block_by_hash(hash)
+                                    .map(|block| block.header.height)
+                                    .unwrap_or_default()
+                            });
+                        self.mark_block_state(hash, height, BlockValidationState::FullyValidated);
+                        self.mark_block_state(hash, height, BlockValidationState::Connected);
                         self.downloader.note_block_received(hash);
                         self.pending_compact_blocks.remove(&hash);
                         self.side_branches.remove(&hash);
                     }
+                    self.mark_finalized_boundary(node);
                     self.side_branches.remove_canonical_blocks(node);
                     if let Some(peer) = preferred_peer {
                         self.push_block_download_work_for_peer(peer, node, outbound);
@@ -1773,6 +2101,12 @@ impl NodeSync {
                         &format!("dropping invalid side branch tip={} error={}", tip, err),
                     );
                     for hash in candidate_hashes {
+                        let height = self
+                            .block_validation_heights
+                            .get(&hash)
+                            .copied()
+                            .unwrap_or_default();
+                        self.mark_block_state(hash, height, BlockValidationState::Invalid);
                         self.downloader.note_block_received(hash);
                         self.pending_compact_blocks.remove(&hash);
                         self.side_branches.remove(&hash);
@@ -2023,6 +2357,71 @@ impl NodeSync {
         self.sync_state().headers_synced && node.height() >= self.sync_state().best_height
     }
 
+    fn mark_block_state(&mut self, hash: [u8; 48], height: u64, state: BlockValidationState) {
+        let _state_label = state.as_str();
+        self.block_validation_heights.insert(hash, height);
+        self.block_validation_states.insert(hash, state);
+    }
+
+    fn mark_finalized_boundary(&mut self, node: &Node) {
+        let Some(checkpoint) = node.finalized_checkpoint().ok().flatten() else {
+            return;
+        };
+        self.mark_block_state(
+            checkpoint.block_hash,
+            checkpoint.height,
+            BlockValidationState::Finalized,
+        );
+    }
+
+    fn pending_untrusted_validation_blocks(&self) -> usize {
+        self.side_branches.len().max(
+            self.block_validation_states
+                .values()
+                .filter(|state| {
+                    matches!(
+                        state,
+                        BlockValidationState::BodyDownloaded
+                            | BlockValidationState::TempStoredUntrusted
+                            | BlockValidationState::ValidationQueued
+                    )
+                })
+                .count(),
+        )
+    }
+
+    fn checkpoint_anchor_allows_fast_download(&self, node: &Node) -> bool {
+        if !network_params(self.network)
+            .limits
+            .enable_checkpoint_anchored_sync
+        {
+            return false;
+        }
+        // Genesis is the hard anchor for fresh nodes. Once local finality exists,
+        // the finalized checkpoint becomes the stronger anchor.
+        node.finalized_checkpoint().ok().flatten().is_some() || node.height() == 0
+    }
+
+    fn fast_body_download_backpressure_active(&self, node: &Node) -> bool {
+        let limits = network_params(self.network).limits;
+        let pending_validation = self.pending_untrusted_validation_blocks();
+        pending_validation >= limits.max_pending_validation_blocks
+            || self.side_branches.len() >= limits.max_untrusted_block_cache
+            || self.side_branches.total_size_bytes() >= limits.max_untrusted_block_cache_bytes
+            || self.side_branches.max_height().is_some_and(|height| {
+                height.saturating_sub(node.height()) >= limits.max_fast_download_ahead
+            })
+    }
+
+    fn block_download_stage_lookahead(&self, node: &Node) -> u64 {
+        let limits = network_params(self.network).limits;
+        if limits.enable_fast_body_download && self.checkpoint_anchor_allows_fast_download(node) {
+            limits.max_fast_download_ahead
+        } else {
+            self.block_download_lookahead()
+        }
+    }
+
     fn maybe_request_mempool_snapshots(
         &mut self,
         node: &Node,
@@ -2246,6 +2645,17 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
             let lock = acquire_global_test_lock();
             let previous = env::var_os(key);
@@ -3008,7 +3418,7 @@ mod tests {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
         sync.prime(&node);
-        let lookahead = sync.block_download_lookahead();
+        let lookahead = sync.block_download_stage_lookahead(&node);
         let batch_limit = sync.block_request_batch_limit();
         let _ = sync
             .expand_events(
@@ -4602,6 +5012,87 @@ mod tests {
         assert_eq!(peer.sync.sync_state().best_height, 0);
         assert!(peer.sync.side_branches.is_empty());
         assert!(outbound.is_empty());
+    }
+
+    #[test]
+    fn fast_download_diagnostics_keep_downloaded_bodies_untrusted() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let blocks = mine_reference_blocks(Network::Regnet, 2);
+        peer.sync
+            .relay
+            .accept_headers(
+                &blocks
+                    .iter()
+                    .map(|block| block.header.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("validated headers");
+        let buffered_tip = blocks[1].clone();
+        let buffered_hash = buffered_tip.header.block_hash();
+
+        peer.sync.side_branches.insert("remote", buffered_tip);
+        peer.sync.mark_block_state(
+            buffered_hash,
+            blocks[1].header.height,
+            BlockValidationState::TempStoredUntrusted,
+        );
+
+        let diagnostics = peer.sync.fast_download_diagnostics(&peer.node);
+
+        assert_eq!(diagnostics.best_header_height, 2);
+        assert_eq!(diagnostics.best_connected_height, 0);
+        assert_eq!(diagnostics.best_downloaded_body_height, 2);
+        assert_eq!(diagnostics.pending_validation_blocks, 1);
+        assert_eq!(diagnostics.untrusted_downloaded_blocks, 1);
+        assert_eq!(diagnostics.validation_lag_blocks, 2);
+        assert_eq!(diagnostics.chain_validation_status, "body_download_ahead");
+        assert_eq!(diagnostics.sync_mode, "checkpoint_anchored_downloading");
+        assert!(!diagnostics.safe_to_mine);
+        assert!(!diagnostics.safe_to_serve);
+        assert_eq!(
+            peer.sync
+                .block_validation_states
+                .get(&buffered_hash)
+                .map(BlockValidationState::as_str),
+            Some("TEMP_STORED_UNTRUSTED")
+        );
+    }
+
+    #[test]
+    fn checkpoint_conflicting_header_is_rejected_before_body_download() {
+        let _guard = EnvVarGuard::set("ATHO_PRUNETEST_MAX_REORG_DEPTH", "1");
+        let mut node = Node::new(NodeConfig::new(Network::Prunetest));
+        let miner = Miner::new(1);
+        let finalized_block = node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("mine finalized boundary block");
+        node.mine_and_connect_candidate_block(&miner)
+            .expect("bury finalized boundary");
+        let checkpoint = node
+            .finalized_checkpoint()
+            .expect("checkpoint lookup")
+            .expect("checkpoint present");
+        assert_eq!(checkpoint.height, 1);
+        assert_eq!(checkpoint.block_hash, finalized_block.header.block_hash());
+
+        let mut sync = NodeSync::new(Network::Prunetest);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("conflict");
+        let conflicting_hash = [0x42; 48];
+        assert_ne!(conflicting_hash, checkpoint.block_hash);
+        sync.note_pending_header_block("conflict", checkpoint.height, conflicting_hash);
+
+        sync.stage_header_blocks_near_tip(&node);
+
+        assert_eq!(sync.downloader.stats().pending_blocks, 0);
+        assert_eq!(
+            sync.block_validation_states.get(&conflicting_hash),
+            Some(&BlockValidationState::Invalid)
+        );
+        assert!(
+            sync.connections().ban_score("conflict") >= 40,
+            "checkpoint-conflicting peer should be penalized before body download"
+        );
     }
 
     #[test]
