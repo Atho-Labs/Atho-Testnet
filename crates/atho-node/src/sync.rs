@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER: usize = 1_024;
+const MAX_SIDE_BRANCH_BLOCKS: usize = 4_096;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
@@ -54,7 +54,7 @@ pub struct NodeSync {
     connections: ConnectionManager,
     downloader: BlockDownloadScheduler,
     mempool_snapshot_peers: BTreeSet<String>,
-    branch_buffers: BTreeMap<String, BufferedBranch>,
+    side_branches: SideBranchPool,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
     addr_rate_windows: BTreeMap<String, AddrRateWindow>,
     last_addr_received_unix: Option<u64>,
@@ -70,14 +70,159 @@ struct PendingCompactBlock {
 }
 
 #[derive(Debug, Clone, Default)]
-struct BufferedBranch {
-    blocks: BTreeMap<[u8; 48], Block>,
+struct SideBranchPool {
+    blocks: BTreeMap<[u8; 48], SideBranchBlock>,
+    children_by_parent: BTreeMap<[u8; 48], BTreeSet<[u8; 48]>>,
+    next_seen_order: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SideBranchBlock {
+    block: Block,
+    peers: BTreeSet<String>,
+    first_seen_order: u64,
+    last_seen_order: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct AddrRateWindow {
     window_start_unix: u64,
     messages: u32,
+}
+
+impl SideBranchPool {
+    fn insert(&mut self, peer: &str, block: Block) {
+        let block_hash = block.header.block_hash();
+        let previous_hash = block.header.previous_block_hash;
+        self.next_seen_order = self.next_seen_order.saturating_add(1);
+        let seen_order = self.next_seen_order;
+
+        if let Some(entry) = self.blocks.get_mut(&block_hash) {
+            entry.peers.insert(peer.to_string());
+            entry.last_seen_order = seen_order;
+            return;
+        }
+
+        self.children_by_parent
+            .entry(previous_hash)
+            .or_default()
+            .insert(block_hash);
+        self.blocks.insert(
+            block_hash,
+            SideBranchBlock {
+                block,
+                peers: BTreeSet::from([peer.to_string()]),
+                first_seen_order: seen_order,
+                last_seen_order: seen_order,
+            },
+        );
+        self.enforce_limit();
+    }
+
+    fn remove(&mut self, block_hash: &[u8; 48]) -> Option<Block> {
+        let entry = self.blocks.remove(block_hash)?;
+        let previous_hash = entry.block.header.previous_block_hash;
+        let remove_parent_entry =
+            if let Some(children) = self.children_by_parent.get_mut(&previous_hash) {
+                children.remove(block_hash);
+                children.is_empty()
+            } else {
+                false
+            };
+        if remove_parent_entry {
+            self.children_by_parent.remove(&previous_hash);
+        }
+        self.children_by_parent.remove(block_hash);
+        Some(entry.block)
+    }
+
+    fn get(&self, block_hash: &[u8; 48]) -> Option<&Block> {
+        self.blocks.get(block_hash).map(|entry| &entry.block)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    fn block_hashes(&self) -> Vec<[u8; 48]> {
+        self.blocks.keys().copied().collect()
+    }
+
+    fn leaf_hashes(&self) -> Vec<[u8; 48]> {
+        let leaves = self
+            .blocks
+            .keys()
+            .filter(|hash| {
+                self.children_by_parent
+                    .get(*hash)
+                    .is_none_or(BTreeSet::is_empty)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            self.block_hashes()
+        } else {
+            leaves
+        }
+    }
+
+    fn remove_canonical_blocks(&mut self, node: &Node) {
+        let canonical_hashes = self
+            .blocks
+            .keys()
+            .filter(|hash| node.is_canonical_block(hash))
+            .copied()
+            .collect::<Vec<_>>();
+        for hash in canonical_hashes {
+            self.remove(&hash);
+        }
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.blocks.len() > MAX_SIDE_BRANCH_BLOCKS {
+            let Some(evict_hash) = self.eviction_candidate() else {
+                break;
+            };
+            self.remove(&evict_hash);
+        }
+    }
+
+    fn eviction_candidate(&self) -> Option<[u8; 48]> {
+        self.blocks
+            .iter()
+            .filter(|(hash, _)| {
+                self.children_by_parent
+                    .get(*hash)
+                    .is_none_or(BTreeSet::is_empty)
+            })
+            .max_by_key(|(hash, entry)| {
+                (
+                    entry.block.header.height,
+                    entry.last_seen_order,
+                    entry.first_seen_order,
+                    **hash,
+                )
+            })
+            .map(|(hash, _)| *hash)
+            .or_else(|| {
+                self.blocks
+                    .iter()
+                    .max_by_key(|(hash, entry)| {
+                        (
+                            entry.block.header.height,
+                            entry.last_seen_order,
+                            entry.first_seen_order,
+                            **hash,
+                        )
+                    })
+                    .map(|(hash, _)| *hash)
+            })
+    }
 }
 
 impl NodeSync {
@@ -88,7 +233,7 @@ impl NodeSync {
             connections: ConnectionManager::new(network),
             downloader: BlockDownloadScheduler::default(),
             mempool_snapshot_peers: BTreeSet::new(),
-            branch_buffers: BTreeMap::new(),
+            side_branches: SideBranchPool::default(),
             pending_compact_blocks: BTreeMap::new(),
             addr_rate_windows: BTreeMap::new(),
             last_addr_received_unix: None,
@@ -944,7 +1089,7 @@ impl NodeSync {
             );
             self.downloader.note_block_received(block_hash);
             self.pending_compact_blocks.remove(&block_hash);
-            self.remove_buffered_block(peer, &block_hash);
+            self.side_branches.remove(&block_hash);
             self.push_scheduled_block_requests(outbound);
             self.process_buffered_branches(node, outbound)?;
             return Ok(());
@@ -968,7 +1113,8 @@ impl NodeSync {
                     );
                     self.downloader.note_block_received(block_hash);
                     self.pending_compact_blocks.remove(&block_hash);
-                    self.remove_buffered_block(peer, &block_hash);
+                    self.side_branches.remove(&block_hash);
+                    self.side_branches.remove_canonical_blocks(node);
                     self.push_scheduled_block_requests(outbound);
                     self.process_buffered_branches(node, outbound)?;
                     return Ok(());
@@ -1039,73 +1185,41 @@ impl NodeSync {
         pow::branch_is_preferred(branch, &current_blocks[fork_index + 1..])
     }
 
-    fn buffer_peer_block(&mut self, peer: &str, block: Block) {
-        let buffer = self.branch_buffers.entry(peer.to_string()).or_default();
-        buffer.blocks.insert(block.header.block_hash(), block);
-        while buffer.blocks.len() > MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER {
-            // Preserve the lowest-height blocks: they are the bridge back to the
-            // canonical fork point. Dropping them can leave a deep fork permanently
-            // unreconstructable even after every later block has arrived.
-            let Some(evict_hash) = buffer
-                .blocks
-                .iter()
-                .max_by_key(|(hash, block)| (block.header.height, **hash))
-                .map(|(hash, _)| *hash)
-            else {
-                break;
-            };
-            buffer.blocks.remove(&evict_hash);
-        }
-    }
-
     fn buffer_peer_block_with_known_ancestors(&mut self, peer: &str, block: Block, node: &Node) {
         let mut previous_hash = block.header.previous_block_hash;
-        self.buffer_peer_block(peer, block);
+        self.side_branches.insert(peer, block);
 
         let mut visited = BTreeSet::new();
         while !node.is_canonical_block(&previous_hash) && visited.insert(previous_hash) {
             let parent = self
-                .branch_buffers
-                .get(peer)
-                .and_then(|buffer| buffer.blocks.get(&previous_hash).cloned())
+                .side_branches
+                .get(&previous_hash)
+                .cloned()
                 .or_else(|| node.block_by_hash(previous_hash));
             let Some(parent) = parent else {
                 break;
             };
             previous_hash = parent.header.previous_block_hash;
-            self.buffer_peer_block(peer, parent);
+            self.side_branches.insert(peer, parent);
         }
     }
 
-    fn remove_buffered_block(&mut self, peer: &str, block_hash: &[u8; 48]) {
-        let mut remove_peer = false;
-        if let Some(buffer) = self.branch_buffers.get_mut(peer) {
-            buffer.blocks.remove(block_hash);
-            remove_peer = buffer.blocks.is_empty();
-        }
-        if remove_peer {
-            self.branch_buffers.remove(peer);
-        }
-    }
-
-    fn buffered_branch_from_tip(
-        &self,
-        peer: &str,
-        node: &Node,
-        tip_hash: [u8; 48],
-    ) -> Option<Vec<Block>> {
-        let buffer = self.branch_buffers.get(peer)?;
+    fn buffered_branch_from_tip(&self, node: &Node, tip_hash: [u8; 48]) -> Option<Vec<Block>> {
         let mut branch_reversed = Vec::new();
         let mut current_hash = tip_hash;
+        let mut visited = BTreeSet::new();
 
         loop {
-            let block = buffer.blocks.get(&current_hash)?.clone();
+            if !visited.insert(current_hash) {
+                return None;
+            }
+            let block = self.side_branches.get(&current_hash)?.clone();
             let previous_hash = block.header.previous_block_hash;
             branch_reversed.push(block);
             if node.is_canonical_block(&previous_hash) {
                 break;
             }
-            if buffer.blocks.contains_key(&previous_hash) {
+            if self.side_branches.get(&previous_hash).is_some() {
                 current_hash = previous_hash;
                 continue;
             }
@@ -1116,13 +1230,11 @@ impl NodeSync {
         Some(branch_reversed)
     }
 
-    fn best_buffered_branch(&self, peer: &str, node: &Node) -> Option<Vec<Block>> {
-        let buffer = self.branch_buffers.get(peer)?;
+    fn best_buffered_branch(&self, node: &Node) -> Option<Vec<Block>> {
         let mut best: Option<Vec<Block>> = None;
         let current_blocks = node.blocks();
-        let tip_hashes = buffer.blocks.keys().copied().collect::<Vec<_>>();
-        for tip_hash in tip_hashes {
-            let Some(candidate) = self.buffered_branch_from_tip(peer, node, tip_hash) else {
+        for tip_hash in self.side_branches.leaf_hashes() {
+            let Some(candidate) = self.buffered_branch_from_tip(node, tip_hash) else {
                 continue;
             };
             if !Self::branch_is_preferred_over_current(&candidate, current_blocks) {
@@ -1139,15 +1251,18 @@ impl NodeSync {
         best
     }
 
-    fn process_buffered_branches_for_peer(
+    fn process_buffered_branch_once(
         &mut self,
-        peer: &str,
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<bool, NodeSyncError> {
+        if self.side_branches.is_empty() {
+            return Ok(false);
+        }
+
         let mut progressed = false;
         loop {
-            let Some(candidate_branch) = self.best_buffered_branch(peer, node) else {
+            let Some(candidate_branch) = self.best_buffered_branch(node) else {
                 return Ok(progressed);
             };
 
@@ -1161,19 +1276,36 @@ impl NodeSync {
                     for hash in candidate_hashes {
                         self.downloader.note_block_received(hash);
                         self.pending_compact_blocks.remove(&hash);
-                        self.remove_buffered_block(peer, &hash);
+                        self.side_branches.remove(&hash);
                     }
+                    self.side_branches.remove_canonical_blocks(node);
                     self.push_scheduled_block_requests(outbound);
                     progressed = true;
                 }
                 Ok(_) => return Ok(progressed),
                 Err(NodeError::Storage(StorageError::ForkPointUnavailable)) => {
                     if let Some(tip_hash) = candidate_hashes.last().copied() {
-                        self.remove_buffered_block(peer, &tip_hash);
+                        self.side_branches.remove(&tip_hash);
                     }
                 }
                 Err(err) if Self::recoverable_branch_error(&err) => return Ok(progressed),
-                Err(err) => return Err(err.into()),
+                Err(err) => {
+                    let tip = candidate_hashes
+                        .last()
+                        .copied()
+                        .map(|hash| short_hash(&hash))
+                        .unwrap_or_else(|| String::from("<empty>"));
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!("dropping invalid side branch tip={} error={}", tip, err),
+                    );
+                    for hash in candidate_hashes {
+                        self.downloader.note_block_received(hash);
+                        self.pending_compact_blocks.remove(&hash);
+                        self.side_branches.remove(&hash);
+                    }
+                    progressed = true;
+                }
             }
         }
     }
@@ -1184,14 +1316,7 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<(), NodeSyncError> {
         loop {
-            let peers = self.branch_buffers.keys().cloned().collect::<Vec<_>>();
-            let mut progressed = false;
-            for peer in peers {
-                if self.process_buffered_branches_for_peer(&peer, node, outbound)? {
-                    progressed = true;
-                }
-            }
-            if !progressed {
+            if !self.process_buffered_branch_once(node, outbound)? {
                 return Ok(());
             }
         }
@@ -2997,13 +3122,7 @@ mod tests {
             .handle_received_block("remote", blocks[2].clone(), &mut peer.node, &mut outbound)
             .expect("buffer future tip");
         assert_eq!(peer.node.height(), 0);
-        assert_eq!(
-            peer.sync
-                .branch_buffers
-                .get("remote")
-                .map(|buffer| buffer.blocks.len()),
-            Some(1)
-        );
+        assert_eq!(Some(peer.sync.side_branches.len()), Some(1));
 
         let tx = signed_missing_utxo_transaction([8; 48]);
         let txid = tx.txid();
@@ -3017,13 +3136,7 @@ mod tests {
             .expect("future-chain tx is ignored until its inputs exist locally");
 
         assert!(!peer.node.mempool_contains(&txid));
-        assert_eq!(
-            peer.sync
-                .branch_buffers
-                .get("remote")
-                .map(|buffer| buffer.blocks.len()),
-            Some(1)
-        );
+        assert_eq!(Some(peer.sync.side_branches.len()), Some(1));
 
         peer.sync
             .handle_received_block("remote", blocks[1].clone(), &mut peer.node, &mut outbound)
@@ -3034,7 +3147,7 @@ mod tests {
 
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), blocks[2].header.block_hash());
-        assert!(!peer.sync.branch_buffers.contains_key("remote"));
+        assert!(peer.sync.side_branches.is_empty());
     }
 
     #[test]
@@ -3432,7 +3545,7 @@ mod tests {
         assert_eq!(local.node.height(), remote.node.height());
         assert_eq!(local.node.tip_hash(), remote_tip);
         assert_eq!(local.node.tip_hash(), remote.node.tip_hash());
-        assert!(local.sync.branch_buffers.is_empty());
+        assert!(local.sync.side_branches.is_empty());
     }
 
     #[test]
@@ -3482,7 +3595,7 @@ mod tests {
         assert!(err.to_string().contains("block network mismatch"));
         assert_eq!(peer.node.height(), 0);
         assert_eq!(peer.sync.sync_state().best_height, 0);
-        assert!(!peer.sync.branch_buffers.contains_key("remote"));
+        assert!(peer.sync.side_branches.is_empty());
         assert!(outbound.is_empty());
     }
 
@@ -3517,7 +3630,7 @@ mod tests {
                 .block_hash()
         );
         assert_eq!(peer.sync.sync_state().best_height, 4);
-        assert!(!peer.sync.branch_buffers.contains_key("remote"));
+        assert!(peer.sync.side_branches.is_empty());
     }
 
     #[test]
@@ -3542,20 +3655,14 @@ mod tests {
             .expect("recoverable branch mismatch");
 
         assert!(outbound.is_empty());
-        assert_eq!(
-            peer.sync
-                .branch_buffers
-                .get("peer")
-                .map(|buffer| buffer.blocks.len()),
-            Some(1)
-        );
+        assert_eq!(peer.sync.side_branches.len(), 1);
     }
 
     #[test]
-    fn buffered_orphan_pool_is_bounded_per_peer() {
+    fn side_branch_pool_is_bounded_and_preserves_low_bridge_blocks() {
         let mut sync = NodeSync::new(Network::Regnet);
-        for height in 1..=(MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER as u64 + 8) {
-            sync.buffer_peer_block(
+        for height in 1..=(MAX_SIDE_BRANCH_BLOCKS as u64 + 8) {
+            sync.side_branches.insert(
                 "peer",
                 coinbase_block(
                     Network::Regnet,
@@ -3567,12 +3674,12 @@ mod tests {
             );
         }
 
-        let buffer = sync.branch_buffers.get("peer").expect("peer buffer");
-        assert_eq!(buffer.blocks.len(), MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER);
-        assert!(buffer
+        assert_eq!(sync.side_branches.len(), MAX_SIDE_BRANCH_BLOCKS);
+        assert!(sync
+            .side_branches
             .blocks
             .values()
-            .all(|block| block.header.height <= MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER as u64));
+            .all(|entry| entry.block.header.height <= MAX_SIDE_BRANCH_BLOCKS as u64));
     }
 
     #[test]
@@ -3617,7 +3724,7 @@ mod tests {
         assert!(outbound.is_empty());
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
-        assert!(!peer.sync.branch_buffers.contains_key("peer"));
+        assert!(peer.sync.side_branches.is_empty());
     }
 
     #[test]
@@ -3631,13 +3738,7 @@ mod tests {
         left.sync
             .handle_received_block(&right.id, blocks[2].clone(), &mut left.node, &mut outbound)
             .expect("buffer future tip");
-        assert_eq!(
-            left.sync
-                .branch_buffers
-                .get(&right.id)
-                .map(|buffer| buffer.blocks.len()),
-            Some(1)
-        );
+        assert_eq!(left.sync.side_branches.len(), 1);
 
         let notice = left
             .sync
@@ -3647,13 +3748,7 @@ mod tests {
             notice,
             SyncNotice::Disconnected { peer, .. } if peer == right.id
         ));
-        assert_eq!(
-            left.sync
-                .branch_buffers
-                .get(&right.id)
-                .map(|buffer| buffer.blocks.len()),
-            Some(1)
-        );
+        assert_eq!(left.sync.side_branches.len(), 1);
 
         left.sync
             .handle_received_block(&right.id, blocks[1].clone(), &mut left.node, &mut outbound)
@@ -3664,13 +3759,17 @@ mod tests {
 
         assert_eq!(left.node.height(), 3);
         assert_eq!(left.node.tip_hash(), blocks[2].header.block_hash());
-        assert!(!left.sync.branch_buffers.contains_key(&right.id));
+        assert!(left.sync.side_branches.is_empty());
     }
 
     #[test]
-    fn cross_peer_branch_blocks_reconstruct_after_parent_arrives() {
+    fn cross_peer_side_branch_blocks_reconstruct_over_local_fork() {
         let mut peer = SandboxPeer::new("peer", Network::Regnet);
         let miner = Miner::new(1);
+        mine_with_timestamp_offset(&mut peer.node, &miner, 0);
+        mine_with_timestamp_offset(&mut peer.node, &miner, 1);
+        peer.sync.prime(&peer.node);
+
         let mut reference_node = Node::new(NodeConfig::new(Network::Regnet));
 
         let block_1 = miner.solve_block(
@@ -3700,16 +3799,15 @@ mod tests {
             .handle_received_block("peer-a", block_3.clone(), &mut peer.node, &mut outbound)
             .expect("buffer tip block from peer-a");
         peer.sync
-            .handle_received_block("peer-a", block_2.clone(), &mut peer.node, &mut outbound)
-            .expect("buffer middle block from peer-a");
+            .handle_received_block("peer-b", block_2.clone(), &mut peer.node, &mut outbound)
+            .expect("buffer middle block from peer-b");
         peer.sync
-            .handle_received_block("peer-b", block_1.clone(), &mut peer.node, &mut outbound)
+            .handle_received_block("peer-c", block_1.clone(), &mut peer.node, &mut outbound)
             .expect("reconstruct buffered branch across peers");
 
         assert!(outbound.is_empty());
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
-        assert!(!peer.sync.branch_buffers.contains_key("peer-a"));
-        assert!(!peer.sync.branch_buffers.contains_key("peer-b"));
+        assert!(peer.sync.side_branches.is_empty());
     }
 }
