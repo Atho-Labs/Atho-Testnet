@@ -3,6 +3,12 @@ use crate::protocol::{Hash48, InventoryKind, InventoryVector};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+const PEER_TIMEOUT_PENALTY: u32 = 12;
+const PEER_NOT_FOUND_PENALTY: u32 = 6;
+const PEER_DISCONNECT_PENALTY: u32 = 18;
+const PEER_SUCCESS_DECAY: u32 = 4;
+const PEER_PENALTY_CAP: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadAssignment {
     pub peer: String,
@@ -15,6 +21,15 @@ pub struct StaleDownload {
     pub hash: Hash48,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadStats {
+    pub ready_peers: usize,
+    pub pending_blocks: usize,
+    pub inflight_blocks: usize,
+    pub completed_blocks: usize,
+    pub penalized_peers: usize,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BlockDownloadScheduler {
     ready_peers: BTreeSet<String>,
@@ -25,6 +40,7 @@ pub struct BlockDownloadScheduler {
     peer_hints: BTreeMap<Hash48, BTreeSet<String>>,
     failed_peers: BTreeMap<Hash48, BTreeSet<String>>,
     completed: BTreeSet<Hash48>,
+    peer_penalties: BTreeMap<String, u32>,
 }
 
 impl BlockDownloadScheduler {
@@ -37,6 +53,9 @@ impl BlockDownloadScheduler {
     pub fn note_peer_disconnected(&mut self, peer: &str) {
         self.ready_peers.remove(peer);
         if let Some(inflight) = self.inflight_by_peer.remove(peer) {
+            if !inflight.is_empty() {
+                self.penalize_peer(peer, PEER_DISCONNECT_PENALTY);
+            }
             for hash in inflight {
                 self.inflight_owner.remove(&hash);
                 self.inflight_started.remove(&hash);
@@ -104,6 +123,7 @@ impl BlockDownloadScheduler {
         self.failed_peers.remove(&hash);
         self.pending.retain(|candidate| *candidate != hash);
         if let Some(owner) = self.inflight_owner.remove(&hash) {
+            self.decay_peer_penalty(&owner, PEER_SUCCESS_DECAY);
             if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
                 inflight.retain(|candidate| *candidate != hash);
             }
@@ -129,12 +149,14 @@ impl BlockDownloadScheduler {
     }
 
     pub fn note_not_found(&mut self, peer: &str, hashes: &[[u8; 48]]) {
+        let mut penalize = false;
         for hash in hashes.iter().copied().map(Hash48::from) {
             if let Some(owner) = self.inflight_owner.get(&hash) {
                 if owner != peer {
                     continue;
                 }
             }
+            penalize = true;
             self.inflight_owner.remove(&hash);
             self.inflight_started.remove(&hash);
             if let Some(inflight) = self.inflight_by_peer.get_mut(peer) {
@@ -149,8 +171,11 @@ impl BlockDownloadScheduler {
                 .or_default()
                 .insert(peer.to_string());
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
-                self.pending.push_back(hash);
+                self.pending.push_front(hash);
             }
+        }
+        if penalize {
+            self.penalize_peer(peer, PEER_NOT_FOUND_PENALTY);
         }
     }
 
@@ -294,14 +319,16 @@ impl BlockDownloadScheduler {
                     .get(peer)
                     .map(VecDeque::len)
                     .unwrap_or(0);
+                let penalty = self.peer_penalty(peer);
                 (inflight < max_requests_per_peer).then_some((
+                    penalty,
                     inflight,
                     (index + peers.len() - (start_index % peers.len())) % peers.len(),
                     peer,
                 ))
             })
-            .min_by_key(|(inflight, rotation, _)| (*inflight, *rotation))
-            .map(|(_, _, peer)| peer.clone())
+            .min_by_key(|(penalty, inflight, rotation, _)| (*penalty, *inflight, *rotation))
+            .map(|(_, _, _, peer)| peer.clone())
     }
 
     pub fn assignment_for_peer(
@@ -432,10 +459,11 @@ impl BlockDownloadScheduler {
                     .entry(hash)
                     .or_default()
                     .insert(owner.clone());
+                self.penalize_peer(&owner, PEER_TIMEOUT_PENALTY);
                 requeued.push(StaleDownload { peer: owner, hash });
             }
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
-                self.pending.push_back(hash);
+                self.pending.push_front(hash);
             }
         }
         requeued
@@ -474,8 +502,9 @@ impl BlockDownloadScheduler {
                 .entry(hash)
                 .or_default()
                 .insert(peer.to_string());
+            self.penalize_peer(peer, PEER_TIMEOUT_PENALTY);
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
-                self.pending.push_back(hash);
+                self.pending.push_front(hash);
             }
             requeued.push(StaleDownload {
                 peer: peer.to_string(),
@@ -487,6 +516,39 @@ impl BlockDownloadScheduler {
 
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.inflight_owner.is_empty()
+    }
+
+    pub fn stats(&self) -> DownloadStats {
+        DownloadStats {
+            ready_peers: self.ready_peers.len(),
+            pending_blocks: self.pending.len(),
+            inflight_blocks: self.inflight_owner.len(),
+            completed_blocks: self.completed.len(),
+            penalized_peers: self
+                .peer_penalties
+                .values()
+                .filter(|penalty| **penalty > 0)
+                .count(),
+        }
+    }
+
+    pub fn peer_penalty(&self, peer: &str) -> u32 {
+        self.peer_penalties.get(peer).copied().unwrap_or(0)
+    }
+
+    fn penalize_peer(&mut self, peer: &str, points: u32) {
+        let entry = self.peer_penalties.entry(peer.to_string()).or_default();
+        *entry = entry.saturating_add(points).min(PEER_PENALTY_CAP);
+    }
+
+    fn decay_peer_penalty(&mut self, peer: &str, points: u32) {
+        let Some(entry) = self.peer_penalties.get_mut(peer) else {
+            return;
+        };
+        *entry = entry.saturating_sub(points);
+        if *entry == 0 {
+            self.peer_penalties.remove(peer);
+        }
     }
 
     fn remove_empty_hints(&mut self, hash: Hash48) {
@@ -643,5 +705,51 @@ mod tests {
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].peer, "right");
         assert_eq!(retry[0].inventory[0].hash, Hash48::from([9; 48]));
+    }
+
+    #[test]
+    fn scheduler_prefers_lower_penalty_peer_after_timeout() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("slow");
+        scheduler.note_peer_ready("fast");
+        scheduler.note_headers("slow", [[1; 48], [2; 48]]);
+        scheduler.note_headers("fast", [[1; 48], [2; 48]]);
+
+        let first = scheduler
+            .assignment_for_peer("slow", 1, 1)
+            .expect("slow first assignment");
+        assert_eq!(first.peer, "slow");
+        scheduler.requeue_stale_inflight_for_peer("slow", Duration::ZERO);
+        assert!(scheduler.peer_penalty("slow") > scheduler.peer_penalty("fast"));
+
+        let retry = scheduler.assignments(1, 1);
+
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].peer, "fast");
+        assert_eq!(retry[0].inventory[0].hash, Hash48::from([1; 48]));
+    }
+
+    #[test]
+    fn successful_response_decays_peer_penalty_and_updates_stats() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_headers("left", [[3; 48]]);
+
+        let first = scheduler.assignments(1, 1);
+        assert_eq!(first.len(), 1);
+        scheduler.requeue_stale_inflight_for_peer("left", Duration::ZERO);
+        let penalized = scheduler.peer_penalty("left");
+        assert!(penalized > 0);
+
+        let retry = scheduler
+            .assignment_for_peer("left", 1, 1)
+            .expect("retry assignment");
+        assert_eq!(retry.inventory[0].hash, Hash48::from([3; 48]));
+        scheduler.note_block_received([3; 48]);
+
+        assert!(scheduler.peer_penalty("left") < penalized);
+        assert_eq!(scheduler.stats().pending_blocks, 0);
+        assert_eq!(scheduler.stats().inflight_blocks, 0);
+        assert_eq!(scheduler.stats().completed_blocks, 1);
     }
 }

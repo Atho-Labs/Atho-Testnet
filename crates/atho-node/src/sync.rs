@@ -22,10 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
-const BLOCK_DOWNLOAD_LOOKAHEAD: u64 = 256;
-const BLOCK_REQUEST_BATCH_LIMIT: usize = 64;
-const HEADERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const SYNC_METRICS_LOG_INTERVAL_SECS: u64 = 10;
 const MAX_SIDE_BRANCH_BLOCKS: usize = 4_096;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -65,6 +62,11 @@ pub struct NodeSync {
     last_addr_received_unix: Option<u64>,
     getaddr_last_sent_unix: BTreeMap<String, u64>,
     addr_relay_last_sent_unix: BTreeMap<String, u64>,
+    last_observed_tip: Option<[u8; 48]>,
+    last_block_progress_unix: u64,
+    last_sync_metrics_log_unix: u64,
+    last_stale_recovery_unix: u64,
+    stale_recovery_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -246,11 +248,17 @@ impl NodeSync {
             last_addr_received_unix: None,
             getaddr_last_sent_unix: BTreeMap::new(),
             addr_relay_last_sent_unix: BTreeMap::new(),
+            last_observed_tip: None,
+            last_block_progress_unix: 0,
+            last_sync_metrics_log_unix: 0,
+            last_stale_recovery_unix: 0,
+            stale_recovery_count: 0,
         }
     }
 
     pub fn prime(&mut self, node: &Node) {
         self.prime_relay_from_node_locator(node);
+        self.update_sync_progress_watchdog(node);
     }
 
     pub fn sync_state(&self) -> &SyncState {
@@ -402,13 +410,18 @@ impl NodeSync {
         let mut outbound = Vec::new();
         self.prune_pending_compact_blocks();
         self.refresh_sync_target_from_live_peers(node);
+        self.update_sync_progress_watchdog(node);
+        self.log_sync_metrics_if_due(node);
         if let Some(event) = self.header_timeout_disconnect_event(remote_addr, node) {
             outbound.push(event);
             return Ok(outbound);
         }
+        if self.maybe_trigger_stale_recovery(remote_addr, node, &mut outbound) {
+            return Ok(outbound);
+        }
         let stale_downloads = self
             .downloader
-            .requeue_stale_inflight_for_peer(remote_addr, BLOCK_REQUEST_RETRY_TIMEOUT);
+            .requeue_stale_inflight_for_peer(remote_addr, self.block_request_retry_timeout());
         if !stale_downloads.is_empty() {
             let first_hash = stale_downloads
                 .first()
@@ -478,6 +491,29 @@ impl NodeSync {
             .into_iter()
             .filter(|peer| peer.handshake_ready)
             .count()
+    }
+
+    fn block_request_retry_timeout(&self) -> Duration {
+        Duration::from_millis(network_params(self.network).limits.block_request_timeout_ms)
+    }
+
+    fn headers_request_timeout(&self) -> Duration {
+        Duration::from_millis(
+            network_params(self.network)
+                .limits
+                .headers_request_timeout_ms,
+        )
+    }
+
+    fn block_download_lookahead(&self) -> u64 {
+        network_params(self.network).limits.block_download_lookahead
+    }
+
+    fn block_request_batch_limit(&self) -> usize {
+        network_params(self.network)
+            .limits
+            .block_request_batch_limit
+            .max(1)
     }
 
     fn expand_events(
@@ -567,6 +603,126 @@ impl NodeSync {
             Some(Hash48::from(node.tip_hash())),
             peer_best_height,
         );
+        self.update_sync_progress_watchdog(node);
+    }
+
+    fn update_sync_progress_watchdog(&mut self, node: &Node) {
+        let tip = node.tip_hash();
+        if self.last_observed_tip != Some(tip) {
+            self.last_observed_tip = Some(tip);
+            self.last_block_progress_unix = now_unix();
+        } else if self.last_block_progress_unix == 0 {
+            self.last_block_progress_unix = now_unix();
+        }
+    }
+
+    fn log_sync_metrics_if_due(&mut self, node: &Node) {
+        let now = now_unix();
+        if now.saturating_sub(self.last_sync_metrics_log_unix) < SYNC_METRICS_LOG_INTERVAL_SECS {
+            return;
+        }
+
+        let stats = self.downloader.stats();
+        if node.height() >= self.sync_state().best_height
+            && stats.pending_blocks == 0
+            && stats.inflight_blocks == 0
+            && self.pending_header_blocks.is_empty()
+            && self.pending_compact_blocks.is_empty()
+        {
+            return;
+        }
+
+        self.last_sync_metrics_log_unix = now;
+        let progress_age = now.saturating_sub(self.last_block_progress_unix);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "sync metrics local_height={} target_height={} headers_synced={} ready_peers={} pending_blocks={} inflight_blocks={} pending_header_heights={} side_branch_blocks={} pending_compact={} penalized_peers={} stale_recoveries={} last_progress_age_secs={}",
+                node.height(),
+                self.sync_state().best_height,
+                self.sync_state().headers_synced,
+                stats.ready_peers,
+                stats.pending_blocks,
+                stats.inflight_blocks,
+                self.pending_header_blocks.len(),
+                self.side_branches.blocks.len(),
+                self.pending_compact_blocks.len(),
+                stats.penalized_peers,
+                self.stale_recovery_count,
+                progress_age,
+            ),
+        );
+    }
+
+    fn maybe_trigger_stale_recovery(
+        &mut self,
+        remote_addr: &str,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) -> bool {
+        let target_height = self.sync_state().best_height.max(
+            self.connections
+                .remote_best_height(remote_addr)
+                .unwrap_or(node.height()),
+        );
+        if node.height() >= target_height || self.ready_peer_count() == 0 {
+            return false;
+        }
+
+        let now = now_unix();
+        let retry_timeout = self.block_request_retry_timeout();
+        let stale_after = retry_timeout.as_secs().saturating_mul(2).max(12);
+        if now.saturating_sub(self.last_block_progress_unix) < stale_after {
+            return false;
+        }
+        if now.saturating_sub(self.last_stale_recovery_unix) < retry_timeout.as_secs().max(1) {
+            return false;
+        }
+
+        let stats = self.downloader.stats();
+        if stats.pending_blocks == 0
+            && stats.inflight_blocks == 0
+            && self.pending_header_blocks.is_empty()
+            && self.sync_state().headers_synced
+        {
+            return false;
+        }
+
+        self.last_stale_recovery_unix = now;
+        self.stale_recovery_count = self.stale_recovery_count.saturating_add(1);
+        let requeued = self
+            .downloader
+            .requeue_stale_inflight_details(Duration::ZERO);
+        let first_hash = requeued
+            .first()
+            .map(|download| short_hash(&download.hash.into_inner()))
+            .unwrap_or_else(|| String::from("<none>"));
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "sync stale recovery peer={} local_height={} target_height={} requeued={} first_hash={} pending_blocks={} inflight_blocks={} pending_header_heights={} ready_peers={} last_progress_age_secs={}",
+                remote_addr,
+                node.height(),
+                target_height,
+                requeued.len(),
+                first_hash,
+                stats.pending_blocks,
+                stats.inflight_blocks,
+                self.pending_header_blocks.len(),
+                stats.ready_peers,
+                now.saturating_sub(self.last_block_progress_unix),
+            ),
+        );
+
+        self.reseed_locator_from_node(node);
+        self.relay.mark_headers_unsynced();
+        if self.peer_is_ready(remote_addr) && !self.header_request_inflight(remote_addr) {
+            self.queue_getheaders(remote_addr, outbound);
+        }
+        self.heal_buffered_branch_parents(Some(remote_addr), node, outbound);
+        self.push_block_download_work_for_peer(remote_addr, node, outbound);
+        self.push_address_discovery_events(remote_addr, node, outbound);
+        true
     }
 
     fn local_version_message(&self, node: &Node) -> NetworkMessage {
@@ -1041,7 +1197,7 @@ impl NodeSync {
             peer,
             limits.max_blocks_in_flight,
             limits.max_requests_per_peer,
-            BLOCK_REQUEST_BATCH_LIMIT,
+            self.block_request_batch_limit(),
         ) {
             self.push_download_assignment(assignment, outbound);
         }
@@ -1103,7 +1259,9 @@ impl NodeSync {
     fn header_request_inflight(&self, remote_addr: &str) -> bool {
         self.header_requests_started
             .get(remote_addr)
-            .is_some_and(|started| started.elapsed().unwrap_or_default() < HEADERS_REQUEST_TIMEOUT)
+            .is_some_and(|started| {
+                started.elapsed().unwrap_or_default() < self.headers_request_timeout()
+            })
     }
 
     fn header_timeout_disconnect_event(
@@ -1124,7 +1282,7 @@ impl NodeSync {
             .header_requests_started
             .get(remote_addr)
             .is_some_and(|started| {
-                started.elapsed().unwrap_or_default() >= HEADERS_REQUEST_TIMEOUT
+                started.elapsed().unwrap_or_default() >= self.headers_request_timeout()
             });
         if !timed_out {
             return None;
@@ -1169,7 +1327,10 @@ impl NodeSync {
         if header.previous_block_hash == node.tip_hash() {
             return false;
         }
-        header.height > node.height().saturating_add(BLOCK_DOWNLOAD_LOOKAHEAD)
+        header.height
+            > node
+                .height()
+                .saturating_add(self.block_download_lookahead())
     }
 
     fn defer_unsolicited_future_block(
@@ -1473,7 +1634,9 @@ impl NodeSync {
     }
 
     fn stage_header_blocks_near_tip(&mut self, node: &Node) {
-        let max_height = node.height().saturating_add(BLOCK_DOWNLOAD_LOOKAHEAD);
+        let max_height = node
+            .height()
+            .saturating_add(self.block_download_lookahead());
         let heights = self
             .pending_header_blocks
             .range(..=max_height)
@@ -2845,20 +3008,22 @@ mod tests {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
         sync.prime(&node);
+        let lookahead = sync.block_download_lookahead();
+        let batch_limit = sync.block_request_batch_limit();
         let _ = sync
             .expand_events(
                 vec![ConnectionEvent::Ready {
                     peer: String::from("right"),
-                    best_height: BLOCK_DOWNLOAD_LOOKAHEAD + 8,
+                    best_height: lookahead + 8,
                 }],
                 &mut node,
             )
             .expect("ready peer");
 
-        let hashes = (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 8)
+        let hashes = (1..=lookahead + 8)
             .map(|height| synthetic_header_hash(height, 0x91))
             .collect::<Vec<_>>();
-        for (height, hash) in (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 8).zip(hashes.iter().copied()) {
+        for (height, hash) in (1..=lookahead + 8).zip(hashes.iter().copied()) {
             sync.note_pending_header_block("right", height, hash);
         }
 
@@ -2866,17 +3031,14 @@ mod tests {
         sync.push_block_download_work_for_peer("right", &node, &mut outbound);
 
         let requested = outbound_getdata_hashes(&outbound);
-        assert_eq!(requested.len(), BLOCK_REQUEST_BATCH_LIMIT);
+        assert_eq!(requested.len(), batch_limit);
         assert_eq!(
             requested,
-            hashes
-                .into_iter()
-                .take(BLOCK_REQUEST_BATCH_LIMIT)
-                .collect::<Vec<_>>()
+            hashes.into_iter().take(batch_limit).collect::<Vec<_>>()
         );
         assert_eq!(
             sync.pending_header_blocks.keys().next().copied(),
-            Some(BLOCK_DOWNLOAD_LOOKAHEAD + 1)
+            Some(lookahead + 1)
         );
     }
 
@@ -2896,10 +3058,12 @@ mod tests {
         let _ = connect_handshake_only(&mut local, &mut header_peer);
         let _ = connect_handshake_only(&mut local, &mut fast_peer);
 
-        let hashes = (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 16)
+        let lookahead = local.sync.block_download_lookahead();
+        let batch_limit = local.sync.block_request_batch_limit();
+        let hashes = (1..=lookahead + 16)
             .map(|height| synthetic_header_hash(height, 0xA7))
             .collect::<Vec<_>>();
-        for (height, hash) in (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 16).zip(hashes) {
+        for (height, hash) in (1..=lookahead + 16).zip(hashes) {
             local
                 .sync
                 .note_pending_header_block(&header_peer.id, height, hash);
@@ -2920,7 +3084,7 @@ mod tests {
             .sync
             .push_block_download_work_for_peer(&fast_peer.id, &local.node, &mut outbound);
         let requested = outbound_getdata_hashes(&outbound);
-        assert_eq!(requested.len(), BLOCK_REQUEST_BATCH_LIMIT);
+        assert_eq!(requested.len(), batch_limit);
         assert_eq!(
             outbound_getdata_peers(&outbound),
             vec![fast_peer.id.clone()],
@@ -2949,10 +3113,11 @@ mod tests {
             .push_block_download_work_for_peer(&only_peer.id, &local.node, &mut outbound);
         assert_eq!(outbound_getdata_hashes(&outbound), vec![wanted_hash]);
 
-        local.sync.downloader.backdate_inflight_for_peer(
-            &only_peer.id,
-            BLOCK_REQUEST_RETRY_TIMEOUT + Duration::from_secs(1),
-        );
+        let retry_timeout = local.sync.block_request_retry_timeout();
+        local
+            .sync
+            .downloader
+            .backdate_inflight_for_peer(&only_peer.id, retry_timeout + Duration::from_secs(1));
         let retry = local
             .sync
             .maintain_peer_sync(&only_peer.id, &local.node)
@@ -2966,6 +3131,52 @@ mod tests {
         );
         assert_eq!(outbound_getdata_hashes(&retry), vec![wanted_hash]);
         assert!(local.sync.downloader.is_inflight(wanted_hash));
+    }
+
+    #[test]
+    fn sync_watchdog_requeues_stale_work_and_rehydrates_headers() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(64, [64; 48], Vec::<UtxoEntry>::new())
+            .expect("peer height");
+        let _ = connect_handshake_only(&mut local, &mut peer);
+
+        let wanted_hash = [8; 48];
+        local.sync.downloader.note_headers(&peer.id, [wanted_hash]);
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .push_block_download_work_for_peer(&peer.id, &local.node, &mut outbound);
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![wanted_hash]);
+
+        local.sync.header_requests_started.remove(&peer.id);
+        local.sync.last_block_progress_unix = now_unix().saturating_sub(60);
+        local.sync.last_stale_recovery_unix = 0;
+
+        let recovery = local
+            .sync
+            .maintain_peer_sync(&peer.id, &local.node)
+            .expect("watchdog recovery");
+
+        assert_eq!(local.sync.stale_recovery_count, 1);
+        assert!(
+            !recovery
+                .iter()
+                .any(|event| matches!(event, ConnectionEvent::Disconnect { .. })),
+            "watchdog recovery must refresh work without tearing down a useful low-peer sync"
+        );
+        assert!(recovery.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+                ..
+            }
+        )));
+        assert_eq!(outbound_getdata_hashes(&recovery), vec![wanted_hash]);
     }
 
     #[test]
@@ -3253,9 +3464,10 @@ mod tests {
         }
 
         assert!(left.sync.header_requests_started.contains_key(&right.id));
+        let headers_timeout = left.sync.headers_request_timeout();
         left.sync.header_requests_started.insert(
             right.id.clone(),
-            SystemTime::now() - HEADERS_REQUEST_TIMEOUT - Duration::from_secs(1),
+            SystemTime::now() - headers_timeout - Duration::from_secs(1),
         );
 
         let events = left
@@ -4007,7 +4219,7 @@ mod tests {
         let mut right = SandboxPeer::new("right", Network::Regnet);
         let _ = connect(&mut left, &mut right);
 
-        let far_height = BLOCK_DOWNLOAD_LOOKAHEAD + 32;
+        let far_height = left.sync.block_download_lookahead() + 32;
         let block = coinbase_block(
             Network::Regnet,
             far_height,
@@ -4050,7 +4262,7 @@ mod tests {
         let mut right = SandboxPeer::new("right", Network::Regnet);
         let _ = connect(&mut left, &mut right);
 
-        let far_height = BLOCK_DOWNLOAD_LOOKAHEAD + 64;
+        let far_height = left.sync.block_download_lookahead() + 64;
         let block = Miner::new(1).solve_block(coinbase_block(
             Network::Regnet,
             far_height,

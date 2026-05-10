@@ -31,7 +31,6 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
 
@@ -684,7 +683,7 @@ fn spawn_peer_thread(
                         }
                         if handshake_ready
                             && last_sync_maintenance.elapsed().unwrap_or_default()
-                                >= SYNC_MAINTENANCE_INTERVAL
+                                >= sync_maintenance_interval(peer_network)
                         {
                             let events = {
                                 let mut state = state.lock().expect("p2p runtime state poisoned");
@@ -874,6 +873,10 @@ fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_read_timeout(Some(PEER_IO_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     Ok(())
+}
+
+fn sync_maintenance_interval(network: Network) -> Duration {
+    Duration::from_millis(network_params(network).limits.sync_maintenance_interval_ms)
 }
 
 fn flush_send_events(
