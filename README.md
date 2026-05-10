@@ -6,7 +6,7 @@ Mainnet launch paths, mainnet DNS seeds, mainnet bootstrap peers, and mainnet op
 
 - Website: <https://atho.io>
 - Testnet explorer: <https://atho.io/explore/>
-- Current testnet release: `v0.1.5`
+- Current testnet release: `v0.1.6`
 - Public testnet seed/API nodes: `testnet-node1.atho.io`, `testnet-node2.atho.io`
 - Public testnet peers: `162.222.206.163:9100`, `74.208.219.116:9100`
 
@@ -79,6 +79,13 @@ cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
 This repo intentionally keeps the public surface small: `runtestnet.py`, `runtime_launcher.py`, this README, and the Rust source needed to run the public testnet software.
+
+## v0.1.6 Patch Notes
+
+- Fixed fork recovery when a node already has winning-chain blocks archived locally but they are no longer canonical after mining on an isolated fork.
+- Header serving now ignores archived side-branch locator hashes and only anchors responses to the node's canonical chain, preventing invalid header sequences after reorgs.
+- Sync now replays known non-canonical blocks from local storage during header catch-up instead of skipping them as already downloaded.
+- Branch buffering now preserves the low-height bridge back to the fork point and backfills known archived ancestors, preventing deep fork recovery from dropping the blocks needed to reconnect.
 
 ## v0.1.5 Patch Notes
 
