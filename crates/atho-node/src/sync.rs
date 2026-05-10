@@ -28,6 +28,8 @@ const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
 const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
+const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
+const ADDR_RELAY_INTERVAL_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Error)]
 pub enum NodeSyncError {
@@ -56,6 +58,8 @@ pub struct NodeSync {
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
     addr_rate_windows: BTreeMap<String, AddrRateWindow>,
     last_addr_received_unix: Option<u64>,
+    getaddr_last_sent_unix: BTreeMap<String, u64>,
+    addr_relay_last_sent_unix: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,11 +92,13 @@ impl NodeSync {
             pending_compact_blocks: BTreeMap::new(),
             addr_rate_windows: BTreeMap::new(),
             last_addr_received_unix: None,
+            getaddr_last_sent_unix: BTreeMap::new(),
+            addr_relay_last_sent_unix: BTreeMap::new(),
         }
     }
 
     pub fn prime(&mut self, node: &Node) {
-        self.relay.prime(node.blocks());
+        self.prime_relay_from_node_locator(node);
     }
 
     pub fn sync_state(&self) -> &SyncState {
@@ -155,7 +161,7 @@ impl NodeSync {
         remote_addr: impl Into<String>,
         node: &Node,
     ) -> Result<Vec<ConnectionEvent>, NodeSyncError> {
-        let local_version = self.relay.build_version_message(node.blocks());
+        let local_version = self.local_version_message(node);
         Ok(self.connections.open_outbound(remote_addr, local_version)?)
     }
 
@@ -165,7 +171,7 @@ impl NodeSync {
         message: NetworkMessage,
         node: &mut Node,
     ) -> Result<(Vec<ConnectionEvent>, Vec<SyncNotice>), NodeSyncError> {
-        let local_version = self.relay.build_version_message(node.blocks());
+        let local_version = self.local_version_message(node);
         let events = match self
             .connections
             .receive(remote_addr, message, &local_version)
@@ -259,7 +265,7 @@ impl NodeSync {
         self.push_scheduled_block_requests_for_peer(remote_addr, &mut outbound);
 
         if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
-            self.relay.reseed_locator_from_local_tip(node.blocks());
+            self.reseed_locator_from_node(node);
             let _ = dev::append_log(
                 "p2p",
                 &format!(
@@ -274,6 +280,7 @@ impl NodeSync {
                 message: self.relay.build_getheaders(remote_addr.to_string()),
             });
         }
+        self.push_address_discovery_events(remote_addr, node, &mut outbound);
 
         Ok(outbound)
     }
@@ -336,13 +343,18 @@ impl NodeSync {
             .filter(|peer| peer.handshake_ready)
             .filter_map(|peer| peer.best_height)
             .max();
-        self.relay
-            .refresh_sync_target(node.blocks(), peer_best_height);
+        self.relay.refresh_sync_target_at(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            peer_best_height,
+        );
     }
 
     fn note_peer_disconnected(&mut self, peer: &str, node: &Node) {
         self.downloader.note_peer_disconnected(peer);
         self.mempool_snapshot_peers.remove(peer);
+        self.getaddr_last_sent_unix.remove(peer);
+        self.addr_relay_last_sent_unix.remove(peer);
         // Buffered blocks are already marked received by the downloader. Keep
         // them across disconnects so a reconnect or another peer can still
         // complete the branch instead of leaving an unrecoverable gap.
@@ -357,8 +369,36 @@ impl NodeSync {
             .filter(|peer| peer.handshake_ready)
             .filter_map(|peer| peer.best_height)
             .max();
+        self.relay.note_local_chain_progress_at(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            peer_best_height,
+        );
+    }
+
+    fn local_version_message(&self, node: &Node) -> NetworkMessage {
         self.relay
-            .note_local_chain_progress(node.blocks(), peer_best_height);
+            .build_version_message(node.height(), node.tip_hash(), node.chainwork_bytes())
+    }
+
+    fn prime_relay_from_node_locator(&mut self, node: &Node) {
+        self.relay.prime_with_locator(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            node.block_locator_hashes()
+                .into_iter()
+                .map(Hash48::from)
+                .collect(),
+        );
+    }
+
+    fn reseed_locator_from_node(&mut self, node: &Node) {
+        self.relay.reseed_locator_hashes(
+            node.block_locator_hashes()
+                .into_iter()
+                .map(Hash48::from)
+                .collect(),
+        );
     }
 
     fn handle_message(
@@ -449,6 +489,25 @@ impl NodeSync {
                     }
                 }
                 self.relay.accept_headers(&headers)?;
+                if header_count == 0 && node.height() < self.relay.sync_state().best_height {
+                    self.reseed_locator_from_node(node);
+                    self.relay.mark_headers_unsynced();
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "empty headers while behind peer={} local_height={} target_height={} locator_len={}",
+                            peer,
+                            node.height(),
+                            self.relay.sync_state().best_height,
+                            self.relay.sync_state().locator_hashes.len()
+                        ),
+                    );
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: self.relay.build_getheaders(peer.to_string()),
+                    });
+                    return Ok(());
+                }
                 if let Some(last_header) = headers.last() {
                     self.note_observed_peer_tip(peer, last_header, node);
                 }
@@ -479,6 +538,7 @@ impl NodeSync {
                         message: self.relay.build_getheaders(peer.to_string()),
                     });
                 } else {
+                    self.record_getaddr_sent(peer, now_unix());
                     outbound.push(ConnectionEvent::Send {
                         peer: peer.to_string(),
                         message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
@@ -629,6 +689,77 @@ impl NodeSync {
         Ok(())
     }
 
+    fn push_address_discovery_events(
+        &mut self,
+        remote_addr: &str,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        if !self.chain_synced(node) || !self.peer_is_ready(remote_addr) {
+            return;
+        }
+
+        let now = now_unix();
+        if self.should_send_periodic_getaddr(remote_addr, now) {
+            self.record_getaddr_sent(remote_addr, now);
+            let _ = dev::append_log("p2p", &format!("periodic getaddr peer={remote_addr}"));
+            outbound.push(ConnectionEvent::Send {
+                peer: remote_addr.to_string(),
+                message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
+            });
+        }
+
+        if !self.should_send_periodic_addr_relay(remote_addr, now) {
+            return;
+        }
+        let addresses = self.connections.relay_addresses_for_peer(remote_addr);
+        if addresses.is_empty() {
+            return;
+        }
+        self.record_addr_relay_sent(remote_addr, now);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "periodic addr relay peer={} count={}",
+                remote_addr,
+                addresses.len()
+            ),
+        );
+        outbound.push(ConnectionEvent::Send {
+            peer: remote_addr.to_string(),
+            message: NetworkMessage::new(self.network, MessagePayload::Addr { addresses }),
+        });
+    }
+
+    fn peer_is_ready(&self, remote_addr: &str) -> bool {
+        self.connections
+            .peer_snapshots()
+            .into_iter()
+            .any(|peer| peer.remote_addr == remote_addr && peer.handshake_ready)
+    }
+
+    fn should_send_periodic_getaddr(&self, remote_addr: &str, now: u64) -> bool {
+        self.getaddr_last_sent_unix
+            .get(remote_addr)
+            .is_none_or(|last| now.saturating_sub(*last) >= ADDR_DISCOVERY_INTERVAL_SECS)
+    }
+
+    fn record_getaddr_sent(&mut self, remote_addr: &str, now: u64) {
+        self.getaddr_last_sent_unix
+            .insert(remote_addr.to_string(), now);
+    }
+
+    fn should_send_periodic_addr_relay(&self, remote_addr: &str, now: u64) -> bool {
+        self.addr_relay_last_sent_unix
+            .get(remote_addr)
+            .is_none_or(|last| now.saturating_sub(*last) >= ADDR_RELAY_INTERVAL_SECS)
+    }
+
+    fn record_addr_relay_sent(&mut self, remote_addr: &str, now: u64) {
+        self.addr_relay_last_sent_unix
+            .insert(remote_addr.to_string(), now);
+    }
+
     fn allow_addr_message(&mut self, peer: &str) -> bool {
         let now = now_unix();
         let limits = network_params(self.network).limits;
@@ -653,8 +784,12 @@ impl NodeSync {
             .note_peer_tip(peer, header.height, Hash48::from(observed_tip));
         let previous_target = self.sync_state().best_height;
         let previous_headers_synced = self.sync_state().headers_synced;
-        self.relay
-            .note_observed_tip(node.blocks(), header.height, observed_tip);
+        self.relay.note_observed_tip_at(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            header.height,
+            observed_tip,
+        );
         if header.height > node.height()
             && (header.height > previous_target || previous_headers_synced)
         {
@@ -1416,6 +1551,7 @@ mod tests {
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
     use atho_p2p::protocol::PeerAddress;
+    use atho_storage::db::{ChainstateSnapshot, Database};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
     use std::collections::VecDeque;
@@ -1587,6 +1723,62 @@ mod tests {
         )
     }
 
+    fn synthetic_coinbase_block(
+        network: Network,
+        height: u64,
+        previous_block_hash: [u8; 48],
+        salt: u8,
+    ) -> Block {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
+                locking_script: vec![salt, height as u8],
+            }],
+            lock_time: height as u32,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let transactions = vec![coinbase];
+        Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: network,
+                height,
+                previous_block_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 1_700_000_000 + u64::from(salt) * 10_000 + height * 75,
+                difficulty_target_or_bits: pow::target_for_height(network, height),
+                nonce: u64::from(salt) << 32 | height,
+            },
+            transactions,
+        )
+    }
+
+    fn persist_synthetic_chain(network: Network, height: u64, salt: u8) -> [u8; 48] {
+        let genesis = genesis::genesis_state(network).block;
+        let mut blocks = vec![genesis];
+        let mut previous_hash = blocks[0].header.block_hash();
+        for next_height in 1..=height {
+            let block = synthetic_coinbase_block(network, next_height, previous_hash, salt);
+            previous_hash = block.header.block_hash();
+            blocks.push(block);
+        }
+        let snapshot = ChainstateSnapshot {
+            height,
+            tip_hash: previous_hash,
+            tip_header: blocks.last().map(|block| block.header.clone()),
+        };
+        Database::open(network)
+            .expect("database")
+            .replace_chainstate(&snapshot, &[], &blocks)
+            .expect("replace synthetic chainstate");
+        previous_hash
+    }
+
     fn mine_reference_blocks(network: Network, count: usize) -> Vec<Block> {
         let miner = Miner::new(1);
         let mut node = Node::new(NodeConfig::new(network));
@@ -1737,6 +1929,43 @@ mod tests {
             .address_manager()
             .advertisable_addresses(8);
         assert!(addresses.iter().any(|address| address.host == "8.8.8.8"));
+    }
+
+    #[test]
+    fn synced_peer_periodically_relays_known_peer_addresses() {
+        let mut leaf = SandboxPeer::new("leaf", Network::Regnet);
+        let mut bootstrap = SandboxPeer::new("bootstrap", Network::Regnet);
+        let _ = connect(&mut leaf, &mut bootstrap);
+
+        bootstrap
+            .sync
+            .seed_peer_addresses(&[PeerAddress {
+                host: String::from("127.0.0.42"),
+                port: 18445,
+                services: 0,
+                last_seen_unix: 0,
+            }])
+            .expect("seed relay address");
+
+        let events = bootstrap
+            .sync
+            .maintain_peer_sync(&leaf.id, &bootstrap.node)
+            .expect("maintain peer sync");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                peer,
+                message:
+                    NetworkMessage {
+                        payload: MessagePayload::Addr { addresses },
+                        ..
+                    },
+            } if peer == "leaf"
+                && addresses
+                    .iter()
+                    .any(|address| address.host == "127.0.0.42" && address.port == 18445)
+        )));
     }
 
     #[test]
@@ -3051,6 +3280,66 @@ mod tests {
         assert_eq!(canonical.node.height(), fork.node.height());
         assert_eq!(canonical.node.tip_hash(), fork.node.tip_hash());
         assert_eq!(canonical.sync.sync_state().best_height, fork.node.height());
+    }
+
+    #[test]
+    fn restarted_node_locator_finds_common_ancestor_beyond_recent_reload_window() {
+        let left_root = temp_data_dir("deep-fork-left");
+        let right_root = temp_data_dir("deep-fork-right");
+        fs::create_dir_all(&left_root).expect("left root");
+        fs::create_dir_all(&right_root).expect("right root");
+
+        {
+            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &left_root);
+            persist_synthetic_chain(Network::Regnet, 30, 11);
+        }
+        {
+            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &right_root);
+            persist_synthetic_chain(Network::Regnet, 32, 22);
+        }
+
+        let _left_guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &left_root);
+        let left = SandboxPeer::new_persistent("left", Network::Regnet);
+        assert!(
+            left.node.blocks_len() < left.node.height() as usize,
+            "reloaded node must only have recent blocks in memory"
+        );
+        let genesis_hash = genesis::genesis_hash(Network::Regnet);
+        assert!(
+            !atho_p2p::sync::block_locator(left.node.blocks())
+                .iter()
+                .any(|hash| (*hash).into_inner() == genesis_hash),
+            "old recent-only locator would not contain a common ancestor"
+        );
+        assert!(
+            left.node.block_locator_hashes().contains(&genesis_hash),
+            "full persisted locator must include genesis as a fallback ancestor"
+        );
+
+        let locator_hashes = left
+            .sync
+            .sync_state()
+            .locator_hashes
+            .iter()
+            .copied()
+            .map(Hash48::into_inner)
+            .collect::<Vec<_>>();
+
+        let _right_guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &right_root);
+        let right = Node::load_or_new(NodeConfig::new(Network::Regnet));
+        let headers = right.headers_after_locator(
+            &locator_hashes,
+            [0; 48],
+            network_params(Network::Regnet)
+                .limits
+                .max_headers_per_message,
+        );
+
+        assert!(
+            !headers.is_empty(),
+            "a restarted forked node must request from a locator the remote can anchor"
+        );
+        assert_eq!(headers.first().map(|header| header.height), Some(1));
     }
 
     #[test]

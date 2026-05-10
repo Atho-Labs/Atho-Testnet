@@ -24,8 +24,8 @@ use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput};
-use atho_p2p::address_manager::format_remote_addr;
-use atho_p2p::config::{default_bootstrap_peers, network_params};
+use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
+use atho_p2p::config::{configured_bootstrap_peers, default_bootstrap_peers, network_params};
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent};
 use atho_p2p::protocol::NetworkMessage;
 use atho_rpc::command::{
@@ -2831,6 +2831,40 @@ impl NodeService {
                 ),
             );
         }
+
+        let bootstrap_addresses = configured_bootstrap_peers(network)
+            .into_iter()
+            .filter_map(|peer| parse_remote_addr(&peer, network.p2p_port()))
+            .collect::<Vec<_>>();
+        if bootstrap_addresses.is_empty() {
+            return;
+        }
+        let accepted = match self
+            .orchestrator
+            .sync
+            .seed_peer_addresses(&bootstrap_addresses)
+        {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "bootstrap peer seed failed network={} error={err}",
+                        network.id()
+                    ),
+                );
+                return;
+            }
+        };
+        if !accepted.is_empty() && public_source {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "seeded {} configured bootstrap peer address(es) into discovery graph",
+                    accepted.len()
+                ),
+            );
+        }
     }
 }
 
@@ -3366,6 +3400,22 @@ mod tests {
 
         let peers = service.p2p_bootstrap_peers(8);
         assert!(peers.iter().any(|peer| peer == "8.8.8.8:9200"));
+    }
+
+    #[test]
+    fn p2p_prime_seeds_configured_testnet_bootstrap_peers_for_relay() {
+        let root = temp_data_dir("configured-testnet-bootstrap-peers");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
+        service.p2p_prime();
+
+        let peers = service.p2p_bootstrap_peers(16);
+        assert!(peers
+            .iter()
+            .any(|peer| peer == "testnet-node2.atho.io:9100"));
+        assert!(peers.iter().any(|peer| peer == "74.208.219.116:9100"));
     }
 
     #[test]

@@ -276,23 +276,7 @@ impl ConnectionManager {
                     message: NetworkMessage::new(
                         self.network,
                         MessagePayload::Addr {
-                            addresses: {
-                                let limits = network_params(self.network).limits;
-                                let share_limit = limits
-                                    .max_outbound_peers
-                                    .saturating_mul(8)
-                                    .max(8)
-                                    .min(limits.max_addr_per_message);
-                                self.address_manager
-                                    .relay_addresses(share_limit)
-                                    .into_iter()
-                                    .filter(|address| {
-                                        let remote = format_remote_addr(address);
-                                        remote != remote_addr
-                                            && !self.banlist.is_banned(&remote, now)
-                                    })
-                                    .collect()
-                            },
+                            addresses: self.relay_addresses_for_peer(remote_addr),
                         },
                     ),
                 }])
@@ -369,6 +353,24 @@ impl ConnectionManager {
 
     pub fn address_manager(&self) -> &AddressManager {
         &self.address_manager
+    }
+
+    pub fn relay_addresses_for_peer(&self, remote_addr: &str) -> Vec<PeerAddress> {
+        let now = now_unix();
+        let limits = network_params(self.network).limits;
+        let share_limit = limits
+            .max_outbound_peers
+            .saturating_mul(8)
+            .max(8)
+            .min(limits.max_addr_per_message);
+        self.address_manager
+            .relay_addresses(share_limit)
+            .into_iter()
+            .filter(|address| {
+                let remote = format_remote_addr(address);
+                remote != remote_addr && !self.banlist.is_banned(&remote, now)
+            })
+            .collect()
     }
 
     pub fn peer_count(&self) -> usize {

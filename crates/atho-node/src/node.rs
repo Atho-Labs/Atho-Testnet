@@ -11,6 +11,7 @@ use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
 use atho_core::crypto::hash::sha3_256;
+use atho_core::genesis;
 use atho_core::transaction::Transaction;
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
 use atho_p2p::protocol::PeerAddress;
@@ -80,6 +81,56 @@ impl Node {
 
     pub fn blocks(&self) -> &[Block] {
         self.chainstate.blocks()
+    }
+
+    pub fn block_locator_hashes(&self) -> Vec<[u8; 48]> {
+        const MAX_LOCATOR_HASHES: usize = 32;
+        const LINEAR_RECENT_HASHES: usize = 10;
+
+        let mut locator = Vec::new();
+        let mut height = self.height();
+        let mut step = 1u64;
+
+        loop {
+            if let Some(record) = self.block_record_by_height(height) {
+                if locator.last().copied() != Some(record.block_hash) {
+                    locator.push(record.block_hash);
+                }
+            } else if height == self.height() {
+                let tip_hash = self.tip_hash();
+                if locator.last().copied() != Some(tip_hash) {
+                    locator.push(tip_hash);
+                }
+            }
+
+            if height == 0 {
+                break;
+            }
+            if locator.len().saturating_add(1) >= MAX_LOCATOR_HASHES {
+                break;
+            }
+            if locator.len() >= LINEAR_RECENT_HASHES {
+                step = step.saturating_mul(2);
+            }
+            height = height.saturating_sub(step);
+        }
+
+        let genesis_hash = genesis::genesis_hash(self.network());
+        if locator.last().copied() != Some(genesis_hash) {
+            if locator.len() >= MAX_LOCATOR_HASHES {
+                let _ = locator.pop();
+            }
+            locator.push(genesis_hash);
+        }
+        locator
+    }
+
+    pub fn chainwork_bytes(&self) -> [u8; 48] {
+        let chainwork = self
+            .block_record_by_height(self.height())
+            .map(|record| record.chainwork)
+            .unwrap_or_else(|| pow::accumulated_chain_work(self.blocks()).to_bytes_be());
+        fixed_hash48_from_be_bytes(&chainwork)
     }
 
     pub fn canonical_blocks(&self) -> Result<Vec<Block>, NodeError> {
@@ -531,6 +582,15 @@ fn transaction_fee_from_utxos(
     input_total.checked_sub(tx.checked_output_value_atoms()?)
 }
 
+fn fixed_hash48_from_be_bytes(bytes: &[u8]) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    let copy_len = bytes.len().min(out.len());
+    let out_start = out.len() - copy_len;
+    let bytes_start = bytes.len() - copy_len;
+    out[out_start..].copy_from_slice(&bytes[bytes_start..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,7 +606,7 @@ mod tests {
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
-    use atho_storage::db::Database;
+    use atho_storage::db::{ChainstateSnapshot, Database};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
     use std::ffi::OsString;
@@ -612,6 +672,61 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn synthetic_coinbase_block(
+        network: Network,
+        height: u64,
+        previous_block_hash: [u8; 48],
+        salt: u8,
+    ) -> Block {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
+                locking_script: vec![salt, height as u8],
+            }],
+            lock_time: height as u32,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: network,
+                height,
+                previous_block_hash,
+                merkle_root: merkle_root(std::slice::from_ref(&tx)),
+                witness_root: witness_root(std::slice::from_ref(&tx)),
+                timestamp: 1_700_000_000 + u64::from(salt) * 10_000 + height * 75,
+                difficulty_target_or_bits: pow::target_for_height(network, height),
+                nonce: u64::from(salt) << 32 | height,
+            },
+            vec![tx],
+        )
+    }
+
+    fn persist_synthetic_chain(network: Network, height: u64, salt: u8) -> [u8; 48] {
+        let genesis = atho_core::genesis::genesis_state(network).block;
+        let mut blocks = vec![genesis];
+        let mut previous_hash = blocks[0].header.block_hash();
+        for next_height in 1..=height {
+            let block = synthetic_coinbase_block(network, next_height, previous_hash, salt);
+            previous_hash = block.header.block_hash();
+            blocks.push(block);
+        }
+        let snapshot = ChainstateSnapshot {
+            height,
+            tip_hash: previous_hash,
+            tip_header: blocks.last().map(|block| block.header.clone()),
+        };
+        Database::open(network)
+            .expect("database")
+            .replace_chainstate(&snapshot, &[], &blocks)
+            .expect("replace synthetic chainstate");
+        previous_hash
     }
 
     struct EnvVarGuard {
@@ -1059,6 +1174,39 @@ mod tests {
         assert_eq!(reloaded.tip_hash(), tip_hash);
         assert_eq!(reloaded.difficulty_target_for_next_block(), next_target);
         assert_eq!(reloaded.utxo_count(), 2);
+    }
+
+    #[test]
+    fn reloaded_node_locator_uses_persisted_history_beyond_recent_window() {
+        let root = temp_data_dir("persisted-locator");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let tip_hash = persist_synthetic_chain(Network::Regnet, 30, 11);
+
+        let reloaded = Node::load_or_new(NodeConfig::new(Network::Regnet));
+        assert_eq!(reloaded.height(), 30);
+        assert_eq!(reloaded.tip_hash(), tip_hash);
+        assert!(
+            reloaded.blocks_len() < reloaded.height() as usize,
+            "test must cover a chain reloaded with only recent blocks in memory"
+        );
+
+        let genesis_hash = atho_core::genesis::genesis_hash(Network::Regnet);
+        let recent_only_locator = atho_p2p::sync::block_locator(reloaded.blocks());
+        assert!(
+            !recent_only_locator
+                .iter()
+                .any(|hash| (*hash).into_inner() == genesis_hash),
+            "the old recent-only locator would not find a fork older than the reload window"
+        );
+
+        let locator = reloaded.block_locator_hashes();
+        assert_eq!(locator.first().copied(), Some(tip_hash));
+        assert!(
+            locator.contains(&genesis_hash),
+            "persistent locators must retain a guaranteed common ancestor"
+        );
     }
 
     #[test]
