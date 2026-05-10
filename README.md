@@ -6,7 +6,7 @@ Mainnet launch paths, mainnet DNS seeds, mainnet bootstrap peers, and mainnet op
 
 - Website: <https://atho.io>
 - Testnet explorer: <https://atho.io/explore/>
-- Current testnet release: `v0.1.7`
+- Current testnet release: `v0.1.8`
 - Public testnet seed/API nodes: `testnet-node1.atho.io`, `testnet-node2.atho.io`
 - Public testnet peers: `162.222.206.163:9100`, `74.208.219.116:9100`
 
@@ -79,6 +79,14 @@ cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
 This repo intentionally keeps the public surface small: `runtestnet.py`, `runtime_launcher.py`, this README, and the Rust source needed to run the public testnet software.
+
+## v0.1.8 Patch Notes
+
+- Added header-first block scheduling improvements from Alpha so peers can keep pipelined block request windows full without one-block-at-a-time stalls.
+- Hardened header acceptance by rejecting wrong-network headers, out-of-bounds targets, and headers that fail their committed proof of work before full block download.
+- Improved low-peer sync behavior so the only useful peer is retried for stale block responses instead of being disconnected for ordinary slowness.
+- Added per-peer stale request requeue handling so timed-out blocks can be retried cleanly without stranding pending downloads.
+- Added same-box sync regression coverage for Alpha, Testnet release, and the local Testnet checkout.
 
 ## v0.1.7 Patch Notes
 

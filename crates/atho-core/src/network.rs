@@ -154,9 +154,9 @@ impl Network {
     /// ship mainnet operator launch paths.
     pub fn operator_launch_allowed(self) -> Result<(), &'static str> {
         match self {
-            Self::Mainnet => Err(
-                "the selected network is disabled in this repository; use testnet here",
-            ),
+            Self::Mainnet => {
+                Err("the selected network is disabled in this repository; use testnet here")
+            }
             Self::Testnet | Self::Regnet | Self::Prunetest => Ok(()),
         }
     }

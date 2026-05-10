@@ -23,6 +23,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+const BLOCK_DOWNLOAD_LOOKAHEAD: u64 = 256;
+const BLOCK_REQUEST_BATCH_LIMIT: usize = 64;
+const HEADERS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SIDE_BRANCH_BLOCKS: usize = 4_096;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,6 +59,8 @@ pub struct NodeSync {
     mempool_snapshot_peers: BTreeSet<String>,
     side_branches: SideBranchPool,
     pending_compact_blocks: BTreeMap<[u8; 48], PendingCompactBlock>,
+    pending_header_blocks: BTreeMap<u64, BTreeMap<[u8; 48], BTreeSet<String>>>,
+    header_requests_started: BTreeMap<String, SystemTime>,
     addr_rate_windows: BTreeMap<String, AddrRateWindow>,
     last_addr_received_unix: Option<u64>,
     getaddr_last_sent_unix: BTreeMap<String, u64>,
@@ -235,6 +240,8 @@ impl NodeSync {
             mempool_snapshot_peers: BTreeSet::new(),
             side_branches: SideBranchPool::default(),
             pending_compact_blocks: BTreeMap::new(),
+            pending_header_blocks: BTreeMap::new(),
+            header_requests_started: BTreeMap::new(),
             addr_rate_windows: BTreeMap::new(),
             last_addr_received_unix: None,
             getaddr_last_sent_unix: BTreeMap::new(),
@@ -395,19 +402,57 @@ impl NodeSync {
         let mut outbound = Vec::new();
         self.prune_pending_compact_blocks();
         self.refresh_sync_target_from_live_peers(node);
-        let requeued = self
+        if let Some(event) = self.header_timeout_disconnect_event(remote_addr, node) {
+            outbound.push(event);
+            return Ok(outbound);
+        }
+        let stale_downloads = self
             .downloader
-            .requeue_stale_inflight(BLOCK_REQUEST_RETRY_TIMEOUT);
-        if requeued > 0 {
+            .requeue_stale_inflight_for_peer(remote_addr, BLOCK_REQUEST_RETRY_TIMEOUT);
+        if !stale_downloads.is_empty() {
+            let first_hash = stale_downloads
+                .first()
+                .map(|download| short_hash(&download.hash.into_inner()))
+                .unwrap_or_else(|| String::from("<none>"));
+            if self.ready_peer_count() <= 1 {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "sync maintenance retrying stale block requests in low-peer mode peer={} count={} first_hash={}",
+                        remote_addr,
+                        stale_downloads.len(),
+                        first_hash
+                    ),
+                );
+                self.heal_buffered_branch_parents(Some(remote_addr), node, &mut outbound);
+                self.push_block_download_work_for_peer(remote_addr, node, &mut outbound);
+                if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
+                    self.reseed_locator_from_node(node);
+                    self.queue_getheaders(remote_addr, &mut outbound);
+                }
+                self.push_address_discovery_events(remote_addr, node, &mut outbound);
+                return Ok(outbound);
+            }
             let _ = dev::append_log(
                 "p2p",
                 &format!(
-                    "sync maintenance requeued stale block requests peer={} count={}",
-                    remote_addr, requeued
+                    "sync maintenance timed out block requests peer={} count={} first_hash={}",
+                    remote_addr,
+                    stale_downloads.len(),
+                    first_hash
                 ),
             );
+            outbound.push(ConnectionEvent::Disconnect {
+                peer: remote_addr.to_string(),
+                reason: format!(
+                    "block download timeout count={} first_hash={first_hash}",
+                    stale_downloads.len()
+                ),
+            });
+            return Ok(outbound);
         }
-        self.push_scheduled_block_requests_for_peer(remote_addr, &mut outbound);
+        self.heal_buffered_branch_parents(Some(remote_addr), node, &mut outbound);
+        self.push_block_download_work_for_peer(remote_addr, node, &mut outbound);
 
         if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
             self.reseed_locator_from_node(node);
@@ -420,14 +465,19 @@ impl NodeSync {
                     self.sync_state().best_height
                 ),
             );
-            outbound.push(ConnectionEvent::Send {
-                peer: remote_addr.to_string(),
-                message: self.relay.build_getheaders(remote_addr.to_string()),
-            });
+            self.queue_getheaders(remote_addr, &mut outbound);
         }
         self.push_address_discovery_events(remote_addr, node, &mut outbound);
 
         Ok(outbound)
+    }
+
+    fn ready_peer_count(&self) -> usize {
+        self.connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+            .count()
     }
 
     fn expand_events(
@@ -465,10 +515,7 @@ impl NodeSync {
                         peer: peer.clone(),
                         best_height,
                     });
-                    outbound.push(ConnectionEvent::Send {
-                        peer: peer.clone(),
-                        message: self.relay.build_getheaders(peer.clone()),
-                    });
+                    self.queue_getheaders(&peer, &mut outbound);
                 }
                 ConnectionEvent::Message { peer, message } => {
                     self.handle_message(&peer, message, node, &mut outbound)?;
@@ -498,6 +545,7 @@ impl NodeSync {
     fn note_peer_disconnected(&mut self, peer: &str, node: &Node) {
         self.downloader.note_peer_disconnected(peer);
         self.mempool_snapshot_peers.remove(peer);
+        self.header_requests_started.remove(peer);
         self.getaddr_last_sent_unix.remove(peer);
         self.addr_relay_last_sent_unix.remove(peer);
         // Buffered blocks are already marked received by the downloader. Keep
@@ -608,6 +656,7 @@ impl NodeSync {
                 });
             }
             MessagePayload::Headers { headers } => {
+                self.header_requests_started.remove(peer);
                 let first_height = headers.first().map(|header| header.height);
                 let last_height = headers.last().map(|header| header.height);
                 let header_count = headers.len();
@@ -647,10 +696,7 @@ impl NodeSync {
                             self.relay.sync_state().locator_hashes.len()
                         ),
                     );
-                    outbound.push(ConnectionEvent::Send {
-                        peer: peer.to_string(),
-                        message: self.relay.build_getheaders(peer.to_string()),
-                    });
+                    self.queue_getheaders(peer, outbound);
                     return Ok(());
                 }
                 if let Some(last_header) = headers.last() {
@@ -670,27 +716,24 @@ impl NodeSync {
                     ),
                 );
                 let mut known_noncanonical_blocks = Vec::new();
-                let mut missing_block_hashes = Vec::new();
-                for hash in headers.iter().map(|header| header.block_hash()) {
+                for header in &headers {
+                    let hash = header.block_hash();
                     if node.is_canonical_block(&hash) {
+                        self.remove_pending_header_block(header.height, &hash);
                         continue;
                     }
                     if let Some(block) = node.block_by_hash(hash) {
                         known_noncanonical_blocks.push(block);
                     } else {
-                        missing_block_hashes.push(hash);
+                        self.note_pending_header_block(peer, header.height, hash);
                     }
                 }
-                self.downloader.note_headers(peer, missing_block_hashes);
-                self.push_scheduled_block_requests(outbound);
+                self.push_block_download_work_for_peer(peer, node, outbound);
                 for block in known_noncanonical_blocks {
                     self.handle_received_block(peer, block, node, outbound)?;
                 }
                 if !self.relay.sync_state().headers_synced {
-                    outbound.push(ConnectionEvent::Send {
-                        peer: peer.to_string(),
-                        message: self.relay.build_getheaders(peer.to_string()),
-                    });
+                    self.queue_getheaders(peer, outbound);
                 } else {
                     self.record_getaddr_sent(peer, now_unix());
                     outbound.push(ConnectionEvent::Send {
@@ -783,7 +826,7 @@ impl NodeSync {
                     .map(|vector| vector.hash.into_inner())
                     .collect::<Vec<_>>();
                 self.downloader.note_not_found(peer, &hashes);
-                self.push_scheduled_block_requests(outbound);
+                self.push_block_download_work_for_peer(peer, node, outbound);
             }
             MessagePayload::Pong { .. } => {}
             MessagePayload::Version(_)
@@ -986,16 +1029,19 @@ impl NodeSync {
         }
     }
 
-    fn push_scheduled_block_requests_for_peer(
+    fn push_block_download_work_for_peer(
         &mut self,
         peer: &str,
+        node: &Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) {
+        self.stage_header_blocks_near_tip(node);
         let limits = network_params(self.network).limits;
-        if let Some(assignment) = self.downloader.assignment_for_peer(
+        if let Some(assignment) = self.downloader.assignment_for_peer_limited(
             peer,
             limits.max_blocks_in_flight,
             limits.max_requests_per_peer,
+            BLOCK_REQUEST_BATCH_LIMIT,
         ) {
             self.push_download_assignment(assignment, outbound);
         }
@@ -1032,7 +1078,7 @@ impl NodeSync {
     }
 
     fn should_rehydrate_headers_from_local_tip(&self, remote_addr: &str, node: &Node) -> bool {
-        if self.sync_state().inflight_headers_peer.is_some() {
+        if self.header_request_inflight(remote_addr) {
             return false;
         }
         if !self
@@ -1054,6 +1100,112 @@ impl NodeSync {
         !self.sync_state().headers_synced || self.downloader.is_idle()
     }
 
+    fn header_request_inflight(&self, remote_addr: &str) -> bool {
+        self.header_requests_started
+            .get(remote_addr)
+            .is_some_and(|started| started.elapsed().unwrap_or_default() < HEADERS_REQUEST_TIMEOUT)
+    }
+
+    fn header_timeout_disconnect_event(
+        &mut self,
+        remote_addr: &str,
+        node: &Node,
+    ) -> Option<ConnectionEvent> {
+        let target_height = self.sync_state().best_height.max(
+            self.connections
+                .remote_best_height(remote_addr)
+                .unwrap_or(node.height()),
+        );
+        if node.height() >= target_height {
+            self.header_requests_started.remove(remote_addr);
+            return None;
+        }
+        let timed_out = self
+            .header_requests_started
+            .get(remote_addr)
+            .is_some_and(|started| {
+                started.elapsed().unwrap_or_default() >= HEADERS_REQUEST_TIMEOUT
+            });
+        if !timed_out {
+            return None;
+        }
+        self.header_requests_started.remove(remote_addr);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "headers request timed out peer={} local_height={} target_height={}",
+                remote_addr,
+                node.height(),
+                target_height
+            ),
+        );
+        Some(ConnectionEvent::Disconnect {
+            peer: remote_addr.to_string(),
+            reason: format!(
+                "headers download timeout local_height={} target_height={target_height}",
+                node.height()
+            ),
+        })
+    }
+
+    fn queue_getheaders(&mut self, peer: &str, outbound: &mut Vec<ConnectionEvent>) {
+        self.header_requests_started
+            .insert(peer.to_string(), SystemTime::now());
+        outbound.push(ConnectionEvent::Send {
+            peer: peer.to_string(),
+            message: self.relay.build_getheaders(peer.to_string()),
+        });
+    }
+
+    fn should_defer_unsolicited_future_block(
+        &self,
+        header: &BlockHeader,
+        node: &Node,
+        requested: bool,
+    ) -> bool {
+        if requested || header.network_id != self.network {
+            return false;
+        }
+        if header.previous_block_hash == node.tip_hash() {
+            return false;
+        }
+        header.height > node.height().saturating_add(BLOCK_DOWNLOAD_LOOKAHEAD)
+    }
+
+    fn defer_unsolicited_future_block(
+        &mut self,
+        peer: &str,
+        header: &BlockHeader,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+        source: &str,
+        requested: bool,
+    ) -> bool {
+        if !self.should_defer_unsolicited_future_block(header, node, requested) {
+            return false;
+        }
+
+        let block_hash = header.block_hash();
+        self.note_observed_peer_tip(peer, header, node);
+        if !self.sync_state().headers_synced && !self.header_request_inflight(peer) {
+            self.reseed_locator_from_node(node);
+            self.queue_getheaders(peer, outbound);
+        }
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "deferred far-ahead unsolicited block source={} peer={} height={} hash={} local_height={} target_height={}",
+                source,
+                peer,
+                header.height,
+                short_hash(&block_hash),
+                node.height(),
+                self.sync_state().best_height
+            ),
+        );
+        true
+    }
+
     fn handle_received_block(
         &mut self,
         peer: &str,
@@ -1062,6 +1214,7 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<(), NodeSyncError> {
         let block_hash = block.header.block_hash();
+        let block_height = block.header.height;
         if let Err(validation) =
             crate::validation::validate_block(&block, block.header.height, self.network)
         {
@@ -1077,6 +1230,18 @@ impl NodeSync {
             );
             return Err(NodeError::Validation(validation).into());
         }
+        let requested = self.downloader.is_inflight(block_hash);
+        if self.defer_unsolicited_future_block(
+            peer,
+            &block.header,
+            node,
+            outbound,
+            "block",
+            requested,
+        ) {
+            self.pending_compact_blocks.remove(&block_hash);
+            return Ok(());
+        }
         if node.is_canonical_block(&block_hash) {
             let _ = dev::append_log(
                 "p2p",
@@ -1090,8 +1255,9 @@ impl NodeSync {
             self.downloader.note_block_received(block_hash);
             self.pending_compact_blocks.remove(&block_hash);
             self.side_branches.remove(&block_hash);
-            self.push_scheduled_block_requests(outbound);
-            self.process_buffered_branches(node, outbound)?;
+            self.remove_pending_header_block(block.header.height, &block_hash);
+            self.push_block_download_work_for_peer(peer, node, outbound);
+            self.process_buffered_branches(Some(peer), node, outbound)?;
             return Ok(());
         }
 
@@ -1115,8 +1281,9 @@ impl NodeSync {
                     self.pending_compact_blocks.remove(&block_hash);
                     self.side_branches.remove(&block_hash);
                     self.side_branches.remove_canonical_blocks(node);
-                    self.push_scheduled_block_requests(outbound);
-                    self.process_buffered_branches(node, outbound)?;
+                    self.remove_pending_header_block(block.header.height, &block_hash);
+                    self.push_block_download_work_for_peer(peer, node, outbound);
+                    self.process_buffered_branches(Some(peer), node, outbound)?;
                     return Ok(());
                 }
                 Err(NodeError::Validation(validation))
@@ -1152,6 +1319,7 @@ impl NodeSync {
         }
 
         self.note_observed_peer_tip(peer, &block.header, node);
+        let previous_hash = block.header.previous_block_hash;
         let _ = dev::append_log(
             "p2p",
             &format!(
@@ -1166,12 +1334,28 @@ impl NodeSync {
         self.buffer_peer_block_with_known_ancestors(peer, block, node);
         self.downloader.note_block_received(block_hash);
         self.pending_compact_blocks.remove(&block_hash);
-        self.push_scheduled_block_requests(outbound);
-        self.process_buffered_branches(node, outbound)?;
+        self.remove_pending_header_block(block_height, &block_hash);
+        if !node.is_canonical_block(&previous_hash)
+            && self.side_branches.get(&previous_hash).is_none()
+        {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "orphan parent needed peer={} parent={} child={}",
+                    peer,
+                    short_hash(&previous_hash),
+                    short_hash(&block_hash)
+                ),
+            );
+        }
+        self.heal_buffered_branch_parents(Some(peer), node, outbound);
+        self.push_block_download_work_for_peer(peer, node, outbound);
+        self.process_buffered_branches(Some(peer), node, outbound)?;
 
         Ok(())
     }
 
+    #[cfg(test)]
     fn branch_is_preferred_over_current(branch: &[Block], current_blocks: &[Block]) -> bool {
         let Some(first) = branch.first() else {
             return false;
@@ -1204,6 +1388,127 @@ impl NodeSync {
         }
     }
 
+    fn heal_buffered_branch_parents(
+        &mut self,
+        preferred_peer: Option<&str>,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        let mut discovered_local_parent = true;
+        while discovered_local_parent {
+            discovered_local_parent = false;
+            for parent_hash in self.missing_buffered_parent_hashes(node) {
+                if let Some(parent) = node.block_by_hash(parent_hash) {
+                    let parent_peer = preferred_peer.unwrap_or("local-archive");
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "rehydrating buffered branch parent source=local-archive height={} hash={}",
+                            parent.header.height,
+                            short_hash(&parent_hash)
+                        ),
+                    );
+                    self.side_branches.insert(parent_peer, parent);
+                    self.downloader.note_block_received(parent_hash);
+                    discovered_local_parent = true;
+                }
+            }
+        }
+
+        for parent_hash in self.missing_buffered_parent_hashes(node) {
+            self.downloader
+                .queue_priority_block(preferred_peer, parent_hash);
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "queued orphan parent request peer={} parent={}",
+                    preferred_peer.unwrap_or("<any>"),
+                    short_hash(&parent_hash)
+                ),
+            );
+        }
+        if let Some(peer) = preferred_peer {
+            self.push_block_download_work_for_peer(peer, node, outbound);
+        } else {
+            self.stage_header_blocks_near_tip(node);
+            self.push_scheduled_block_requests(outbound);
+        }
+    }
+
+    fn note_pending_header_block(&mut self, peer: &str, height: u64, hash: [u8; 48]) {
+        self.pending_header_blocks
+            .entry(height)
+            .or_default()
+            .entry(hash)
+            .or_default()
+            .insert(peer.to_string());
+    }
+
+    fn remove_pending_header_block(&mut self, height: u64, hash: &[u8; 48]) {
+        if let Some(blocks_at_height) = self.pending_header_blocks.get_mut(&height) {
+            blocks_at_height.remove(hash);
+            if blocks_at_height.is_empty() {
+                self.pending_header_blocks.remove(&height);
+            }
+        }
+    }
+
+    fn block_source_peers_for_height(
+        &self,
+        height: u64,
+        mut peers: BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        for snapshot in self.connections.peer_snapshots() {
+            if !snapshot.handshake_ready {
+                continue;
+            }
+            if snapshot
+                .best_height
+                .is_some_and(|best_height| best_height >= height)
+            {
+                peers.insert(snapshot.remote_addr);
+            }
+        }
+        peers
+    }
+
+    fn stage_header_blocks_near_tip(&mut self, node: &Node) {
+        let max_height = node.height().saturating_add(BLOCK_DOWNLOAD_LOOKAHEAD);
+        let heights = self
+            .pending_header_blocks
+            .range(..=max_height)
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>();
+        for height in heights {
+            let Some(blocks_at_height) = self.pending_header_blocks.remove(&height) else {
+                continue;
+            };
+            for (hash, peers) in blocks_at_height {
+                if node.is_canonical_block(&hash) || node.block_by_hash(hash).is_some() {
+                    self.downloader.note_block_received(hash);
+                    continue;
+                }
+                for peer in self.block_source_peers_for_height(height, peers) {
+                    self.downloader.note_headers(&peer, [hash]);
+                }
+            }
+        }
+    }
+
+    fn missing_buffered_parent_hashes(&self, node: &Node) -> Vec<[u8; 48]> {
+        let mut missing = BTreeSet::new();
+        for entry in self.side_branches.blocks.values() {
+            let parent_hash = entry.block.header.previous_block_hash;
+            if node.is_canonical_block(&parent_hash)
+                || self.side_branches.get(&parent_hash).is_some()
+            {
+                continue;
+            }
+            missing.insert(parent_hash);
+        }
+        missing.into_iter().collect()
+    }
+
     fn buffered_branch_from_tip(&self, node: &Node, tip_hash: [u8; 48]) -> Option<Vec<Block>> {
         let mut branch_reversed = Vec::new();
         let mut current_hash = tip_hash;
@@ -1232,12 +1537,11 @@ impl NodeSync {
 
     fn best_buffered_branch(&self, node: &Node) -> Option<Vec<Block>> {
         let mut best: Option<Vec<Block>> = None;
-        let current_blocks = node.blocks();
         for tip_hash in self.side_branches.leaf_hashes() {
             let Some(candidate) = self.buffered_branch_from_tip(node, tip_hash) else {
                 continue;
             };
-            if !Self::branch_is_preferred_over_current(&candidate, current_blocks) {
+            if !node.branch_is_preferred_over_current(&candidate) {
                 continue;
             }
             match &best {
@@ -1253,6 +1557,7 @@ impl NodeSync {
 
     fn process_buffered_branch_once(
         &mut self,
+        preferred_peer: Option<&str>,
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<bool, NodeSyncError> {
@@ -1279,7 +1584,12 @@ impl NodeSync {
                         self.side_branches.remove(&hash);
                     }
                     self.side_branches.remove_canonical_blocks(node);
-                    self.push_scheduled_block_requests(outbound);
+                    if let Some(peer) = preferred_peer {
+                        self.push_block_download_work_for_peer(peer, node, outbound);
+                    } else {
+                        self.stage_header_blocks_near_tip(node);
+                        self.push_scheduled_block_requests(outbound);
+                    }
                     progressed = true;
                 }
                 Ok(_) => return Ok(progressed),
@@ -1312,11 +1622,12 @@ impl NodeSync {
 
     fn process_buffered_branches(
         &mut self,
+        preferred_peer: Option<&str>,
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<(), NodeSyncError> {
         loop {
-            if !self.process_buffered_branch_once(node, outbound)? {
+            if !self.process_buffered_branch_once(preferred_peer, node, outbound)? {
                 return Ok(());
             }
         }
@@ -1357,6 +1668,17 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         self.prune_pending_compact_blocks();
         let block_hash = message.header.block_hash();
+        let requested = self.downloader.is_inflight(block_hash);
+        if self.defer_unsolicited_future_block(
+            peer,
+            &message.header,
+            node,
+            outbound,
+            "compact",
+            requested,
+        ) {
+            return Ok(());
+        }
         let mempool_by_short_id = node
             .mempool_transactions()
             .into_iter()
@@ -2020,6 +2342,83 @@ mod tests {
         }
     }
 
+    fn collect_handshake_events(
+        queue: &mut VecDeque<QueuedSend>,
+        notices: &mut Vec<SyncNotice>,
+        from: &str,
+        events: Vec<ConnectionEvent>,
+    ) {
+        for event in events {
+            match event {
+                ConnectionEvent::Send { peer, message }
+                    if matches!(
+                        message.payload,
+                        MessagePayload::Version(_) | MessagePayload::Verack
+                    ) =>
+                {
+                    queue.push_back(QueuedSend {
+                        from: from.to_string(),
+                        to: peer,
+                        message,
+                    });
+                }
+                ConnectionEvent::Send { .. } => {}
+                ConnectionEvent::Ready { peer, best_height } => {
+                    notices.push(SyncNotice::Ready { peer, best_height });
+                }
+                ConnectionEvent::Disconnect { peer, reason } => {
+                    notices.push(SyncNotice::Disconnected { peer, reason });
+                }
+                ConnectionEvent::Message { .. } => panic!("unexpected raw message event"),
+            }
+        }
+    }
+
+    fn outbound_getdata_hashes(events: &[ConnectionEvent]) -> Vec<[u8; 48]> {
+        events
+            .iter()
+            .flat_map(|event| match event {
+                ConnectionEvent::Send {
+                    message:
+                        NetworkMessage {
+                            payload: MessagePayload::GetData { inventory },
+                            ..
+                        },
+                    ..
+                } => inventory
+                    .iter()
+                    .filter(|item| item.kind == InventoryKind::Block)
+                    .map(|item| item.hash.into_inner())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn outbound_getdata_peers(events: &[ConnectionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ConnectionEvent::Send {
+                    peer,
+                    message:
+                        NetworkMessage {
+                            payload: MessagePayload::GetData { .. },
+                            ..
+                        },
+                } => Some(peer.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn synthetic_header_hash(height: u64, salt: u8) -> [u8; 48] {
+        let mut hash = [salt; 48];
+        hash[..8].copy_from_slice(&height.to_be_bytes());
+        hash[47] = salt ^ (height as u8);
+        hash
+    }
+
     fn drain(
         left: &mut SandboxPeer,
         right: &mut SandboxPeer,
@@ -2064,6 +2463,42 @@ mod tests {
         collect_events(&mut queue, &mut notices, &left.id, events);
         let mut drained = drain(left, right, &mut queue);
         notices.append(&mut drained);
+        notices
+    }
+
+    fn connect_handshake_only(left: &mut SandboxPeer, right: &mut SandboxPeer) -> Vec<SyncNotice> {
+        left.sync.add_manual_peer(right.id.clone());
+        right.sync.add_manual_peer(left.id.clone());
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        collect_handshake_events(&mut queue, &mut notices, &left.id, events);
+        while let Some(queued) = queue.pop_front() {
+            if queued.to == left.id {
+                let (events, mut new_notices) = left
+                    .sync
+                    .receive(&queued.from, queued.message, &mut left.node)
+                    .expect("left receive");
+                collect_handshake_events(&mut queue, &mut notices, &left.id, events);
+                notices.append(&mut new_notices);
+            } else if queued.to == right.id {
+                let (events, mut new_notices) = right
+                    .sync
+                    .receive(&queued.from, queued.message, &mut right.node)
+                    .expect("right receive");
+                collect_handshake_events(&mut queue, &mut notices, &right.id, events);
+                notices.append(&mut new_notices);
+            } else {
+                panic!("unknown peer {}", queued.to);
+            }
+        }
         notices
     }
 
@@ -2299,7 +2734,8 @@ mod tests {
         let miner = Miner::new(1);
         let mut previous_hash = node.tip_hash();
         let mut blocks = Vec::new();
-        for height in 1..=129 {
+        let request_limit = network_params(Network::Regnet).limits.max_requests_per_peer;
+        for height in 1..=(request_limit as u64 + 1) {
             let mut block = coinbase_block(
                 Network::Regnet,
                 height,
@@ -2307,7 +2743,7 @@ mod tests {
                 target,
                 1_700_000_000 + height,
             );
-            if height == 128 {
+            if height == request_limit as u64 {
                 block = miner.solve_block(block);
             }
             previous_hash = block.header.block_hash();
@@ -2334,11 +2770,16 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>();
-        assert_eq!(requested_before, 128);
+        assert_eq!(requested_before, request_limit);
 
         outbound.clear();
-        sync.handle_received_block("right", blocks[127].clone(), &mut node, &mut outbound)
-            .expect("buffer future block");
+        sync.handle_received_block(
+            "right",
+            blocks[request_limit - 1].clone(),
+            &mut node,
+            &mut outbound,
+        )
+        .expect("buffer future block");
 
         assert_eq!(node.height(), 0);
         let requested_after = outbound
@@ -2356,6 +2797,175 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(requested_after, 1);
+    }
+
+    #[test]
+    fn block_refill_stays_on_current_peer_socket() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("peer-a");
+        sync.downloader.note_peer_ready("peer-b");
+
+        let miner = Miner::new(1);
+        let first_block = miner.solve_block(node.build_candidate_block().expect("candidate"));
+        let request_limit = network_params(Network::Regnet).limits.max_requests_per_peer;
+        let mut hashes = vec![first_block.header.block_hash()];
+        for index in 0..=request_limit {
+            let mut hash = [0u8; 48];
+            hash[0..8].copy_from_slice(&(index as u64 + 100).to_be_bytes());
+            hashes.push(hash);
+        }
+        sync.downloader
+            .note_headers("peer-a", hashes.iter().copied());
+        sync.downloader
+            .note_headers("peer-b", hashes.iter().copied());
+
+        let mut outbound = Vec::new();
+        sync.push_block_download_work_for_peer("peer-a", &node, &mut outbound);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![String::from("peer-a")]
+        );
+
+        outbound.clear();
+        sync.handle_received_block("peer-a", first_block, &mut node, &mut outbound)
+            .expect("accepted first block refills peer-a");
+
+        assert_eq!(node.height(), 1);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![String::from("peer-a")],
+            "a peer receive path must not assign block requests to another peer thread"
+        );
+    }
+
+    #[test]
+    fn headers_stage_only_near_tip_blocks_in_small_batches() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        let _ = sync
+            .expand_events(
+                vec![ConnectionEvent::Ready {
+                    peer: String::from("right"),
+                    best_height: BLOCK_DOWNLOAD_LOOKAHEAD + 8,
+                }],
+                &mut node,
+            )
+            .expect("ready peer");
+
+        let hashes = (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 8)
+            .map(|height| synthetic_header_hash(height, 0x91))
+            .collect::<Vec<_>>();
+        for (height, hash) in (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 8).zip(hashes.iter().copied()) {
+            sync.note_pending_header_block("right", height, hash);
+        }
+
+        let mut outbound = Vec::new();
+        sync.push_block_download_work_for_peer("right", &node, &mut outbound);
+
+        let requested = outbound_getdata_hashes(&outbound);
+        assert_eq!(requested.len(), BLOCK_REQUEST_BATCH_LIMIT);
+        assert_eq!(
+            requested,
+            hashes
+                .into_iter()
+                .take(BLOCK_REQUEST_BATCH_LIMIT)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sync.pending_header_blocks.keys().next().copied(),
+            Some(BLOCK_DOWNLOAD_LOOKAHEAD + 1)
+        );
+    }
+
+    #[test]
+    fn headers_from_one_peer_keep_other_ready_peer_pipeline_full() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut header_peer = SandboxPeer::new("header-peer", Network::Regnet);
+        let mut fast_peer = SandboxPeer::new("fast-peer", Network::Regnet);
+        header_peer
+            .node
+            .dev_seed_chainstate(512, [11; 48], Vec::<UtxoEntry>::new())
+            .expect("header peer height");
+        fast_peer
+            .node
+            .dev_seed_chainstate(512, [22; 48], Vec::<UtxoEntry>::new())
+            .expect("fast peer height");
+        let _ = connect_handshake_only(&mut local, &mut header_peer);
+        let _ = connect_handshake_only(&mut local, &mut fast_peer);
+
+        let hashes = (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 16)
+            .map(|height| synthetic_header_hash(height, 0xA7))
+            .collect::<Vec<_>>();
+        for (height, hash) in (1..=BLOCK_DOWNLOAD_LOOKAHEAD + 16).zip(hashes) {
+            local
+                .sync
+                .note_pending_header_block(&header_peer.id, height, hash);
+        }
+
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .push_block_download_work_for_peer(&header_peer.id, &local.node, &mut outbound);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![header_peer.id.clone()],
+            "the header sender still gets the first pipeline refill on its own socket"
+        );
+
+        outbound.clear();
+        local
+            .sync
+            .push_block_download_work_for_peer(&fast_peer.id, &local.node, &mut outbound);
+        let requested = outbound_getdata_hashes(&outbound);
+        assert_eq!(requested.len(), BLOCK_REQUEST_BATCH_LIMIT);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![fast_peer.id.clone()],
+            "a ready peer that claims the advertised height must be able to keep its own block window full"
+        );
+    }
+
+    #[test]
+    fn low_peer_stale_block_request_retries_without_disconnect() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut only_peer = SandboxPeer::new("only-peer", Network::Regnet);
+        only_peer
+            .node
+            .dev_seed_chainstate(64, [64; 48], Vec::<UtxoEntry>::new())
+            .expect("peer height");
+        let _ = connect_handshake_only(&mut local, &mut only_peer);
+
+        let wanted_hash = [7; 48];
+        local
+            .sync
+            .downloader
+            .note_headers(&only_peer.id, [wanted_hash]);
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .push_block_download_work_for_peer(&only_peer.id, &local.node, &mut outbound);
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![wanted_hash]);
+
+        local.sync.downloader.backdate_inflight_for_peer(
+            &only_peer.id,
+            BLOCK_REQUEST_RETRY_TIMEOUT + Duration::from_secs(1),
+        );
+        let retry = local
+            .sync
+            .maintain_peer_sync(&only_peer.id, &local.node)
+            .expect("maintenance retry");
+
+        assert!(
+            !retry
+                .iter()
+                .any(|event| matches!(event, ConnectionEvent::Disconnect { .. })),
+            "low-peer mode must not tear down the only useful peer for a stale block response"
+        );
+        assert_eq!(outbound_getdata_hashes(&retry), vec![wanted_hash]);
+        assert!(local.sync.downloader.is_inflight(wanted_hash));
     }
 
     #[test]
@@ -2599,6 +3209,64 @@ mod tests {
         ));
         assert_eq!(left.sync.sync_state().best_height, right.node.height());
         assert!(!left.sync.sync_state().headers_synced);
+    }
+
+    #[test]
+    fn stalled_headers_request_disconnects_peer_instead_of_spinning() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        right
+            .node
+            .dev_seed_chainstate(2, [2; 48], Vec::<UtxoEntry>::new())
+            .expect("seed remote height");
+        right.sync.prime(&right.node);
+
+        right
+            .sync
+            .accept_inbound(left.id.clone())
+            .expect("accept inbound");
+
+        let mut queue = VecDeque::new();
+        let mut notices = Vec::new();
+        let events = left
+            .sync
+            .open_outbound(right.id.clone(), &left.node)
+            .expect("open outbound");
+        collect_events(&mut queue, &mut notices, &left.id, events);
+
+        let left_version = queue.pop_front().expect("left version");
+        let (events, mut new_notices) = right
+            .sync
+            .receive(&left_version.from, left_version.message, &mut right.node)
+            .expect("right receives version");
+        collect_events(&mut queue, &mut notices, &right.id, events);
+        notices.append(&mut new_notices);
+
+        for _ in 0..2 {
+            let queued = queue.pop_front().expect("right handshake reply");
+            let (events, mut new_notices) = left
+                .sync
+                .receive(&queued.from, queued.message, &mut left.node)
+                .expect("left receives handshake reply");
+            collect_events(&mut queue, &mut notices, &left.id, events);
+            notices.append(&mut new_notices);
+        }
+
+        assert!(left.sync.header_requests_started.contains_key(&right.id));
+        left.sync.header_requests_started.insert(
+            right.id.clone(),
+            SystemTime::now() - HEADERS_REQUEST_TIMEOUT - Duration::from_secs(1),
+        );
+
+        let events = left
+            .sync
+            .maintain_peer_sync(&right.id, &left.node)
+            .expect("maintenance");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Disconnect { peer, reason }
+                if peer == &right.id && reason.contains("headers download timeout")
+        )));
     }
 
     #[test]
@@ -3334,6 +4002,86 @@ mod tests {
     }
 
     #[test]
+    fn far_ahead_compact_block_is_header_signal_not_orphan_work() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let far_height = BLOCK_DOWNLOAD_LOOKAHEAD + 32;
+        let block = coinbase_block(
+            Network::Regnet,
+            far_height,
+            [42; 48],
+            pow::target_for_height(Network::Regnet, far_height),
+            1_700_000_000 + far_height,
+        );
+
+        let mut outbound = Vec::new();
+        left.sync
+            .handle_compact_block(
+                &right.id,
+                compact_block_from_block(&block),
+                &mut left.node,
+                &mut outbound,
+            )
+            .expect("defer far-ahead compact block");
+
+        assert_eq!(left.node.height(), 0);
+        assert_eq!(left.sync.sync_state().best_height, far_height);
+        assert!(!left.sync.sync_state().headers_synced);
+        assert!(left.sync.side_branches.is_empty());
+        assert!(left.sync.pending_compact_blocks.is_empty());
+        assert!(outbound_getdata_hashes(&outbound).is_empty());
+        assert!(outbound.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn far_ahead_unsolicited_block_is_not_buffered_as_orphan() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let far_height = BLOCK_DOWNLOAD_LOOKAHEAD + 64;
+        let block = Miner::new(1).solve_block(coinbase_block(
+            Network::Regnet,
+            far_height,
+            [43; 48],
+            pow::target_for_height(Network::Regnet, far_height),
+            1_700_000_000 + far_height,
+        ));
+
+        let mut outbound = Vec::new();
+        left.sync
+            .handle_received_block(&right.id, block, &mut left.node, &mut outbound)
+            .expect("defer far-ahead full block");
+
+        assert_eq!(left.node.height(), 0);
+        assert_eq!(left.sync.sync_state().best_height, far_height);
+        assert!(!left.sync.sync_state().headers_synced);
+        assert!(left.sync.side_branches.is_empty());
+        assert!(outbound_getdata_hashes(&outbound).is_empty());
+        assert!(outbound.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn pending_compact_blocks_are_bounded_and_stale_entries_are_pruned() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
@@ -3484,6 +4232,51 @@ mod tests {
             "a restarted forked node must request from a locator the remote can anchor"
         );
         assert_eq!(headers.first().map(|header| header.height), Some(1));
+    }
+
+    #[test]
+    fn restarted_sync_selects_branch_from_fork_point_outside_recent_reload_window() {
+        let root = temp_data_dir("deep-reorg-after-restart");
+        fs::create_dir_all(&root).expect("data root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        persist_synthetic_chain(Network::Regnet, 32, 1);
+
+        let mut local = SandboxPeer::new_persistent("local", Network::Regnet);
+        assert_eq!(local.node.height(), 32);
+        assert!(
+            !local
+                .node
+                .blocks()
+                .iter()
+                .any(|block| block.header.height == 0),
+            "reload keeps only the recent tail, so sync must consult persisted history"
+        );
+
+        let mut remote_branch = Vec::new();
+        let mut previous_hash = genesis::genesis_hash(Network::Regnet);
+        for height in 1..=33 {
+            let block = synthetic_coinbase_block(Network::Regnet, height, previous_hash, 2);
+            previous_hash = block.header.block_hash();
+            local.sync.side_branches.insert("remote", block.clone());
+            remote_branch.push(block);
+        }
+        let remote_tip = remote_branch
+            .last()
+            .expect("remote branch")
+            .header
+            .block_hash();
+
+        let best = local
+            .sync
+            .best_buffered_branch(&local.node)
+            .expect("preferred remote branch");
+        assert_eq!(best.len(), 33);
+        assert_eq!(
+            best.last().map(|block| block.header.block_hash()),
+            Some(remote_tip)
+        );
+        assert!(local.node.branch_is_preferred_over_current(&best));
     }
 
     #[test]
@@ -3650,11 +4443,12 @@ mod tests {
         ));
 
         let mut outbound = Vec::new();
+        peer.sync.downloader.note_peer_ready("peer");
         peer.sync
             .handle_received_block("peer", block, &mut peer.node, &mut outbound)
             .expect("recoverable branch mismatch");
 
-        assert!(outbound.is_empty());
+        assert!(outbound_getdata_hashes(&outbound).contains(&arbitrary_tip));
         assert_eq!(peer.sync.side_branches.len(), 1);
     }
 
@@ -3711,12 +4505,17 @@ mod tests {
         );
 
         let mut outbound = Vec::new();
+        peer.sync.downloader.note_peer_ready("peer");
         peer.sync
             .handle_received_block("peer", block_3.clone(), &mut peer.node, &mut outbound)
             .expect("buffer tip block");
+        assert!(outbound_getdata_hashes(&outbound).contains(&block_2.header.block_hash()));
+        outbound.clear();
         peer.sync
             .handle_received_block("peer", block_2.clone(), &mut peer.node, &mut outbound)
             .expect("buffer middle block");
+        assert!(outbound_getdata_hashes(&outbound).contains(&block_1.header.block_hash()));
+        outbound.clear();
         peer.sync
             .handle_received_block("peer", block_1.clone(), &mut peer.node, &mut outbound)
             .expect("reconstruct buffered branch");
@@ -3739,6 +4538,7 @@ mod tests {
             .handle_received_block(&right.id, blocks[2].clone(), &mut left.node, &mut outbound)
             .expect("buffer future tip");
         assert_eq!(left.sync.side_branches.len(), 1);
+        assert!(outbound_getdata_hashes(&outbound).contains(&blocks[1].header.block_hash()));
 
         let notice = left
             .sync
@@ -3795,12 +4595,19 @@ mod tests {
         );
 
         let mut outbound = Vec::new();
+        peer.sync.downloader.note_peer_ready("peer-a");
+        peer.sync.downloader.note_peer_ready("peer-b");
+        peer.sync.downloader.note_peer_ready("peer-c");
         peer.sync
             .handle_received_block("peer-a", block_3.clone(), &mut peer.node, &mut outbound)
             .expect("buffer tip block from peer-a");
+        assert!(outbound_getdata_hashes(&outbound).contains(&block_2.header.block_hash()));
+        outbound.clear();
         peer.sync
             .handle_received_block("peer-b", block_2.clone(), &mut peer.node, &mut outbound)
             .expect("buffer middle block from peer-b");
+        assert!(outbound_getdata_hashes(&outbound).contains(&block_1.header.block_hash()));
+        outbound.clear();
         peer.sync
             .handle_received_block("peer-c", block_1.clone(), &mut peer.node, &mut outbound)
             .expect("reconstruct buffered branch across peers");

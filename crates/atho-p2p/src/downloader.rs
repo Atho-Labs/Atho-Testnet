@@ -9,6 +9,12 @@ pub struct DownloadAssignment {
     pub inventory: Vec<InventoryVector>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleDownload {
+    pub peer: String,
+    pub hash: Hash48,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct BlockDownloadScheduler {
     ready_peers: BTreeSet<String>,
@@ -17,6 +23,7 @@ pub struct BlockDownloadScheduler {
     inflight_owner: BTreeMap<Hash48, String>,
     inflight_started: BTreeMap<Hash48, Instant>,
     peer_hints: BTreeMap<Hash48, BTreeSet<String>>,
+    failed_peers: BTreeMap<Hash48, BTreeSet<String>>,
     completed: BTreeSet<Hash48>,
 }
 
@@ -39,6 +46,11 @@ impl BlockDownloadScheduler {
                 if let Some(hints) = self.peer_hints.get_mut(&hash) {
                     hints.remove(peer);
                 }
+                self.remove_empty_hints(hash);
+                self.failed_peers
+                    .entry(hash)
+                    .or_default()
+                    .insert(peer.to_string());
             }
         }
     }
@@ -69,9 +81,27 @@ impl BlockDownloadScheduler {
             .insert(peer.to_string());
     }
 
+    pub fn queue_priority_block(&mut self, peer: Option<&str>, hash: [u8; 48]) {
+        let hash = Hash48::from(hash);
+        if let Some(peer) = peer {
+            self.peer_hints
+                .entry(hash)
+                .or_default()
+                .insert(peer.to_string());
+        }
+        if self.completed.contains(&hash)
+            || self.inflight_owner.contains_key(&hash)
+            || self.pending.contains(&hash)
+        {
+            return;
+        }
+        self.pending.push_front(hash);
+    }
+
     pub fn note_block_received(&mut self, hash: [u8; 48]) {
         let hash = Hash48::from(hash);
         self.completed.insert(hash);
+        self.failed_peers.remove(&hash);
         self.pending.retain(|candidate| *candidate != hash);
         if let Some(owner) = self.inflight_owner.remove(&hash) {
             if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
@@ -79,6 +109,23 @@ impl BlockDownloadScheduler {
             }
         }
         self.inflight_started.remove(&hash);
+    }
+
+    pub fn is_inflight(&self, hash: [u8; 48]) -> bool {
+        self.inflight_owner.contains_key(&Hash48::from(hash))
+    }
+
+    #[doc(hidden)]
+    pub fn backdate_inflight_for_peer(&mut self, peer: &str, age: Duration) {
+        let Some(inflight) = self.inflight_by_peer.get(peer) else {
+            return;
+        };
+        let started_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        for hash in inflight {
+            if let Some(started) = self.inflight_started.get_mut(hash) {
+                *started = started_at;
+            }
+        }
     }
 
     pub fn note_not_found(&mut self, peer: &str, hashes: &[[u8; 48]]) {
@@ -96,6 +143,11 @@ impl BlockDownloadScheduler {
             if let Some(hints) = self.peer_hints.get_mut(&hash) {
                 hints.remove(peer);
             }
+            self.remove_empty_hints(hash);
+            self.failed_peers
+                .entry(hash)
+                .or_default()
+                .insert(peer.to_string());
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
                 self.pending.push_back(hash);
             }
@@ -106,6 +158,19 @@ impl BlockDownloadScheduler {
         &mut self,
         max_blocks_in_flight: usize,
         max_requests_per_peer: usize,
+    ) -> Vec<DownloadAssignment> {
+        self.assignments_limited(
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_peer,
+        )
+    }
+
+    pub fn assignments_limited(
+        &mut self,
+        max_blocks_in_flight: usize,
+        max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
     ) -> Vec<DownloadAssignment> {
         if self.ready_peers.is_empty() || self.pending.is_empty() || max_blocks_in_flight == 0 {
             return Vec::new();
@@ -131,9 +196,14 @@ impl BlockDownloadScheduler {
             // Prefer hinted peers when possible, but never let one peer monopolize the queue.
             // The scheduler balances by current in-flight load first, then uses hash hints and
             // round-robin rotation to keep propagation and catch-up work spread out.
-            let Some(peer) =
-                self.select_peer_for_hash(&peers, cursor, &hash, max_requests_per_peer)
-            else {
+            let Some(peer) = self.select_peer_for_hash_limited(
+                &peers,
+                cursor,
+                &hash,
+                max_requests_per_peer,
+                max_requests_per_batch,
+                &staged,
+            ) else {
                 self.pending.push_front(hash);
                 break;
             };
@@ -161,23 +231,64 @@ impl BlockDownloadScheduler {
             .collect()
     }
 
-    fn select_peer_for_hash(
+    fn select_peer_for_hash_limited(
         &self,
         peers: &[String],
         start_index: usize,
         hash: &Hash48,
         max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
+        staged: &BTreeMap<String, Vec<InventoryVector>>,
     ) -> Option<String> {
         if peers.is_empty() {
             return None;
         }
 
-        let hinted = self.peer_hints.get(hash);
+        let hinted = self.peer_hints.get(hash).filter(|hints| !hints.is_empty());
+        let failed = self.failed_peers.get(hash);
+        self.select_peer_from_candidates(
+            peers,
+            start_index,
+            max_requests_per_peer,
+            max_requests_per_batch,
+            staged,
+            |peer| {
+                hinted.is_none_or(|hints| hints.contains(peer))
+                    && failed.is_none_or(|failed| !failed.contains(peer))
+            },
+        )
+        .or_else(|| {
+            self.select_peer_from_candidates(
+                peers,
+                start_index,
+                max_requests_per_peer,
+                max_requests_per_batch,
+                staged,
+                |peer| hinted.is_none_or(|hints| hints.contains(peer)),
+            )
+        })
+    }
+
+    fn select_peer_from_candidates(
+        &self,
+        peers: &[String],
+        start_index: usize,
+        max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
+        staged: &BTreeMap<String, Vec<InventoryVector>>,
+        mut allowed: impl FnMut(&String) -> bool,
+    ) -> Option<String> {
         peers
             .iter()
             .enumerate()
-            .filter(|(_, peer)| hinted.is_none_or(|hints| hints.contains(*peer)))
+            .filter(|(_, peer)| allowed(peer))
             .filter_map(|(index, peer)| {
+                if staged
+                    .get(peer)
+                    .is_some_and(|inventory| inventory.len() >= max_requests_per_batch)
+                {
+                    return None;
+                }
                 let inflight = self
                     .inflight_by_peer
                     .get(peer)
@@ -199,10 +310,26 @@ impl BlockDownloadScheduler {
         max_blocks_in_flight: usize,
         max_requests_per_peer: usize,
     ) -> Option<DownloadAssignment> {
+        self.assignment_for_peer_limited(
+            peer,
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_peer,
+        )
+    }
+
+    pub fn assignment_for_peer_limited(
+        &mut self,
+        peer: &str,
+        max_blocks_in_flight: usize,
+        max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
+    ) -> Option<DownloadAssignment> {
         if !self.ready_peers.contains(peer)
             || self.pending.is_empty()
             || max_blocks_in_flight == 0
             || max_requests_per_peer == 0
+            || max_requests_per_batch == 0
         {
             return None;
         }
@@ -220,7 +347,9 @@ impl BlockDownloadScheduler {
             .get(peer)
             .map(VecDeque::len)
             .unwrap_or(0);
-        let peer_capacity = max_requests_per_peer.saturating_sub(peer_inflight);
+        let peer_capacity = max_requests_per_peer
+            .saturating_sub(peer_inflight)
+            .min(max_requests_per_batch);
         if peer_capacity == 0 {
             return None;
         }
@@ -238,8 +367,17 @@ impl BlockDownloadScheduler {
             let hinted_to_peer = self
                 .peer_hints
                 .get(&hash)
+                .filter(|hints| !hints.is_empty())
                 .is_none_or(|hints| hints.contains(peer));
-            if !hinted_to_peer {
+            let failed_for_peer = self
+                .failed_peers
+                .get(&hash)
+                .is_some_and(|failed| failed.contains(peer));
+            let all_ready_peers_failed = self.failed_peers.get(&hash).is_some_and(|failed| {
+                !self.ready_peers.is_empty()
+                    && self.ready_peers.iter().all(|ready| failed.contains(ready))
+            });
+            if !hinted_to_peer || (failed_for_peer && !all_ready_peers_failed) {
                 skipped.push(hash);
                 continue;
             }
@@ -267,6 +405,10 @@ impl BlockDownloadScheduler {
     }
 
     pub fn requeue_stale_inflight(&mut self, timeout: Duration) -> usize {
+        self.requeue_stale_inflight_details(timeout).len()
+    }
+
+    pub fn requeue_stale_inflight_details(&mut self, timeout: Duration) -> Vec<StaleDownload> {
         let now = Instant::now();
         let stale = self
             .inflight_started
@@ -275,24 +417,82 @@ impl BlockDownloadScheduler {
                 (now.duration_since(*started) >= timeout).then_some(*hash)
             })
             .collect::<Vec<_>>();
-        let mut requeued = 0usize;
+        let mut requeued = Vec::new();
         for hash in stale {
             self.inflight_started.remove(&hash);
             if let Some(owner) = self.inflight_owner.remove(&hash) {
                 if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
                     inflight.retain(|candidate| *candidate != hash);
                 }
+                if let Some(hints) = self.peer_hints.get_mut(&hash) {
+                    hints.remove(&owner);
+                }
+                self.remove_empty_hints(hash);
+                self.failed_peers
+                    .entry(hash)
+                    .or_default()
+                    .insert(owner.clone());
+                requeued.push(StaleDownload { peer: owner, hash });
             }
             if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
                 self.pending.push_back(hash);
-                requeued = requeued.saturating_add(1);
             }
+        }
+        requeued
+    }
+
+    pub fn requeue_stale_inflight_for_peer(
+        &mut self,
+        peer: &str,
+        timeout: Duration,
+    ) -> Vec<StaleDownload> {
+        let now = Instant::now();
+        let Some(inflight) = self.inflight_by_peer.get(peer) else {
+            return Vec::new();
+        };
+        let stale = inflight
+            .iter()
+            .filter(|hash| {
+                self.inflight_started
+                    .get(hash)
+                    .is_some_and(|started| now.duration_since(*started) >= timeout)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let mut requeued = Vec::new();
+        for hash in stale {
+            self.inflight_started.remove(&hash);
+            self.inflight_owner.remove(&hash);
+            if let Some(inflight) = self.inflight_by_peer.get_mut(peer) {
+                inflight.retain(|candidate| *candidate != hash);
+            }
+            if let Some(hints) = self.peer_hints.get_mut(&hash) {
+                hints.remove(peer);
+            }
+            self.remove_empty_hints(hash);
+            self.failed_peers
+                .entry(hash)
+                .or_default()
+                .insert(peer.to_string());
+            if !self.completed.contains(&hash) && !self.pending.contains(&hash) {
+                self.pending.push_back(hash);
+            }
+            requeued.push(StaleDownload {
+                peer: peer.to_string(),
+                hash,
+            });
         }
         requeued
     }
 
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty() && self.inflight_owner.is_empty()
+    }
+
+    fn remove_empty_hints(&mut self, hash: Hash48) {
+        if self.peer_hints.get(&hash).is_some_and(BTreeSet::is_empty) {
+            self.peer_hints.remove(&hash);
+        }
     }
 }
 
@@ -359,9 +559,11 @@ mod tests {
         let first = scheduler.assignments(1, 1);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].inventory[0].hash, Hash48::from([7; 48]));
+        assert!(scheduler.is_inflight([7; 48]));
         assert!(scheduler.assignments(1, 1).is_empty());
 
         assert_eq!(scheduler.requeue_stale_inflight(Duration::ZERO), 1);
+        assert!(!scheduler.is_inflight([7; 48]));
         let retry = scheduler
             .assignment_for_peer("left", 1, 1)
             .expect("retry assignment");
@@ -401,5 +603,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![[1; 48], [2; 48], [3; 48]]
         );
+    }
+
+    #[test]
+    fn timed_out_only_hint_does_not_strand_pending_block() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_peer_ready("right");
+        scheduler.note_headers("left", [[7; 48]]);
+
+        let first = scheduler
+            .assignment_for_peer("left", 1, 1)
+            .expect("left assignment");
+        assert_eq!(first.inventory[0].hash, Hash48::from([7; 48]));
+
+        let stale = scheduler.requeue_stale_inflight_for_peer("left", Duration::ZERO);
+        assert_eq!(stale.len(), 1);
+        scheduler.note_peer_disconnected("left");
+
+        let retry = scheduler.assignments(1, 1);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].peer, "right");
+        assert_eq!(retry[0].inventory[0].hash, Hash48::from([7; 48]));
+    }
+
+    #[test]
+    fn priority_block_request_can_bootstrap_orphan_parent_download() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_peer_ready("right");
+
+        scheduler.queue_priority_block(Some("left"), [9; 48]);
+        let first = scheduler.assignments(1, 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].peer, "left");
+
+        scheduler.note_not_found("left", &[[9; 48]]);
+        let retry = scheduler.assignments(1, 1);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].peer, "right");
+        assert_eq!(retry[0].inventory[0].hash, Hash48::from([9; 48]));
     }
 }

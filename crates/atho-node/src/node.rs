@@ -180,6 +180,31 @@ impl Node {
         self.chainstate.block_by_height(height).ok().flatten()
     }
 
+    pub fn branch_is_preferred_over_current(&self, branch: &[Block]) -> bool {
+        let Some(first) = branch.first() else {
+            return false;
+        };
+        let Some(fork_height) = self.known_block_height(&first.header.previous_block_hash) else {
+            return false;
+        };
+        let Some(fork_block) = self.block_by_height(fork_height) else {
+            return false;
+        };
+        if fork_block.header.block_hash() != first.header.previous_block_hash {
+            return false;
+        }
+
+        let mut current_branch =
+            Vec::with_capacity(self.height().saturating_sub(fork_height) as usize);
+        for height in fork_height.saturating_add(1)..=self.height() {
+            let Some(block) = self.block_by_height(height) else {
+                return false;
+            };
+            current_branch.push(block);
+        }
+        pow::branch_is_preferred(branch, &current_branch)
+    }
+
     pub fn block_record_by_hash(&self, block_hash: [u8; 48]) -> Option<BlockArchiveRecord> {
         self.chainstate
             .block_record_by_hash(block_hash)

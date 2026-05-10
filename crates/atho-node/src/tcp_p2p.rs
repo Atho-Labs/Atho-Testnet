@@ -31,7 +31,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
-const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(500);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
 
@@ -697,6 +697,11 @@ fn spawn_peer_thread(
                                     }
                                 }
                             };
+                            if let Some(reason) = disconnect_event_for_peer(&events, &peer_id) {
+                                return format!(
+                                    "sync maintenance disconnect peer={peer_id} reason={reason}"
+                                );
+                            }
                             let bytes_sent = match flush_send_events(&mut stream, &peer_id, events)
                             {
                                 Ok(bytes_sent) => bytes_sent,
@@ -887,6 +892,13 @@ fn flush_send_events(
         }
     }
     Ok(bytes_sent)
+}
+
+fn disconnect_event_for_peer(events: &[ConnectionEvent], peer_id: &str) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        ConnectionEvent::Disconnect { peer, reason } if peer == peer_id => Some(reason.clone()),
+        _ => None,
+    })
 }
 
 fn log_peer_message(direction: &str, peer_id: &str, message: &NetworkMessage, bytes: usize) {
