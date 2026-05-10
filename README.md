@@ -6,7 +6,7 @@ Mainnet launch paths, mainnet DNS seeds, mainnet bootstrap peers, and mainnet op
 
 - Website: <https://atho.io>
 - Testnet explorer: <https://atho.io/explore/>
-- Current testnet release: `v0.1.4`
+- Current testnet release: `v0.1.5`
 - Public testnet seed/API nodes: `testnet-node1.atho.io`, `testnet-node2.atho.io`
 - Public testnet peers: `162.222.206.163:9100`, `74.208.219.116:9100`
 
@@ -79,3 +79,10 @@ cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
 This repo intentionally keeps the public surface small: `runtestnet.py`, `runtime_launcher.py`, this README, and the Rust source needed to run the public testnet software.
+
+## v0.1.5 Patch Notes
+
+- Hardened fork recovery after bootstrap outages by building header sync locators from persisted chain history instead of only the recent in-memory reload window.
+- Added periodic, relay-safe peer address sharing so connected nodes can organically learn `testnet-node2` and other healthy peers from the network.
+- Seeded configured testnet bootstrap peers into the live discovery graph so bootstrap nodes can relay both public testnet peers to older connected clients.
+- Tightened TCP sync regression tests around chain-sync readiness, real-socket reorg recovery, transaction relay, and peer address gossip.

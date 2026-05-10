@@ -1386,7 +1386,14 @@ mod tests {
             .expect("connect outbound");
 
         wait_until("peer handshake", Duration::from_secs(10), || {
-            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+            let left_snapshot = left.snapshot();
+            let right_snapshot = right.snapshot();
+            left_snapshot.peer_count == 1
+                && right_snapshot.peer_count == 1
+                && left_snapshot.headers_synced
+                && right_snapshot.headers_synced
+                && left_snapshot.height >= left_snapshot.sync_best_height
+                && right_snapshot.height >= right_snapshot.sync_best_height
         });
 
         let announced_at = Instant::now();
@@ -1414,7 +1421,14 @@ mod tests {
             .expect("connect outbound");
 
         wait_until("peer handshake", Duration::from_secs(10), || {
-            left.snapshot().peer_count == 1 && right.snapshot().peer_count == 1
+            let left_snapshot = left.snapshot();
+            let right_snapshot = right.snapshot();
+            left_snapshot.peer_count == 1
+                && right_snapshot.peer_count == 1
+                && left_snapshot.headers_synced
+                && right_snapshot.headers_synced
+                && left_snapshot.height >= left_snapshot.sync_best_height
+                && right_snapshot.height >= right_snapshot.sync_best_height
         });
 
         let left_diagnostics = {
@@ -1895,7 +1909,8 @@ mod tests {
             })
         };
         assert!(
-            matches!(response, RpcResponse::TransactionSubmitted(submitted) if submitted == txid)
+            matches!(response, RpcResponse::TransactionSubmitted(submitted) if submitted == txid),
+            "unexpected submit response: {response:?}"
         );
 
         wait_until("relayed transaction", Duration::from_secs(30), || {

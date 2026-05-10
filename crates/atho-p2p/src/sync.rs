@@ -16,11 +16,22 @@ pub struct SyncState {
 
 impl SyncState {
     pub fn prime(&mut self, blocks: &[Block]) {
-        self.best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
-        self.best_tip = blocks
+        let best_height = blocks.last().map(|block| block.header.height).unwrap_or(0);
+        let best_tip = blocks
             .last()
             .map(|block| Hash48::from(block.header.block_hash()));
-        self.locator_hashes = block_locator(blocks);
+        self.prime_with_locator(best_height, best_tip, block_locator(blocks));
+    }
+
+    pub fn prime_with_locator(
+        &mut self,
+        best_height: u64,
+        best_tip: Option<Hash48>,
+        locator_hashes: Vec<Hash48>,
+    ) {
+        self.best_height = best_height;
+        self.best_tip = best_tip;
+        self.locator_hashes = locator_hashes;
         self.requested_locator_hashes.clear();
         self.headers_synced = true;
         crate::audit::append_log(
