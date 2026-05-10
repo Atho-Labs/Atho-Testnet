@@ -5,12 +5,12 @@ use atho_core::network::Network;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 pub const MAINNET_DNS_SEEDS: &[&str] = &[];
-pub const TESTNET_DNS_SEEDS: &[&str] = &["testnet-node1.atho.io"];
+pub const TESTNET_DNS_SEEDS: &[&str] = &["testnet-node1.atho.io", "testnet-node2.atho.io"];
 pub const REGNET_DNS_SEEDS: &[&str] = &[];
 pub const PRUNETEST_DNS_SEEDS: &[&str] = &[];
 
 pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[];
-pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &["162.222.206.163:9100"];
+pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &["162.222.206.163:9100", "74.208.219.116:9100"];
 pub const REGNET_BOOTSTRAP_PEERS: &[&str] = &[];
 pub const PRUNETEST_BOOTSTRAP_PEERS: &[&str] = &[];
 
@@ -227,7 +227,9 @@ mod tests {
             configured_bootstrap_peers(Network::Testnet),
             vec![
                 String::from("testnet-node1.atho.io:9100"),
+                String::from("testnet-node2.atho.io:9100"),
                 String::from(TESTNET_BOOTSTRAP_PEERS[0]),
+                String::from(TESTNET_BOOTSTRAP_PEERS[1]),
             ]
         );
         assert!(configured_bootstrap_peers(Network::Regnet).is_empty());
@@ -252,7 +254,10 @@ mod tests {
         assert!(dns_seed_targets(Network::Mainnet).is_empty());
         assert_eq!(
             dns_seed_targets(Network::Testnet),
-            vec![String::from("testnet-node1.atho.io:9100")]
+            vec![
+                String::from("testnet-node1.atho.io:9100"),
+                String::from("testnet-node2.atho.io:9100"),
+            ]
         );
         assert!(dns_seed_targets(Network::Regnet).is_empty());
     }

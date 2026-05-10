@@ -6,9 +6,9 @@ Mainnet launch paths, mainnet DNS seeds, mainnet bootstrap peers, and mainnet op
 
 - Website: <https://atho.io>
 - Testnet explorer: <https://atho.io/explore/>
-- Current testnet release: `v0.1.3`
-- Public testnet seed/API node: `testnet-node1.atho.io`
-- Public testnet peer: `162.222.206.163:9100`
+- Current testnet release: `v0.1.4`
+- Public testnet seed/API nodes: `testnet-node1.atho.io`, `testnet-node2.atho.io`
+- Public testnet peers: `162.222.206.163:9100`, `74.208.219.116:9100`
 
 ## Requirements
 
