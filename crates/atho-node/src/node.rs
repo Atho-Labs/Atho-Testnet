@@ -160,6 +160,14 @@ impl Node {
         self.chainstate.contains_block(*block_hash).unwrap_or(false)
     }
 
+    pub fn is_canonical_block(&self, block_hash: &[u8; 48]) -> bool {
+        let Some(record) = self.block_record_by_hash(*block_hash) else {
+            return false;
+        };
+        self.block_record_by_height(record.height)
+            .is_some_and(|canonical| canonical.block_hash == *block_hash)
+    }
+
     pub fn known_block_height(&self, block_hash: &[u8; 48]) -> Option<u64> {
         self.chainstate.known_block_height(*block_hash)
     }

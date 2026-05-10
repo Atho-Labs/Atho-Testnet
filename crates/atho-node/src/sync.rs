@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BLOCK_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER: usize = 256;
+const MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER: usize = 1_024;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
@@ -524,14 +524,23 @@ impl NodeSync {
                         self.relay.sync_state().best_height
                     ),
                 );
-                self.downloader.note_headers(
-                    peer,
-                    headers
-                        .iter()
-                        .map(|header| header.block_hash())
-                        .filter(|hash| !node.contains_block(hash)),
-                );
+                let mut known_noncanonical_blocks = Vec::new();
+                let mut missing_block_hashes = Vec::new();
+                for hash in headers.iter().map(|header| header.block_hash()) {
+                    if node.is_canonical_block(&hash) {
+                        continue;
+                    }
+                    if let Some(block) = node.block_by_hash(hash) {
+                        known_noncanonical_blocks.push(block);
+                    } else {
+                        missing_block_hashes.push(hash);
+                    }
+                }
+                self.downloader.note_headers(peer, missing_block_hashes);
                 self.push_scheduled_block_requests(outbound);
+                for block in known_noncanonical_blocks {
+                    self.handle_received_block(peer, block, node, outbound)?;
+                }
                 if !self.relay.sync_state().headers_synced {
                     outbound.push(ConnectionEvent::Send {
                         peer: peer.to_string(),
@@ -923,7 +932,7 @@ impl NodeSync {
             );
             return Err(NodeError::Validation(validation).into());
         }
-        if node.contains_block(&block_hash) {
+        if node.is_canonical_block(&block_hash) {
             let _ = dev::append_log(
                 "p2p",
                 &format!(
@@ -1008,7 +1017,7 @@ impl NodeSync {
                 short_hash(&node.tip_hash())
             ),
         );
-        self.buffer_peer_block(peer, block);
+        self.buffer_peer_block_with_known_ancestors(peer, block, node);
         self.downloader.note_block_received(block_hash);
         self.pending_compact_blocks.remove(&block_hash);
         self.push_scheduled_block_requests(outbound);
@@ -1034,15 +1043,37 @@ impl NodeSync {
         let buffer = self.branch_buffers.entry(peer.to_string()).or_default();
         buffer.blocks.insert(block.header.block_hash(), block);
         while buffer.blocks.len() > MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER {
+            // Preserve the lowest-height blocks: they are the bridge back to the
+            // canonical fork point. Dropping them can leave a deep fork permanently
+            // unreconstructable even after every later block has arrived.
             let Some(evict_hash) = buffer
                 .blocks
                 .iter()
-                .min_by_key(|(hash, block)| (block.header.height, **hash))
+                .max_by_key(|(hash, block)| (block.header.height, **hash))
                 .map(|(hash, _)| *hash)
             else {
                 break;
             };
             buffer.blocks.remove(&evict_hash);
+        }
+    }
+
+    fn buffer_peer_block_with_known_ancestors(&mut self, peer: &str, block: Block, node: &Node) {
+        let mut previous_hash = block.header.previous_block_hash;
+        self.buffer_peer_block(peer, block);
+
+        let mut visited = BTreeSet::new();
+        while !node.is_canonical_block(&previous_hash) && visited.insert(previous_hash) {
+            let parent = self
+                .branch_buffers
+                .get(peer)
+                .and_then(|buffer| buffer.blocks.get(&previous_hash).cloned())
+                .or_else(|| node.block_by_hash(previous_hash));
+            let Some(parent) = parent else {
+                break;
+            };
+            previous_hash = parent.header.previous_block_hash;
+            self.buffer_peer_block(peer, parent);
         }
     }
 
@@ -1071,7 +1102,7 @@ impl NodeSync {
             let block = buffer.blocks.get(&current_hash)?.clone();
             let previous_hash = block.header.previous_block_hash;
             branch_reversed.push(block);
-            if node.contains_block(&previous_hash) {
+            if node.is_canonical_block(&previous_hash) {
                 break;
             }
             if buffer.blocks.contains_key(&previous_hash) {
@@ -1365,7 +1396,7 @@ impl NodeSync {
             .iter()
             .filter(|vector| match vector.kind {
                 InventoryKind::Block => {
-                    chain_synced && !node.contains_block(&vector.hash.into_inner())
+                    chain_synced && !node.is_canonical_block(&vector.hash.into_inner())
                 }
                 // During initial catch-up, ignore mempool relay entirely so a policy-only
                 // transaction error cannot disconnect the sync peer or starve block download.
@@ -3343,6 +3374,68 @@ mod tests {
     }
 
     #[test]
+    fn archived_side_branch_headers_replay_known_blocks_and_finish_reorg() {
+        let root = temp_data_dir("archived-side-branch-reorg");
+        fs::create_dir_all(&root).expect("data root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let miner = Miner::new(1);
+
+        let mut archived_branch_node = Node::new(NodeConfig::new(Network::Regnet));
+        let archived_1 = mine_with_timestamp_offset(&mut archived_branch_node, &miner, 10);
+        let archived_2 = mine_with_timestamp_offset(&mut archived_branch_node, &miner, 20);
+
+        let mut local = SandboxPeer::new_persistent("local", Network::Regnet);
+        local
+            .node
+            .connect_block(&archived_1)
+            .expect("archive branch 1");
+        local
+            .node
+            .connect_block(&archived_2)
+            .expect("archive branch 2");
+
+        let mut local_fork_node = Node::new(NodeConfig::new(Network::Regnet));
+        let local_fork = (0..3)
+            .map(|index| mine_with_timestamp_offset(&mut local_fork_node, &miner, 1_000 + index))
+            .collect::<Vec<_>>();
+        local
+            .node
+            .consider_branch(&local_fork)
+            .expect("switch to local fork");
+        local.sync.prime(&local.node);
+        assert_eq!(local.node.tip_hash(), local_fork[2].header.block_hash());
+        assert!(local.node.contains_block(&archived_1.header.block_hash()));
+        assert!(!local
+            .node
+            .is_canonical_block(&archived_1.header.block_hash()));
+        assert!(local.node.contains_block(&archived_2.header.block_hash()));
+        assert!(!local
+            .node
+            .is_canonical_block(&archived_2.header.block_hash()));
+
+        let remote_extension = (0..3)
+            .map(|index| {
+                mine_with_timestamp_offset(&mut archived_branch_node, &miner, 2_000 + index)
+            })
+            .collect::<Vec<_>>();
+        let remote_tip = remote_extension
+            .last()
+            .expect("remote extension")
+            .header
+            .block_hash();
+        let mut remote = SandboxPeer::new("remote", Network::Regnet);
+        remote.node = archived_branch_node;
+        remote.sync.prime(&remote.node);
+
+        let _ = connect(&mut local, &mut remote);
+
+        assert_eq!(local.node.height(), remote.node.height());
+        assert_eq!(local.node.tip_hash(), remote_tip);
+        assert_eq!(local.node.tip_hash(), remote.node.tip_hash());
+        assert!(local.sync.branch_buffers.is_empty());
+    }
+
+    #[test]
     fn branch_fork_choice_uses_work_not_raw_height() {
         let genesis = genesis::genesis_state(Network::Regnet).block;
         let genesis_hash = genesis.header.block_hash();
@@ -3476,7 +3569,10 @@ mod tests {
 
         let buffer = sync.branch_buffers.get("peer").expect("peer buffer");
         assert_eq!(buffer.blocks.len(), MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER);
-        assert!(buffer.blocks.values().all(|block| block.header.height >= 9));
+        assert!(buffer
+            .blocks
+            .values()
+            .all(|block| block.header.height <= MAX_BUFFERED_BRANCH_BLOCKS_PER_PEER as u64));
     }
 
     #[test]
