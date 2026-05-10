@@ -7,9 +7,11 @@
 //! fee-floor checks happen here before transactions are mined into templates.
 use crate::dev;
 use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
+use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -91,10 +93,18 @@ fn unix_timestamp() -> u64 {
 }
 
 /// In-memory transaction pool for standard-policy transactions.
+#[derive(Debug, Clone)]
+struct MempoolFingerprintCache {
+    network: Network,
+    fingerprint: [u8; 32],
+}
+
 #[derive(Debug, Default)]
 pub struct Mempool {
     entries: BTreeMap<[u8; 48], MempoolEntry>,
     spent_inputs: BTreeSet<([u8; 48], u32)>,
+    total_fee_atoms: u64,
+    fingerprint_cache: RefCell<Option<MempoolFingerprintCache>>,
 }
 
 impl Mempool {
@@ -127,6 +137,10 @@ impl Mempool {
         for key in Self::input_keys(tx) {
             let _ = self.spent_inputs.remove(&key);
         }
+    }
+
+    fn invalidate_fingerprint(&self) {
+        self.fingerprint_cache.replace(None);
     }
 
     fn validate_entry<F>(
@@ -169,7 +183,9 @@ impl Mempool {
         }
         self.validate_entry(&entry, network, spend_height, lookup)?;
         self.reserve_inputs(&entry.transaction)?;
+        self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
         self.entries.insert(txid, entry);
+        self.invalidate_fingerprint();
         let entry = self
             .entries
             .get(&txid)
@@ -207,6 +223,7 @@ impl Mempool {
     {
         let current = std::mem::take(&mut self.entries);
         self.spent_inputs.clear();
+        self.total_fee_atoms = 0;
         let before = current.len();
         for (txid, entry) in current {
             if self
@@ -214,9 +231,11 @@ impl Mempool {
                 .is_ok()
                 && self.reserve_inputs(&entry.transaction).is_ok()
             {
+                self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
                 self.entries.insert(txid, entry);
             }
         }
+        self.invalidate_fingerprint();
         let kept = self.entries.len();
         let _ = dev::append_log(
             "mempool",
@@ -368,25 +387,68 @@ impl Mempool {
     }
 
     pub fn total_fee_atoms(&self) -> u64 {
-        self.entries.values().map(|entry| entry.fee_atoms).sum()
+        self.total_fee_atoms
     }
 
     pub fn spent_inputs_snapshot(&self) -> Vec<([u8; 48], u32)> {
         self.spent_inputs.iter().cloned().collect()
     }
 
+    pub fn fingerprint(&self, network: Network) -> [u8; 32] {
+        if let Some(cache) = self.fingerprint_cache.borrow().as_ref() {
+            if cache.network == network {
+                return cache.fingerprint;
+            }
+        }
+
+        let mut preimage = Vec::with_capacity(
+            network.id().len()
+                + 16
+                + self.entries.len().saturating_mul(48)
+                + self.spent_inputs.len().saturating_mul(52),
+        );
+        preimage.extend_from_slice(network.id().as_bytes());
+        preimage.extend_from_slice(&(self.entries.len() as u64).to_be_bytes());
+        preimage.extend_from_slice(&self.total_fee_atoms.to_be_bytes());
+        for txid in self.entries.keys() {
+            preimage.extend_from_slice(txid);
+        }
+        for (txid, output_index) in &self.spent_inputs {
+            preimage.extend_from_slice(txid);
+            preimage.extend_from_slice(&output_index.to_be_bytes());
+        }
+        let fingerprint = sha3_256(&preimage);
+        self.fingerprint_cache
+            .replace(Some(MempoolFingerprintCache {
+                network,
+                fingerprint,
+            }));
+        fingerprint
+    }
+
     pub fn remove_block_transactions(&mut self, block: &atho_core::block::Block) {
+        let mut removed_any = false;
         for tx in &block.transactions {
             let txid = tx.txid();
             if let Some(entry) = self.entries.remove(&txid) {
                 self.release_inputs(&entry.transaction);
+                self.total_fee_atoms = self.total_fee_atoms.saturating_sub(entry.fee_atoms);
+                removed_any = true;
             }
+        }
+        if removed_any {
+            self.invalidate_fingerprint();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn insert_unchecked(&mut self, entry: MempoolEntry) {
-        self.entries.insert(entry.txid(), entry);
+        let txid = entry.txid();
+        if let Some(previous) = self.entries.insert(txid, entry.clone()) {
+            self.total_fee_atoms = self.total_fee_atoms.saturating_sub(previous.fee_atoms);
+        }
+        self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+        self.invalidate_fingerprint();
     }
 }
 
@@ -526,6 +588,58 @@ mod tests {
     }
 
     #[test]
+    fn mempool_total_fee_and_fingerprint_update_from_cached_state() {
+        let mut mempool = Mempool::new();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [0x55; 48],
+                output_index: 0,
+                unlocking_script: vec![0x55],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![0x56],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let empty = mempool.fingerprint(Network::Regnet);
+        let entry = MempoolEntry::new(tx.clone(), 17);
+        let txid = entry.txid();
+
+        mempool.insert_unchecked(entry);
+        assert_eq!(mempool.total_fee_atoms(), 17);
+        let populated = mempool.fingerprint(Network::Regnet);
+        assert_ne!(empty, populated);
+        assert_eq!(mempool.fingerprint(Network::Regnet), populated);
+
+        let block = atho_core::block::Block {
+            header: atho_core::block::BlockHeader {
+                version: 1,
+                network_id: Network::Regnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: [0; 48],
+                witness_root: [0; 48],
+                timestamp: 0,
+                difficulty_target_or_bits: [0xff; 48],
+                nonce: 0,
+            },
+            transactions: vec![tx],
+            witnesses: Default::default(),
+            fees_total_atoms: 0,
+            fees_miner_atoms: 0,
+        };
+        assert!(mempool.contains(&txid));
+        mempool.remove_block_transactions(&block);
+        assert_eq!(mempool.total_fee_atoms(), 0);
+        assert_eq!(mempool.fingerprint(Network::Regnet), empty);
+    }
+
+    #[test]
     fn mempool_rejects_sub_dust_outputs() {
         let mut mempool = Mempool::new();
         let tx = Transaction {
@@ -649,12 +763,8 @@ mod tests {
 
         let low_txid = low.txid();
         let high_txid = high.txid();
-        let _ = mempool
-            .entries
-            .insert(low_txid, MempoolEntry::new(low.clone(), 2_500));
-        let _ = mempool
-            .entries
-            .insert(high_txid, MempoolEntry::new(high.clone(), 3_000));
+        mempool.insert_unchecked(MempoolEntry::new(low.clone(), 2_500));
+        mempool.insert_unchecked(MempoolEntry::new(high.clone(), 3_000));
 
         let mut utxos = std::collections::BTreeMap::new();
         utxos.insert(
@@ -780,8 +890,8 @@ mod tests {
 
         let valid_entry = MempoolEntry::new(valid.clone(), 3_000);
         let invalid_entry = MempoolEntry::new(invalid.clone(), 3_000);
-        let _ = mempool.entries.insert(valid.txid(), valid_entry);
-        let _ = mempool.entries.insert(invalid.txid(), invalid_entry);
+        mempool.insert_unchecked(valid_entry);
+        mempool.insert_unchecked(invalid_entry);
 
         let mut utxos = std::collections::BTreeMap::new();
         utxos.insert(

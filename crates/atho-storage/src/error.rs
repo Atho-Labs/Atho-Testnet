@@ -49,6 +49,13 @@ pub enum StorageError {
     InvalidBranchSequence,
     #[error("candidate branch is not preferred over the current chain")]
     BranchNotPreferred,
+    #[error("reorg depth {depth} exceeds max reorg depth {max_depth}")]
+    ReorgTooDeep {
+        depth: u64,
+        max_depth: u64,
+        fork_height: u64,
+        current_height: u64,
+    },
     #[error("failed to restore canonical state during rollback")]
     RollbackFailure,
 }
@@ -94,6 +101,7 @@ impl AthoErrorMeta for StorageError {
             Self::ForkPointUnavailable => &DB_FORK_POINT_UNAVAILABLE,
             Self::InvalidBranchSequence => &DB_INVALID_BRANCH_SEQUENCE,
             Self::BranchNotPreferred => &DB_BRANCH_NOT_PREFERRED,
+            Self::ReorgTooDeep { .. } => &DB_BRANCH_NOT_PREFERRED,
             Self::RollbackFailure => &DB_ROLLBACK_FAILURE,
         }
     }
@@ -112,6 +120,14 @@ impl AthoErrorMeta for StorageError {
             }
             Self::Io(error) => Some(error.to_string()),
             Self::Lmdb(error) => Some(error.to_string()),
+            Self::ReorgTooDeep {
+                depth,
+                max_depth,
+                fork_height,
+                current_height,
+            } => Some(format!(
+                "reorg depth {depth} exceeds max {max_depth} at fork height {fork_height} from current height {current_height}"
+            )),
             _ => None,
         }
     }

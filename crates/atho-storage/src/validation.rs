@@ -965,24 +965,16 @@ pub fn validate_block_with_context_and_schedule(
         mut utxos,
     } = context;
 
-    validate_block_impl_with_schedule(block, height, network, false, schedule)?;
-    // CONSENSUS: The parent hash check binds this block to one exact chain tip.
-    if block.header.previous_block_hash != expected_previous_hash {
-        return Err(ValidationError::BlockParentHashMismatch);
-    }
-
-    if let Some(minimum_timestamp) = pow::minimum_next_block_timestamp(previous_blocks) {
-        if block.header.timestamp < minimum_timestamp {
-            return Err(ValidationError::InvalidBlockTimestamp);
-        }
-    }
-
-    if block.header.difficulty_target_or_bits != expected_target {
-        return Err(ValidationError::BlockTargetOutOfBounds);
-    }
-    if !pow::meets_target(&block.header.block_hash(), &expected_target) {
-        return Err(ValidationError::ProofOfWorkInvalid);
-    }
+    validate_contextual_header_precheck(
+        block,
+        height,
+        network,
+        expected_previous_hash,
+        expected_target,
+        previous_blocks,
+        schedule,
+    )?;
+    validate_block_impl_with_schedule(block, height, network, true, schedule)?;
 
     let block_witness_root = block.header.witness_root;
     // INVARIANT: No input may be spent twice within one block.
@@ -1050,6 +1042,51 @@ pub fn validate_block_with_context_and_schedule(
     }
     if block.fees_total_atoms != block.fees_miner_atoms {
         return Err(ValidationError::FeeMismatch);
+    }
+    Ok(())
+}
+
+fn validate_contextual_header_precheck(
+    block: &Block,
+    height: u64,
+    network: Network,
+    expected_previous_hash: [u8; 48],
+    expected_target: [u8; 48],
+    previous_blocks: &[Block],
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    if block.transactions.is_empty() {
+        return Err(ValidationError::EmptyBlock);
+    }
+    if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
+        return Err(ValidationError::InvalidBlockVersion);
+    }
+    if block.header.network_id != network {
+        return Err(ValidationError::BlockNetworkMismatch);
+    }
+    if block.header.height != height {
+        return Err(ValidationError::InvalidBlockHeight);
+    }
+    if block.header.timestamp == 0 {
+        return Err(ValidationError::InvalidBlockTimestamp);
+    }
+    if !pow::target_within_bounds(&block.header.difficulty_target_or_bits) {
+        return Err(ValidationError::BlockTargetOutOfBounds);
+    }
+    // CONSENSUS: The parent hash check binds this block to one exact chain tip.
+    if block.header.previous_block_hash != expected_previous_hash {
+        return Err(ValidationError::BlockParentHashMismatch);
+    }
+    if let Some(minimum_timestamp) = pow::minimum_next_block_timestamp(previous_blocks) {
+        if block.header.timestamp < minimum_timestamp {
+            return Err(ValidationError::InvalidBlockTimestamp);
+        }
+    }
+    if block.header.difficulty_target_or_bits != expected_target {
+        return Err(ValidationError::BlockTargetOutOfBounds);
+    }
+    if !pow::meets_target(&block.header.block_hash(), &expected_target) {
+        return Err(ValidationError::ProofOfWorkInvalid);
     }
     Ok(())
 }
@@ -1269,6 +1306,51 @@ mod tests {
                 UtxoSet::new(Network::Mainnet),
             ),
             Err(ValidationError::BlockTargetOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn contextual_validation_rejects_wrong_parent_before_body_commitments() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![1],
+            }],
+            lock_time: 1,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let transactions = vec![coinbase];
+        let target = pow::initial_target_for_network(Network::Mainnet);
+        let block = solve_block(Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [9; 48],
+                merkle_root: [1; 48],
+                witness_root: witness_root(&transactions),
+                timestamp: 1,
+                difficulty_target_or_bits: target,
+                nonce: 0,
+            },
+            transactions,
+        ));
+
+        assert_eq!(
+            validate_block_with_context(
+                &block,
+                1,
+                Network::Mainnet,
+                [0; 48],
+                target,
+                &[],
+                UtxoSet::new(Network::Mainnet),
+            ),
+            Err(ValidationError::BlockParentHashMismatch)
         );
     }
 

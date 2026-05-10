@@ -1672,6 +1672,14 @@ mod tests {
                             peers: vec![NetworkPeerDiagnostics {
                                 remote_addr: String::from("74.208.219.116:56000"),
                                 direction: NetworkPeerDirection::Outbound,
+                                roles: vec![
+                                    String::from("OUTBOUND_PEER"),
+                                    String::from("FULL_RELAY_PEER"),
+                                    String::from("BLOCK_RELAY_PEER"),
+                                    String::from("SYNC_PEER"),
+                                    String::from("TX_RELAY_PEER"),
+                                    String::from("ADDR_RELAY_PEER"),
+                                ],
                                 handshake_ready: true,
                                 best_height: Some(block_count),
                                 protocol_version: Some(1),
@@ -1983,6 +1991,14 @@ mod tests {
                             peers: vec![NetworkPeerDiagnostics {
                                 remote_addr: String::from("74.208.219.116:56000"),
                                 direction: NetworkPeerDirection::Outbound,
+                                roles: vec![
+                                    String::from("OUTBOUND_PEER"),
+                                    String::from("FULL_RELAY_PEER"),
+                                    String::from("BLOCK_RELAY_PEER"),
+                                    String::from("SYNC_PEER"),
+                                    String::from("TX_RELAY_PEER"),
+                                    String::from("ADDR_RELAY_PEER"),
+                                ],
                                 handshake_ready: true,
                                 best_height: Some(2),
                                 protocol_version: Some(1),
@@ -2429,6 +2445,11 @@ mod tests {
         let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "1");
         let rpc_address = free_rpc_address();
+        let api_address = free_rpc_address();
+        let (_, api_port) = api_address
+            .rsplit_once(':')
+            .expect("free API address includes port");
+        let _api_port = EnvVarGuard::set_value("ATHO_API_PORT", api_port);
 
         let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Regnet, rpc_address);
         let status = wait_for_status(&conn, |status| status.connected && status.running);

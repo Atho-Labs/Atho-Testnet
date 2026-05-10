@@ -216,6 +216,24 @@ fn show_status(args: &[String]) -> Result<(), String> {
         "peer_count_outbound={}",
         status.network_diagnostics.outbound_peer_count
     );
+    println!(
+        "peer_count_block_relay={}",
+        status.network_diagnostics.block_relay_peer_count
+    );
+    println!(
+        "peer_count_sync={}",
+        status.network_diagnostics.sync_peer_count
+    );
+    println!(
+        "topology_health_score={}",
+        status.network_diagnostics.topology_health_score
+    );
+    if !status.network_diagnostics.topology_warnings.is_empty() {
+        println!(
+            "topology_warnings={}",
+            status.network_diagnostics.topology_warnings.join("; ")
+        );
+    }
     println!("bytes_sent={}", status.network_diagnostics.bytes_sent);
     println!(
         "bytes_received={}",
@@ -225,9 +243,10 @@ fn show_status(args: &[String]) -> Result<(), String> {
         println!("peers:");
         for peer in &status.network_diagnostics.peers {
             println!(
-                "- {} dir={:?} ready={} height={:?} proto={:?} sent={} recv={} quality={:?}",
+                "- {} dir={:?} roles={} ready={} height={:?} proto={:?} sent={} recv={} quality={:?}",
                 peer.remote_addr,
                 peer.direction,
+                peer.roles.join(","),
                 peer.handshake_ready,
                 peer.best_height,
                 peer.protocol_version,

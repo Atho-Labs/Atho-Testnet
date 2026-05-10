@@ -5732,6 +5732,14 @@ mod tests {
             peers: vec![NetworkPeerDiagnostics {
                 remote_addr: String::from("74.208.219.116:56000"),
                 direction: NetworkPeerDirection::Outbound,
+                roles: vec![
+                    String::from("OUTBOUND_PEER"),
+                    String::from("FULL_RELAY_PEER"),
+                    String::from("BLOCK_RELAY_PEER"),
+                    String::from("SYNC_PEER"),
+                    String::from("TX_RELAY_PEER"),
+                    String::from("ADDR_RELAY_PEER"),
+                ],
                 handshake_ready: true,
                 best_height: Some(12),
                 protocol_version: Some(1),
@@ -5748,6 +5756,7 @@ mod tests {
             connecting_peers: vec![NetworkPeerDiagnostics {
                 remote_addr: String::from("9.9.9.9:9200"),
                 direction: NetworkPeerDirection::Outbound,
+                roles: vec![String::from("OUTBOUND_PEER")],
                 handshake_ready: false,
                 best_height: None,
                 protocol_version: None,

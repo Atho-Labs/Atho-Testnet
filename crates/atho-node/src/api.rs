@@ -418,8 +418,15 @@ fn route_request(
 
 fn status_value(config: &ApiConfig, service: &NodeService) -> Result<Value, ApiError> {
     let status = service.node_status();
-    let chain_synced =
-        status.running && status.headers_synced && status.block_count >= status.sync_best_height;
+    let validation_safe = status
+        .network_diagnostics
+        .chain_validation_status
+        .is_empty()
+        || status.network_diagnostics.safe_to_serve;
+    let chain_synced = status.running
+        && status.headers_synced
+        && status.block_count >= status.sync_best_height
+        && validation_safe;
     let index_tip_hash = service.explorer_index().tip_hash();
     Ok(json!({
         "api_online": true,
@@ -438,6 +445,13 @@ fn status_value(config: &ApiConfig, service: &NodeService) -> Result<Value, ApiE
         "mempool_count": status.mempool_count,
         "peer_count": status.network_diagnostics.peer_count,
         "sync_best_height": status.sync_best_height,
+        "sync_mode": status.network_diagnostics.sync_mode.clone(),
+        "chain_validation_status": status.network_diagnostics.chain_validation_status.clone(),
+        "safe_to_mine": status.network_diagnostics.safe_to_mine,
+        "safe_to_serve": status.network_diagnostics.safe_to_serve,
+        "validation_lag_blocks": status.network_diagnostics.validation_lag_blocks,
+        "pending_validation_blocks": status.network_diagnostics.pending_validation_blocks,
+        "untrusted_downloaded_blocks": status.network_diagnostics.untrusted_downloaded_blocks,
         "index": {
             "enabled": service.explorer_index_enabled(),
             "ready": service.explorer_index_ready(),
@@ -459,8 +473,15 @@ fn status_value(config: &ApiConfig, service: &NodeService) -> Result<Value, ApiE
 
 fn health_value(service: &NodeService) -> Result<Value, ApiError> {
     let status = service.node_status();
-    let chain_synced =
-        status.running && status.headers_synced && status.block_count >= status.sync_best_height;
+    let validation_safe = status
+        .network_diagnostics
+        .chain_validation_status
+        .is_empty()
+        || status.network_diagnostics.safe_to_serve;
+    let chain_synced = status.running
+        && status.headers_synced
+        && status.block_count >= status.sync_best_height
+        && validation_safe;
     let health = network_health_label(&status);
     Ok(json!({
         "api_online": true,
@@ -476,6 +497,10 @@ fn health_value(service: &NodeService) -> Result<Value, ApiError> {
         "sync_best_height": status.sync_best_height,
         "peer_count": status.network_diagnostics.peer_count,
         "mempool_count": status.mempool_count,
+        "sync_mode": status.network_diagnostics.sync_mode.clone(),
+        "chain_validation_status": status.network_diagnostics.chain_validation_status.clone(),
+        "safe_to_mine": status.network_diagnostics.safe_to_mine,
+        "validation_lag_blocks": status.network_diagnostics.validation_lag_blocks,
         "index_ready": service.explorer_index_ready(),
         "index_source": service.explorer_index_source(),
         "status": health,
@@ -772,12 +797,37 @@ fn peers_summary_value(service: &NodeService) -> Result<Value, ApiError> {
         "peer_count": diagnostics.peer_count,
         "inbound_peer_count": diagnostics.inbound_peer_count,
         "outbound_peer_count": diagnostics.outbound_peer_count,
+        "full_relay_peer_count": diagnostics.full_relay_peer_count,
+        "block_relay_peer_count": diagnostics.block_relay_peer_count,
+        "sync_peer_count": diagnostics.sync_peer_count,
+        "tx_relay_peer_count": diagnostics.tx_relay_peer_count,
+        "addr_relay_peer_count": diagnostics.addr_relay_peer_count,
+        "topology_health_score": diagnostics.topology_health_score,
+        "topology_warnings": diagnostics.topology_warnings.clone(),
+        "sync_mode": diagnostics.sync_mode.clone(),
+        "chain_validation_status": diagnostics.chain_validation_status.clone(),
+        "best_header_height": diagnostics.best_header_height,
+        "best_downloaded_body_height": diagnostics.best_downloaded_body_height,
+        "best_validated_height": diagnostics.best_validated_height,
+        "best_connected_height": diagnostics.best_connected_height,
+        "latest_finalized_height": diagnostics.latest_finalized_height,
+        "latest_finalized_hash": hex::encode(diagnostics.latest_finalized_hash),
+        "pending_validation_blocks": diagnostics.pending_validation_blocks,
+        "untrusted_downloaded_blocks": diagnostics.untrusted_downloaded_blocks,
+        "untrusted_downloaded_bytes": diagnostics.untrusted_downloaded_bytes,
+        "fast_download_enabled": diagnostics.fast_download_enabled,
+        "checkpoint_anchored_sync_enabled": diagnostics.checkpoint_anchored_sync_enabled,
+        "background_validation_enabled": diagnostics.background_validation_enabled,
+        "safe_to_mine": diagnostics.safe_to_mine,
+        "safe_to_serve": diagnostics.safe_to_serve,
+        "validation_lag_blocks": diagnostics.validation_lag_blocks,
         "connecting_peer_count": diagnostics.connecting_peer_count,
         "bytes_sent": diagnostics.bytes_sent,
         "bytes_received": diagnostics.bytes_received,
         "peers": diagnostics.peers.iter().map(|peer| json!({
             "remote_addr": peer.remote_addr,
             "direction": peer.direction,
+            "roles": peer.roles.clone(),
             "handshake_ready": peer.handshake_ready,
             "best_height": peer.best_height,
             "protocol_version": peer.protocol_version,
@@ -932,6 +982,19 @@ fn network_peers_value(service: &NodeService) -> Result<Value, ApiError> {
         "active_peers": diagnostics.peer_count,
         "inbound_peers": diagnostics.inbound_peer_count,
         "outbound_peers": diagnostics.outbound_peer_count,
+        "full_relay_peers": diagnostics.full_relay_peer_count,
+        "block_relay_peers": diagnostics.block_relay_peer_count,
+        "sync_peers": diagnostics.sync_peer_count,
+        "tx_relay_peers": diagnostics.tx_relay_peer_count,
+        "addr_relay_peers": diagnostics.addr_relay_peer_count,
+        "topology_health_score": diagnostics.topology_health_score,
+        "topology_warnings": diagnostics.topology_warnings.clone(),
+        "sync_mode": diagnostics.sync_mode.clone(),
+        "chain_validation_status": diagnostics.chain_validation_status.clone(),
+        "safe_to_mine": diagnostics.safe_to_mine,
+        "validation_lag_blocks": diagnostics.validation_lag_blocks,
+        "pending_validation_blocks": diagnostics.pending_validation_blocks,
+        "untrusted_downloaded_blocks": diagnostics.untrusted_downloaded_blocks,
         "connecting_peers": diagnostics.connecting_peer_count,
         "known_nodes": service.known_node_count(),
         "bytes_sent": diagnostics.bytes_sent,
@@ -1403,7 +1466,12 @@ fn network_health_label(status: &atho_rpc::response::NodeStatus) -> &'static str
     let chain_synced = status.headers_synced && status.block_count >= status.sync_best_height;
     let peers_ok = status.network_diagnostics.peer_count > 0
         || matches!(status.network, Network::Regnet | Network::Prunetest);
-    if chain_synced && peers_ok {
+    let validation_safe = status
+        .network_diagnostics
+        .chain_validation_status
+        .is_empty()
+        || status.network_diagnostics.safe_to_serve;
+    if chain_synced && peers_ok && validation_safe {
         "Healthy"
     } else {
         "Warning"

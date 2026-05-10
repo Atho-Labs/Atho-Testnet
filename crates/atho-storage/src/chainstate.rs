@@ -8,8 +8,8 @@ use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use crate::validation;
 use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
-use atho_core::consensus::pow;
-use atho_core::constants::PRUNE_DEPTH_BLOCKS;
+use atho_core::consensus::{pow, rules};
+use atho_core::constants::{MAX_REORG_DEPTH_BLOCKS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
 use std::fs::{self, File};
@@ -52,6 +52,16 @@ pub enum ChainSelectionOutcome {
 pub struct ChainSelectionResult {
     pub outcome: ChainSelectionOutcome,
     pub disconnected: Vec<Block>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedCheckpoint {
+    pub height: u64,
+    pub block_hash: [u8; 48],
+    pub chainwork: Vec<u8>,
+    pub network: Network,
+    pub ruleset_version: u32,
+    pub timestamp: u64,
 }
 
 #[derive(Debug)]
@@ -211,6 +221,14 @@ impl Chainstate {
         &mut self,
         branch: &[Block],
     ) -> Result<ChainSelectionResult, StorageError> {
+        self.select_branch_with_max_reorg_depth(branch, self.max_reorg_depth())
+    }
+
+    fn select_branch_with_max_reorg_depth(
+        &mut self,
+        branch: &[Block],
+        max_reorg_depth: u64,
+    ) -> Result<ChainSelectionResult, StorageError> {
         if branch.is_empty() {
             return Err(StorageError::EmptyBranch);
         }
@@ -222,6 +240,11 @@ impl Chainstate {
         }
 
         let disconnected = self.canonical_branch_after(fork_height)?;
+        if !disconnected.is_empty() {
+            if let Some(err) = reorg_depth_error(self.height, fork_height, max_reorg_depth) {
+                return Err(err);
+            }
+        }
         if !disconnected.is_empty() && !pow::branch_is_preferred(branch, &disconnected) {
             return Ok(ChainSelectionResult {
                 outcome: ChainSelectionOutcome::KeptCurrent,
@@ -654,6 +677,38 @@ impl Chainstate {
 
     pub fn prune_depth(&self) -> u64 {
         effective_prune_depth(self.network)
+    }
+
+    pub fn max_reorg_depth(&self) -> u64 {
+        effective_max_reorg_depth(self.network)
+    }
+
+    pub fn finalized_height(&self) -> Option<u64> {
+        self.height.checked_sub(self.max_reorg_depth())
+    }
+
+    pub fn finalized_checkpoint(&self) -> Result<Option<FinalizedCheckpoint>, StorageError> {
+        self.finalized_checkpoint_for_depth(self.max_reorg_depth())
+    }
+
+    fn finalized_checkpoint_for_depth(
+        &self,
+        depth: u64,
+    ) -> Result<Option<FinalizedCheckpoint>, StorageError> {
+        let Some(height) = self.height.checked_sub(depth) else {
+            return Ok(None);
+        };
+        let Some(record) = self.block_record_by_height(height)? else {
+            return Err(StorageError::IncompleteBlockHistory);
+        };
+        Ok(Some(FinalizedCheckpoint {
+            height,
+            block_hash: record.block_hash,
+            chainwork: record.chainwork,
+            network: record.network,
+            ruleset_version: rules::ruleset_version_at_height(height),
+            timestamp: record.timestamp,
+        }))
     }
 
     pub fn last_prune_report(&self) -> Option<&BlockPruneReport> {
@@ -1254,6 +1309,31 @@ fn effective_prune_depth(network: Network) -> u64 {
     PRUNE_DEPTH_BLOCKS
 }
 
+fn effective_max_reorg_depth(network: Network) -> u64 {
+    if network == Network::Prunetest {
+        if let Ok(raw) = std::env::var("ATHO_PRUNETEST_MAX_REORG_DEPTH") {
+            if let Ok(value) = raw.parse::<u64>() {
+                return value;
+            }
+        }
+    }
+    MAX_REORG_DEPTH_BLOCKS
+}
+
+fn reorg_depth_error(
+    current_height: u64,
+    fork_height: u64,
+    max_reorg_depth: u64,
+) -> Option<StorageError> {
+    let depth = current_height.saturating_sub(fork_height);
+    (depth > max_reorg_depth).then_some(StorageError::ReorgTooDeep {
+        depth,
+        max_depth: max_reorg_depth,
+        fork_height,
+        current_height,
+    })
+}
+
 fn legacy_persisted_state_present(network: Network) -> bool {
     let snapshot_present =
         chainstate_snapshot_path(network).exists() || utxo_snapshot_path(network).exists();
@@ -1418,6 +1498,57 @@ mod tests {
             },
             transactions,
         ))
+    }
+
+    fn synthetic_coinbase_successor_with_script(
+        state: &mut Chainstate,
+        locking_script: Vec<u8>,
+    ) -> Block {
+        let previous_timestamp = state
+            .tip
+            .as_ref()
+            .map(|header| header.timestamp)
+            .unwrap_or_else(|| genesis::genesis_state(state.network).block.header.timestamp);
+        let height = state.height.saturating_add(1);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(state.network, height),
+                locking_script,
+            }],
+            lock_time: u32::try_from(height).unwrap_or(u32::MAX),
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let transactions = vec![coinbase];
+        Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: state.network,
+                height,
+                previous_block_hash: state.tip_hash,
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: previous_timestamp.saturating_add(1),
+                difficulty_target_or_bits: [0xff; 48],
+                nonce: height,
+            },
+            transactions,
+        )
+    }
+
+    fn push_synthetic_coinbase_successor_with_script(
+        state: &mut Chainstate,
+        locking_script: Vec<u8>,
+    ) -> Block {
+        let block = synthetic_coinbase_successor_with_script(state, locking_script);
+        state.tip = Some(block.header.clone());
+        state.tip_hash = block.header.block_hash();
+        state.height = block.header.height;
+        state.blocks.push(block.clone());
+        block
     }
 
     fn fixture_utxo_key(txid: [u8; 48], output_index: u32) -> Vec<u8> {
@@ -2211,6 +2342,79 @@ mod tests {
         let reopened = Chainstate::try_load_or_new(Network::Mainnet).expect("reopen");
         assert_eq!(reopened.height, 3);
         assert_eq!(reopened.tip_hash, fork_3.header.block_hash());
+    }
+
+    #[test]
+    fn max_reorg_depth_allows_exact_boundary() {
+        assert!(reorg_depth_error(4, 2, 2).is_none());
+    }
+
+    #[test]
+    fn max_reorg_depth_rejects_one_over_boundary() {
+        assert!(matches!(
+            reorg_depth_error(4, 1, 2),
+            Some(StorageError::ReorgTooDeep {
+                depth: 3,
+                max_depth: 2,
+                fork_height: 1,
+                current_height: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn select_branch_rejects_reorg_deeper_than_max_depth() {
+        let mut state = Chainstate::new(Network::Regnet);
+        let main_1 = push_synthetic_coinbase_successor_with_script(&mut state, vec![1]);
+        let _main_2 = push_synthetic_coinbase_successor_with_script(&mut state, vec![2]);
+        let _main_3 = push_synthetic_coinbase_successor_with_script(&mut state, vec![3]);
+        let _main_4 = push_synthetic_coinbase_successor_with_script(&mut state, vec![4]);
+        let before = (state.height, state.tip_hash, state.utxo_count());
+
+        let mut fork_state = Chainstate::new(Network::Regnet);
+        fork_state.blocks.push(main_1.clone());
+        fork_state.tip = Some(main_1.header.clone());
+        fork_state.tip_hash = main_1.header.block_hash();
+        fork_state.height = main_1.header.height;
+        let fork_2 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![22]);
+        let fork_3 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![33]);
+        let fork_4 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![44]);
+        let fork_5 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![55]);
+
+        let result = state.select_branch_with_max_reorg_depth(&[fork_2, fork_3, fork_4, fork_5], 2);
+        assert!(matches!(
+            result,
+            Err(StorageError::ReorgTooDeep {
+                depth: 3,
+                max_depth: 2,
+                fork_height: 1,
+                current_height: 4,
+            })
+        ));
+        assert_eq!(state.height, before.0);
+        assert_eq!(state.tip_hash, before.1);
+        assert_eq!(state.utxo_count(), before.2);
+    }
+
+    #[test]
+    fn finalized_checkpoint_tracks_boundary_record() {
+        let mut state = Chainstate::new(Network::Regnet);
+        let main_1 = push_synthetic_coinbase_successor_with_script(&mut state, vec![1]);
+        let _main_2 = push_synthetic_coinbase_successor_with_script(&mut state, vec![2]);
+        let _main_3 = push_synthetic_coinbase_successor_with_script(&mut state, vec![3]);
+
+        let checkpoint = state
+            .finalized_checkpoint_for_depth(2)
+            .expect("checkpoint lookup")
+            .expect("checkpoint present");
+        assert_eq!(checkpoint.height, 1);
+        assert_eq!(checkpoint.block_hash, main_1.header.block_hash());
+        assert_eq!(checkpoint.network, Network::Regnet);
+        assert_eq!(
+            checkpoint.ruleset_version,
+            rules::ruleset_version_at_height(1)
+        );
+        assert!(!checkpoint.chainwork.is_empty());
     }
 
     #[test]
