@@ -124,13 +124,11 @@ impl RelayLoop {
     pub fn reseed_locator_from_local_tip(&mut self, blocks: &[Block]) {
         self.sync.locator_hashes = block_locator(blocks);
         self.sync.inflight_headers_peer = None;
-        self.sync.requested_locator_hashes.clear();
     }
 
     pub fn reseed_locator_hashes(&mut self, locator_hashes: Vec<Hash48>) {
         self.sync.locator_hashes = locator_hashes;
         self.sync.inflight_headers_peer = None;
-        self.sync.requested_locator_hashes.clear();
     }
 
     pub fn mark_headers_unsynced(&mut self) {
@@ -139,6 +137,15 @@ impl RelayLoop {
 
     pub fn accept_headers(&mut self, headers: &[BlockHeader]) -> Result<(), ProtocolError> {
         self.sync.accept_headers(self.network, headers)
+    }
+
+    pub fn accept_headers_from_peer(
+        &mut self,
+        peer: &str,
+        headers: &[BlockHeader],
+    ) -> Result<(), ProtocolError> {
+        self.sync
+            .accept_headers_from_peer(peer, self.network, headers)
     }
 
     pub fn note_local_chain_progress(&mut self, blocks: &[Block], peer_best_height: Option<u64>) {
@@ -161,16 +168,18 @@ impl RelayLoop {
             .max(peer_best_height.unwrap_or(local_best_height))
             .max(local_best_height);
         if let Some(local_tip) = local_tip {
-            self.sync.locator_hashes.retain(|hash| *hash != local_tip);
-            self.sync.locator_hashes.insert(0, local_tip);
-            self.sync.locator_hashes.truncate(32);
+            if local_best_height >= self.sync.best_height || self.sync.locator_hashes.is_empty() {
+                self.sync.locator_hashes.retain(|hash| *hash != local_tip);
+                self.sync.locator_hashes.insert(0, local_tip);
+                self.sync.locator_hashes.truncate(32);
+            }
             if local_best_height >= self.sync.best_height {
                 self.sync.best_tip = Some(local_tip);
             }
         }
         if local_best_height >= self.sync.best_height {
             self.sync.headers_synced = true;
-            self.sync.inflight_headers_peer = None;
+            self.sync.clear_requested_header_locators();
         }
     }
 
@@ -202,7 +211,7 @@ impl RelayLoop {
         self.sync.best_height = self.sync.best_height.max(local_best_height);
         if local_best_height >= self.sync.best_height {
             self.sync.headers_synced = true;
-            self.sync.inflight_headers_peer = None;
+            self.sync.clear_requested_header_locators();
             self.sync.best_tip = local_tip;
         } else if advanced_target {
             self.sync.headers_synced = false;
@@ -223,23 +232,24 @@ impl RelayLoop {
         local_tip: Option<Hash48>,
         peer_best_height: Option<u64>,
     ) {
-        if let Some(peer_best_height) = peer_best_height {
-            self.sync.best_height = self
-                .sync
-                .best_height
-                .max(peer_best_height)
-                .max(local_best_height);
-            self.sync.headers_synced = self.sync.best_height <= local_best_height;
-        } else if local_best_height >= self.sync.best_height {
-            self.sync.best_height = local_best_height;
+        let previous_best_height = self.sync.best_height;
+        let target_height = peer_best_height
+            .unwrap_or(local_best_height)
+            .max(local_best_height)
+            .max(previous_best_height);
+        let target_advanced = target_height > previous_best_height;
+        self.sync.best_height = target_height;
+
+        if local_best_height >= self.sync.best_height {
             self.sync.headers_synced = true;
-        } else {
+        } else if target_advanced {
             self.sync.headers_synced = false;
         }
-        self.sync.inflight_headers_peer = None;
-        self.sync.requested_locator_hashes.clear();
         if self.sync.headers_synced {
-            self.sync.best_tip = local_tip;
+            if local_best_height >= self.sync.best_height {
+                self.sync.clear_requested_header_locators();
+                self.sync.best_tip = local_tip;
+            }
         }
     }
 
@@ -348,6 +358,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_sync_target_preserves_inflight_header_locators_while_behind() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = false;
+        relay.sync.locator_hashes = vec![Hash48::from([9; 48])];
+        let _ = relay.build_getheaders("peer");
+
+        relay.refresh_sync_target(&local_blocks, Some(128));
+
+        assert!(!relay.sync.headers_synced);
+        assert!(relay
+            .sync
+            .requested_locator_hashes_by_peer
+            .contains_key("peer"));
+    }
+
+    #[test]
+    fn refresh_sync_target_does_not_forget_completed_header_sync_while_bodies_lag() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = true;
+        relay.sync.best_tip = Some(Hash48::from([8; 48]));
+        relay.sync.locator_hashes = vec![Hash48::from([8; 48])];
+
+        relay.refresh_sync_target(&local_blocks, Some(128));
+
+        assert_eq!(relay.sync.best_height, 128);
+        assert!(relay.sync.headers_synced);
+        assert_eq!(relay.sync.best_tip, Some(Hash48::from([8; 48])));
+        assert_eq!(relay.sync.locator_hashes, vec![Hash48::from([8; 48])]);
+    }
+
+    #[test]
     fn refresh_sync_target_drops_stale_remote_height_once_local_tip_catches_up() {
         let mut relay = RelayLoop::new(Network::Regnet);
         let local_blocks = vec![Block {
@@ -392,6 +439,22 @@ mod tests {
             relay.sync.locator_hashes.first().copied(),
             Some(Hash48::from(local_blocks[0].header.block_hash()))
         );
+    }
+
+    #[test]
+    fn local_progress_does_not_replace_advanced_header_locator_while_behind() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        let local_blocks = vec![genesis::genesis_block(Network::Regnet)];
+
+        relay.sync.best_height = 128;
+        relay.sync.headers_synced = true;
+        relay.sync.locator_hashes = vec![Hash48::from([9; 48])];
+
+        relay.note_local_chain_progress(&local_blocks, Some(128));
+
+        assert_eq!(relay.sync.best_height, 128);
+        assert!(relay.sync.headers_synced);
+        assert_eq!(relay.sync.locator_hashes, vec![Hash48::from([9; 48])]);
     }
 
     #[test]

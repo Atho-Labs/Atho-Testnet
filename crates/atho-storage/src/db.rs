@@ -614,10 +614,14 @@ impl Database {
         Ok(report)
     }
 
-    /// Commits the tip snapshot, UTXO set, and optional appended block together.
+    /// Commits the tip snapshot, UTXO state, and optional appended block together.
     ///
     /// STORAGE: This transaction must remain atomic. Writing the tip without the
     /// matching UTXO image would let the node restart into a corrupt state.
+    ///
+    /// PERFORMANCE: normal block connection applies only the block's UTXO delta.
+    /// Rewriting the whole UTXO table on every block makes historical sync
+    /// quadratic as the chain grows.
     pub fn commit_chainstate(
         &self,
         snapshot: &ChainstateSnapshot,
@@ -625,14 +629,19 @@ impl Database {
         appended_block: Option<(u64, &Block)>,
     ) -> Result<(), StorageError> {
         let snapshot_value = bincode::serialize(snapshot).map_err(|_| StorageError::CorruptData)?;
-        let mut serialized_utxos = Vec::with_capacity(utxos.len());
-        for utxo in utxos {
-            let key = utxo_key(utxo.txid, utxo.output_index);
-            let value = bincode::serialize(utxo).map_err(|_| StorageError::CorruptData)?;
-            serialized_utxos.push((key, value));
-        }
+        let serialized_utxos = if appended_block.is_none() {
+            let mut serialized = Vec::with_capacity(utxos.len());
+            for utxo in utxos {
+                let key = utxo_key(utxo.txid, utxo.output_index);
+                let value = bincode::serialize(utxo).map_err(|_| StorageError::CorruptData)?;
+                serialized.push((key, value));
+            }
+            Some(serialized)
+        } else {
+            None
+        };
 
-        let appended = if let Some((height, block)) = appended_block {
+        let archive_append = if let Some((height, block)) = appended_block {
             if block.header.network_id != self.network {
                 return Err(StorageError::CrossNetworkReplay);
             }
@@ -653,7 +662,7 @@ impl Database {
 
         self.write_with_retry(|state| {
             let mut txn = state.env.begin_rw_txn()?;
-            if let Some((height, block, location)) = appended {
+            if let Some((height, block, location)) = archive_append {
                 write_block_archive(&mut txn, state, self.network, height, block, location)?;
             }
             txn.put(
@@ -662,16 +671,18 @@ impl Database {
                 &snapshot_value,
                 WriteFlags::empty(),
             )?;
-            clear_db(&mut txn, state.utxos)?;
-            for (key, value) in &serialized_utxos {
-                txn.put(
-                    state.utxos,
-                    &key.as_slice(),
-                    &value.as_slice(),
-                    WriteFlags::empty(),
-                )?;
-            }
-            if appended.is_none() {
+            if let Some((_, block)) = appended_block {
+                apply_utxo_delta(&mut txn, state, self.network, block)?;
+            } else if let Some(serialized_utxos) = &serialized_utxos {
+                clear_db(&mut txn, state.utxos)?;
+                for (key, value) in serialized_utxos {
+                    txn.put(
+                        state.utxos,
+                        &key.as_slice(),
+                        &value.as_slice(),
+                        WriteFlags::empty(),
+                    )?;
+                }
                 rebuild_height_index(&mut txn, state, snapshot.tip_hash)?;
             }
             #[cfg(test)]
@@ -1080,7 +1091,7 @@ fn write_block_archive(
         file_number: location.file_number,
         record_offset: location.record_offset,
         payload_length: location.payload_length,
-        raw_block_size: block.canonical_bytes().len() as u32,
+        raw_block_size: block.full_size_bytes() as u32,
         weight_bytes: block.weight_bytes() as u32,
         vsize_bytes: block.vsize_bytes() as u32,
         tx_count: block.transactions.len() as u32,
@@ -1127,6 +1138,55 @@ fn write_block_archive(
         &order_value,
         WriteFlags::empty(),
     )?;
+    Ok(())
+}
+
+fn apply_utxo_delta(
+    txn: &mut RwTransaction<'_>,
+    state: &DatabaseState,
+    network: Network,
+    block: &Block,
+) -> Result<(), StorageError> {
+    for tx in &block.transactions {
+        for input in &tx.inputs {
+            let key = utxo_key(input.previous_txid, input.output_index);
+            match txn.del(state.utxos, &key.as_slice(), None) {
+                Ok(()) => {}
+                // Block connection has already validated the spend against the
+                // in-memory chainstate. Treat an absent persisted key as an
+                // idempotent delete so dev-seeded or self-repaired state can
+                // still commit the correct post-block UTXO image.
+                Err(LmdbError::NotFound) => {}
+                Err(err) => return Err(StorageError::Lmdb(err)),
+            }
+        }
+
+        let txid = tx.txid();
+        for (output_index, output) in tx.outputs.iter().enumerate() {
+            let entry = UtxoEntry::new(
+                network,
+                txid,
+                output_index as u32,
+                output.value_atoms,
+                output.locking_script.clone(),
+                block.header.height,
+                tx.is_coinbase(),
+            );
+            let key = utxo_key(entry.txid, entry.output_index);
+            match txn.get(state.utxos, &key.as_slice()) {
+                Ok(_) => return Err(StorageError::DuplicateUtxo),
+                Err(LmdbError::NotFound) => {}
+                Err(err) => return Err(StorageError::Lmdb(err)),
+            }
+            let value = bincode::serialize(&entry).map_err(|_| StorageError::CorruptData)?;
+            txn.put(
+                state.utxos,
+                &key.as_slice(),
+                &value.as_slice(),
+                WriteFlags::empty(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1283,7 +1343,7 @@ mod tests {
     use crate::path::ATHO_DATA_DIR_ENV;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::block::{merkle_root, witness_root};
-    use atho_core::transaction::{Transaction, TxOutput};
+    use atho_core::transaction::{Transaction, TxInput, TxOutput};
     use std::ffi::OsString;
     use std::fs;
     use std::io::{Seek, SeekFrom, Write};
@@ -1357,6 +1417,44 @@ mod tests {
             nonce: 42 + height,
         };
         Block::new(header, vec![tx])
+    }
+
+    fn block_with_transactions(
+        network: Network,
+        height: u64,
+        previous_block_hash: [u8; 48],
+        transactions: Vec<Transaction>,
+    ) -> Block {
+        let header = BlockHeader {
+            version: 1,
+            network_id: network,
+            height,
+            previous_block_hash,
+            merkle_root: merkle_root(&transactions),
+            witness_root: witness_root(&transactions),
+            timestamp: 1_700_000_000 + height,
+            difficulty_target_or_bits: [7; 48],
+            nonce: 42 + height,
+        };
+        Block::new(header, transactions)
+    }
+
+    fn output_entry(
+        network: Network,
+        tx: &Transaction,
+        output_index: u32,
+        created_height: u64,
+    ) -> UtxoEntry {
+        let output = &tx.outputs[output_index as usize];
+        UtxoEntry::new(
+            network,
+            tx.txid(),
+            output_index,
+            output.value_atoms,
+            output.locking_script.clone(),
+            created_height,
+            tx.is_coinbase(),
+        )
     }
 
     #[test]
@@ -1451,6 +1549,95 @@ mod tests {
             .block_storage_path()
             .join(format!("blk{:05}.dat", second_record.file_number))
             .exists());
+    }
+
+    #[test]
+    fn commit_chainstate_appended_block_applies_utxo_delta() {
+        let root = temp_data_dir("incremental-utxo-delta");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+
+        let genesis = sample_block(Network::Regnet, 0, [0; 48]);
+        let snapshot = ChainstateSnapshot {
+            height: 0,
+            tip_hash: genesis.header.block_hash(),
+            tip_header: Some(genesis.header.clone()),
+        };
+        database
+            .commit_chainstate(&snapshot, &[], Some((0, &genesis)))
+            .expect("commit genesis delta");
+
+        let first = sample_block(Network::Regnet, 1, genesis.header.block_hash());
+        let snapshot = ChainstateSnapshot {
+            height: 1,
+            tip_hash: first.header.block_hash(),
+            tip_header: Some(first.header.clone()),
+        };
+        database
+            .commit_chainstate(&snapshot, &[], Some((1, &first)))
+            .expect("commit first delta without full utxo image");
+
+        let first_coinbase = output_entry(Network::Regnet, &first.transactions[0], 0, 1);
+        let mut utxos = database.load_utxos().expect("load utxos");
+        utxos.sort_by(|left, right| left.txid.cmp(&right.txid));
+        assert!(utxos.iter().any(|entry| entry.txid == first_coinbase.txid
+            && entry.output_index == first_coinbase.output_index));
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: atho_core::consensus::subsidy::block_subsidy_atoms_for_network(
+                    Network::Regnet,
+                    2,
+                ),
+                locking_script: vec![9, 9, 2],
+            }],
+            lock_time: 2,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: first_coinbase.txid,
+                output_index: first_coinbase.output_index,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: first_coinbase.value_atoms.saturating_sub(1),
+                locking_script: vec![4, 5, 6],
+            }],
+            lock_time: 2,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let second = block_with_transactions(
+            Network::Regnet,
+            2,
+            first.header.block_hash(),
+            vec![coinbase.clone(), spend.clone()],
+        );
+        let snapshot = ChainstateSnapshot {
+            height: 2,
+            tip_hash: second.header.block_hash(),
+            tip_header: Some(second.header.clone()),
+        };
+        database
+            .commit_chainstate(&snapshot, &[], Some((2, &second)))
+            .expect("commit spend delta without full utxo image");
+
+        let utxos = database.load_utxos().expect("load updated utxos");
+        assert!(!utxos.iter().any(|entry| entry.txid == first_coinbase.txid
+            && entry.output_index == first_coinbase.output_index));
+        let spend_output = output_entry(Network::Regnet, &spend, 0, 2);
+        assert!(utxos.iter().any(|entry| entry.txid == spend_output.txid
+            && entry.output_index == spend_output.output_index));
+        let coinbase_output = output_entry(Network::Regnet, &coinbase, 0, 2);
+        assert!(utxos.iter().any(|entry| entry.txid == coinbase_output.txid
+            && entry.output_index == coinbase_output.output_index));
     }
 
     #[test]

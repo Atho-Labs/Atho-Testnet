@@ -148,6 +148,48 @@ impl BlockDownloadScheduler {
 
     pub fn note_block_received(&mut self, hash: [u8; 48]) {
         let hash = Hash48::from(hash);
+        self.note_hash_completed(hash);
+    }
+
+    pub fn note_peer_delivery_progress(&mut self, peer: &str) {
+        let Some(inflight) = self.inflight_by_peer.get(peer) else {
+            return;
+        };
+        let now = Instant::now();
+        for hash in inflight {
+            if let Some(started) = self.inflight_started.get_mut(hash) {
+                *started = now;
+            }
+        }
+    }
+
+    pub fn prune_completed_where(
+        &mut self,
+        mut is_completed: impl FnMut(&Hash48) -> bool,
+    ) -> usize {
+        let candidates = self
+            .pending
+            .iter()
+            .chain(self.inflight_owner.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut pruned = 0usize;
+        for hash in candidates {
+            if is_completed(&hash) {
+                self.note_hash_completed(hash);
+                pruned = pruned.saturating_add(1);
+            }
+        }
+        pruned
+    }
+
+    pub fn sort_pending_by_key<K: Ord>(&mut self, mut key: impl FnMut(&Hash48) -> K) {
+        let mut pending = self.pending.drain(..).collect::<Vec<_>>();
+        pending.sort_by_key(|hash| key(hash));
+        self.pending = pending.into();
+    }
+
+    fn note_hash_completed(&mut self, hash: Hash48) {
         self.completed.insert(hash);
         self.failed_peers.remove(&hash);
         self.pending.retain(|candidate| *candidate != hash);
@@ -162,6 +204,12 @@ impl BlockDownloadScheduler {
 
     pub fn is_inflight(&self, hash: [u8; 48]) -> bool {
         self.inflight_owner.contains_key(&Hash48::from(hash))
+    }
+
+    pub fn inflight_peer(&self, hash: [u8; 48]) -> Option<&str> {
+        self.inflight_owner
+            .get(&Hash48::from(hash))
+            .map(String::as_str)
     }
 
     #[doc(hidden)]
@@ -709,6 +757,69 @@ mod tests {
             .expect("retry assignment");
         assert_eq!(retry.peer, "left");
         assert_eq!(retry.inventory[0].hash, Hash48::from([7; 48]));
+    }
+
+    #[test]
+    fn peer_delivery_progress_extends_remaining_batch_deadlines() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_headers("left", [[1; 48], [2; 48]]);
+
+        let first = scheduler.assignments(2, 2);
+        assert_eq!(first.len(), 1);
+        assert_eq!(scheduler.stats().inflight_blocks, 2);
+
+        scheduler.backdate_inflight_for_peer("left", Duration::from_secs(30));
+        scheduler.note_peer_delivery_progress("left");
+
+        assert!(
+            scheduler
+                .requeue_stale_inflight_for_peer("left", Duration::from_secs(10))
+                .is_empty(),
+            "an actively serving peer should not have the tail of the same batch timed out"
+        );
+        assert_eq!(scheduler.stats().inflight_blocks, 2);
+    }
+
+    #[test]
+    fn completed_prune_removes_pending_and_inflight_work() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_headers("left", [[1; 48], [2; 48], [3; 48]]);
+
+        let first = scheduler.assignments(2, 2);
+        assert_eq!(first[0].inventory.len(), 2);
+        assert_eq!(scheduler.stats().pending_blocks, 1);
+        assert_eq!(scheduler.stats().inflight_blocks, 2);
+
+        let pruned = scheduler.prune_completed_where(|hash| {
+            *hash == Hash48::from([1; 48]) || *hash == Hash48::from([3; 48])
+        });
+
+        assert_eq!(pruned, 2);
+        assert_eq!(scheduler.stats().pending_blocks, 0);
+        assert_eq!(scheduler.stats().inflight_blocks, 1);
+        assert!(scheduler.is_inflight([2; 48]));
+        assert!(scheduler.assignments(3, 3).is_empty());
+    }
+
+    #[test]
+    fn pending_downloads_can_be_reprioritized_by_chain_height() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("peer");
+        scheduler.note_headers("peer", [[9; 48], [1; 48], [5; 48]]);
+
+        scheduler.sort_pending_by_key(|hash| hash.into_inner()[0]);
+
+        let assignment = scheduler
+            .assignment_for_peer("peer", 3, 3)
+            .expect("assignment");
+        let requested = assignment
+            .inventory
+            .iter()
+            .map(|item| item.hash.into_inner()[0])
+            .collect::<Vec<_>>();
+        assert_eq!(requested, vec![1, 5, 9]);
     }
 
     #[test]

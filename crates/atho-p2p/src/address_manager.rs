@@ -169,6 +169,9 @@ impl AddressManager {
                 if public_network && !is_publicly_routable_host(&peer.address.host) {
                     continue;
                 }
+                if public_network && peer.address.port != self.network.p2p_port() {
+                    continue;
+                }
                 if is_stale_address(self.network, peer.address.last_seen_unix, now) {
                     continue;
                 }
@@ -363,6 +366,9 @@ fn address_is_acceptable(
         return false;
     }
     if public_source && !is_publicly_routable_host(&address.host) {
+        return false;
+    }
+    if public_source && address.port != network.p2p_port() {
         return false;
     }
     !(public_source && is_stale_address(network, address.last_seen_unix, now_unix))
@@ -654,6 +660,35 @@ mod tests {
         let relay = manager.relay_addresses(8);
         assert_eq!(relay.len(), 1);
         assert_eq!(relay[0].host, "8.8.8.8");
+    }
+
+    #[test]
+    fn public_gossip_rejects_non_listening_source_ports() {
+        let mut manager = AddressManager::new(Network::Testnet);
+        let now = now_unix();
+        let accepted = manager
+            .note_gossip_addresses(
+                &[
+                    PeerAddress {
+                        host: String::from("74.208.219.116"),
+                        port: 33284,
+                        services: 0,
+                        last_seen_unix: now,
+                    },
+                    PeerAddress {
+                        host: String::from("74.208.219.116"),
+                        port: Network::Testnet.p2p_port(),
+                        services: 0,
+                        last_seen_unix: now,
+                    },
+                ],
+                true,
+            )
+            .expect("gossip");
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].port, Network::Testnet.p2p_port());
+        assert_eq!(manager.advertisable_addresses(8).len(), 1);
     }
 
     #[test]

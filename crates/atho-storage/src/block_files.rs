@@ -272,7 +272,9 @@ impl BlockFileStore {
         file.write_all(&self.network.p2p_magic())?;
         file.write_all(&payload_length.to_le_bytes())?;
         file.write_all(payload)?;
-        file.sync_data()?;
+        if durable_block_file_fsync_enabled() {
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -303,6 +305,13 @@ fn rotation_bytes() -> u64 {
         }
     }
     BLOCK_FILE_ROTATE_BYTES
+}
+
+fn durable_block_file_fsync_enabled() -> bool {
+    matches!(
+        std::env::var("ATHO_SYNC_BLOCK_FILES").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 #[cfg(test)]
