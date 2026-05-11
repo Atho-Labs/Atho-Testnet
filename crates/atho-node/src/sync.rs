@@ -28,6 +28,7 @@ const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS: usize = 32;
 const MAX_ORPHAN_PARENT_REQUESTS_PER_PASS: usize = 16;
+const BRIDGE_PARENT_STAGE_LOOKAHEAD: u64 = 128;
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
 const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
 const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
@@ -692,6 +693,44 @@ impl NodeSync {
             .limits
             .block_request_batch_limit
             .max(1)
+    }
+
+    fn buffered_parent_bridge_active(&self, node: &Node) -> bool {
+        !self.side_branches.is_empty() && !self.missing_buffered_parent_hashes(node).is_empty()
+    }
+
+    fn effective_max_requests_per_peer(&self, node: &Node) -> usize {
+        let limit = network_params(self.network)
+            .limits
+            .max_requests_per_peer
+            .max(1);
+        if self.buffered_parent_bridge_active(node) {
+            limit.min(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS.max(1))
+        } else {
+            limit
+        }
+    }
+
+    fn effective_block_request_batch_limit(&self, node: &Node) -> usize {
+        let limit = self.block_request_batch_limit();
+        if self.buffered_parent_bridge_active(node) {
+            limit.min(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS.max(1))
+        } else {
+            limit
+        }
+    }
+
+    fn effective_max_blocks_in_flight(&self, node: &Node) -> usize {
+        let limit = network_params(self.network)
+            .limits
+            .max_blocks_in_flight
+            .max(1);
+        if self.buffered_parent_bridge_active(node) {
+            let peer_count = self.ready_peer_count().max(1);
+            limit.min(self.effective_max_requests_per_peer(node) * peer_count)
+        } else {
+            limit
+        }
     }
 
     fn expand_events(
@@ -1390,12 +1429,15 @@ impl NodeSync {
         Ok(())
     }
 
-    fn push_scheduled_block_requests(&mut self, outbound: &mut Vec<ConnectionEvent>) {
-        let limits = network_params(self.network).limits;
-        for assignment in self
-            .downloader
-            .assignments(limits.max_blocks_in_flight, limits.max_requests_per_peer)
-        {
+    fn push_scheduled_block_requests(&mut self, node: &Node, outbound: &mut Vec<ConnectionEvent>) {
+        let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
+        let max_requests_per_peer = self.effective_max_requests_per_peer(node);
+        let max_requests_per_batch = self.effective_block_request_batch_limit(node);
+        for assignment in self.downloader.assignments_limited(
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_batch,
+        ) {
             self.push_download_assignment(assignment, outbound);
         }
     }
@@ -1407,12 +1449,14 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) {
         self.stage_header_blocks_near_tip(node);
-        let limits = network_params(self.network).limits;
+        let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
+        let max_requests_per_peer = self.effective_max_requests_per_peer(node);
+        let max_requests_per_batch = self.effective_block_request_batch_limit(node);
         if let Some(assignment) = self.downloader.assignment_for_peer_limited(
             peer,
-            limits.max_blocks_in_flight,
-            limits.max_requests_per_peer,
-            self.block_request_batch_limit(),
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_batch,
         ) {
             self.push_download_assignment(assignment, outbound);
         }
@@ -1860,7 +1904,7 @@ impl NodeSync {
             self.push_block_download_work_for_peer(peer, node, outbound);
         } else {
             self.stage_header_blocks_near_tip(node);
-            self.push_scheduled_block_requests(outbound);
+            self.push_scheduled_block_requests(node, outbound);
         }
     }
 
@@ -1921,7 +1965,7 @@ impl NodeSync {
         }
         let max_height = node
             .height()
-            .saturating_add(self.block_download_stage_lookahead(node));
+            .saturating_add(self.active_block_download_stage_lookahead(node));
         let heights = self
             .pending_header_blocks
             .range(..=max_height)
@@ -2118,7 +2162,7 @@ impl NodeSync {
                         self.push_block_download_work_for_peer(peer, node, outbound);
                     } else {
                         self.stage_header_blocks_near_tip(node);
-                        self.push_scheduled_block_requests(outbound);
+                        self.push_scheduled_block_requests(node, outbound);
                     }
                     return Ok(candidate_count);
                 }
@@ -2462,6 +2506,16 @@ impl NodeSync {
             limits.max_fast_download_ahead
         } else {
             self.block_download_lookahead()
+        }
+    }
+
+    fn active_block_download_stage_lookahead(&self, node: &Node) -> u64 {
+        if self.buffered_parent_bridge_active(node) {
+            self.block_download_lookahead()
+                .min(BRIDGE_PARENT_STAGE_LOOKAHEAD)
+                .max(1)
+        } else {
+            self.block_download_stage_lookahead(node)
         }
     }
 
@@ -3381,7 +3435,7 @@ mod tests {
         );
 
         let mut outbound = Vec::new();
-        sync.push_scheduled_block_requests(&mut outbound);
+        sync.push_scheduled_block_requests(&node, &mut outbound);
         let requested_before = outbound
             .iter()
             .map(|event| match event {
@@ -5359,6 +5413,42 @@ mod tests {
         assert_eq!(requested.len(), 2);
         assert_eq!(requested[0], blocks[2].header.block_hash());
         assert_eq!(requested[1], blocks[4].header.block_hash());
+    }
+
+    #[test]
+    fn buffered_parent_gap_throttles_future_download_window() {
+        let node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("peer");
+        let blocks = mine_reference_blocks(Network::Regnet, 6);
+        sync.side_branches.insert("peer", blocks[5].clone());
+
+        let fast_lookahead = sync.block_download_stage_lookahead(&node);
+        assert!(fast_lookahead > BRIDGE_PARENT_STAGE_LOOKAHEAD);
+        let hashes = (1..=fast_lookahead + 8)
+            .map(|height| synthetic_header_hash(height, 0xB7))
+            .collect::<Vec<_>>();
+        for (height, hash) in (1..=fast_lookahead + 8).zip(hashes.iter().copied()) {
+            sync.note_pending_header_block("peer", height, hash);
+        }
+
+        let mut outbound = Vec::new();
+        sync.push_block_download_work_for_peer("peer", &node, &mut outbound);
+
+        let requested = outbound_getdata_hashes(&outbound);
+        let expected_batch = sync
+            .block_request_batch_limit()
+            .min(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS);
+        assert_eq!(requested.len(), expected_batch);
+        assert_eq!(
+            requested,
+            hashes.into_iter().take(expected_batch).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sync.pending_header_blocks.keys().next().copied(),
+            Some(BRIDGE_PARENT_STAGE_LOOKAHEAD + 1)
+        );
     }
 
     #[test]
