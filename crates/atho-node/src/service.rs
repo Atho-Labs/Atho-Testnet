@@ -1840,6 +1840,7 @@ impl NodeService {
             .address_manager()
             .advertisable_addresses(max.saturating_mul(4));
         let mut scored = Vec::new();
+        let mut backed_off = Vec::new();
 
         for address in candidates.drain(..) {
             let remote_addr = format_remote_addr(&address);
@@ -1851,6 +1852,7 @@ impl NodeService {
                 .as_ref()
                 .is_some_and(|record| record.backoff_until_unix > now)
             {
+                backed_off.push((address, remote_addr, health));
                 continue;
             }
             scored.push((address, remote_addr, health));
@@ -1900,6 +1902,37 @@ impl NodeService {
             }
             if peers.len() >= max {
                 return peers;
+            }
+        }
+
+        if peers.is_empty() && connected_peers.is_empty() {
+            backed_off.sort_by(|left, right| {
+                let left_health = left.2.as_ref();
+                let right_health = right.2.as_ref();
+                left_health
+                    .map(|record| record.backoff_until_unix)
+                    .cmp(&right_health.map(|record| record.backoff_until_unix))
+                    .then(
+                        right_health
+                            .map(|record| record.quality_score)
+                            .cmp(&left_health.map(|record| record.quality_score)),
+                    )
+                    .then(
+                        right_health
+                            .and_then(|record| record.last_success_unix)
+                            .cmp(&left_health.and_then(|record| record.last_success_unix)),
+                    )
+                    .then(right.0.last_seen_unix.cmp(&left.0.last_seen_unix))
+                    .then(left.0.host.cmp(&right.0.host))
+                    .then(left.0.port.cmp(&right.0.port))
+            });
+            for (_, remote_addr, _) in backed_off {
+                if seen.insert(remote_addr.clone()) {
+                    peers.push(remote_addr);
+                }
+                if peers.len() >= max {
+                    break;
+                }
             }
         }
 
@@ -3839,6 +3872,37 @@ mod tests {
         assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:9200"));
         assert!(peers.iter().any(|peer| peer == "9.9.9.9:9200"));
         assert!(!peers.iter().any(|peer| peer == "7.7.7.7:9200"));
+    }
+
+    #[test]
+    fn bootstrap_peers_rescue_backed_off_records_when_no_other_peer_is_available() {
+        let root = temp_data_dir("bootstrap-health-rescue");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.sandbox_with_node_mut(|node| {
+            node.observe_peer("6.6.6.6:9200", 12, 1_700_000_000)
+                .expect("peer observation");
+        });
+
+        let now = unix_timestamp();
+        service.p2p_save_peer_health(&PeerHealthRecord {
+            network: Network::Regnet,
+            remote_addr: String::from("6.6.6.6:9200"),
+            quality_score: 40,
+            consecutive_failures: 8,
+            backoff_until_unix: now.saturating_add(3_600),
+            last_failure_unix: Some(now),
+            last_success_unix: Some(now.saturating_sub(600)),
+        });
+        service.p2p_prime();
+
+        let peers = service.p2p_bootstrap_peers(8);
+        assert!(
+            peers.iter().any(|peer| peer == "6.6.6.6:9200"),
+            "a node with no live peers must keep a rescue dial path even if every known peer is backed off"
+        );
     }
 
     #[test]

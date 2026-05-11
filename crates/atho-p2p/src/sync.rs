@@ -170,16 +170,24 @@ impl SyncState {
         }
         if let Some(last) = headers.last() {
             let prior_target = self.best_height;
+            let prior_headers_synced = self.headers_synced;
             self.best_height = self.best_height.max(last.height);
-            self.best_tip = Some(Hash48::from(last.block_hash()));
-            self.headers_synced = headers.len()
-                < network_params(network).limits.max_headers_per_message
-                && last.height >= prior_target;
-            self.locator_hashes
-                .retain(|hash| *hash != Hash48::from(last.block_hash()));
-            self.locator_hashes
-                .insert(0, Hash48::from(last.block_hash()));
-            self.locator_hashes.truncate(32);
+            let reaches_prior_target = last.height >= prior_target;
+            let should_advance_locator = reaches_prior_target || !prior_headers_synced;
+            if should_advance_locator {
+                self.best_tip = Some(Hash48::from(last.block_hash()));
+                self.locator_hashes
+                    .retain(|hash| *hash != Hash48::from(last.block_hash()));
+                self.locator_hashes
+                    .insert(0, Hash48::from(last.block_hash()));
+                self.locator_hashes.truncate(32);
+            }
+            if reaches_prior_target {
+                self.headers_synced =
+                    headers.len() < network_params(network).limits.max_headers_per_message;
+            } else if !prior_headers_synced {
+                self.headers_synced = false;
+            }
             crate::audit::append_log(
                 "p2p",
                 &format!(
@@ -383,6 +391,31 @@ mod tests {
             state.locator_hashes.first().copied(),
             Some(Hash48::from(third.block_hash()))
         );
+    }
+
+    #[test]
+    fn stale_header_batch_does_not_unsync_a_higher_synced_target() {
+        let synced_tip = Hash48::from([8; 48]);
+        let mut state = SyncState {
+            best_height: 128,
+            best_tip: Some(synced_tip),
+            locator_hashes: vec![synced_tip],
+            headers_synced: true,
+            ..SyncState::default()
+        };
+        state.requested_locator_hashes = vec![Hash48::from([0; 48])];
+        let first = solved_header(Network::Mainnet, 1, [0; 48]);
+        let second = solved_header(Network::Mainnet, 2, first.block_hash());
+        let third = solved_header(Network::Mainnet, 3, second.block_hash());
+
+        state
+            .accept_headers(Network::Mainnet, &[first, second, third])
+            .expect("accept stale peer headers");
+
+        assert_eq!(state.best_height, 128);
+        assert!(state.headers_synced);
+        assert_eq!(state.best_tip, Some(synced_tip));
+        assert_eq!(state.locator_hashes.first().copied(), Some(synced_tip));
     }
 
     #[test]

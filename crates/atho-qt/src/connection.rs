@@ -25,6 +25,7 @@ const LOCAL_RPC_STOP_RETRY_ATTEMPTS: usize = 50;
 const LEGACY_RPC_COMPAT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const LEGACY_RPC_COMPAT_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS: usize = 30;
+const MANAGED_LOCAL_NODE_SELF_HEAL_RESTARTS: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistedChainTipStatus {
@@ -131,8 +132,11 @@ impl StatusMonitor {
 
 #[derive(Debug)]
 struct ManagedNodeState {
+    network: Network,
+    rpc_address: String,
     child: Mutex<Option<Child>>,
     startup_error: Mutex<Option<String>>,
+    self_heal_restarts: Mutex<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,10 +146,13 @@ struct PortOwnerProcess {
 }
 
 impl ManagedNodeState {
-    fn new(child: Child) -> Self {
+    fn new(network: Network, rpc_address: String, child: Child) -> Self {
         Self {
+            network,
+            rpc_address,
             child: Mutex::new(Some(child)),
             startup_error: Mutex::new(None),
+            self_heal_restarts: Mutex::new(0),
         }
     }
 
@@ -170,37 +177,102 @@ impl ManagedNodeState {
     }
 
     fn observe_exit(&self, network: Network) -> Option<String> {
+        debug_assert_eq!(network, self.network);
         if let Some(error) = self.startup_error() {
             return Some(error);
         }
 
-        let mut child = self
-            .child
-            .lock()
-            .expect("managed node child mutex poisoned");
-        let Some(process) = child.as_mut() else {
-            return self.startup_error();
+        let poll_result = {
+            let mut child = self
+                .child
+                .lock()
+                .expect("managed node child mutex poisoned");
+            let Some(process) = child.as_mut() else {
+                return self.startup_error();
+            };
+
+            match process.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = child.take();
+                    Ok(Some(status))
+                }
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            }
         };
 
-        match process.try_wait() {
+        match poll_result {
             Ok(Some(status)) => {
-                let error = if status.success() {
-                    format!("local node exited unexpectedly for {}", network.id())
-                } else {
-                    format!(
-                        "local node exited with status {status} for {}",
-                        network.id()
-                    )
-                };
-                let _ = child.take();
-                Some(self.set_startup_error(error))
+                let error = managed_node_exit_error(network, &status);
+                match self.self_heal_after_exit(&status) {
+                    Ok(true) => None,
+                    Ok(false) => Some(self.set_startup_error(error)),
+                    Err(err) => Some(
+                        self.set_startup_error(format!("{error}; self-heal restart failed: {err}")),
+                    ),
+                }
             }
             Ok(None) => None,
             Err(err) => {
-                let _ = child.take();
                 Some(self.set_startup_error(format!("failed to poll local node state: {err}")))
             }
         }
+    }
+
+    fn self_heal_after_exit(&self, status: &std::process::ExitStatus) -> Result<bool, String> {
+        if !managed_node_exit_is_retryable(status) {
+            return Ok(false);
+        }
+
+        let attempt = {
+            let mut restarts = self
+                .self_heal_restarts
+                .lock()
+                .expect("managed node self-heal mutex poisoned");
+            if *restarts >= MANAGED_LOCAL_NODE_SELF_HEAL_RESTARTS {
+                return Ok(false);
+            }
+            *restarts += 1;
+            *restarts
+        };
+
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "local node exited with status {status} for {}; attempting lightweight self-heal restart {attempt}/{} rpc={}",
+                self.network.id(),
+                MANAGED_LOCAL_NODE_SELF_HEAL_RESTARTS,
+                self.rpc_address
+            ),
+        );
+
+        self_heal_managed_local_node_before_start(self.network, &self.rpc_address)?;
+        let child = spawn_managed_local_node_child(self.network, &self.rpc_address)?;
+        {
+            let mut child_slot = self
+                .child
+                .lock()
+                .expect("managed node child mutex poisoned");
+            *child_slot = Some(child);
+        }
+        {
+            let mut startup_error = self
+                .startup_error
+                .lock()
+                .expect("managed node startup error mutex poisoned");
+            *startup_error = None;
+        }
+
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "local node self-heal restart launched for {} rpc={} stdio_log={}",
+                self.network.id(),
+                self.rpc_address,
+                local_node_stdio_log_path(self.network).display()
+            ),
+        );
+        Ok(true)
     }
 }
 
@@ -216,6 +288,25 @@ impl Drop for ManagedNodeState {
             let _ = child.wait();
         }
     }
+}
+
+fn managed_node_exit_error(network: Network, status: &std::process::ExitStatus) -> String {
+    if status.success() {
+        format!("local node exited unexpectedly for {}", network.id())
+    } else {
+        format!(
+            "local node exited with status {status} for {}",
+            network.id()
+        )
+    }
+}
+
+fn managed_node_exit_is_retryable(status: &std::process::ExitStatus) -> bool {
+    managed_node_exit_status_is_retryable(status.success(), status.code())
+}
+
+fn managed_node_exit_status_is_retryable(success: bool, _code: Option<i32>) -> bool {
+    !success
 }
 
 #[derive(Debug)]
@@ -827,6 +918,30 @@ fn start_local_node_if_needed(
         return Ok(LocalNodeStartup::external_rpc());
     }
 
+    self_heal_managed_local_node_before_start(network, rpc_address)?;
+    let child = spawn_managed_local_node_child(network, rpc_address)?;
+    let node = Arc::new(ManagedNodeState::new(
+        network,
+        rpc_address.to_string(),
+        child,
+    ));
+    let _ = atho_node::dev::append_log(
+        "atho-qt",
+        &format!(
+            "spawned local node bootstrap for {} rpc={} stdio_log={}",
+            network.id(),
+            rpc_address,
+            local_node_stdio_log_path(network).display()
+        ),
+    );
+    spawn_bootstrap_watcher(network, rpc_address.to_string(), Arc::clone(&node));
+    Ok(LocalNodeStartup::managed(node))
+}
+
+fn self_heal_managed_local_node_before_start(
+    network: Network,
+    rpc_address: &str,
+) -> Result<(), String> {
     match inspect_existing_rpc_endpoint(network, rpc_address) {
         ExistingRpcEndpoint::None => {}
         ExistingRpcEndpoint::SameNetworkRunning => {
@@ -871,9 +986,11 @@ fn start_local_node_if_needed(
             ));
         }
         ExistingRpcEndpoint::OccupiedByNonAtho => {
-            return Err(format!(
-                "rpc address {rpc_address} is already occupied by a non-Atho service or an incompatible node; choose a different RPC port or stop the conflicting process."
-            ));
+            if !force_stop_owned_local_athod(rpc_address, network)? {
+                return Err(format!(
+                    "rpc address {rpc_address} is already occupied by a non-Atho service or an incompatible node; choose a different RPC port or stop the conflicting process."
+                ));
+            }
         }
     }
 
@@ -884,7 +1001,50 @@ fn start_local_node_if_needed(
         ));
     }
 
-    let mut command = if let Some(binary) = node_binary_path() {
+    if force_stop_owned_local_athod_on_default_p2p(network)? {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "reclaimed stale managed local-node p2p listener before restart network={}",
+                network.id()
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+fn spawn_managed_local_node_child(network: Network, rpc_address: &str) -> Result<Child, String> {
+    let mut command = managed_local_node_command(network, rpc_address);
+    let (stdout, stderr) = local_node_stdio(network)?;
+    if let Some(p2p_addr) = managed_local_node_p2p_bind_address(network) {
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "managed local node p2p bind override network={} addr={}",
+                network.id(),
+                p2p_addr
+            ),
+        );
+        command.env("ATHO_P2P_ADDR", p2p_addr);
+    }
+    command
+        .env("ATHO_MANAGED_PARENT_PID", managed_parent_pid_env_value())
+        .env("ATHO_RPC_ADDR", rpc_address)
+        .env("ATHO_NETWORK", network.cli_arg())
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+
+    command.spawn().map_err(|err| {
+        let startup_error = format!("failed to spawn local node: {err}");
+        let _ = atho_node::dev::append_log("atho-qt", &startup_error);
+        startup_error
+    })
+}
+
+fn managed_local_node_command(network: Network, rpc_address: &str) -> Command {
+    if let Some(binary) = node_binary_path() {
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
@@ -923,47 +1083,11 @@ fn start_local_node_if_needed(
             .arg("--rpc-addr")
             .arg(rpc_address);
         command
-    };
-    let (stdout, stderr) = local_node_stdio(network)?;
-    if let Some(p2p_addr) = managed_local_node_p2p_bind_address(network) {
-        let _ = atho_node::dev::append_log(
-            "atho-qt",
-            &format!(
-                "managed local node p2p bind override network={} addr={}",
-                network.id(),
-                p2p_addr
-            ),
-        );
-        command.env("ATHO_P2P_ADDR", p2p_addr);
     }
-    command
-        .env("ATHO_RPC_ADDR", rpc_address)
-        .env("ATHO_NETWORK", network.cli_arg())
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
+}
 
-    match command.spawn() {
-        Ok(child) => {
-            let node = Arc::new(ManagedNodeState::new(child));
-            let _ = atho_node::dev::append_log(
-                "atho-qt",
-                &format!(
-                    "spawned local node bootstrap for {} rpc={} stdio_log={}",
-                    network.id(),
-                    rpc_address,
-                    local_node_stdio_log_path(network).display()
-                ),
-            );
-            spawn_bootstrap_watcher(network, rpc_address.to_string(), Arc::clone(&node));
-            Ok(LocalNodeStartup::managed(node))
-        }
-        Err(err) => {
-            let startup_error = format!("failed to spawn local node: {err}");
-            let _ = atho_node::dev::append_log("atho-qt", &startup_error);
-            Err(startup_error)
-        }
-    }
+fn managed_parent_pid_env_value() -> String {
+    std::process::id().to_string()
 }
 
 fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> ExistingRpcEndpoint {
@@ -1241,8 +1365,12 @@ fn stop_existing_local_node(rpc_address: &str, network: Network) -> Result<(), S
 }
 
 fn wait_for_rpc_bind_release(rpc_address: &str, attempts: usize) -> bool {
+    wait_for_bind_release(rpc_address, attempts)
+}
+
+fn wait_for_bind_release(bind_address: &str, attempts: usize) -> bool {
     for _ in 0..attempts {
-        if rpc_bind_available(rpc_address) {
+        if rpc_bind_available(bind_address) {
             return true;
         }
         thread::sleep(Duration::from_millis(LOCAL_RPC_READY_RETRY_DELAY_MS));
@@ -1280,6 +1408,59 @@ fn force_stop_owned_local_athod(rpc_address: &str, network: Network) -> Result<b
         "existing local athod pid {} kept rpc address {} after termination attempts for {}",
         owner.pid,
         rpc_address,
+        network.id()
+    ))
+}
+
+fn force_stop_owned_local_athod_on_default_p2p(network: Network) -> Result<bool, String> {
+    if std::env::var("ATHO_P2P_ADDR")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+
+    let bind_address = atho_node::runtime::default_p2p_bind_address(network);
+    let Some(port) = bind_address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next().map(|addr| addr.port()))
+    else {
+        return Ok(false);
+    };
+    let Some(owner) = listening_process_on_port(port) else {
+        return Ok(false);
+    };
+    if !command_matches_managed_local_athod(&owner.command, network, "") {
+        return Ok(false);
+    }
+
+    let _ = atho_node::dev::append_log(
+        "atho-qt",
+        &format!(
+            "force-stopping stale managed athod p2p listener network={} p2p={} pid={} command={}",
+            network.id(),
+            bind_address,
+            owner.pid,
+            owner.command
+        ),
+    );
+
+    terminate_process(owner.pid, false)?;
+    if wait_for_bind_release(&bind_address, LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS) {
+        return Ok(true);
+    }
+
+    terminate_process(owner.pid, true)?;
+    if wait_for_bind_release(&bind_address, LOCAL_RPC_FORCE_STOP_RETRY_ATTEMPTS) {
+        return Ok(true);
+    }
+
+    Err(format!(
+        "existing local athod pid {} kept p2p address {} after termination attempts for {}",
+        owner.pid,
+        bind_address,
         network.id()
     ))
 }
@@ -2340,6 +2521,11 @@ mod tests {
             "127.0.0.1:9110"
         ));
         assert!(command_matches_managed_local_athod(
+            "cargo run --manifest-path /repo/Cargo.toml -p atho-node --bin athod -- --network testnet --rpc-addr 127.0.0.1:9110",
+            Network::Testnet,
+            "127.0.0.1:9110"
+        ));
+        assert!(command_matches_managed_local_athod(
             "/opt/atho/bin/athod --rpc-addr 127.0.0.1:9010",
             Network::Mainnet,
             "127.0.0.1:9010"
@@ -2358,6 +2544,22 @@ mod tests {
             Network::Testnet,
             "127.0.0.1:9110"
         ));
+    }
+
+    #[test]
+    fn managed_node_exit_retry_policy_covers_cargo_status_101() {
+        assert!(managed_node_exit_status_is_retryable(false, Some(101)));
+        assert!(managed_node_exit_status_is_retryable(false, Some(1)));
+        assert!(managed_node_exit_status_is_retryable(false, None));
+        assert!(!managed_node_exit_status_is_retryable(true, Some(0)));
+    }
+
+    #[test]
+    fn managed_parent_pid_env_value_tracks_current_client() {
+        assert_eq!(
+            managed_parent_pid_env_value(),
+            std::process::id().to_string()
+        );
     }
 
     #[test]
@@ -2400,7 +2602,11 @@ mod tests {
             .arg("sleep 2")
             .spawn()
             .expect("spawn managed child");
-        let managed = Arc::new(ManagedNodeState::new(child));
+        let managed = Arc::new(ManagedNodeState::new(
+            Network::Mainnet,
+            rpc_address.clone(),
+            child,
+        ));
         let client = RpcClient::new(rpc_address.clone());
 
         let status = collect_rpc_status(

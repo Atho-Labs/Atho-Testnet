@@ -28,6 +28,7 @@ const FRAME_HEADER_BYTES: usize = 24;
 const OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const OUTBOUND_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(32);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const PEER_INBOUND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -342,8 +343,13 @@ fn spawn_outbound_maintainer(
         while !stop_requested.load(Ordering::Acquire) {
             let mut health = load_peer_health_snapshot(&state, network, &remote_addr);
             let now_unix = unix_timestamp();
-            if health.backoff_until_unix > now_unix {
-                let remaining = health.backoff_until_unix.saturating_sub(now_unix).max(1);
+            let connected_peer_count = {
+                let state = state.lock().expect("p2p runtime state poisoned");
+                state.p2p_peer_count()
+            };
+            if let Some(remaining) =
+                outbound_backoff_wait(connected_peer_count, health.backoff_until_unix, now_unix)
+            {
                 sleep_with_stop(&stop_requested, Duration::from_secs(remaining));
                 continue;
             }
@@ -372,7 +378,15 @@ fn spawn_outbound_maintainer(
                 Err(err) => {
                     let failure = err.to_string();
                     health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-                    let retry_delay = next_outbound_retry_delay(health.consecutive_failures);
+                    let connected_peer_count = {
+                        let state = state.lock().expect("p2p runtime state poisoned");
+                        state.p2p_peer_count()
+                    };
+                    let retry_delay = if connected_peer_count == 0 {
+                        OUTBOUND_RETRY_INTERVAL
+                    } else {
+                        next_outbound_retry_delay(health.consecutive_failures)
+                    };
                     health.backoff_until_unix =
                         now_unix.saturating_add(retry_delay.as_secs().max(1));
                     health.quality_score = health
@@ -610,6 +624,7 @@ fn spawn_peer_thread(
             let mut last_announced_mempool = None;
             let mut announced_mempool_txids = BTreeSet::new();
             let mut last_activity = SystemTime::now();
+            let mut last_inbound_activity = last_activity;
             let peer_network = {
                 let state = state.lock().expect("p2p runtime state poisoned");
                 state.network()
@@ -665,6 +680,7 @@ fn spawn_peer_thread(
                             let mut state = state.lock().expect("p2p runtime state poisoned");
                             state.p2p_note_bytes_received(&peer_id, bytes_received);
                             last_activity = SystemTime::now();
+                            last_inbound_activity = last_activity;
                         }
                         log_peer_message("rx", &peer_id, &message, bytes_received);
                         message
@@ -718,6 +734,19 @@ fn spawn_peer_thread(
                                     last_activity = SystemTime::now();
                                 }
                             }
+                        }
+                        if handshake_ready
+                            && peer_inbound_stalled(
+                                last_inbound_activity,
+                                SystemTime::now(),
+                                PEER_INBOUND_STALL_TIMEOUT,
+                            )
+                        {
+                            let idle = last_inbound_activity
+                                .elapsed()
+                                .unwrap_or_default()
+                                .as_secs();
+                            return format!("peer inbound stalled peer={peer_id} idle_secs={idle}");
                         }
                         if handshake_ready
                             && last_activity.elapsed().unwrap_or_default() >= KEEPALIVE_INTERVAL
@@ -1199,6 +1228,27 @@ pub(crate) fn next_outbound_retry_delay(consecutive_failures: u32) -> Duration {
         .min(OUTBOUND_MAX_RETRY_INTERVAL)
 }
 
+fn outbound_backoff_wait(
+    connected_peer_count: usize,
+    backoff_until_unix: u64,
+    now_unix: u64,
+) -> Option<u64> {
+    if connected_peer_count == 0 || backoff_until_unix <= now_unix {
+        return None;
+    }
+    Some(backoff_until_unix.saturating_sub(now_unix).max(1))
+}
+
+fn peer_inbound_stalled(
+    last_inbound_activity: SystemTime,
+    now: SystemTime,
+    timeout: Duration,
+) -> bool {
+    now.duration_since(last_inbound_activity)
+        .unwrap_or_default()
+        >= timeout
+}
+
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1586,6 +1636,37 @@ mod tests {
         assert_eq!(next_outbound_retry_delay(3), Duration::from_secs(4));
         assert_eq!(next_outbound_retry_delay(4), Duration::from_secs(8));
         assert_eq!(next_outbound_retry_delay(8), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn outbound_backoff_is_ignored_when_node_has_no_live_peers() {
+        let now = unix_timestamp();
+        assert_eq!(
+            outbound_backoff_wait(0, now.saturating_add(3_600), now),
+            None,
+            "a disconnected node must keep probing instead of sleeping through stale backoff"
+        );
+        assert_eq!(
+            outbound_backoff_wait(1, now.saturating_add(3_600), now),
+            Some(3_600)
+        );
+        assert_eq!(outbound_backoff_wait(1, now, now), None);
+    }
+
+    #[test]
+    fn peer_inbound_stall_detection_uses_received_activity_only() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let timeout = Duration::from_secs(30);
+        assert!(!peer_inbound_stalled(
+            now - Duration::from_secs(29),
+            now,
+            timeout
+        ));
+        assert!(peer_inbound_stalled(
+            now - Duration::from_secs(30),
+            now,
+            timeout
+        ));
     }
 
     #[test]
