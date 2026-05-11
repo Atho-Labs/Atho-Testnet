@@ -519,6 +519,17 @@ impl BlockDownloadScheduler {
         self.pending.is_empty() && self.inflight_owner.is_empty()
     }
 
+    pub fn total_inflight_len(&self) -> usize {
+        self.inflight_owner.len()
+    }
+
+    pub fn peer_inflight_len(&self, peer: &str) -> usize {
+        self.inflight_by_peer
+            .get(peer)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
     pub fn stats(&self) -> DownloadStats {
         DownloadStats {
             ready_peers: self.ready_peers.len(),

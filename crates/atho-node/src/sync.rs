@@ -720,6 +720,14 @@ impl NodeSync {
         }
     }
 
+    fn effective_scheduled_block_request_batch_limit(&self, node: &Node) -> usize {
+        if self.buffered_parent_bridge_active(node) {
+            self.effective_block_request_batch_limit(node)
+        } else {
+            self.effective_max_requests_per_peer(node)
+        }
+    }
+
     fn effective_max_blocks_in_flight(&self, node: &Node) -> usize {
         let limit = network_params(self.network)
             .limits
@@ -731,6 +739,16 @@ impl NodeSync {
         } else {
             limit
         }
+    }
+
+    fn bridge_parent_request_capacity_for_peer(&self, peer: &str) -> usize {
+        let limit = network_params(self.network)
+            .limits
+            .max_requests_per_peer
+            .max(1)
+            .min(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS.max(1));
+        let inflight = self.downloader.peer_inflight_len(peer);
+        limit.saturating_sub(inflight).max(1)
     }
 
     fn expand_events(
@@ -1432,7 +1450,7 @@ impl NodeSync {
     fn push_scheduled_block_requests(&mut self, node: &Node, outbound: &mut Vec<ConnectionEvent>) {
         let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
         let max_requests_per_peer = self.effective_max_requests_per_peer(node);
-        let max_requests_per_batch = self.effective_block_request_batch_limit(node);
+        let max_requests_per_batch = self.effective_scheduled_block_request_batch_limit(node);
         for assignment in self.downloader.assignments_limited(
             max_blocks_in_flight,
             max_requests_per_peer,
@@ -1449,9 +1467,25 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) {
         self.stage_header_blocks_near_tip(node);
-        let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
-        let max_requests_per_peer = self.effective_max_requests_per_peer(node);
-        let max_requests_per_batch = self.effective_block_request_batch_limit(node);
+        let bridge_active = self.buffered_parent_bridge_active(node);
+        let peer_inflight = self.downloader.peer_inflight_len(peer);
+        let total_inflight = self.downloader.total_inflight_len();
+        let bridge_capacity = self.bridge_parent_request_capacity_for_peer(peer);
+        let max_blocks_in_flight = if bridge_active {
+            total_inflight.saturating_add(bridge_capacity)
+        } else {
+            self.effective_max_blocks_in_flight(node)
+        };
+        let max_requests_per_peer = if bridge_active {
+            peer_inflight.saturating_add(bridge_capacity)
+        } else {
+            self.effective_max_requests_per_peer(node)
+        };
+        let max_requests_per_batch = if bridge_active {
+            bridge_capacity
+        } else {
+            self.effective_block_request_batch_limit(node)
+        };
         if let Some(assignment) = self.downloader.assignment_for_peer_limited(
             peer,
             max_blocks_in_flight,
