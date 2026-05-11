@@ -118,6 +118,34 @@ impl BlockDownloadScheduler {
         true
     }
 
+    pub fn reassign_priority_block(&mut self, peer: Option<&str>, hash: [u8; 48]) -> bool {
+        let hash = Hash48::from(hash);
+        if self.completed.contains(&hash) {
+            return false;
+        }
+        if let Some(owner) = self.inflight_owner.get(&hash).cloned() {
+            if peer.is_some_and(|preferred| preferred == owner) {
+                return false;
+            }
+            self.inflight_owner.remove(&hash);
+            self.inflight_started.remove(&hash);
+            if let Some(inflight) = self.inflight_by_peer.get_mut(&owner) {
+                inflight.retain(|candidate| *candidate != hash);
+            }
+        }
+        if let Some(index) = self.pending.iter().position(|candidate| *candidate == hash) {
+            self.pending.remove(index);
+        }
+        if let Some(peer) = peer {
+            self.peer_hints
+                .entry(hash)
+                .or_default()
+                .insert(peer.to_string());
+        }
+        self.pending.push_front(hash);
+        true
+    }
+
     pub fn note_block_received(&mut self, hash: [u8; 48]) {
         let hash = Hash48::from(hash);
         self.completed.insert(hash);
@@ -353,6 +381,40 @@ impl BlockDownloadScheduler {
         max_requests_per_peer: usize,
         max_requests_per_batch: usize,
     ) -> Option<DownloadAssignment> {
+        self.assignment_for_peer_filtered_limited(
+            peer,
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_batch,
+            |_| true,
+        )
+    }
+
+    pub fn assignment_for_peer_matching_limited(
+        &mut self,
+        peer: &str,
+        max_blocks_in_flight: usize,
+        max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
+        allowed_hashes: &BTreeSet<Hash48>,
+    ) -> Option<DownloadAssignment> {
+        self.assignment_for_peer_filtered_limited(
+            peer,
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            max_requests_per_batch,
+            |hash| allowed_hashes.contains(hash),
+        )
+    }
+
+    fn assignment_for_peer_filtered_limited(
+        &mut self,
+        peer: &str,
+        max_blocks_in_flight: usize,
+        max_requests_per_peer: usize,
+        max_requests_per_batch: usize,
+        mut allowed_hash: impl FnMut(&Hash48) -> bool,
+    ) -> Option<DownloadAssignment> {
         if !self.ready_peers.contains(peer)
             || self.pending.is_empty()
             || max_blocks_in_flight == 0
@@ -392,6 +454,10 @@ impl BlockDownloadScheduler {
             let Some(hash) = self.pending.pop_front() else {
                 break;
             };
+            if !allowed_hash(&hash) {
+                skipped.push(hash);
+                continue;
+            }
             let hinted_to_peer = self
                 .peer_hints
                 .get(&hash)
@@ -717,6 +783,56 @@ mod tests {
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].peer, "right");
         assert_eq!(retry[0].inventory[0].hash, Hash48::from([9; 48]));
+    }
+
+    #[test]
+    fn priority_block_can_be_reassigned_from_backlogged_peer() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("slow");
+        scheduler.note_peer_ready("fast");
+        scheduler.note_headers("slow", [[9; 48]]);
+        scheduler.note_headers("fast", [[9; 48]]);
+
+        let slow = scheduler
+            .assignment_for_peer("slow", 1, 1)
+            .expect("slow first assignment");
+        assert_eq!(slow.peer, "slow");
+        assert_eq!(slow.inventory[0].hash, Hash48::from([9; 48]));
+        assert_eq!(scheduler.peer_inflight_len("slow"), 1);
+
+        assert!(scheduler.reassign_priority_block(Some("fast"), [9; 48]));
+        assert_eq!(scheduler.peer_inflight_len("slow"), 0);
+        let fast = scheduler
+            .assignment_for_peer("fast", 1, 1)
+            .expect("fast reassignment");
+        assert_eq!(fast.peer, "fast");
+        assert_eq!(fast.inventory[0].hash, Hash48::from([9; 48]));
+    }
+
+    #[test]
+    fn filtered_peer_assignment_leaves_unrelated_future_blocks_pending() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("peer");
+        scheduler.note_headers("peer", [[1; 48], [2; 48], [3; 48]]);
+        let allowed = BTreeSet::from([Hash48::from([2; 48])]);
+
+        let assignment = scheduler
+            .assignment_for_peer_matching_limited("peer", 3, 3, 3, &allowed)
+            .expect("allowed parent assignment");
+
+        assert_eq!(assignment.inventory.len(), 1);
+        assert_eq!(assignment.inventory[0].hash, Hash48::from([2; 48]));
+        let future = scheduler
+            .assignment_for_peer("peer", 3, 3)
+            .expect("unrelated pending blocks remain available later");
+        assert_eq!(
+            future
+                .inventory
+                .iter()
+                .map(|item| item.hash)
+                .collect::<Vec<_>>(),
+            vec![Hash48::from([1; 48]), Hash48::from([3; 48])]
+        );
     }
 
     #[test]
