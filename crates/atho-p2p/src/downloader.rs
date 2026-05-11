@@ -100,7 +100,7 @@ impl BlockDownloadScheduler {
             .insert(peer.to_string());
     }
 
-    pub fn queue_priority_block(&mut self, peer: Option<&str>, hash: [u8; 48]) {
+    pub fn queue_priority_block(&mut self, peer: Option<&str>, hash: [u8; 48]) -> bool {
         let hash = Hash48::from(hash);
         if let Some(peer) = peer {
             self.peer_hints
@@ -112,9 +112,10 @@ impl BlockDownloadScheduler {
             || self.inflight_owner.contains_key(&hash)
             || self.pending.contains(&hash)
         {
-            return;
+            return false;
         }
         self.pending.push_front(hash);
+        true
     }
 
     pub fn note_block_received(&mut self, hash: [u8; 48]) {
