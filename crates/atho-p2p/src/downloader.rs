@@ -151,6 +151,14 @@ impl BlockDownloadScheduler {
         self.note_hash_completed(hash);
     }
 
+    pub fn is_completed(&self, hash: [u8; 48]) -> bool {
+        self.completed.contains(&Hash48::from(hash))
+    }
+
+    pub fn forget_completed(&mut self, hash: [u8; 48]) -> bool {
+        self.completed.remove(&Hash48::from(hash))
+    }
+
     pub fn note_peer_delivery_progress(&mut self, peer: &str) {
         let Some(inflight) = self.inflight_by_peer.get(peer) else {
             return;

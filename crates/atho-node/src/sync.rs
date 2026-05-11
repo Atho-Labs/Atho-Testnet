@@ -629,7 +629,7 @@ impl NodeSync {
                 self.heal_buffered_branch_parents(Some(remote_addr), node, &mut outbound);
                 self.push_block_download_work_for_peer(remote_addr, node, &mut outbound);
                 if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
-                    self.reseed_locator_from_node(node);
+                    self.refresh_header_locator_from_node_if_needed(node);
                     self.queue_getheaders(remote_addr, &mut outbound);
                 }
                 self.push_address_discovery_events(remote_addr, node, &mut outbound);
@@ -647,7 +647,7 @@ impl NodeSync {
             self.heal_buffered_branch_parents(None, node, &mut outbound);
             self.push_scheduled_block_requests(node, &mut outbound);
             if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
-                self.reseed_locator_from_node(node);
+                self.refresh_header_locator_from_node_if_needed(node);
                 self.queue_getheaders(remote_addr, &mut outbound);
             }
             self.push_address_discovery_events(remote_addr, node, &mut outbound);
@@ -657,7 +657,7 @@ impl NodeSync {
         self.push_block_download_work_for_peer(remote_addr, node, &mut outbound);
 
         if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
-            self.reseed_locator_from_node(node);
+            self.refresh_header_locator_from_node_if_needed(node);
             let _ = dev::append_log(
                 "p2p",
                 &format!(
@@ -1082,6 +1082,12 @@ impl NodeSync {
                 .map(Hash48::from)
                 .collect(),
         );
+    }
+
+    fn refresh_header_locator_from_node_if_needed(&mut self, node: &Node) {
+        if !self.header_locator_is_ahead_of_local_tip(node) {
+            self.reseed_locator_from_node(node);
+        }
     }
 
     fn header_locator_is_ahead_of_local_tip(&self, node: &Node) -> bool {
@@ -1817,9 +1823,7 @@ impl NodeSync {
         if self.sync_state().headers_synced || self.header_request_inflight(peer) {
             return;
         }
-        if !self.header_locator_is_ahead_of_local_tip(node) {
-            self.reseed_locator_from_node(node);
-        }
+        self.refresh_header_locator_from_node_if_needed(node);
         self.queue_getheaders(peer, outbound);
     }
 
@@ -2133,6 +2137,21 @@ impl NodeSync {
             .take(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS)
             .rev()
         {
+            if self.downloader.is_completed(parent_hash)
+                && !node.is_canonical_block(&parent_hash)
+                && self.side_branches.get(&parent_hash).is_none()
+                && node.block_by_hash(parent_hash).is_none()
+            {
+                self.downloader.forget_completed(parent_hash);
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "reopening missing buffered parent download parent={} local_height={}",
+                        short_hash(&parent_hash),
+                        node.height()
+                    ),
+                );
+            }
             if self
                 .downloader
                 .queue_priority_block(preferred_peer, parent_hash)
@@ -5322,6 +5341,54 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_header_rehydrate_preserves_known_header_locator() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        right
+            .node
+            .dev_seed_chainstate(64, [64; 48], Vec::<UtxoEntry>::new())
+            .expect("seed remote height");
+        let _ = connect_handshake_only(&mut left, &mut right);
+        left.sync.header_requests_started.clear();
+
+        let known_header_hash = [88; 48];
+        let known_header_height = left.node.height().saturating_add(32);
+        left.sync.mark_block_state(
+            known_header_hash,
+            known_header_height,
+            BlockValidationState::HeaderValidated,
+        );
+        left.sync
+            .relay
+            .reseed_locator_hashes(vec![Hash48::from(known_header_hash)]);
+        left.sync.relay.mark_headers_unsynced();
+
+        let outbound = left
+            .sync
+            .maintain_peer_sync(&right.id, &left.node)
+            .expect("maintenance");
+        let getheaders_locator = outbound.iter().find_map(|event| match event {
+            ConnectionEvent::Send {
+                message:
+                    NetworkMessage {
+                        payload: MessagePayload::GetHeaders(request),
+                        ..
+                    },
+                ..
+            } => Some(request.locator_hashes.clone()),
+            _ => None,
+        });
+
+        assert_eq!(
+            getheaders_locator
+                .and_then(|locator| locator.first().copied())
+                .map(Hash48::into_inner),
+            Some(known_header_hash),
+            "maintenance rehydrate must not rewind the header locator to the connected tip"
+        );
+    }
+
+    #[test]
     fn deferred_unsolicited_future_block_does_not_poison_fast_download_backpressure() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
@@ -6045,6 +6112,35 @@ mod tests {
             "an in-flight bridge parent must block future body requests until the gap is healed"
         );
         assert_eq!(sync.pending_header_blocks.keys().next().copied(), Some(1));
+    }
+
+    #[test]
+    fn buffered_parent_repair_reopens_completed_missing_parent() {
+        let node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("peer");
+
+        let parent_hash = synthetic_header_hash(1, 0xCA);
+        let child = Miner::new(1).solve_block(coinbase_block(
+            Network::Regnet,
+            2,
+            parent_hash,
+            pow::target_for_height(Network::Regnet, 2),
+            1_700_000_150,
+        ));
+        sync.side_branches.insert("peer", child);
+        sync.mark_block_state(parent_hash, 1, BlockValidationState::HeaderValidated);
+        sync.downloader.note_block_received(parent_hash);
+
+        let mut outbound = Vec::new();
+        sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
+
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![parent_hash]);
+        assert!(
+            sync.downloader.is_inflight(parent_hash),
+            "a missing parent cannot stay suppressed just because an old scheduler entry said it was complete"
+        );
     }
 
     #[test]

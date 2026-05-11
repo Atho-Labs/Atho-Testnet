@@ -281,6 +281,7 @@ struct WalletRegistryEntry {
 #[derive(Debug)]
 struct WalletScanJob {
     started_at: Instant,
+    cancel_requested: Arc<AtomicBool>,
     receiver: mpsc::Receiver<Result<WalletScanOutcome, String>>,
 }
 
@@ -885,6 +886,7 @@ impl DesktopApp {
 
     pub(crate) fn clear_wallet_state(&mut self) {
         self.stop_mining_job();
+        self.cancel_wallet_scan_job("wallet state cleared");
         self.send_job = None;
         self.mining_job = None;
         self.pending_mining_restart = None;
@@ -907,7 +909,6 @@ impl DesktopApp {
         self.wallet_balance_summary_cache = WalletBalanceSummary::default();
         self.wallet_balance_cache = 0;
         self.wallet_cache_dirty = true;
-        self.wallet_scan_job = None;
         self.wallet_readiness_gate_active = false;
         self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
@@ -1095,7 +1096,7 @@ impl DesktopApp {
     #[cfg(test)]
     fn force_wallet_cache_refresh_for_test(&mut self) {
         self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
-        self.wallet_scan_job = None;
+        self.cancel_wallet_scan_job("forced wallet cache refresh");
         self.wallet_cache_dirty = false;
         self.refresh_wallet_cache();
     }
@@ -1233,14 +1234,24 @@ impl DesktopApp {
         receive_addresses: Vec<WalletAddress>,
         wallet_scan_nonce: u64,
         scan_limit: usize,
+        cancel_requested: Arc<AtomicBool>,
     ) -> Result<WalletScanOutcome, String> {
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let status = connection.status();
         let snapshot_token = Self::connection_snapshot_token(&status);
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let utxos = match connection.request(RpcRequest::ListUtxos) {
             RpcResponse::Utxos(utxos) => utxos,
             RpcResponse::Error(err) => return Err(format!("utxo lookup failed: {err}")),
             other => return Err(format!("unexpected UTXO response: {other:?}")),
         };
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let reserved_inputs = match connection.request(RpcRequest::GetMempoolSpentInputs) {
             RpcResponse::MempoolSpentInputs(inputs) => inputs
                 .into_iter()
@@ -1256,6 +1267,9 @@ impl DesktopApp {
             }
         };
 
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let address_digests = wallet_addresses_cache
             .iter()
             .map(|address| address.payment_digest)
@@ -1265,6 +1279,9 @@ impl DesktopApp {
             RpcResponse::Error(err) => return Err(format!("block count lookup failed: {err}")),
             other => return Err(format!("unexpected block count response: {other:?}")),
         };
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let mut owned = utxos
             .into_par_iter()
             .filter_map(|utxo| {
@@ -1292,6 +1309,9 @@ impl DesktopApp {
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
         let wallet_activity_cache =
             Self::request_wallet_activity_rows(&connection, &wallet_addresses_cache)?;
+        if cancel_requested.load(Ordering::Acquire) {
+            return Err(String::from("wallet scan cancelled"));
+        }
         let end_status = connection.status();
         if snapshot_token != Self::connection_snapshot_token(&end_status) {
             return Err(String::from(
@@ -1409,7 +1429,8 @@ impl DesktopApp {
     }
 
     fn start_wallet_scan_job(&mut self) {
-        if self.wallet.is_none() || self.wallet_scan_job.is_some() {
+        if self.wallet.is_none() || self.wallet_scan_job.is_some() || !self.wallet_scan_rpc_ready()
+        {
             return;
         }
 
@@ -1428,14 +1449,24 @@ impl DesktopApp {
         };
         let connection = self.connection.clone();
         let wallet_scan_nonce = self.wallet_scan_nonce;
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let worker_cancel_requested = Arc::clone(&cancel_requested);
         let (sender, receiver) = mpsc::channel();
 
         thread::spawn(move || {
+            if worker_cancel_requested.load(Ordering::Acquire) {
+                let _ = sender.send(Err(String::from("wallet scan cancelled")));
+                return;
+            }
             let wallet_addresses_cache = if let Some(wallet) = wallet_for_scan {
                 wallet.discovery_addresses_up_to(scan_limit)
             } else {
                 wallet_addresses_cache
             };
+            if worker_cancel_requested.load(Ordering::Acquire) {
+                let _ = sender.send(Err(String::from("wallet scan cancelled")));
+                return;
+            }
             let receive_addresses = wallet_addresses_cache
                 .iter()
                 .filter(|address| address.path.kind == AddressKind::Receive)
@@ -1448,15 +1479,28 @@ impl DesktopApp {
                 receive_addresses,
                 wallet_scan_nonce,
                 scan_limit,
+                worker_cancel_requested,
             );
             let _ = sender.send(result);
         });
 
         self.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now(),
+            cancel_requested,
             receiver,
         });
         self.wallet_cache_dirty = false;
+    }
+
+    fn cancel_wallet_scan_job(&mut self, reason: &str) {
+        let Some(job) = self.wallet_scan_job.take() else {
+            return;
+        };
+        job.cancel_requested.store(true, Ordering::Release);
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!("wallet scan cancelled reason={reason}"),
+        );
     }
 
     fn apply_wallet_scan_outcome(&mut self, outcome: WalletScanOutcome) {
@@ -1516,6 +1560,16 @@ impl DesktopApp {
                 self.apply_wallet_scan_outcome(outcome);
             }
             Ok(Err(err)) => {
+                if err.contains("wallet scan cancelled") {
+                    self.wallet_cache_dirty = true;
+                    self.release_wallet_readiness_gate("wallet scan cancelled");
+                    self.last_wallet_refresh_at = Instant::now();
+                    let _ = atho_node::dev::append_log(
+                        "atho-qt",
+                        &format!("wallet scan cancelled error={err}"),
+                    );
+                    return;
+                }
                 if err.contains("node RPC is not ready")
                     || err.contains("backend state changed during refresh")
                 {
@@ -1579,12 +1633,7 @@ impl DesktopApp {
             return;
         }
         if !self.wallet_scan_rpc_ready() {
-            if self.wallet_scan_job.take().is_some() {
-                let _ = atho_node::dev::append_log(
-                    "atho-qt",
-                    "wallet scan job dropped because RPC is not ready",
-                );
-            }
+            self.cancel_wallet_scan_job("wallet scan RPC not ready");
             self.release_wallet_readiness_gate("wallet scan RPC not ready");
             return;
         }
@@ -1606,7 +1655,7 @@ impl DesktopApp {
     }
 
     fn wallet_scan_rpc_ready(&self) -> bool {
-        self.ui_state.connected && self.view_model.running
+        self.ui_state.connected && self.view_model.running && self.view_model.chain_synced()
     }
 
     fn wallet_scan_height(status: &ConnectionStatus) -> u64 {
@@ -7053,6 +7102,77 @@ mod tests {
     }
 
     #[test]
+    fn wallet_scan_waits_for_public_network_to_finish_syncing() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Mainnet);
+        app.wallet = Some(Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[5u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Mainnet,
+        ));
+        app.wallet_cache_dirty = true;
+        app.last_wallet_refresh_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+
+        let unsynced = ConnectionStatus {
+            network: Network::Mainnet,
+            rpc_address: String::from("127.0.0.1:18444"),
+            block_count: 42,
+            tip_hash: [0x42; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0; 32],
+            peer_count: 1,
+            inbound_peer_count: 0,
+            outbound_peer_count: 1,
+            connecting_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            connecting_peers: Vec::new(),
+            running: true,
+            headers_synced: true,
+            sync_best_height: 100,
+            connected: true,
+            startup_error: None,
+        };
+        app.apply_connection_status(unsynced.clone());
+
+        app.refresh_wallet_cache_if_needed();
+
+        assert!(!app.wallet_scan_rpc_ready());
+        assert!(app.wallet_scan_job.is_none());
+        assert!(app.wallet_cache_dirty);
+
+        app.apply_connection_status(ConnectionStatus {
+            block_count: 100,
+            sync_best_height: 100,
+            ..unsynced
+        });
+        assert!(app.wallet_scan_rpc_ready());
+    }
+
+    #[test]
+    fn clearing_wallet_state_cancels_inflight_wallet_scan() {
+        let mut app = DesktopApp::new(Network::Regnet);
+        let (_sender, receiver) = mpsc::channel();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        app.wallet_scan_job = Some(WalletScanJob {
+            started_at: Instant::now(),
+            cancel_requested: Arc::clone(&cancel_requested),
+            receiver,
+        });
+
+        app.clear_wallet_state();
+
+        assert!(cancel_requested.load(Ordering::Acquire));
+        assert!(app.wallet_scan_job.is_none());
+    }
+
+    #[test]
     fn wallet_readiness_gate_releases_when_rpc_is_not_ready() {
         let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "1");
         let _clear_local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "0");
@@ -7091,6 +7211,7 @@ mod tests {
             started_at: Instant::now()
                 .checked_sub(WALLET_SCAN_STALL_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
             receiver,
         });
         app.wallet_readiness_gate_active = true;
@@ -7145,6 +7266,7 @@ mod tests {
             .expect("send deferred scan result");
         app.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now(),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
             receiver,
         });
 
