@@ -23,6 +23,17 @@ use atho_storage::db::{
 };
 use atho_storage::error::StorageError;
 
+fn chain_trace_enabled() -> bool {
+    matches!(
+        std::env::var("ATHO_DEV_CHAIN_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn should_log_chain_progress(height: u64) -> bool {
+    chain_trace_enabled() || height <= 10 || height % 100 == 0
+}
+
 #[derive(Debug)]
 pub struct Node {
     pub config: NodeConfig,
@@ -155,11 +166,9 @@ impl Node {
     }
 
     pub fn is_canonical_block(&self, block_hash: &[u8; 48]) -> bool {
-        let Some(record) = self.block_record_by_hash(*block_hash) else {
-            return false;
-        };
-        self.block_record_by_height(record.height)
-            .is_some_and(|canonical| canonical.block_hash == *block_hash)
+        self.chainstate
+            .is_canonical_block(*block_hash)
+            .unwrap_or(false)
     }
 
     pub fn known_block_height(&self, block_hash: &[u8; 48]) -> Option<u64> {
@@ -467,14 +476,19 @@ impl Node {
         self.mempool.remove_block_transactions(block);
         self.revalidate_mempool_if_needed();
         let mempool_count = self.mempool.len();
-        let _ = dev::record_block(self.chainstate.height, block);
-        let _ = dev::append_log(
-            "chain",
-            &format!(
-                "connected mempool={mempool_count} {}",
-                dev::summarize_block(block)
-            ),
-        );
+        if chain_trace_enabled() {
+            let _ = dev::record_block(self.chainstate.height, block);
+        } else if should_log_chain_progress(self.chainstate.height) {
+            let _ = dev::append_log(
+                "chain",
+                &format!(
+                    "connected height={} hash={} txs={} mempool={mempool_count}",
+                    self.chainstate.height,
+                    hex::encode(block.header.block_hash()),
+                    block.transactions.len()
+                ),
+            );
+        }
         Ok(())
     }
 

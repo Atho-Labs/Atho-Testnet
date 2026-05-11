@@ -12,6 +12,7 @@ use atho_core::consensus::{pow, rules};
 use atho_core::constants::{MAX_REORG_DEPTH_BLOCKS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,6 +72,7 @@ pub struct Chainstate {
     pub tip_hash: [u8; 48],
     pub height: u64,
     blocks: Vec<Block>,
+    block_index_by_hash: BTreeMap<[u8; 48], usize>,
     utxos: UtxoSet,
     undo_stack: Vec<ChainUndo>,
     storage: Option<Database>,
@@ -104,12 +106,15 @@ impl Chainstate {
                 0,
             ))
             .expect("genesis utxo is network-local and unique");
+        let blocks = vec![genesis_block];
+        let block_index_by_hash = build_block_index_by_hash(&blocks);
         Self {
             network,
             tip: Some(genesis_header),
             tip_hash: genesis.block_hash,
             height: 0,
-            blocks: vec![genesis_block],
+            blocks,
+            block_index_by_hash,
             utxos,
             undo_stack: Vec::new(),
             storage,
@@ -174,7 +179,12 @@ impl Chainstate {
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
-        let working_utxos = self.utxos.clone();
+        let working_utxos = if block.transactions.len() == 1 && block.transactions[0].is_coinbase()
+        {
+            UtxoSet::new(self.network)
+        } else {
+            self.utxos.clone()
+        };
         validation::validate_block_with_context(
             block,
             self.height.saturating_add(1),
@@ -195,9 +205,8 @@ impl Chainstate {
                 tip_hash: next_tip_hash,
                 tip_header: Some(block.header.clone()),
             };
-            let utxos: Vec<_> = self.utxos.entries().cloned().collect();
             if let Err(err) =
-                storage.commit_chainstate(&snapshot, &utxos, Some((block.header.height, block)))
+                storage.commit_chainstate(&snapshot, &[], Some((block.header.height, block)))
             {
                 self.utxos.disconnect_block(undo);
                 return Err(err);
@@ -207,6 +216,8 @@ impl Chainstate {
         self.tip = Some(block.header.clone());
         self.tip_hash = next_tip_hash;
         self.height = block.header.height;
+        self.block_index_by_hash
+            .insert(next_tip_hash, self.blocks.len());
         self.blocks.push(block.clone());
         self.undo_stack.push(ChainUndo {
             previous_tip,
@@ -262,6 +273,13 @@ impl Chainstate {
                     && self.undo_stack.len() >= disconnected.len()
             })
             .unwrap_or(false);
+        if disconnected.is_empty() {
+            self.extend_with_validated_branch(branch)?;
+            return Ok(ChainSelectionResult {
+                outcome: ChainSelectionOutcome::Extended,
+                disconnected,
+            });
+        }
         if !can_switch_incrementally {
             self.replace_with_validated_branch(fork_height, branch)?;
             return Ok(ChainSelectionResult {
@@ -332,6 +350,20 @@ impl Chainstate {
         })
     }
 
+    fn extend_with_validated_branch(&mut self, branch: &[Block]) -> Result<(), StorageError> {
+        let mut connected = 0usize;
+        for block in branch {
+            if let Err(err) = self.connect_block(block) {
+                for _ in 0..connected {
+                    self.disconnect_last_block()?;
+                }
+                return Err(err);
+            }
+            connected = connected.saturating_add(1);
+        }
+        Ok(())
+    }
+
     pub fn utxo_snapshot(&self) -> UtxoSet {
         self.utxos.clone()
     }
@@ -341,13 +373,8 @@ impl Chainstate {
     }
 
     pub fn block_by_hash(&self, block_hash: [u8; 48]) -> Result<Option<Block>, StorageError> {
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .find(|block| block.header.block_hash() == block_hash)
-            .cloned()
-        {
-            return Ok(Some(block));
+        if let Some(index) = self.block_index_by_hash.get(&block_hash).copied() {
+            return Ok(self.blocks.get(index).cloned());
         }
         let Some(storage) = &self.storage else {
             return Ok(None);
@@ -357,6 +384,24 @@ impl Chainstate {
 
     pub fn contains_block(&self, block_hash: [u8; 48]) -> Result<bool, StorageError> {
         Ok(self.block_by_hash(block_hash)?.is_some())
+    }
+
+    pub fn is_canonical_block(&self, block_hash: [u8; 48]) -> Result<bool, StorageError> {
+        if self.block_index_by_hash.contains_key(&block_hash) {
+            return Ok(true);
+        }
+        let Some(storage) = &self.storage else {
+            return Ok(false);
+        };
+        let Some(record) = storage.load_block_record(block_hash)? else {
+            return Ok(false);
+        };
+        if !record.main_chain {
+            return Ok(false);
+        }
+        Ok(storage
+            .load_block_hash_by_height(record.height)?
+            .is_some_and(|canonical_hash| canonical_hash == block_hash))
     }
 
     pub fn block_record_by_hash(
@@ -406,11 +451,8 @@ impl Chainstate {
         &self,
         height: u64,
     ) -> Result<Option<BlockArchiveRecord>, StorageError> {
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .find(|block| block.header.height == height)
-        {
+        if let Some(index) = self.memory_block_index_for_height(height) {
+            let block = &self.blocks[index];
             return self.block_record_by_hash(block.header.block_hash());
         }
         let Some(storage) = &self.storage else {
@@ -499,6 +541,7 @@ impl Chainstate {
         self.tip_hash = bundle.snapshot.tip_hash;
         self.height = bundle.snapshot.height;
         self.blocks = bundle.blocks;
+        self.block_index_by_hash = build_block_index_by_hash(&self.blocks);
         self.utxos = utxos;
         self.undo_stack.clear();
         self.prune_history();
@@ -573,13 +616,8 @@ impl Chainstate {
     }
 
     pub fn block_by_height(&self, height: u64) -> Result<Option<Block>, StorageError> {
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .find(|block| block.header.height == height)
-            .cloned()
-        {
-            return Ok(Some(block));
+        if let Some(index) = self.memory_block_index_for_height(height) {
+            return Ok(self.blocks.get(index).cloned());
         }
         let Some(storage) = &self.storage else {
             return Ok(None);
@@ -588,6 +626,16 @@ impl Chainstate {
             return Ok(None);
         };
         storage.load_block(block_hash)
+    }
+
+    fn memory_block_index_for_height(&self, height: u64) -> Option<usize> {
+        let first_height = self.blocks.first()?.header.height;
+        let offset = height.checked_sub(first_height)?;
+        let index = usize::try_from(offset).ok()?;
+        self.blocks
+            .get(index)
+            .is_some_and(|block| block.header.height == height)
+            .then_some(index)
     }
 
     pub fn headers_after_locator(
@@ -759,6 +807,8 @@ impl Chainstate {
 
         let _ = self.undo_stack.pop();
         let _ = self.blocks.pop();
+        self.block_index_by_hash
+            .remove(&removed_block.header.block_hash());
         self.tip = undo.previous_tip;
         self.tip_hash = undo.previous_tip_hash;
         self.height = previous_height;
@@ -781,6 +831,9 @@ impl Chainstate {
         let prune_depth = effective_prune_depth(self.network);
         let retain = usize::try_from(prune_depth.saturating_add(1)).unwrap_or(usize::MAX);
         self.prune_history_to_retain(retain);
+        if self.height < prune_depth {
+            return;
+        }
         if let Some(storage) = &self.storage {
             match storage.prune_archived_blocks(self.height, prune_depth) {
                 Ok(report) => {
@@ -805,6 +858,7 @@ impl Chainstate {
         self.blocks.drain(1..1 + prune_count);
         let undo_prune_count = prune_count.min(self.undo_stack.len());
         self.undo_stack.drain(0..undo_prune_count);
+        self.block_index_by_hash = build_block_index_by_hash(&self.blocks);
     }
 
     fn save_persisted_chainstate(&self) -> Result<(), StorageError> {
@@ -842,18 +896,15 @@ impl Chainstate {
         self.tip_hash = tip_hash;
         self.height = height;
         self.blocks = blocks;
+        self.block_index_by_hash = build_block_index_by_hash(&self.blocks);
         self.utxos = utxos;
         self.undo_stack = undo_stack;
         self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
     }
 
     pub fn known_block_height(&self, block_hash: [u8; 48]) -> Option<u64> {
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .find(|block| block.header.block_hash() == block_hash)
-        {
-            return Some(block.header.height);
+        if let Some(index) = self.block_index_by_hash.get(&block_hash).copied() {
+            return self.blocks.get(index).map(|block| block.header.height);
         }
         self.storage
             .as_ref()
@@ -927,6 +978,7 @@ impl Chainstate {
         self.tip_hash = validated.tip_hash;
         self.height = validated.height;
         self.blocks = validated.blocks;
+        self.block_index_by_hash = validated.block_index_by_hash;
         self.utxos = validated.utxos;
         self.undo_stack = validated.undo_stack;
         self.prune_history();
@@ -989,6 +1041,7 @@ impl PersistedChainstate {
             Some(db) => rehydrate_undo_stack_from_storage(network, db, &blocks, &utxos)?,
             None => Vec::new(),
         };
+        let block_index_by_hash = build_block_index_by_hash(&blocks);
 
         Ok(Chainstate {
             network,
@@ -996,6 +1049,7 @@ impl PersistedChainstate {
             tip_hash: self.tip_hash,
             height: self.height,
             blocks,
+            block_index_by_hash,
             utxos,
             undo_stack,
             storage,
@@ -1003,6 +1057,14 @@ impl PersistedChainstate {
             last_prune_error: None,
         })
     }
+}
+
+fn build_block_index_by_hash(blocks: &[Block]) -> BTreeMap<[u8; 48], usize> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.header.block_hash(), index))
+        .collect()
 }
 
 fn validate_replacement_chain(

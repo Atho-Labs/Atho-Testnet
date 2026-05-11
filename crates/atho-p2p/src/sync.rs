@@ -4,6 +4,9 @@ use crate::protocol::{GetHeadersMessage, Hash48, ProtocolError};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::network::Network;
+use std::collections::BTreeMap;
+
+const MAX_OUTSTANDING_HEADER_LOCATORS_PER_PEER: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncState {
@@ -13,6 +16,7 @@ pub struct SyncState {
     pub inflight_headers_peer: Option<String>,
     pub locator_hashes: Vec<Hash48>,
     pub(crate) requested_locator_hashes: Vec<Hash48>,
+    pub(crate) requested_locator_hashes_by_peer: BTreeMap<String, Vec<Vec<Hash48>>>,
 }
 
 impl SyncState {
@@ -33,7 +37,7 @@ impl SyncState {
         self.best_height = best_height;
         self.best_tip = best_tip;
         self.locator_hashes = locator_hashes;
-        self.requested_locator_hashes.clear();
+        self.clear_requested_header_locators();
         self.headers_synced = true;
         crate::audit::append_log(
             "p2p",
@@ -53,6 +57,14 @@ impl SyncState {
         let peer = peer.into();
         self.inflight_headers_peer = Some(peer.clone());
         self.requested_locator_hashes = self.locator_hashes.clone();
+        let peer_locators = self
+            .requested_locator_hashes_by_peer
+            .entry(peer.clone())
+            .or_default();
+        peer_locators.push(self.locator_hashes.clone());
+        while peer_locators.len() > MAX_OUTSTANDING_HEADER_LOCATORS_PER_PEER {
+            peer_locators.remove(0);
+        }
         crate::audit::append_log(
             "p2p",
             &format!(
@@ -72,14 +84,68 @@ impl SyncState {
         network: Network,
         headers: &[BlockHeader],
     ) -> Result<(), ProtocolError> {
+        self.accept_headers_with_locator(network, headers, self.requested_locator_hashes.clone())?;
+        self.clear_requested_header_locators();
+        Ok(())
+    }
+
+    pub fn accept_headers_from_peer(
+        &mut self,
+        peer: &str,
+        network: Network,
+        headers: &[BlockHeader],
+    ) -> Result<(), ProtocolError> {
+        let requested_locator_hashes = self
+            .take_requested_locator_for_headers(peer, headers)
+            .unwrap_or_else(|| self.requested_locator_hashes.clone());
+        self.accept_headers_with_locator(network, headers, requested_locator_hashes)?;
+        if self.inflight_headers_peer.as_deref() == Some(peer) {
+            self.inflight_headers_peer = None;
+        }
+        Ok(())
+    }
+
+    fn take_requested_locator_for_headers(
+        &mut self,
+        peer: &str,
+        headers: &[BlockHeader],
+    ) -> Option<Vec<Hash48>> {
+        let mut locators = self.requested_locator_hashes_by_peer.remove(peer)?;
+        let mut matched_pos = None;
+        let locator = if let Some(first) = headers.first() {
+            let previous_hash = Hash48::from(first.previous_block_hash);
+            matched_pos = locators
+                .iter()
+                .position(|locator| locator.contains(&previous_hash));
+            match matched_pos {
+                Some(index) => locators.remove(index),
+                None => locators.first().cloned().unwrap_or_default(),
+            }
+        } else if locators.is_empty() {
+            Vec::new()
+        } else {
+            matched_pos = Some(0);
+            locators.remove(0)
+        };
+        if !locators.is_empty() || matched_pos.is_none() {
+            self.requested_locator_hashes_by_peer
+                .insert(peer.to_string(), locators);
+        }
+        Some(locator)
+    }
+
+    fn accept_headers_with_locator(
+        &mut self,
+        network: Network,
+        headers: &[BlockHeader],
+        requested_locator_hashes: Vec<Hash48>,
+    ) -> Result<(), ProtocolError> {
         if headers.len() > network_params(network).limits.max_headers_per_message {
             return Err(ProtocolError::TooManyHeaders);
         }
         if let Some(first) = headers.first() {
-            if !self.requested_locator_hashes.is_empty()
-                && !self
-                    .requested_locator_hashes
-                    .contains(&Hash48::from(first.previous_block_hash))
+            if !requested_locator_hashes.is_empty()
+                && !requested_locator_hashes.contains(&Hash48::from(first.previous_block_hash))
             {
                 return Err(ProtocolError::InvalidHeadersSequence);
             }
@@ -114,8 +180,6 @@ impl SyncState {
             self.locator_hashes
                 .insert(0, Hash48::from(last.block_hash()));
             self.locator_hashes.truncate(32);
-            self.inflight_headers_peer = None;
-            self.requested_locator_hashes.clear();
             crate::audit::append_log(
                 "p2p",
                 &format!(
@@ -127,10 +191,14 @@ impl SyncState {
             );
         } else {
             self.headers_synced = true;
-            self.inflight_headers_peer = None;
-            self.requested_locator_hashes.clear();
         }
         Ok(())
+    }
+
+    pub fn clear_requested_header_locators(&mut self) {
+        self.inflight_headers_peer = None;
+        self.requested_locator_hashes.clear();
+        self.requested_locator_hashes_by_peer.clear();
     }
 }
 
@@ -329,5 +397,37 @@ mod tests {
             state.accept_headers(Network::Mainnet, &[header]),
             Err(ProtocolError::InvalidHeadersSequence)
         );
+    }
+
+    #[test]
+    fn concurrent_header_responses_use_each_peers_locator() {
+        let mut state = SyncState {
+            locator_hashes: vec![Hash48::from([9; 48])],
+            ..Default::default()
+        };
+        state.request_headers("first", [0; 48]);
+        state.locator_hashes = vec![Hash48::from([1; 48])];
+        state.request_headers("second", [0; 48]);
+
+        let header = solved_header(Network::Mainnet, 335, [9; 48]);
+        state
+            .accept_headers_from_peer("first", Network::Mainnet, &[header])
+            .expect("late first peer response should use first peer locator");
+    }
+
+    #[test]
+    fn overlapping_header_responses_from_same_peer_keep_older_locator() {
+        let mut state = SyncState {
+            locator_hashes: vec![Hash48::from([9; 48])],
+            ..Default::default()
+        };
+        state.request_headers("peer", [0; 48]);
+        state.locator_hashes = vec![Hash48::from([1; 48])];
+        state.request_headers("peer", [0; 48]);
+
+        let header = solved_header(Network::Mainnet, 335, [9; 48]);
+        state
+            .accept_headers_from_peer("peer", Network::Mainnet, &[header])
+            .expect("late response should match any outstanding locator for that peer");
     }
 }

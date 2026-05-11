@@ -624,6 +624,41 @@ fn spawn_peer_thread(
                 if stop_requested.load(Ordering::Acquire) {
                     return String::from("runtime stopping");
                 }
+                if handshake_ready
+                    && last_sync_maintenance.elapsed().unwrap_or_default()
+                        >= sync_maintenance_interval(peer_network)
+                {
+                    let events = {
+                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        match state.p2p_maintain_peer_sync(&peer_id) {
+                            Ok(events) => events,
+                            Err(err) => {
+                                return format!(
+                                    "sync maintenance failed peer={peer_id} error={err}"
+                                );
+                            }
+                        }
+                    };
+                    if let Some(reason) = disconnect_event_for_peer(&events, &peer_id) {
+                        return format!(
+                            "sync maintenance disconnect peer={peer_id} reason={reason}"
+                        );
+                    }
+                    let bytes_sent = match flush_send_events(&mut stream, &peer_id, events) {
+                        Ok(bytes_sent) => bytes_sent,
+                        Err(err) => {
+                            return format!(
+                                "sync maintenance send failed peer={peer_id} error={err}"
+                            );
+                        }
+                    };
+                    if bytes_sent > 0 {
+                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        state.p2p_note_bytes_sent(&peer_id, bytes_sent);
+                        last_activity = SystemTime::now();
+                    }
+                    last_sync_maintenance = SystemTime::now();
+                }
                 let message = match read_message(&mut stream, peer_network) {
                     Ok(Some((message, bytes_received))) => {
                         if bytes_received > 0 {
@@ -685,42 +720,6 @@ fn spawn_peer_thread(
                             }
                         }
                         if handshake_ready
-                            && last_sync_maintenance.elapsed().unwrap_or_default()
-                                >= sync_maintenance_interval(peer_network)
-                        {
-                            let events = {
-                                let mut state = state.lock().expect("p2p runtime state poisoned");
-                                match state.p2p_maintain_peer_sync(&peer_id) {
-                                    Ok(events) => events,
-                                    Err(err) => {
-                                        return format!(
-                                            "sync maintenance failed peer={peer_id} error={err}"
-                                        );
-                                    }
-                                }
-                            };
-                            if let Some(reason) = disconnect_event_for_peer(&events, &peer_id) {
-                                return format!(
-                                    "sync maintenance disconnect peer={peer_id} reason={reason}"
-                                );
-                            }
-                            let bytes_sent = match flush_send_events(&mut stream, &peer_id, events)
-                            {
-                                Ok(bytes_sent) => bytes_sent,
-                                Err(err) => {
-                                    return format!(
-                                        "sync maintenance send failed peer={peer_id} error={err}"
-                                    );
-                                }
-                            };
-                            if bytes_sent > 0 {
-                                let mut state = state.lock().expect("p2p runtime state poisoned");
-                                state.p2p_note_bytes_sent(&peer_id, bytes_sent);
-                                last_activity = SystemTime::now();
-                            }
-                            last_sync_maintenance = SystemTime::now();
-                        }
-                        if handshake_ready
                             && last_activity.elapsed().unwrap_or_default() >= KEEPALIVE_INTERVAL
                         {
                             let keepalive = NetworkMessage::new(
@@ -741,12 +740,15 @@ fn spawn_peer_thread(
                                 let mut state = state.lock().expect("p2p runtime state poisoned");
                                 state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                                 last_activity = SystemTime::now();
-                                let _ = dev::append_log(
-                                    "p2p",
-                                    &format!("keepalive ping sent peer={peer_id}"),
-                                );
+                                if std::env::var_os("ATHO_P2P_TRACE_MESSAGES").is_some() {
+                                    let _ = dev::append_log(
+                                        "p2p",
+                                        &format!("keepalive ping sent peer={peer_id}"),
+                                    );
+                                }
                             }
                         }
+                        thread::sleep(Duration::from_millis(5));
                         continue;
                     }
                     Err(err) => {
@@ -916,6 +918,9 @@ fn disconnect_event_for_peer(events: &[ConnectionEvent], peer_id: &str) -> Optio
 }
 
 fn log_peer_message(direction: &str, peer_id: &str, message: &NetworkMessage, bytes: usize) {
+    if !should_log_peer_message(message) {
+        return;
+    }
     let _ = dev::append_log(
         "p2p",
         &format!(
@@ -926,6 +931,21 @@ fn log_peer_message(direction: &str, peer_id: &str, message: &NetworkMessage, by
             message_payload_summary(&message.payload)
         ),
     );
+}
+
+fn should_log_peer_message(message: &NetworkMessage) -> bool {
+    if std::env::var_os("ATHO_P2P_TRACE_MESSAGES").is_some() {
+        return true;
+    }
+    matches!(
+        &message.payload,
+        MessagePayload::Version(_)
+            | MessagePayload::Verack
+            | MessagePayload::GetHeaders(_)
+            | MessagePayload::Headers { .. }
+            | MessagePayload::GetAddr
+            | MessagePayload::Addr { .. }
+    )
 }
 
 fn message_payload_summary(payload: &MessagePayload) -> String {
@@ -1084,6 +1104,7 @@ fn read_exact_with_timeouts(
                         "peer stalled while sending frame",
                     )));
                 }
+                thread::sleep(Duration::from_millis(5));
                 continue;
             }
             Err(err) => return Err(TcpP2pError::Io(err)),

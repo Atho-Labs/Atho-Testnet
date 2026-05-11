@@ -5,6 +5,7 @@ use crate::node::Node;
 use crate::validation::{finalize_witness_commit_refs, ValidationError};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
+use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT};
 use atho_core::network::Network;
 use atho_p2p::config::network_params;
 use atho_p2p::connection::{ConnectionDirection, ConnectionEvent, ConnectionManager};
@@ -26,7 +27,7 @@ const SYNC_METRICS_LOG_INTERVAL_SECS: u64 = 10;
 const MAX_SIDE_BRANCH_BLOCKS: usize = 4_096;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS: usize = 32;
+const MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS: usize = 256;
 const MAX_ORPHAN_PARENT_REQUESTS_PER_PASS: usize = 16;
 const BRIDGE_PARENT_STAGE_LOOKAHEAD: u64 = 128;
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
@@ -143,9 +144,11 @@ pub struct NodeSync {
     addr_relay_last_sent_unix: BTreeMap<String, u64>,
     last_observed_tip: Option<[u8; 48]>,
     last_block_progress_unix: u64,
+    last_block_body_received_unix: u64,
     last_sync_metrics_log_unix: u64,
     last_stale_recovery_unix: u64,
     stale_recovery_count: u64,
+    last_urgent_bridge_parent_request_unix: BTreeMap<[u8; 48], u64>,
     block_validation_states: BTreeMap<[u8; 48], BlockValidationState>,
     block_validation_heights: BTreeMap<[u8; 48], u64>,
 }
@@ -161,6 +164,7 @@ struct PendingCompactBlock {
 struct SideBranchPool {
     blocks: BTreeMap<[u8; 48], SideBranchBlock>,
     children_by_parent: BTreeMap<[u8; 48], BTreeSet<[u8; 48]>>,
+    total_size_bytes: usize,
     next_seen_order: u64,
 }
 
@@ -191,6 +195,7 @@ impl SideBranchPool {
             return;
         }
 
+        let block_size = block.full_size_bytes();
         self.children_by_parent
             .entry(previous_hash)
             .or_default()
@@ -204,11 +209,15 @@ impl SideBranchPool {
                 last_seen_order: seen_order,
             },
         );
+        self.total_size_bytes = self.total_size_bytes.saturating_add(block_size);
         self.enforce_limit();
     }
 
     fn remove(&mut self, block_hash: &[u8; 48]) -> Option<Block> {
         let entry = self.blocks.remove(block_hash)?;
+        self.total_size_bytes = self
+            .total_size_bytes
+            .saturating_sub(entry.block.full_size_bytes());
         let previous_hash = entry.block.header.previous_block_hash;
         let remove_parent_entry =
             if let Some(children) = self.children_by_parent.get_mut(&previous_hash) {
@@ -236,10 +245,7 @@ impl SideBranchPool {
     }
 
     fn total_size_bytes(&self) -> usize {
-        self.blocks
-            .values()
-            .map(|entry| entry.block.full_size_bytes())
-            .sum()
+        self.total_size_bytes
     }
 
     fn max_height(&self) -> Option<u64> {
@@ -343,9 +349,11 @@ impl NodeSync {
             addr_relay_last_sent_unix: BTreeMap::new(),
             last_observed_tip: None,
             last_block_progress_unix: 0,
+            last_block_body_received_unix: 0,
             last_sync_metrics_log_unix: 0,
             last_stale_recovery_unix: 0,
             stale_recovery_count: 0,
+            last_urgent_bridge_parent_request_unix: BTreeMap::new(),
             block_validation_states: BTreeMap::new(),
             block_validation_heights: BTreeMap::new(),
         }
@@ -590,6 +598,7 @@ impl NodeSync {
         self.prune_pending_compact_blocks();
         self.refresh_sync_target_from_live_peers(node);
         self.update_sync_progress_watchdog(node);
+        self.prune_completed_download_work(node);
         self.log_sync_metrics_if_due(node);
         if let Some(event) = self.header_timeout_disconnect_event(remote_addr, node) {
             outbound.push(event);
@@ -602,6 +611,7 @@ impl NodeSync {
             .downloader
             .requeue_stale_inflight_for_peer(remote_addr, self.block_request_retry_timeout());
         if !stale_downloads.is_empty() {
+            self.prioritize_pending_downloads_by_height();
             let first_hash = stale_downloads
                 .first()
                 .map(|download| short_hash(&download.hash.into_inner()))
@@ -628,19 +638,19 @@ impl NodeSync {
             let _ = dev::append_log(
                 "p2p",
                 &format!(
-                    "sync maintenance timed out block requests peer={} count={} first_hash={}",
+                    "sync maintenance retrying timed out block requests peer={} count={} first_hash={}",
                     remote_addr,
                     stale_downloads.len(),
                     first_hash
                 ),
             );
-            outbound.push(ConnectionEvent::Disconnect {
-                peer: remote_addr.to_string(),
-                reason: format!(
-                    "block download timeout count={} first_hash={first_hash}",
-                    stale_downloads.len()
-                ),
-            });
+            self.heal_buffered_branch_parents(None, node, &mut outbound);
+            self.push_scheduled_block_requests(node, &mut outbound);
+            if self.should_rehydrate_headers_from_local_tip(remote_addr, node) {
+                self.reseed_locator_from_node(node);
+                self.queue_getheaders(remote_addr, &mut outbound);
+            }
+            self.push_address_discovery_events(remote_addr, node, &mut outbound);
             return Ok(outbound);
         }
         self.heal_buffered_branch_parents(Some(remote_addr), node, &mut outbound);
@@ -688,6 +698,30 @@ impl NodeSync {
         network_params(self.network).limits.block_download_lookahead
     }
 
+    fn prune_completed_download_work(&mut self, node: &Node) {
+        let pruned = self.downloader.prune_completed_where(|hash| {
+            let hash = (*hash).into_inner();
+            node.is_canonical_block(&hash) || node.block_by_hash(hash).is_some()
+        });
+        if pruned > 0 {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "sync maintenance pruned completed download work count={} local_height={}",
+                    pruned,
+                    node.height()
+                ),
+            );
+        }
+    }
+
+    fn prioritize_pending_downloads_by_height(&mut self) {
+        let heights = self.block_validation_heights.clone();
+        self.downloader.sort_pending_by_key(|hash| {
+            heights.get(&hash.into_inner()).copied().unwrap_or(u64::MAX)
+        });
+    }
+
     fn block_request_batch_limit(&self) -> usize {
         network_params(self.network)
             .limits
@@ -696,7 +730,11 @@ impl NodeSync {
     }
 
     fn buffered_parent_bridge_active(&self, node: &Node) -> bool {
-        !self.side_branches.is_empty() && !self.missing_buffered_parent_hashes(node).is_empty()
+        if self.side_branches.is_empty() || self.missing_buffered_parent_hashes(node).is_empty() {
+            return false;
+        }
+        let stale_after = self.block_request_retry_timeout().as_secs().min(2).max(1);
+        now_unix().saturating_sub(self.last_block_progress_unix) >= stale_after
     }
 
     fn effective_max_requests_per_peer(&self, node: &Node) -> usize {
@@ -847,6 +885,13 @@ impl NodeSync {
         self.update_sync_progress_watchdog(node);
     }
 
+    fn note_block_body_progress(&mut self, peer: &str, requested: bool) {
+        self.last_block_body_received_unix = now_unix();
+        if requested {
+            self.downloader.note_peer_delivery_progress(peer);
+        }
+    }
+
     fn update_sync_progress_watchdog(&mut self, node: &Node) {
         let tip = node.tip_hash();
         if self.last_observed_tip != Some(tip) {
@@ -875,6 +920,11 @@ impl NodeSync {
 
         self.last_sync_metrics_log_unix = now;
         let progress_age = now.saturating_sub(self.last_block_progress_unix);
+        let body_age = if self.last_block_body_received_unix == 0 {
+            0
+        } else {
+            now.saturating_sub(self.last_block_body_received_unix)
+        };
         let finalized_checkpoint = node.finalized_checkpoint().ok().flatten();
         let finalized_height = finalized_checkpoint
             .as_ref()
@@ -888,7 +938,7 @@ impl NodeSync {
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "sync metrics local_height={} target_height={} headers_synced={} ready_peers={} pending_blocks={} inflight_blocks={} pending_header_heights={} side_branch_blocks={} pending_compact={} penalized_peers={} stale_recoveries={} last_progress_age_secs={} max_reorg_depth={} finalized_height={} finalized_hash={} sync_mode={} validation_status={} downloaded_body_height={} validation_lag={} pending_validation={} untrusted_bytes={} safe_to_mine={}",
+                "sync metrics local_height={} target_height={} headers_synced={} ready_peers={} pending_blocks={} inflight_blocks={} pending_header_heights={} side_branch_blocks={} pending_compact={} penalized_peers={} stale_recoveries={} last_progress_age_secs={} last_body_age_secs={} max_reorg_depth={} finalized_height={} finalized_hash={} sync_mode={} validation_status={} downloaded_body_height={} validation_lag={} pending_validation={} untrusted_bytes={} safe_to_mine={}",
                 node.height(),
                 self.sync_state().best_height,
                 self.sync_state().headers_synced,
@@ -901,6 +951,7 @@ impl NodeSync {
                 stats.penalized_peers,
                 self.stale_recovery_count,
                 progress_age,
+                body_age,
                 node.max_reorg_depth(),
                 finalized_height,
                 finalized_hash,
@@ -932,8 +983,11 @@ impl NodeSync {
 
         let now = now_unix();
         let retry_timeout = self.block_request_retry_timeout();
-        let stale_after = retry_timeout.as_secs().saturating_mul(2).max(12);
-        if now.saturating_sub(self.last_block_progress_unix) < stale_after {
+        let stale_after = retry_timeout.as_secs().saturating_mul(4).max(30);
+        let last_network_progress = self
+            .last_block_progress_unix
+            .max(self.last_block_body_received_unix);
+        if now.saturating_sub(last_network_progress) < stale_after {
             return false;
         }
         if now.saturating_sub(self.last_stale_recovery_unix) < retry_timeout.as_secs().max(1) {
@@ -953,7 +1007,10 @@ impl NodeSync {
         self.stale_recovery_count = self.stale_recovery_count.saturating_add(1);
         let requeued = self
             .downloader
-            .requeue_stale_inflight_details(Duration::ZERO);
+            .requeue_stale_inflight_details(retry_timeout);
+        if !requeued.is_empty() {
+            self.prioritize_pending_downloads_by_height();
+        }
         let first_hash = requeued
             .first()
             .map(|download| short_hash(&download.hash.into_inner()))
@@ -970,7 +1027,7 @@ impl NodeSync {
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "sync stale recovery peer={} local_height={} target_height={} requeued={} first_hash={} pending_blocks={} inflight_blocks={} pending_header_heights={} ready_peers={} last_progress_age_secs={} finalized_height={} finalized_hash={}",
+                "sync stale recovery peer={} local_height={} target_height={} requeued={} first_hash={} pending_blocks={} inflight_blocks={} pending_header_heights={} ready_peers={} last_progress_age_secs={} last_body_age_secs={} finalized_height={} finalized_hash={}",
                 remote_addr,
                 node.height(),
                 target_height,
@@ -981,6 +1038,11 @@ impl NodeSync {
                 self.pending_header_blocks.len(),
                 stats.ready_peers,
                 now.saturating_sub(self.last_block_progress_unix),
+                if self.last_block_body_received_unix == 0 {
+                    0
+                } else {
+                    now.saturating_sub(self.last_block_body_received_unix)
+                },
                 finalized_height,
                 finalized_hash,
             ),
@@ -1020,6 +1082,14 @@ impl NodeSync {
                 .map(Hash48::from)
                 .collect(),
         );
+    }
+
+    fn header_locator_is_ahead_of_local_tip(&self, node: &Node) -> bool {
+        self.sync_state().locator_hashes.iter().any(|hash| {
+            self.block_validation_heights
+                .get(&hash.into_inner())
+                .is_some_and(|height| *height > node.height())
+        })
     }
 
     fn handle_message(
@@ -1110,7 +1180,7 @@ impl NodeSync {
                         }
                     }
                 }
-                self.relay.accept_headers(&headers)?;
+                self.relay.accept_headers_from_peer(peer, &headers)?;
                 if header_count == 0 && node.height() < self.relay.sync_state().best_height {
                     self.reseed_locator_from_node(node);
                     self.relay.mark_headers_unsynced();
@@ -1416,7 +1486,8 @@ impl NodeSync {
             observed_tip,
         );
         if header.height > node.height()
-            && (header.height > previous_target || previous_headers_synced)
+            && (header.height > previous_target
+                || (previous_headers_synced && should_log_block_progress(header.height)))
         {
             let _ = dev::append_log(
                 "p2p",
@@ -1507,13 +1578,17 @@ impl NodeSync {
         outbound: &mut Vec<ConnectionEvent>,
     ) {
         let missing_parents = self
-            .missing_buffered_parent_hashes(node)
+            .bridge_parent_repair_hashes(node)
             .into_iter()
             .map(Hash48::from)
             .collect::<BTreeSet<_>>();
         if missing_parents.is_empty() {
             return;
         }
+        if self.push_urgent_bridge_parent_retry(peer, node, outbound, &missing_parents, true) {
+            return;
+        }
+        self.prioritize_pending_downloads_by_height();
         let peer_inflight = self.downloader.peer_inflight_len(peer);
         let total_inflight = self.downloader.total_inflight_len();
         let bridge_capacity = self.bridge_parent_request_capacity_for_peer(peer);
@@ -1527,7 +1602,79 @@ impl NodeSync {
             &missing_parents,
         ) {
             self.push_download_assignment(assignment, outbound);
+        } else {
+            self.push_urgent_bridge_parent_retry(peer, node, outbound, &missing_parents, false);
         }
+    }
+
+    fn push_urgent_bridge_parent_retry(
+        &mut self,
+        peer: &str,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+        missing_parents: &BTreeSet<Hash48>,
+        only_if_inflight: bool,
+    ) -> bool {
+        let next_height = node.height().saturating_add(1);
+        let Some(hash) = missing_parents
+            .iter()
+            .copied()
+            .find(|hash| self.download_hash_height(hash.into_inner()) == Some(next_height))
+        else {
+            return false;
+        };
+        let hash_bytes = hash.into_inner();
+        match self.downloader.inflight_peer(hash_bytes) {
+            Some(owner) if owner == peer => return false,
+            Some(_) => {}
+            None if only_if_inflight => return false,
+            None => {}
+        }
+        let now = now_unix();
+        let last_sent = self
+            .last_urgent_bridge_parent_request_unix
+            .get(&hash_bytes)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last_sent) < 2 {
+            return false;
+        }
+        self.last_urgent_bridge_parent_request_unix
+            .insert(hash_bytes, now);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "requesting urgent bridge parent peer={} height={} hash={}",
+                peer,
+                next_height,
+                short_hash(&hash_bytes)
+            ),
+        );
+        outbound.push(ConnectionEvent::Send {
+            peer: peer.to_string(),
+            message: NetworkMessage::new(
+                self.network,
+                MessagePayload::GetData {
+                    inventory: vec![InventoryVector {
+                        kind: InventoryKind::Block,
+                        hash,
+                    }],
+                },
+            ),
+        });
+        true
+    }
+
+    fn download_hash_height(&self, hash: [u8; 48]) -> Option<u64> {
+        self.block_validation_heights
+            .get(&hash)
+            .copied()
+            .or_else(|| {
+                self.side_branches.blocks.values().find_map(|entry| {
+                    (entry.block.header.previous_block_hash == hash)
+                        .then_some(entry.block.header.height.saturating_sub(1))
+                })
+            })
     }
 
     fn push_download_assignment(
@@ -1535,20 +1682,22 @@ impl NodeSync {
         assignment: DownloadAssignment,
         outbound: &mut Vec<ConnectionEvent>,
     ) {
-        let requested = assignment
-            .inventory
-            .iter()
-            .map(|item| short_hash(&item.hash.into_inner()))
-            .collect::<Vec<_>>();
-        let _ = dev::append_log(
-            "p2p",
-            &format!(
-                "requesting blocks peer={} count={} hashes=[{}]",
-                assignment.peer,
-                assignment.inventory.len(),
-                requested.join(",")
-            ),
-        );
+        if p2p_trace_messages_enabled() {
+            let requested = assignment
+                .inventory
+                .iter()
+                .map(|item| short_hash(&item.hash.into_inner()))
+                .collect::<Vec<_>>();
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "requesting blocks peer={} count={} hashes=[{}]",
+                    assignment.peer,
+                    assignment.inventory.len(),
+                    requested.join(",")
+                ),
+            );
+        }
         for item in &assignment.inventory {
             if item.kind == InventoryKind::Block {
                 let hash = item.hash.into_inner();
@@ -1591,7 +1740,10 @@ impl NodeSync {
         if node.height() >= target_height {
             return false;
         }
-        !self.sync_state().headers_synced || self.downloader.is_idle()
+        if !self.sync_state().headers_synced {
+            return self.downloader.is_idle() && self.pending_header_blocks.is_empty();
+        }
+        self.downloader.is_idle()
     }
 
     fn header_request_inflight(&self, remote_addr: &str) -> bool {
@@ -1625,6 +1777,15 @@ impl NodeSync {
         if !timed_out {
             return None;
         }
+        let now = now_unix();
+        if self.last_block_body_received_unix != 0
+            && now.saturating_sub(self.last_block_body_received_unix)
+                < self.headers_request_timeout().as_secs().max(1)
+        {
+            self.header_requests_started
+                .insert(remote_addr.to_string(), SystemTime::now());
+            return None;
+        }
         self.header_requests_started.remove(remote_addr);
         let _ = dev::append_log(
             "p2p",
@@ -1635,13 +1796,7 @@ impl NodeSync {
                 target_height
             ),
         );
-        Some(ConnectionEvent::Disconnect {
-            peer: remote_addr.to_string(),
-            reason: format!(
-                "headers download timeout local_height={} target_height={target_height}",
-                node.height()
-            ),
-        })
+        None
     }
 
     fn queue_getheaders(&mut self, peer: &str, outbound: &mut Vec<ConnectionEvent>) {
@@ -1651,6 +1806,21 @@ impl NodeSync {
             peer: peer.to_string(),
             message: self.relay.build_getheaders(peer.to_string()),
         });
+    }
+
+    fn queue_getheaders_if_needed(
+        &mut self,
+        peer: &str,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        if self.sync_state().headers_synced || self.header_request_inflight(peer) {
+            return;
+        }
+        if !self.header_locator_is_ahead_of_local_tip(node) {
+            self.reseed_locator_from_node(node);
+        }
+        self.queue_getheaders(peer, outbound);
     }
 
     fn should_defer_unsolicited_future_block(
@@ -1686,10 +1856,7 @@ impl NodeSync {
 
         let block_hash = header.block_hash();
         self.note_observed_peer_tip(peer, header, node);
-        if !self.sync_state().headers_synced && !self.header_request_inflight(peer) {
-            self.reseed_locator_from_node(node);
-            self.queue_getheaders(peer, outbound);
-        }
+        self.queue_getheaders_if_needed(peer, node, outbound);
         let _ = dev::append_log(
             "p2p",
             &format!(
@@ -1714,9 +1881,7 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         let block_hash = block.header.block_hash();
         let block_height = block.header.height;
-        if let Err(validation) =
-            crate::validation::validate_block(&block, block.header.height, self.network)
-        {
+        if let Err(validation) = validate_received_block_envelope(&block, self.network) {
             self.mark_block_state(block_hash, block_height, BlockValidationState::Invalid);
             let _ = dev::append_log(
                 "p2p",
@@ -1742,21 +1907,24 @@ impl NodeSync {
             self.pending_compact_blocks.remove(&block_hash);
             return Ok(());
         }
+        self.note_block_body_progress(peer, requested);
         self.mark_block_state(
             block_hash,
             block_height,
             BlockValidationState::BodyDownloaded,
         );
         if node.is_canonical_block(&block_hash) {
-            let _ = dev::append_log(
-                "p2p",
-                &format!(
-                    "received duplicate block peer={} height={} hash={}",
-                    peer,
-                    block.header.height,
-                    short_hash(&block_hash)
-                ),
-            );
+            if p2p_trace_messages_enabled() {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "received duplicate block peer={} height={} hash={}",
+                        peer,
+                        block.header.height,
+                        short_hash(&block_hash)
+                    ),
+                );
+            }
             self.downloader.note_block_received(block_hash);
             self.pending_compact_blocks.remove(&block_hash);
             self.side_branches.remove(&block_hash);
@@ -1788,17 +1956,19 @@ impl NodeSync {
                         BlockValidationState::Connected,
                     );
                     self.mark_finalized_boundary(node);
-                    let _ = dev::append_log(
-                        "p2p",
-                        &format!(
-                            "accepted block peer={} height={} hash={} new_local_height={} target_height={}",
-                            peer,
-                            block.header.height,
-                            short_hash(&block_hash),
-                            node.height(),
-                            self.sync_state().best_height
-                        ),
-                    );
+                    if should_log_block_progress(block.header.height) {
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "accepted block peer={} height={} hash={} new_local_height={} target_height={}",
+                                peer,
+                                block.header.height,
+                                short_hash(&block_hash),
+                                node.height(),
+                                self.sync_state().best_height
+                            ),
+                        );
+                    }
                     self.downloader.note_block_received(block_hash);
                     self.pending_compact_blocks.remove(&block_hash);
                     self.side_branches.remove(&block_hash);
@@ -1847,18 +2017,21 @@ impl NodeSync {
         }
 
         self.note_observed_peer_tip(peer, &block.header, node);
+        self.queue_getheaders_if_needed(peer, node, outbound);
         let previous_hash = block.header.previous_block_hash;
-        let _ = dev::append_log(
-            "p2p",
-            &format!(
-                "buffering block peer={} height={} hash={} prev={} local_tip={}",
-                peer,
-                block.header.height,
-                short_hash(&block_hash),
-                short_hash(&block.header.previous_block_hash),
-                short_hash(&node.tip_hash())
-            ),
-        );
+        if p2p_trace_messages_enabled() {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "buffering block peer={} height={} hash={} prev={} local_tip={}",
+                    peer,
+                    block.header.height,
+                    short_hash(&block_hash),
+                    short_hash(&block.header.previous_block_hash),
+                    short_hash(&node.tip_hash())
+                ),
+            );
+        }
         self.buffer_peer_block_with_known_ancestors(peer, block, node);
         self.mark_block_state(
             block_hash,
@@ -1870,6 +2043,7 @@ impl NodeSync {
         self.remove_pending_header_block(block_height, &block_hash);
         if !node.is_canonical_block(&previous_hash)
             && self.side_branches.get(&previous_hash).is_none()
+            && p2p_trace_messages_enabled()
         {
             let _ = dev::append_log(
                 "p2p",
@@ -1948,8 +2122,12 @@ impl NodeSync {
             }
         }
 
-        let missing_parents = self.missing_buffered_parent_hashes(node);
-        let mut reassigned = 0usize;
+        if !self.buffered_parent_bridge_active(node) {
+            return;
+        }
+
+        let missing_parents = self.bridge_parent_repair_hashes(node);
+        let mut queued = 0usize;
         for parent_hash in missing_parents
             .into_iter()
             .take(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS)
@@ -1957,26 +2135,28 @@ impl NodeSync {
         {
             if self
                 .downloader
-                .reassign_priority_block(preferred_peer, parent_hash)
+                .queue_priority_block(preferred_peer, parent_hash)
             {
-                reassigned = reassigned.saturating_add(1);
-                let _ = dev::append_log(
-                    "p2p",
-                    &format!(
-                        "queued orphan parent request peer={} parent={} reassigned=true",
-                        preferred_peer.unwrap_or("<any>"),
-                        short_hash(&parent_hash)
-                    ),
-                );
+                queued = queued.saturating_add(1);
+                if p2p_trace_messages_enabled() {
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "queued orphan parent request peer={} parent={}",
+                            preferred_peer.unwrap_or("<any>"),
+                            short_hash(&parent_hash)
+                        ),
+                    );
+                }
             }
         }
-        if reassigned > 0 {
+        if queued > 0 && p2p_trace_messages_enabled() {
             let _ = dev::append_log(
                 "p2p",
                 &format!(
-                    "orphan bridge parent requests reassigned peer={} count={} local_height={}",
+                    "orphan bridge parent requests queued peer={} count={} local_height={}",
                     preferred_peer.unwrap_or("<any>"),
-                    reassigned,
+                    queued,
                     node.height()
                 ),
             );
@@ -2130,6 +2310,74 @@ impl NodeSync {
                 .insert(parent_hash);
         }
         missing
+            .into_values()
+            .flat_map(|hashes| hashes.into_iter())
+            .collect()
+    }
+
+    fn bridge_parent_repair_hashes(&self, node: &Node) -> Vec<[u8; 48]> {
+        let mut repair = BTreeMap::new();
+        for parent_hash in self.missing_buffered_parent_hashes(node) {
+            let parent_height = self
+                .side_branches
+                .blocks
+                .values()
+                .find_map(|entry| {
+                    (entry.block.header.previous_block_hash == parent_hash)
+                        .then_some(entry.block.header.height.saturating_sub(1))
+                })
+                .unwrap_or_else(|| node.height().saturating_add(1));
+            repair
+                .entry(parent_height)
+                .or_insert_with(BTreeSet::new)
+                .insert(parent_hash);
+        }
+
+        let Some(max_missing_height) = repair.keys().next_back().copied() else {
+            return Vec::new();
+        };
+        let start_height = node.height().saturating_add(1);
+        for (hash, height) in &self.block_validation_heights {
+            if *height < start_height || *height > max_missing_height {
+                continue;
+            }
+            if self
+                .block_validation_states
+                .get(hash)
+                .is_some_and(|state| *state == BlockValidationState::Invalid)
+            {
+                continue;
+            }
+            if node.is_canonical_block(hash)
+                || self.side_branches.get(hash).is_some()
+                || node.block_by_hash(*hash).is_some()
+            {
+                continue;
+            }
+            repair
+                .entry(*height)
+                .or_insert_with(BTreeSet::new)
+                .insert(*hash);
+        }
+        for (height, blocks_at_height) in self
+            .pending_header_blocks
+            .range(start_height..=max_missing_height)
+        {
+            for hash in blocks_at_height.keys().copied() {
+                if node.is_canonical_block(&hash)
+                    || self.side_branches.get(&hash).is_some()
+                    || node.block_by_hash(hash).is_some()
+                {
+                    continue;
+                }
+                repair
+                    .entry(*height)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(hash);
+            }
+        }
+
+        repair
             .into_values()
             .flat_map(|hashes| hashes.into_iter())
             .collect()
@@ -2652,15 +2900,17 @@ impl NodeSync {
             match vector.kind {
                 InventoryKind::Block => {
                     if let Some(block) = node.block_by_hash(vector.hash.into_inner()) {
-                        let _ = dev::append_log(
-                            "p2p",
-                            &format!(
-                                "serving block peer={} height={} hash={}",
-                                peer,
-                                block.header.height,
-                                short_hash(&block.header.block_hash())
-                            ),
-                        );
+                        if p2p_trace_messages_enabled() {
+                            let _ = dev::append_log(
+                                "p2p",
+                                &format!(
+                                    "serving block peer={} height={} hash={}",
+                                    peer,
+                                    block.header.height,
+                                    short_hash(&block.header.block_hash())
+                                ),
+                            );
+                        }
                         outbound.push(ConnectionEvent::Send {
                             peer: peer.to_string(),
                             message: NetworkMessage::new(
@@ -2753,7 +3003,46 @@ fn short_hash(hash: &[u8; 48]) -> String {
     hex::encode(hash)[..12].to_string()
 }
 
+fn p2p_trace_messages_enabled() -> bool {
+    std::env::var_os("ATHO_P2P_TRACE_MESSAGES").is_some()
+}
+
+fn should_log_block_progress(height: u64) -> bool {
+    p2p_trace_messages_enabled() || height <= 10 || height % 100 == 0
+}
+
+fn validate_received_block_envelope(
+    block: &Block,
+    network: Network,
+) -> Result<(), ValidationError> {
+    if block.transactions.is_empty() {
+        return Err(ValidationError::EmptyBlock);
+    }
+    if block.header.network_id != network {
+        return Err(ValidationError::BlockNetworkMismatch);
+    }
+    if block.header.timestamp == 0 {
+        return Err(ValidationError::InvalidBlockTimestamp);
+    }
+    if !pow::target_within_bounds(&block.header.difficulty_target_or_bits) {
+        return Err(ValidationError::BlockTargetOutOfBounds);
+    }
+    let size_metrics = block.size_metrics();
+    if size_metrics.raw_size_bytes > MAX_BLOCK_RAW_BYTES
+        || size_metrics.vsize_bytes > MAX_BLOCK_VBYTES
+        || size_metrics.weight_bytes > MAX_BLOCK_WEIGHT
+    {
+        return Err(ValidationError::BlockTooLarge);
+    }
+    Ok(())
+}
+
 fn max_buffered_extension_connect_blocks_per_pass() -> usize {
+    if let Ok(value) = std::env::var("ATHO_MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
     #[cfg(test)]
     if let Ok(value) = std::env::var("ATHO_TEST_MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS") {
         if let Ok(parsed) = value.parse::<usize>() {
@@ -3534,6 +3823,7 @@ mod tests {
         assert_eq!(requested_before, request_limit);
 
         outbound.clear();
+        sync.last_block_progress_unix = now_unix().saturating_sub(3);
         sync.handle_received_block(
             "right",
             blocks[request_limit - 1].clone(),
@@ -3661,10 +3951,11 @@ mod tests {
 
         let lookahead = local.sync.block_download_lookahead();
         let batch_limit = local.sync.block_request_batch_limit();
-        let hashes = (1..=lookahead + 16)
+        let staged_count = batch_limit.saturating_mul(2) as u64;
+        let hashes = (1..=lookahead.max(staged_count))
             .map(|height| synthetic_header_hash(height, 0xA7))
             .collect::<Vec<_>>();
-        for (height, hash) in (1..=lookahead + 16).zip(hashes) {
+        for (height, hash) in (1..=lookahead.max(staged_count)).zip(hashes) {
             local
                 .sync
                 .note_pending_header_block(&header_peer.id, height, hash);
@@ -3752,8 +4043,13 @@ mod tests {
         assert_eq!(outbound_getdata_hashes(&outbound), vec![wanted_hash]);
 
         local.sync.header_requests_started.remove(&peer.id);
-        local.sync.last_block_progress_unix = now_unix().saturating_sub(60);
+        local.sync.last_block_progress_unix = now_unix().saturating_sub(120);
         local.sync.last_stale_recovery_unix = 0;
+        let retry_timeout = local.sync.block_request_retry_timeout();
+        local
+            .sync
+            .downloader
+            .backdate_inflight_for_peer(&peer.id, retry_timeout + Duration::from_secs(1));
 
         let recovery = local
             .sync
@@ -3778,6 +4074,41 @@ mod tests {
             }
         )));
         assert_eq!(outbound_getdata_hashes(&recovery), vec![wanted_hash]);
+    }
+
+    #[test]
+    fn sync_watchdog_does_not_requeue_while_block_bodies_are_arriving() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(64, [64; 48], Vec::<UtxoEntry>::new())
+            .expect("peer height");
+        let _ = connect_handshake_only(&mut local, &mut peer);
+
+        let wanted_hash = [9; 48];
+        local.sync.downloader.note_headers(&peer.id, [wanted_hash]);
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .push_block_download_work_for_peer(&peer.id, &local.node, &mut outbound);
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![wanted_hash]);
+
+        local.sync.header_requests_started.remove(&peer.id);
+        local.sync.last_block_progress_unix = now_unix().saturating_sub(120);
+        local.sync.last_block_body_received_unix = now_unix();
+        local.sync.last_stale_recovery_unix = 0;
+
+        let recovery = local
+            .sync
+            .maintain_peer_sync(&peer.id, &local.node)
+            .expect("watchdog maintenance");
+
+        assert_eq!(local.sync.stale_recovery_count, 0);
+        assert!(
+            outbound_getdata_hashes(&recovery).is_empty(),
+            "recent body traffic means the downloader is still alive, even if connection lags"
+        );
+        assert!(local.sync.downloader.is_inflight(wanted_hash));
     }
 
     #[test]
@@ -3815,11 +4146,7 @@ mod tests {
             Some(2)
         );
 
-        let maintenance = left
-            .sync
-            .maintain_peer_sync(&right.id, &left.node)
-            .expect("maintain sync");
-        assert!(maintenance.iter().any(|event| matches!(
+        assert!(outbound.iter().any(|event| matches!(
             event,
             ConnectionEvent::Send {
                 message: NetworkMessage {
@@ -4024,7 +4351,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_headers_request_disconnects_peer_instead_of_spinning() {
+    fn stalled_headers_request_retries_without_disconnect() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
         right
@@ -4075,10 +4402,56 @@ mod tests {
             .sync
             .maintain_peer_sync(&right.id, &left.node)
             .expect("maintenance");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ConnectionEvent::Disconnect { .. })));
         assert!(events.iter().any(|event| matches!(
             event,
-            ConnectionEvent::Disconnect { peer, reason }
-                if peer == &right.id && reason.contains("headers download timeout")
+            ConnectionEvent::Send {
+                peer,
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+            } if peer == &right.id
+        )));
+    }
+
+    #[test]
+    fn headers_timeout_waits_while_block_bodies_are_arriving() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        right
+            .node
+            .dev_seed_chainstate(2, [2; 48], Vec::<UtxoEntry>::new())
+            .expect("seed remote height");
+        let _ = connect_handshake_only(&mut left, &mut right);
+
+        let headers_timeout = left.sync.headers_request_timeout();
+        left.sync.header_requests_started.insert(
+            right.id.clone(),
+            SystemTime::now() - headers_timeout - Duration::from_secs(1),
+        );
+        left.sync.last_block_body_received_unix = now_unix();
+
+        let events = left
+            .sync
+            .maintain_peer_sync(&right.id, &left.node)
+            .expect("maintenance");
+
+        assert!(
+            left.sync.header_requests_started.contains_key(&right.id),
+            "an active block stream should keep the existing header request alive"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                peer,
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+            } if peer == &right.id
         )));
     }
 
@@ -4895,6 +5268,60 @@ mod tests {
     }
 
     #[test]
+    fn far_ahead_tip_uses_known_header_locator_not_connected_tip() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+        left.sync.header_requests_started.clear();
+
+        let known_header_hash = [77; 48];
+        let known_header_height = left.sync.block_download_lookahead() + 8;
+        left.sync.mark_block_state(
+            known_header_hash,
+            known_header_height,
+            BlockValidationState::HeaderSeen,
+        );
+        left.sync
+            .relay
+            .reseed_locator_hashes(vec![Hash48::from(known_header_hash)]);
+        left.sync.relay.mark_headers_unsynced();
+
+        let far_height = left.sync.block_download_lookahead() + 64;
+        let block = Miner::new(1).solve_block(coinbase_block(
+            Network::Regnet,
+            far_height,
+            [43; 48],
+            pow::target_for_height(Network::Regnet, far_height),
+            1_700_000_000 + far_height,
+        ));
+
+        let mut outbound = Vec::new();
+        left.sync
+            .handle_received_block(&right.id, block, &mut left.node, &mut outbound)
+            .expect("defer far-ahead full block");
+
+        let getheaders_locator = outbound.iter().find_map(|event| match event {
+            ConnectionEvent::Send {
+                message:
+                    NetworkMessage {
+                        payload: MessagePayload::GetHeaders(request),
+                        ..
+                    },
+                ..
+            } => Some(request.locator_hashes.clone()),
+            _ => None,
+        });
+
+        assert_eq!(
+            getheaders_locator
+                .and_then(|locator| locator.first().copied())
+                .map(Hash48::into_inner),
+            Some(known_header_hash),
+            "new tip recovery should continue from the best known header locator, not rewind to the connected tip"
+        );
+    }
+
+    #[test]
     fn deferred_unsolicited_future_block_does_not_poison_fast_download_backpressure() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
@@ -5484,6 +5911,11 @@ mod tests {
         let node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
         sync.prime(&node);
+        sync.last_block_progress_unix = now_unix().saturating_sub(
+            sync.block_request_retry_timeout()
+                .as_secs()
+                .saturating_add(1),
+        );
         sync.downloader.note_peer_ready("peer");
         let blocks = mine_reference_blocks(Network::Regnet, 6);
 
@@ -5500,14 +5932,15 @@ mod tests {
     }
 
     #[test]
-    fn orphan_parent_healing_reassigns_parent_from_backlogged_peer() {
+    fn orphan_parent_healing_duplicates_stalled_parent_to_alternate_peer() {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
         sync.prime(&node);
         sync.downloader.note_peer_ready("slow");
         sync.downloader.note_peer_ready("fast");
-        let blocks = mine_reference_blocks(Network::Regnet, 3);
-        let parent_hash = blocks[1].header.block_hash();
+        let blocks = mine_reference_blocks(Network::Regnet, 2);
+        let parent_hash = blocks[0].header.block_hash();
+        sync.mark_block_state(parent_hash, 1, BlockValidationState::HeaderValidated);
 
         sync.downloader.note_headers("slow", [parent_hash]);
         let mut outbound = Vec::new();
@@ -5519,12 +5952,43 @@ mod tests {
         assert_eq!(outbound_getdata_hashes(&outbound), vec![parent_hash]);
         assert_eq!(sync.downloader.peer_inflight_len("slow"), 1);
 
+        let child_hash = blocks[1].header.block_hash();
+        sync.downloader.note_headers("fast", [child_hash]);
+        sync.push_block_download_work_for_peer("fast", &node, &mut outbound);
         outbound.clear();
-        sync.handle_received_block("fast", blocks[2].clone(), &mut node, &mut outbound)
-            .expect("buffer child and reassign missing parent");
+        sync.last_block_progress_unix = now_unix().saturating_sub(3);
+        sync.handle_received_block("fast", blocks[1].clone(), &mut node, &mut outbound)
+            .expect("buffer child and retry missing parent");
 
         assert_eq!(node.height(), 0);
-        assert_eq!(sync.downloader.peer_inflight_len("slow"), 0);
+        assert_eq!(sync.downloader.peer_inflight_len("slow"), 1);
+        assert!(!sync.side_branches.is_empty());
+        assert_eq!(
+            sync.missing_buffered_parent_hashes(&node),
+            vec![parent_hash]
+        );
+        assert_eq!(sync.download_hash_height(parent_hash), Some(1));
+        assert_eq!(sync.downloader.inflight_peer(parent_hash), Some("slow"));
+        assert!(sync.buffered_parent_bridge_active(&node));
+        if outbound_getdata_hashes(&outbound).is_empty() {
+            sync.push_block_download_work_for_peer("fast", &node, &mut outbound);
+        }
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![String::from("fast")]
+        );
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![parent_hash]);
+
+        sync.last_block_progress_unix = now_unix().saturating_sub(
+            sync.block_request_retry_timeout()
+                .as_secs()
+                .saturating_add(1),
+        );
+        sync.downloader
+            .requeue_stale_inflight_for_peer("slow", Duration::ZERO);
+        outbound.clear();
+        sync.push_block_download_work_for_peer("fast", &node, &mut outbound);
+
         assert_eq!(
             outbound_getdata_peers(&outbound),
             vec![String::from("fast")]
@@ -5537,16 +6001,29 @@ mod tests {
         let node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
         sync.prime(&node);
+        sync.last_block_progress_unix = now_unix().saturating_sub(
+            sync.block_request_retry_timeout()
+                .as_secs()
+                .saturating_add(1),
+        );
         sync.downloader.note_peer_ready("peer");
         let blocks = mine_reference_blocks(Network::Regnet, 6);
         sync.side_branches.insert("peer", blocks[5].clone());
 
         let fast_lookahead = sync.block_download_stage_lookahead(&node);
         assert!(fast_lookahead > BRIDGE_PARENT_STAGE_LOOKAHEAD);
-        let hashes = (1..=fast_lookahead + 8)
+        let bridge_hashes = blocks
+            .iter()
+            .take(5)
+            .map(|block| block.header.block_hash())
+            .collect::<Vec<_>>();
+        for block in blocks.iter().take(5) {
+            sync.note_pending_header_block("peer", block.header.height, block.header.block_hash());
+        }
+        let future_hashes = (7..=fast_lookahead + 8)
             .map(|height| synthetic_header_hash(height, 0xB7))
             .collect::<Vec<_>>();
-        for (height, hash) in (1..=fast_lookahead + 8).zip(hashes.iter().copied()) {
+        for (height, hash) in (7..=fast_lookahead + 8).zip(future_hashes.iter().copied()) {
             sync.note_pending_header_block("peer", height, hash);
         }
 
@@ -5554,11 +6031,11 @@ mod tests {
         sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
 
         let requested = outbound_getdata_hashes(&outbound);
-        assert_eq!(requested, vec![blocks[4].header.block_hash()]);
+        assert_eq!(requested, bridge_hashes);
         assert_eq!(
             sync.pending_header_blocks.keys().next().copied(),
             Some(1),
-            "bridge repair must not stage unrelated future headers while a parent gap exists"
+            "bridge repair queues the parent gap directly without staging unrelated future headers"
         );
 
         outbound.clear();
@@ -5567,10 +6044,43 @@ mod tests {
             outbound_getdata_hashes(&outbound).is_empty(),
             "an in-flight bridge parent must block future body requests until the gap is healed"
         );
-        assert_eq!(
-            sync.pending_header_blocks.keys().next().copied(),
-            Some(1)
+        assert_eq!(sync.pending_header_blocks.keys().next().copied(), Some(1));
+    }
+
+    #[test]
+    fn buffered_parent_repair_includes_already_staged_gap() {
+        let node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.last_block_progress_unix = now_unix().saturating_sub(
+            sync.block_request_retry_timeout()
+                .as_secs()
+                .saturating_add(1),
         );
+        sync.downloader.note_peer_ready("peer");
+        let blocks = mine_reference_blocks(Network::Regnet, 6);
+
+        for block in blocks.iter().take(5) {
+            let hash = block.header.block_hash();
+            sync.mark_block_state(
+                hash,
+                block.header.height,
+                BlockValidationState::HeaderValidated,
+            );
+            sync.downloader.note_headers("peer", [hash]);
+        }
+        sync.side_branches.insert("peer", blocks[5].clone());
+
+        let mut outbound = Vec::new();
+        sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
+
+        let requested = outbound_getdata_hashes(&outbound);
+        let expected = blocks
+            .iter()
+            .take(5)
+            .map(|block| block.header.block_hash())
+            .collect::<Vec<_>>();
+        assert_eq!(requested, expected);
     }
 
     #[test]
@@ -5659,7 +6169,7 @@ mod tests {
             .handle_received_block("peer-c", block_1.clone(), &mut peer.node, &mut outbound)
             .expect("reconstruct buffered branch across peers");
 
-        assert!(outbound.is_empty());
+        assert!(outbound_getdata_hashes(&outbound).is_empty());
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
         assert!(peer.sync.side_branches.is_empty());

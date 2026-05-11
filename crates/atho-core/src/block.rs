@@ -12,6 +12,9 @@ use crate::transaction::{Transaction, TxWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+const HEADER_CANONICAL_SIZE_WITHOUT_NONCE: usize = 2 + 1 + 8 + 48 + 48 + 48 + 8 + 48;
+const HEADER_CANONICAL_SIZE: usize = HEADER_CANONICAL_SIZE_WITHOUT_NONCE + 8;
+
 /// Canonical Atho block header.
 ///
 /// The header contains the minimal data needed to identify a block, validate
@@ -48,6 +51,14 @@ pub struct Block {
     pub fees_miner_atoms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSizeMetrics {
+    pub base_size_bytes: usize,
+    pub raw_size_bytes: usize,
+    pub weight_bytes: usize,
+    pub vsize_bytes: usize,
+}
+
 impl Default for Block {
     fn default() -> Self {
         Self {
@@ -73,12 +84,12 @@ impl Default for Block {
 impl BlockHeader {
     /// Returns the number of canonical header bytes before the nonce field.
     pub fn canonical_size_bytes_without_nonce(&self) -> usize {
-        2 + 1 + 8 + 48 + 48 + 48 + 8 + 48
+        HEADER_CANONICAL_SIZE_WITHOUT_NONCE
     }
 
     /// Returns the exact canonical header size used for PoW hashing.
     pub fn canonical_size_bytes(&self) -> usize {
-        self.canonical_size_bytes_without_nonce() + 8
+        HEADER_CANONICAL_SIZE
     }
 
     /// Serializes the header fields that are stable while miners search nonce space.
@@ -98,7 +109,14 @@ impl BlockHeader {
     /// Serializes the full canonical header in consensus order.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.canonical_size_bytes());
-        out.extend_from_slice(&self.canonical_bytes_without_nonce());
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.push(self.network_id.consensus_id());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.previous_block_hash);
+        out.extend_from_slice(&self.merkle_root);
+        out.extend_from_slice(&self.witness_root);
+        out.extend_from_slice(&self.timestamp.to_le_bytes());
+        out.extend_from_slice(&self.difficulty_target_or_bits);
         out.extend_from_slice(&self.nonce.to_le_bytes());
         out
     }
@@ -108,7 +126,26 @@ impl BlockHeader {
     /// CONSENSUS: Any change to this byte layout invalidates historical block
     /// hashes and will split the network.
     pub fn block_hash(&self) -> [u8; 48] {
-        sha3_384(&self.canonical_bytes())
+        let mut bytes = [0u8; HEADER_CANONICAL_SIZE];
+        let mut offset = 0usize;
+        bytes[offset..offset + 2].copy_from_slice(&self.version.to_le_bytes());
+        offset += 2;
+        bytes[offset] = self.network_id.consensus_id();
+        offset += 1;
+        bytes[offset..offset + 8].copy_from_slice(&self.height.to_le_bytes());
+        offset += 8;
+        bytes[offset..offset + 48].copy_from_slice(&self.previous_block_hash);
+        offset += 48;
+        bytes[offset..offset + 48].copy_from_slice(&self.merkle_root);
+        offset += 48;
+        bytes[offset..offset + 48].copy_from_slice(&self.witness_root);
+        offset += 48;
+        bytes[offset..offset + 8].copy_from_slice(&self.timestamp.to_le_bytes());
+        offset += 8;
+        bytes[offset..offset + 48].copy_from_slice(&self.difficulty_target_or_bits);
+        offset += 48;
+        bytes[offset..offset + 8].copy_from_slice(&self.nonce.to_le_bytes());
+        sha3_384(&bytes)
     }
 
     /// Parses the exact canonical header encoding emitted by
@@ -249,6 +286,26 @@ impl Block {
                 .sum::<usize>()
     }
 
+    pub fn size_metrics(&self) -> BlockSizeMetrics {
+        let header_and_count = self.header.canonical_size_bytes() + 4;
+        let mut base_size_bytes = header_and_count;
+        let mut raw_size_bytes = header_and_count;
+        for tx in &self.transactions {
+            base_size_bytes = base_size_bytes.saturating_add(4 + tx.base_size_bytes());
+            raw_size_bytes = raw_size_bytes.saturating_add(4 + tx.full_size_bytes());
+        }
+        let weight_bytes = base_size_bytes
+            .saturating_mul(3)
+            .saturating_add(raw_size_bytes);
+        let vsize_bytes = (weight_bytes.saturating_add(3)) / 4;
+        BlockSizeMetrics {
+            base_size_bytes,
+            raw_size_bytes,
+            weight_bytes,
+            vsize_bytes,
+        }
+    }
+
     pub fn size_bytes(&self) -> usize {
         self.full_size_bytes()
     }
@@ -272,13 +329,11 @@ impl Block {
     }
 
     pub fn weight_bytes(&self) -> usize {
-        let base = self.base_size_bytes();
-        let total = self.full_size_bytes();
-        base.saturating_mul(3).saturating_add(total)
+        self.size_metrics().weight_bytes
     }
 
     pub fn vsize_bytes(&self) -> usize {
-        (self.weight_bytes().saturating_add(3)) / 4
+        self.size_metrics().vsize_bytes
     }
 
     pub fn compact_size_bytes(&self) -> usize {

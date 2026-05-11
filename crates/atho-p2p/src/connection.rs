@@ -219,9 +219,16 @@ impl ConnectionManager {
             match session.handshake.receive(&message, local_version) {
                 Ok(actions) => {
                     if let Some(version) = session.handshake.remote_version() {
-                        self.address_manager
-                            .accept_version(remote_addr.to_string(), version)
-                            .map_err(ConnectionError::Protocol)?;
+                        // An inbound TCP peer's socket address contains its ephemeral source
+                        // port, not necessarily its public listening P2P port. Learning that
+                        // address poisons gossip/outbound rotation with dead ports such as
+                        // x.x.x.x:37156. Outbound peers were explicitly selected by this node,
+                        // so those addresses are safe to keep in the peer table.
+                        if session.direction == ConnectionDirection::Outbound {
+                            self.address_manager
+                                .accept_version(remote_addr.to_string(), version)
+                                .map_err(ConnectionError::Protocol)?;
+                        }
                     }
                     return Ok(actions
                         .into_iter()
@@ -515,6 +522,24 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn inbound_ephemeral_socket_port_is_not_added_to_address_book() {
+        let mut manager = ConnectionManager::new(Network::Testnet);
+        manager
+            .accept_inbound("74.208.219.116:33284")
+            .expect("inbound");
+
+        let _ = manager
+            .receive(
+                "74.208.219.116:33284",
+                version_message(Network::Testnet, 10),
+                &version_message(Network::Testnet, 1),
+            )
+            .expect("version");
+
+        assert!(manager.address_manager.advertisable_addresses(8).is_empty());
     }
 
     #[test]

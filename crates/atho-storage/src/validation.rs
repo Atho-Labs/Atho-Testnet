@@ -808,12 +808,10 @@ fn validate_block_impl_with_schedule(
     if block.header.timestamp == 0 {
         return Err(ValidationError::InvalidBlockTimestamp);
     }
-    let raw_size_bytes = block.full_size_bytes();
-    let vsize_bytes = block.vsize_bytes();
-    let weight_bytes = block.weight_bytes();
-    if raw_size_bytes > MAX_BLOCK_RAW_BYTES
-        || vsize_bytes > MAX_BLOCK_VBYTES
-        || weight_bytes > MAX_BLOCK_WEIGHT
+    let size_metrics = block.size_metrics();
+    if size_metrics.raw_size_bytes > MAX_BLOCK_RAW_BYTES
+        || size_metrics.vsize_bytes > MAX_BLOCK_VBYTES
+        || size_metrics.weight_bytes > MAX_BLOCK_WEIGHT
     {
         return Err(ValidationError::BlockTooLarge);
     }
