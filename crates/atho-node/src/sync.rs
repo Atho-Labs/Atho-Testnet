@@ -1448,6 +1448,20 @@ impl NodeSync {
     }
 
     fn push_scheduled_block_requests(&mut self, node: &Node, outbound: &mut Vec<ConnectionEvent>) {
+        if self.buffered_parent_bridge_active(node) {
+            let ready_peers = self
+                .connections
+                .peer_snapshots()
+                .into_iter()
+                .filter(|peer| peer.handshake_ready)
+                .map(|peer| peer.remote_addr)
+                .collect::<Vec<_>>();
+            for peer in ready_peers {
+                self.push_bridge_parent_download_work_for_peer(&peer, node, outbound);
+            }
+            return;
+        }
+
         let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
         let max_requests_per_peer = self.effective_max_requests_per_peer(node);
         let max_requests_per_batch = self.effective_scheduled_block_request_batch_limit(node);
@@ -1466,31 +1480,51 @@ impl NodeSync {
         node: &Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) {
-        self.stage_header_blocks_near_tip(node);
         let bridge_active = self.buffered_parent_bridge_active(node);
-        let peer_inflight = self.downloader.peer_inflight_len(peer);
-        let total_inflight = self.downloader.total_inflight_len();
-        let bridge_capacity = self.bridge_parent_request_capacity_for_peer(peer);
-        let max_blocks_in_flight = if bridge_active {
-            total_inflight.saturating_add(bridge_capacity)
-        } else {
-            self.effective_max_blocks_in_flight(node)
-        };
-        let max_requests_per_peer = if bridge_active {
-            peer_inflight.saturating_add(bridge_capacity)
-        } else {
-            self.effective_max_requests_per_peer(node)
-        };
-        let max_requests_per_batch = if bridge_active {
-            bridge_capacity
-        } else {
-            self.effective_block_request_batch_limit(node)
-        };
+        if bridge_active {
+            self.push_bridge_parent_download_work_for_peer(peer, node, outbound);
+            return;
+        }
+
+        self.stage_header_blocks_near_tip(node);
+        let max_blocks_in_flight = self.effective_max_blocks_in_flight(node);
+        let max_requests_per_peer = self.effective_max_requests_per_peer(node);
+        let max_requests_per_batch = self.effective_block_request_batch_limit(node);
         if let Some(assignment) = self.downloader.assignment_for_peer_limited(
             peer,
             max_blocks_in_flight,
             max_requests_per_peer,
             max_requests_per_batch,
+        ) {
+            self.push_download_assignment(assignment, outbound);
+        }
+    }
+
+    fn push_bridge_parent_download_work_for_peer(
+        &mut self,
+        peer: &str,
+        node: &Node,
+        outbound: &mut Vec<ConnectionEvent>,
+    ) {
+        let missing_parents = self
+            .missing_buffered_parent_hashes(node)
+            .into_iter()
+            .map(Hash48::from)
+            .collect::<BTreeSet<_>>();
+        if missing_parents.is_empty() {
+            return;
+        }
+        let peer_inflight = self.downloader.peer_inflight_len(peer);
+        let total_inflight = self.downloader.total_inflight_len();
+        let bridge_capacity = self.bridge_parent_request_capacity_for_peer(peer);
+        let max_blocks_in_flight = total_inflight.saturating_add(bridge_capacity);
+        let max_requests_per_peer = peer_inflight.saturating_add(bridge_capacity);
+        if let Some(assignment) = self.downloader.assignment_for_peer_matching_limited(
+            peer,
+            max_blocks_in_flight,
+            max_requests_per_peer,
+            bridge_capacity,
+            &missing_parents,
         ) {
             self.push_download_assignment(assignment, outbound);
         }
@@ -1915,6 +1949,7 @@ impl NodeSync {
         }
 
         let missing_parents = self.missing_buffered_parent_hashes(node);
+        let mut reassigned = 0usize;
         for parent_hash in missing_parents
             .into_iter()
             .take(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS)
@@ -1922,17 +1957,29 @@ impl NodeSync {
         {
             if self
                 .downloader
-                .queue_priority_block(preferred_peer, parent_hash)
+                .reassign_priority_block(preferred_peer, parent_hash)
             {
+                reassigned = reassigned.saturating_add(1);
                 let _ = dev::append_log(
                     "p2p",
                     &format!(
-                        "queued orphan parent request peer={} parent={}",
+                        "queued orphan parent request peer={} parent={} reassigned=true",
                         preferred_peer.unwrap_or("<any>"),
                         short_hash(&parent_hash)
                     ),
                 );
             }
+        }
+        if reassigned > 0 {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "orphan bridge parent requests reassigned peer={} count={} local_height={}",
+                    preferred_peer.unwrap_or("<any>"),
+                    reassigned,
+                    node.height()
+                ),
+            );
         }
         if let Some(peer) = preferred_peer {
             self.push_block_download_work_for_peer(peer, node, outbound);
@@ -3510,7 +3557,10 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>();
-        assert_eq!(requested_after, 1);
+        assert_eq!(
+            requested_after, 0,
+            "a buffered future block frees its slot, but bridge mode must not refill with unrelated future work while its parent is already in flight"
+        );
     }
 
     #[test]
@@ -5450,6 +5500,39 @@ mod tests {
     }
 
     #[test]
+    fn orphan_parent_healing_reassigns_parent_from_backlogged_peer() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("slow");
+        sync.downloader.note_peer_ready("fast");
+        let blocks = mine_reference_blocks(Network::Regnet, 3);
+        let parent_hash = blocks[1].header.block_hash();
+
+        sync.downloader.note_headers("slow", [parent_hash]);
+        let mut outbound = Vec::new();
+        sync.push_block_download_work_for_peer("slow", &node, &mut outbound);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![String::from("slow")]
+        );
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![parent_hash]);
+        assert_eq!(sync.downloader.peer_inflight_len("slow"), 1);
+
+        outbound.clear();
+        sync.handle_received_block("fast", blocks[2].clone(), &mut node, &mut outbound)
+            .expect("buffer child and reassign missing parent");
+
+        assert_eq!(node.height(), 0);
+        assert_eq!(sync.downloader.peer_inflight_len("slow"), 0);
+        assert_eq!(
+            outbound_getdata_peers(&outbound),
+            vec![String::from("fast")]
+        );
+        assert_eq!(outbound_getdata_hashes(&outbound), vec![parent_hash]);
+    }
+
+    #[test]
     fn buffered_parent_gap_throttles_future_download_window() {
         let node = Node::new(NodeConfig::new(Network::Regnet));
         let mut sync = NodeSync::new(Network::Regnet);
@@ -5468,20 +5551,25 @@ mod tests {
         }
 
         let mut outbound = Vec::new();
-        sync.push_block_download_work_for_peer("peer", &node, &mut outbound);
+        sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
 
         let requested = outbound_getdata_hashes(&outbound);
-        let expected_batch = sync
-            .block_request_batch_limit()
-            .min(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS);
-        assert_eq!(requested.len(), expected_batch);
+        assert_eq!(requested, vec![blocks[4].header.block_hash()]);
         assert_eq!(
-            requested,
-            hashes.into_iter().take(expected_batch).collect::<Vec<_>>()
+            sync.pending_header_blocks.keys().next().copied(),
+            Some(1),
+            "bridge repair must not stage unrelated future headers while a parent gap exists"
+        );
+
+        outbound.clear();
+        sync.push_block_download_work_for_peer("peer", &node, &mut outbound);
+        assert!(
+            outbound_getdata_hashes(&outbound).is_empty(),
+            "an in-flight bridge parent must block future body requests until the gap is healed"
         );
         assert_eq!(
             sync.pending_header_blocks.keys().next().copied(),
-            Some(BRIDGE_PARENT_STAGE_LOOKAHEAD + 1)
+            Some(1)
         );
     }
 
