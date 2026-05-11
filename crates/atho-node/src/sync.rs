@@ -26,6 +26,8 @@ const SYNC_METRICS_LOG_INTERVAL_SECS: u64 = 10;
 const MAX_SIDE_BRANCH_BLOCKS: usize = 4_096;
 const MAX_PENDING_COMPACT_BLOCKS: usize = 256;
 const PENDING_COMPACT_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS: usize = 32;
+const MAX_ORPHAN_PARENT_REQUESTS_PER_PASS: usize = 16;
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
 const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
 const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
@@ -72,6 +74,13 @@ impl BlockValidationState {
                 | Self::FullyValidated
                 | Self::Connected
                 | Self::Finalized
+        )
+    }
+
+    fn is_untrusted_pending_validation(self) -> bool {
+        matches!(
+            self,
+            Self::BodyDownloaded | Self::TempStoredUntrusted | Self::ValidationQueued
         )
     }
 }
@@ -210,7 +219,6 @@ impl SideBranchPool {
         if remove_parent_entry {
             self.children_by_parent.remove(&previous_hash);
         }
-        self.children_by_parent.remove(block_hash);
         Some(entry.block)
     }
 
@@ -1594,11 +1602,6 @@ impl NodeSync {
     ) -> Result<(), NodeSyncError> {
         let block_hash = block.header.block_hash();
         let block_height = block.header.height;
-        self.mark_block_state(
-            block_hash,
-            block_height,
-            BlockValidationState::BodyDownloaded,
-        );
         if let Err(validation) =
             crate::validation::validate_block(&block, block.header.height, self.network)
         {
@@ -1627,6 +1630,11 @@ impl NodeSync {
             self.pending_compact_blocks.remove(&block_hash);
             return Ok(());
         }
+        self.mark_block_state(
+            block_hash,
+            block_height,
+            BlockValidationState::BodyDownloaded,
+        );
         if node.is_canonical_block(&block_hash) {
             let _ = dev::append_log(
                 "p2p",
@@ -1828,17 +1836,25 @@ impl NodeSync {
             }
         }
 
-        for parent_hash in self.missing_buffered_parent_hashes(node) {
-            self.downloader
-                .queue_priority_block(preferred_peer, parent_hash);
-            let _ = dev::append_log(
-                "p2p",
-                &format!(
-                    "queued orphan parent request peer={} parent={}",
-                    preferred_peer.unwrap_or("<any>"),
-                    short_hash(&parent_hash)
-                ),
-            );
+        let missing_parents = self.missing_buffered_parent_hashes(node);
+        for parent_hash in missing_parents
+            .into_iter()
+            .take(MAX_ORPHAN_PARENT_REQUESTS_PER_PASS)
+            .rev()
+        {
+            if self
+                .downloader
+                .queue_priority_block(preferred_peer, parent_hash)
+            {
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "queued orphan parent request peer={} parent={}",
+                        preferred_peer.unwrap_or("<any>"),
+                        short_hash(&parent_hash)
+                    ),
+                );
+            }
         }
         if let Some(peer) = preferred_peer {
             self.push_block_download_work_for_peer(peer, node, outbound);
@@ -1975,7 +1991,7 @@ impl NodeSync {
     }
 
     fn missing_buffered_parent_hashes(&self, node: &Node) -> Vec<[u8; 48]> {
-        let mut missing = BTreeSet::new();
+        let mut missing = BTreeMap::new();
         for entry in self.side_branches.blocks.values() {
             let parent_hash = entry.block.header.previous_block_hash;
             if node.is_canonical_block(&parent_hash)
@@ -1983,9 +1999,15 @@ impl NodeSync {
             {
                 continue;
             }
-            missing.insert(parent_hash);
+            missing
+                .entry(entry.block.header.height.saturating_sub(1))
+                .or_insert_with(BTreeSet::new)
+                .insert(parent_hash);
         }
-        missing.into_iter().collect()
+        missing
+            .into_values()
+            .flat_map(|hashes| hashes.into_iter())
+            .collect()
     }
 
     fn buffered_branch_from_tip(&self, node: &Node, tip_hash: [u8; 48]) -> Option<Vec<Block>> {
@@ -2039,25 +2061,42 @@ impl NodeSync {
         preferred_peer: Option<&str>,
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
-    ) -> Result<bool, NodeSyncError> {
+        max_extension_blocks: usize,
+    ) -> Result<usize, NodeSyncError> {
         if self.side_branches.is_empty() {
-            return Ok(false);
+            return Ok(0);
         }
 
-        let mut progressed = false;
         loop {
-            let Some(candidate_branch) = self.best_buffered_branch(node) else {
-                return Ok(progressed);
+            let Some(mut candidate_branch) = self.best_buffered_branch(node) else {
+                return Ok(0);
             };
+            let is_extension = candidate_branch
+                .first()
+                .is_some_and(|block| block.header.previous_block_hash == node.tip_hash());
+            if is_extension && candidate_branch.len() > max_extension_blocks {
+                let original_len = candidate_branch.len();
+                candidate_branch.truncate(max_extension_blocks);
+                let _ = dev::append_log(
+                    "p2p",
+                    &format!(
+                        "buffered extension connect batch capped count={} remaining={}",
+                        candidate_branch.len(),
+                        original_len.saturating_sub(candidate_branch.len())
+                    ),
+                );
+            }
 
             let candidate_hashes = candidate_branch
                 .iter()
                 .map(|candidate| candidate.header.block_hash())
                 .collect::<Vec<_>>();
+            let candidate_count = candidate_hashes.len();
             match node.consider_branch(&candidate_branch) {
                 Ok(selection) if selection.outcome != ChainSelectionOutcome::KeptCurrent => {
                     self.note_local_chain_progress(node);
-                    for hash in candidate_hashes {
+                    for hash in &candidate_hashes {
+                        let hash = *hash;
                         let height = self
                             .block_validation_heights
                             .get(&hash)
@@ -2081,15 +2120,16 @@ impl NodeSync {
                         self.stage_header_blocks_near_tip(node);
                         self.push_scheduled_block_requests(outbound);
                     }
-                    progressed = true;
+                    return Ok(candidate_count);
                 }
-                Ok(_) => return Ok(progressed),
+                Ok(_) => return Ok(0),
                 Err(NodeError::Storage(StorageError::ForkPointUnavailable)) => {
                     if let Some(tip_hash) = candidate_hashes.last().copied() {
                         self.side_branches.remove(&tip_hash);
+                        return Ok(1);
                     }
                 }
-                Err(err) if Self::recoverable_branch_error(&err) => return Ok(progressed),
+                Err(err) if Self::recoverable_branch_error(&err) => return Ok(0),
                 Err(err) => {
                     let tip = candidate_hashes
                         .last()
@@ -2100,7 +2140,8 @@ impl NodeSync {
                         "p2p",
                         &format!("dropping invalid side branch tip={} error={}", tip, err),
                     );
-                    for hash in candidate_hashes {
+                    for hash in &candidate_hashes {
+                        let hash = *hash;
                         let height = self
                             .block_validation_heights
                             .get(&hash)
@@ -2111,7 +2152,7 @@ impl NodeSync {
                         self.pending_compact_blocks.remove(&hash);
                         self.side_branches.remove(&hash);
                     }
-                    progressed = true;
+                    return Ok(candidate_count.max(1));
                 }
             }
         }
@@ -2123,10 +2164,19 @@ impl NodeSync {
         node: &mut Node,
         outbound: &mut Vec<ConnectionEvent>,
     ) -> Result<(), NodeSyncError> {
+        let mut connected_or_dropped = 0usize;
+        let max_connect_blocks = max_buffered_extension_connect_blocks_per_pass();
         loop {
-            if !self.process_buffered_branch_once(preferred_peer, node, outbound)? {
+            let remaining = max_connect_blocks.saturating_sub(connected_or_dropped);
+            if remaining == 0 {
                 return Ok(());
             }
+            let progressed =
+                self.process_buffered_branch_once(preferred_peer, node, outbound, remaining)?;
+            if progressed == 0 {
+                return Ok(());
+            }
+            connected_or_dropped = connected_or_dropped.saturating_add(progressed);
         }
     }
 
@@ -2378,14 +2428,7 @@ impl NodeSync {
         self.side_branches.len().max(
             self.block_validation_states
                 .values()
-                .filter(|state| {
-                    matches!(
-                        state,
-                        BlockValidationState::BodyDownloaded
-                            | BlockValidationState::TempStoredUntrusted
-                            | BlockValidationState::ValidationQueued
-                    )
-                })
+                .filter(|state| state.is_untrusted_pending_validation())
                 .count(),
         )
     }
@@ -2573,6 +2616,16 @@ fn now_unix() -> u64 {
 
 fn short_hash(hash: &[u8; 48]) -> String {
     hex::encode(hash)[..12].to_string()
+}
+
+fn max_buffered_extension_connect_blocks_per_pass() -> usize {
+    #[cfg(test)]
+    if let Ok(value) = std::env::var("ATHO_TEST_MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+    MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS
 }
 
 #[cfg(test)]
@@ -4704,6 +4757,65 @@ mod tests {
     }
 
     #[test]
+    fn deferred_unsolicited_future_block_does_not_poison_fast_download_backpressure() {
+        let mut left = SandboxPeer::new("left", Network::Regnet);
+        let mut right = SandboxPeer::new("right", Network::Regnet);
+        let _ = connect(&mut left, &mut right);
+
+        let far_height = left.sync.block_download_stage_lookahead(&left.node) + 64;
+        let block = Miner::new(1).solve_block(coinbase_block(
+            Network::Regnet,
+            far_height,
+            [44; 48],
+            pow::target_for_height(Network::Regnet, far_height),
+            1_700_000_000 + far_height,
+        ));
+
+        let mut outbound = Vec::new();
+        left.sync
+            .handle_received_block(&right.id, block, &mut left.node, &mut outbound)
+            .expect("defer far-ahead full block");
+
+        let diagnostics = left.sync.fast_download_diagnostics(&left.node);
+        assert_eq!(diagnostics.pending_validation_blocks, 0);
+        assert_eq!(diagnostics.untrusted_downloaded_blocks, 0);
+        assert_eq!(diagnostics.best_downloaded_body_height, 0);
+        assert!(!left.sync.fast_body_download_backpressure_active(&left.node));
+    }
+
+    #[test]
+    fn buffered_extension_connects_in_bounded_batches() {
+        let _guard = EnvVarGuard::set(
+            "ATHO_TEST_MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS",
+            "1",
+        );
+        let cap = max_buffered_extension_connect_blocks_per_pass();
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let blocks = mine_reference_blocks(Network::Regnet, cap + 1);
+        for block in blocks {
+            local.sync.side_branches.insert("remote", block);
+        }
+
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .process_buffered_branches(Some("remote"), &mut local.node, &mut outbound)
+            .expect("first bounded buffered branch pass");
+
+        assert_eq!(local.node.height(), cap as u64);
+        assert_eq!(local.sync.side_branches.len(), 1);
+
+        outbound.clear();
+        local
+            .sync
+            .process_buffered_branches(Some("remote"), &mut local.node, &mut outbound)
+            .expect("second bounded buffered branch pass");
+
+        assert_eq!(local.node.height(), (cap + 1) as u64);
+        assert!(local.sync.side_branches.is_empty());
+    }
+
+    #[test]
     fn pending_compact_blocks_are_bounded_and_stale_entries_are_pruned() {
         let mut left = SandboxPeer::new("left", Network::Regnet);
         let mut right = SandboxPeer::new("right", Network::Regnet);
@@ -5227,6 +5339,26 @@ mod tests {
         assert_eq!(peer.node.height(), 3);
         assert_eq!(peer.node.tip_hash(), block_3.header.block_hash());
         assert!(peer.sync.side_branches.is_empty());
+    }
+
+    #[test]
+    fn orphan_parent_healing_prioritizes_lowest_missing_bridge() {
+        let node = Node::new(NodeConfig::new(Network::Regnet));
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.downloader.note_peer_ready("peer");
+        let blocks = mine_reference_blocks(Network::Regnet, 6);
+
+        sync.side_branches.insert("peer", blocks[5].clone());
+        sync.side_branches.insert("peer", blocks[3].clone());
+
+        let mut outbound = Vec::new();
+        sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
+        let requested = outbound_getdata_hashes(&outbound);
+
+        assert_eq!(requested.len(), 2);
+        assert_eq!(requested[0], blocks[2].header.block_hash());
+        assert_eq!(requested[1], blocks[4].header.block_hash());
     }
 
     #[test]
