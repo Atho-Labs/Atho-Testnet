@@ -51,6 +51,7 @@ pub const POW_PROFILE: ProofOfWork = ProofOfWork {
 pub const SHA3_384_HASH_BITS: usize = 384;
 pub const SHA3_384_HASH_HEX_CHARS: usize = 96;
 pub const TESTNET_STALL_RESET_SECONDS: u64 = 600;
+const LEGACY_TESTNET_TARGET_BLOCK_TIME_SECONDS: u64 = 75;
 
 pub const DIFFICULTY_PROFILE: DifficultyTargetProfile = DifficultyTargetProfile {
     genesis_target: hex!("0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
@@ -72,6 +73,18 @@ pub fn expected_timespan_seconds() -> u64 {
 fn expected_timespan_seconds_for_window(window_blocks: usize) -> u64 {
     POW_PROFILE
         .target_block_time_seconds
+        .saturating_mul(window_blocks.saturating_sub(1) as u64)
+}
+
+fn target_block_time_seconds_for_network(network: Network) -> u64 {
+    match network {
+        Network::Mainnet | Network::Regnet => POW_PROFILE.target_block_time_seconds,
+        Network::Testnet | Network::Prunetest => LEGACY_TESTNET_TARGET_BLOCK_TIME_SECONDS,
+    }
+}
+
+fn expected_timespan_seconds_for_window_and_network(network: Network, window_blocks: usize) -> u64 {
+    target_block_time_seconds_for_network(network)
         .saturating_mul(window_blocks.saturating_sub(1) as u64)
 }
 
@@ -223,7 +236,7 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
         let old_mtp = median_time_past_headers(headers, old_index);
         tip_mtp.saturating_sub(old_mtp)
     };
-    let expected_timespan = expected_timespan_seconds_for_window(window_len);
+    let expected_timespan = expected_timespan_seconds_for_window_and_network(network, window_len);
     let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
     let average_target = mean_target_headers(window);
     let threshold =
@@ -274,7 +287,7 @@ fn next_target_from_blocks(network: Network, blocks: &[Block]) -> [u8; 48] {
         let old_mtp = median_time_past_blocks(blocks, old_index);
         tip_mtp.saturating_sub(old_mtp)
     };
-    let expected_timespan = expected_timespan_seconds_for_window(window_len);
+    let expected_timespan = expected_timespan_seconds_for_window_and_network(network, window_len);
     let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
     let average_target = mean_target_blocks(window);
     let threshold =
@@ -290,7 +303,7 @@ pub fn target_for_next_block(network: Network, previous_blocks: &[Block]) -> [u8
             block
                 .header
                 .timestamp
-                .saturating_add(POW_PROFILE.target_block_time_seconds)
+                .saturating_add(target_block_time_seconds_for_network(network))
         })
         .unwrap_or_default();
     target_for_next_block_with_timestamp(network, previous_blocks, next_timestamp)
@@ -437,7 +450,7 @@ mod tests {
 
     #[test]
     fn pow_profile_matches_reference_timing() {
-        assert_eq!(POW_PROFILE.target_block_time_seconds, 75);
+        assert_eq!(POW_PROFILE.target_block_time_seconds, 100);
         assert_eq!(POW_PROFILE.retarget_interval_blocks, 1);
         assert_eq!(POW_PROFILE.averaging_window_blocks, 17);
         assert_eq!(POW_PROFILE.median_window_blocks, 11);
@@ -454,7 +467,15 @@ mod tests {
 
     #[test]
     fn expected_timespan_is_derived_from_target_block_time() {
-        assert_eq!(expected_timespan_seconds(), 1_200);
+        assert_eq!(expected_timespan_seconds(), 1_600);
+        assert_eq!(
+            expected_timespan_seconds_for_window_and_network(Network::Testnet, 17),
+            1_200
+        );
+        assert_eq!(
+            expected_timespan_seconds_for_window_and_network(Network::Regnet, 17),
+            1_600
+        );
     }
 
     #[test]

@@ -327,12 +327,12 @@ mod tests {
             "0.650 nATHO"
         );
         assert_eq!(
-            format_amount_atoms(781_250_000_000, DisplayUnit::Atho),
-            "0.78125 ATHO"
+            format_amount_atoms(625_000_000_000, DisplayUnit::Atho),
+            "0.625 ATHO"
         );
         assert_eq!(
-            format_amount_atoms(6_250_000_000_000, DisplayUnit::Atho),
-            "6.25 ATHO"
+            format_amount_atoms(5_000_000_000_000, DisplayUnit::Atho),
+            "5 ATHO"
         );
         assert_eq!(
             format_amount_atoms(12_458_300_000_000, DisplayUnit::MicroAtho),

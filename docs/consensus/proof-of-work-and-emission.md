@@ -10,7 +10,7 @@ Current constants:
 
 | Parameter | Value |
 | --- | ---: |
-| Target block time | `75 seconds` |
+| Target block time | `100 seconds` on mainnet/regnet; legacy testnet keeps `75 seconds` |
 | Retarget interval | `1 block` |
 | Averaging window | `17 blocks` |
 | Median window | `11 blocks` |
@@ -74,12 +74,12 @@ Current rules:
 
 | Parameter | Value |
 | --- | ---: |
-| Initial reward | `6.25 ATHO` |
-| Halving interval | `1,680,000 blocks` |
-| Tail reward | `0.78125 ATHO forever` |
+| Initial reward | `5 ATHO` on mainnet/regnet; legacy testnet keeps `6.25 ATHO` |
+| Halving interval | `1,260,000 blocks` on mainnet/regnet; legacy testnet keeps `1,680,000 blocks` |
+| Tail reward | `0.625 ATHO forever` on mainnet/regnet; legacy testnet keeps `0.78125 ATHO` |
 | Maximum supply | none; Atho has permanent tail emission |
-| Tail starts | block `5,040,000`, around year 12 |
-| Annual tail issuance | about `328,500 ATHO/year` |
+| Tail starts | block `3,780,000`, around year 12 |
+| Annual tail issuance | about `197,100 ATHO/year` at 100-second blocks |
 
 Why:
 

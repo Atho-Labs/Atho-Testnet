@@ -426,9 +426,9 @@ mod tests {
         assert!(!testnet_coinbase.is_spendable_at(10 + 148));
         assert!(testnet_coinbase.is_spendable_at(10 + 149));
 
-        assert_eq!(mainnet_payment.required_confirmations(), 7);
-        assert!(!mainnet_payment.is_spendable_at(10 + 5));
-        assert!(mainnet_payment.is_spendable_at(10 + 6));
+        assert_eq!(mainnet_payment.required_confirmations(), 6);
+        assert!(!mainnet_payment.is_spendable_at(10 + 4));
+        assert!(mainnet_payment.is_spendable_at(10 + 5));
 
         assert_eq!(testnet_payment.required_confirmations(), 1);
         assert!(testnet_payment.is_spendable_at(10));

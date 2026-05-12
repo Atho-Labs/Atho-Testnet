@@ -23,11 +23,11 @@ const MAINNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const MAINNET_GENESIS_LOCK_TIME: u32 = 0;
 const MAINNET_GENESIS_TIMESTAMP: u64 = 1_773_360_488;
 const MAINNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
-const MAINNET_GENESIS_NONCE: u64 = 20_164;
+const MAINNET_GENESIS_NONCE: u64 = 37_071;
 const MAINNET_GENESIS_COINBASE_TXID: [u8; 48] =
-    hex!("d5433104080b7866ca0a0e0cf4500b5312f1a97db394765eacb1f267caa1552b9ee2191704bfbdcf777cc55f2c861470");
+    hex!("af1a86a8d195d380c50c8543a217dec58597765e531f7090576954960a4785e7169235e7fe6d25bb8b71b97fc1d673d1");
 const MAINNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("000049993ab4e8874c71e35c659756c3f13d17f5e688a1271800704009017a8d0f69d9b5d8da7d7e398f720b037fd2c8");
+    hex!("0000920b35c7b38223caa7bcf2c44c8defbd242a5d5b7023e977acd80f53fe401ed495aaecb4eabd042612bc0079e1d2");
 
 const TESTNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHT22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -51,10 +51,11 @@ const REGNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const REGNET_GENESIS_LOCK_TIME: u32 = 0;
 const REGNET_GENESIS_TIMESTAMP: u64 = TESTNET_GENESIS_TIMESTAMP;
 const REGNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
-const REGNET_GENESIS_NONCE: u64 = 87_837;
-const REGNET_GENESIS_COINBASE_TXID: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
+const REGNET_GENESIS_NONCE: u64 = 120_555;
+const REGNET_GENESIS_COINBASE_TXID: [u8; 48] =
+    hex!("8ce958b10fbe4e0dffc527ec9d3f664536922be273fcb83451020006f285b4c71b0f4a13996fa6a3059612b55a87ead6");
 const REGNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("00005f08e72e60f4f87c4e11e24fe9b01b32b591df06e7dab2a21239be7efd75d43c0aee5573f69a4067a6117cc3ffdc");
+    hex!("0000de1702be0363ae99bad7e1d18789d135cf7693bdfb8edc17798bdf74e39e044c2bb8450d0cb43c4dab1fe11ba1ec");
 
 const PRUNETEST_GENESIS_REWARD_ADDRESS: &str =
     "ATHP22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -437,6 +438,26 @@ mod tests {
         assert_eq!(
             main.block.transactions[0].outputs[0].value_atoms,
             subsidy::genesis_coinbase_atoms_for_network(Network::Mainnet)
+        );
+        assert_eq!(
+            reg.block.transactions[0].outputs[0].value_atoms,
+            subsidy::genesis_coinbase_atoms_for_network(Network::Regnet)
+        );
+        assert_eq!(
+            main.block.transactions[0].outputs[0].value_atoms,
+            5_000_000_000_000
+        );
+        assert_eq!(
+            reg.block.transactions[0].outputs[0].value_atoms,
+            5_000_000_000_000
+        );
+        assert_eq!(
+            test.block.transactions[0].outputs[0].value_atoms,
+            6_250_000_000_000
+        );
+        assert_eq!(
+            prune.block.transactions[0].outputs[0].value_atoms,
+            6_250_000_000_000
         );
         assert_eq!(main.block.header.version, 1);
         assert_eq!(main.block.header.previous_block_hash, [0; 48]);

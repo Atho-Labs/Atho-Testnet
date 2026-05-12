@@ -90,11 +90,11 @@ Current constants:
 
 - `1 ATHO = 1,000,000,000,000 atoms`
 - fixed max supply: none; Atho uses permanent tail emission
-- initial block reward: `6.25 ATHO`
-- tail block reward: `0.78125 ATHO forever`
-- halving interval: `1,680,000 blocks`
+- initial block reward: `5 ATHO` on mainnet/regnet; legacy testnet remains `6.25 ATHO`
+- tail block reward: `0.625 ATHO forever` on mainnet/regnet; legacy testnet remains `0.78125 ATHO`
+- halving interval: `1,260,000 blocks` on mainnet/regnet; legacy testnet remains `1,680,000 blocks`
 - coinbase maturity: `150 blocks`
-- standard transaction confirmations: `7`
+- standard transaction confirmations: `6` on mainnet/regnet
 
 Implemented in:
 

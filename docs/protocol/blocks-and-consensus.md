@@ -145,9 +145,9 @@ Why:
 
 Current emission model:
 
-- initial subsidy: `6.25 ATHO`
-- halving interval: `1,680,000 blocks`
-- tail subsidy: `0.78125 ATHO` per block forever
+- initial subsidy: `5 ATHO` on mainnet/regnet
+- halving interval: `1,260,000 blocks` on mainnet/regnet
+- tail subsidy: `0.625 ATHO` per block forever on mainnet/regnet
 - fixed max supply cap: none
 
 Fees are tracked in atoms and split into explicit accounting fields on the block structure.

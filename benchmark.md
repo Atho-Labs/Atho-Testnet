@@ -11,7 +11,7 @@
 - Commit hash: `92c3c2b6ae3b153b8bb302ddc5555196f94bf080`
 
 ## Network Parameters
-- Block time: 75 seconds
+- Block time: 100 seconds on mainnet/regnet
 - Vbyte cap: 3,000,000 vbytes
 - Raw cap: about 12 MB
 - Average tx size tested: 546 vbytes

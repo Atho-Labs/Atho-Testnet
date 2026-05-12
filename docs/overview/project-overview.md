@@ -54,10 +54,10 @@ There is no fixed max supply cap. Atho uses proof-of-work with a permanent tail 
 
 Current schedule:
 
-- target block time: 75 seconds
-- initial reward: 6.25 ATHO
-- halving interval: 1,680,000 blocks
-- permanent tail reward: 0.78125 ATHO per block
+- target block time: 100 seconds on mainnet/regnet
+- initial reward: 5 ATHO on mainnet/regnet
+- halving interval: 1,260,000 blocks on mainnet/regnet
+- permanent tail reward: 0.625 ATHO per block on mainnet/regnet
 
 The official display ladder is:
 

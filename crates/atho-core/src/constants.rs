@@ -10,9 +10,9 @@ use crate::network::Network;
 // Display precision only. Consensus and backend accounting use integer atoms.
 pub const DECIMALS: usize = 12;
 pub const ATOMS_PER_ATHO: u64 = 1_000_000_000_000;
-pub const HALVING_INTERVAL_BLOCKS: u64 = 1_680_000;
+pub const HALVING_INTERVAL_BLOCKS: u64 = 1_260_000;
 pub const COINBASE_MATURITY_BLOCKS: u64 = 150;
-pub const STANDARD_TX_CONFIRMATIONS: u64 = 7;
+pub const STANDARD_TX_CONFIRMATIONS: u64 = 6;
 pub const MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE: u64 = 1;
 pub const MIN_TX_FEE_PER_VBYTE_ATOMS: u64 = MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE;
 pub const MIN_TX_FEE_ATOMS: u64 = 500;
@@ -25,16 +25,16 @@ pub const TX_POW_NONCE_BYTES: usize = 8;
 pub const TX_POW_BITS_BYTES: usize = 1;
 pub const TX_POW_DOMAIN: &[u8] = b"ATHO_TX_POW_V1";
 pub const TX_SIGN_DOMAIN: &[u8] = b"ATHO_TX_SIGN_V1";
-pub const BLOCK_TIME_SECONDS: u64 = 75;
+pub const BLOCK_TIME_SECONDS: u64 = 100;
 pub const TARGET_BLOCK_TIME_SECONDS: u64 = BLOCK_TIME_SECONDS;
 /// Maximum tolerated wall-clock lead for a candidate block timestamp.
 ///
 /// CONSENSUS: This is intentionally generous enough for ordinary clock skew but
 /// strict enough to prevent far-future timestamps from steering retarget logic.
 pub const MAX_FUTURE_BLOCK_TIME_SECONDS: u64 = 2 * 60 * 60;
-pub const BLOCKS_PER_YEAR: u64 = 420_480;
-pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = 6_250_000_000_000;
-pub const TAIL_REWARD_ATOMS: u64 = 781_250_000_000;
+pub const BLOCKS_PER_YEAR: u64 = 315_360;
+pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = 5_000_000_000_000;
+pub const TAIL_REWARD_ATOMS: u64 = 625_000_000_000;
 pub const GENESIS_COINBASE_ATOMS: u64 = INITIAL_BLOCK_REWARD_ATOMS;
 pub const POW_RETARGET_INTERVAL_BLOCKS: u64 = 1;
 pub const POW_AVERAGING_WINDOW_BLOCKS: u64 = 17;

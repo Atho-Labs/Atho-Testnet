@@ -1023,12 +1023,12 @@ fn fee_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
             }
             6 => {
                 assert_eq!(
-                    subsidy::get_block_reward_atoms(1_679_999),
-                    6_250_000_000_000
+                    subsidy::get_block_reward_atoms(1_259_999),
+                    5_000_000_000_000
                 );
                 assert_eq!(
-                    subsidy::get_block_reward_atoms(1_680_000),
-                    3_125_000_000_000
+                    subsidy::get_block_reward_atoms(1_260_000),
+                    2_500_000_000_000
                 );
             }
             _ => {

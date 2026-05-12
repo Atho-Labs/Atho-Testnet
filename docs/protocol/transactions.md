@@ -58,8 +58,8 @@ Examples:
 
 - `650 atoms = 0.650 nATHO`
 - `1,000 atoms = 1 nATHO`
-- `0.78125 ATHO = 781,250,000,000 atoms`
-- `6.25 ATHO = 6,250,000,000,000 atoms`
+- `0.625 ATHO = 625,000,000,000 atoms`
+- `5 ATHO = 5,000,000,000,000 atoms`
 
 ## Canonical Encoding
 

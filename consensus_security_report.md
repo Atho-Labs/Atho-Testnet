@@ -11,10 +11,10 @@
 
 ## Consensus Parameters Tested
 - Network: `Mainnet`, `Testnet`, `Regnet`
-- Block time: `75 seconds`
+- Block time: `100 seconds` on mainnet/regnet
 - Vbyte block cap: `3,000,000`
 - Raw block cap: `12,000,000 bytes`
-- Monetary policy constants: `6.25 ATHO` initial reward, `1,680,000` block halving interval, permanent `0.78125 ATHO` tail reward, no fixed max supply cap
+- Monetary policy constants: `5 ATHO` mainnet/regnet initial reward, `1,260,000` block halving interval, permanent `0.625 ATHO` tail reward, no fixed max supply cap
 - Coinbase maturity: `150 blocks`
 - Signature scheme: `Falcon-512`
 - Hashing scheme: `SHA3-384` prehash, `SHA3-256` address digests

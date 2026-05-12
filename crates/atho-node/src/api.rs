@@ -11,7 +11,7 @@ use crate::service::NodeService;
 use atho_core::address::decode_base56_address;
 use atho_core::consensus::{params::consensus_params_for_network, subsidy};
 use atho_core::constants::{
-    ATOMS_PER_ATHO, BLOCKS_PER_YEAR, MAX_STANDARD_OUTPUTS, MIN_OUTPUT_AMOUNT_ATOMS,
+    ATOMS_PER_ATHO, MAX_STANDARD_OUTPUTS, MIN_OUTPUT_AMOUNT_ATOMS,
     MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE, MIN_TX_FEE_ATOMS, TX_POW_MAX_BITS, TX_POW_MIN_BITS,
 };
 use atho_core::network::Network;
@@ -751,9 +751,9 @@ fn fees_value(service: &NodeService, network: Network) -> Result<Value, ApiError
 
 fn supply_value(service: &NodeService, network: Network) -> Result<Value, ApiError> {
     let supply = supply_snapshot(service, network);
-    let tail_height = subsidy::TAIL_EMISSION_START_HEIGHT;
-    let annual_tail_atoms = subsidy::EMISSION_SCHEDULE.blocks_per_year as u128
-        * subsidy::EMISSION_SCHEDULE.tail_reward_atoms as u128;
+    let schedule = subsidy::emission_schedule_for_network(network);
+    let tail_height = schedule.halving_interval_blocks.saturating_mul(3);
+    let annual_tail_atoms = schedule.blocks_per_year as u128 * schedule.tail_reward_atoms as u128;
     Ok(json!({
         "height": supply.height,
         "network_id": network.id(),
@@ -776,10 +776,10 @@ fn supply_value(service: &NodeService, network: Network) -> Result<Value, ApiErr
         "blocks_until_halving": supply.blocks_until_halving,
         "emission_epoch": supply.emission_epoch,
         "coinbase_maturity_blocks": supply.coinbase_maturity_blocks,
-        "initial_block_reward_atoms": subsidy::EMISSION_SCHEDULE.initial_block_reward_atoms,
-        "tail_reward_atoms": subsidy::EMISSION_SCHEDULE.tail_reward_atoms,
+        "initial_block_reward_atoms": schedule.initial_block_reward_atoms,
+        "tail_reward_atoms": schedule.tail_reward_atoms,
         "tail_emission_start_height": tail_height,
-        "blocks_per_year": BLOCKS_PER_YEAR,
+        "blocks_per_year": schedule.blocks_per_year,
         "annual_tail_issuance_atoms": annual_tail_atoms.to_string(),
         "annual_tail_issuance_atho": format_u128_atoms_decimal(annual_tail_atoms),
     }))
@@ -1072,17 +1072,17 @@ fn supply_snapshot(service: &NodeService, network: Network) -> SupplySnapshot {
     let max_supply_atoms = subsidy::max_supply_atoms_for_network(network);
     let current_block_reward_atoms =
         subsidy::block_subsidy_atoms_for_network(network, height.saturating_add(1));
-    let tail_epoch =
-        subsidy::TAIL_EMISSION_START_HEIGHT / subsidy::EMISSION_SCHEDULE.halving_interval_blocks;
-    let emission_epoch =
-        (height / subsidy::EMISSION_SCHEDULE.halving_interval_blocks).min(tail_epoch);
-    let next_halving_height = if height >= subsidy::TAIL_EMISSION_START_HEIGHT {
+    let schedule = subsidy::emission_schedule_for_network(network);
+    let tail_emission_start_height = schedule.halving_interval_blocks.saturating_mul(3);
+    let tail_epoch = tail_emission_start_height / schedule.halving_interval_blocks;
+    let emission_epoch = (height / schedule.halving_interval_blocks).min(tail_epoch);
+    let next_halving_height = if height >= tail_emission_start_height {
         None
     } else {
         Some(
             emission_epoch
                 .saturating_add(1)
-                .saturating_mul(subsidy::EMISSION_SCHEDULE.halving_interval_blocks),
+                .saturating_mul(schedule.halving_interval_blocks),
         )
     };
     let blocks_until_halving = next_halving_height.map(|next| next.saturating_sub(height));
@@ -2131,8 +2131,8 @@ mod tests {
         assert_eq!(stats["max_supply"], Value::Null);
         assert_eq!(stats["max_supply_label"], "No Fixed Cap");
         assert_eq!(stats["emission_epoch"], 0);
-        assert_eq!(stats["next_halving_height"], 1_680_000);
-        assert_eq!(stats["blocks_until_halving"], 1_680_000);
+        assert_eq!(stats["next_halving_height"], 1_260_000);
+        assert_eq!(stats["blocks_until_halving"], 1_260_000);
         assert_eq!(
             stats["latest_block_hash"],
             hex::encode(genesis::genesis_hash(Network::Regnet))
@@ -2165,9 +2165,9 @@ mod tests {
         assert_eq!(supply["max_supply_atoms"], Value::Null);
         assert_eq!(supply["max_supply"], Value::Null);
         assert_eq!(supply["max_supply_label"], "No Fixed Cap");
-        assert_eq!(supply["current_block_reward_atoms"], 6_250_000_000_000u64);
-        assert_eq!(supply["next_halving_height"], 1_680_000);
-        assert_eq!(supply["blocks_until_halving"], 1_680_000);
+        assert_eq!(supply["current_block_reward_atoms"], 5_000_000_000_000u64);
+        assert_eq!(supply["next_halving_height"], 1_260_000);
+        assert_eq!(supply["blocks_until_halving"], 1_260_000);
         assert_eq!(supply["emission_epoch"], 0);
         assert_eq!(supply["coinbase_maturity_blocks"], 150);
     }

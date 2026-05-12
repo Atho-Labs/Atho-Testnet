@@ -60,7 +60,7 @@ That order follows the way a reader usually thinks:
 | Client model | Thin desktop client over RPC |
 | Delivery model | Native installer front-end plus release bundles |
 | Design posture | Deterministic, compact, explicit, auditable |
-| Practical throughput | About 80 TPS on small 1-in/1-out transactions |
+| Practical throughput | About 55-60 TPS on small 1-in/1-out transactions |
 
 ## The Slogan
 
@@ -449,16 +449,16 @@ The project keeps those rules in code so they are visible and testable.
 
 The current documented consensus shape in this repository is:
 
-- block time target: 75 seconds
+- block time target: 100 seconds on mainnet/regnet
 - block cap: 3,000,000 vbytes
 - raw cap: about 12,000,000 bytes
 - transaction model: SigWit-style witness-separated sizing
 - signature scheme: Falcon-512
 - address model: public UTXO
-- practical throughput target: about 65-80 TPS depending on transaction mix
+- practical throughput target: about 55-60 TPS for small common transactions depending on transaction mix
 - small common transaction size: about 500 vbytes for a 1-in/1-out spend
 - rough block capacity at 500 vbytes: about 6,000 transactions per block
-- rough throughput at 75-second blocks and 500 vbyte transactions: about 80 TPS
+- rough throughput at 100-second blocks and 500 vbyte transactions: about 60 TPS
 
 That is a compact but modern payment-chain shape.
 
@@ -762,7 +762,7 @@ The current throughput expectation is:
 
 - small 1-in/1-out transactions: about 500 vbytes
 - 3,000,000 vbyte blocks: about 6,000 such transactions per block
-- 75-second block time: about 80 TPS at that size profile
+- 100-second block time: about 60 TPS at that size profile
 
 That is a target range, not a promise that every transaction mix will land on the same number. Larger transactions reduce throughput, and the system is designed to stay honest about that.
 

@@ -821,7 +821,7 @@ fn render_report(
 
     out.push_str("## Network Parameters\n");
     out.push_str(&format!("- Network: {}\n", cli.network.id()));
-    out.push_str("- Block time: 75 seconds\n");
+    out.push_str("- Block time: 100 seconds on mainnet/regnet\n");
     out.push_str("- Vbyte cap: 3,000,000 vbytes\n");
     out.push_str("- Raw cap: about 12 MB\n");
     out.push_str(&format!(

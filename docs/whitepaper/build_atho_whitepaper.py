@@ -244,14 +244,14 @@ FIGURES: Dict[str, FigureSpec] = {
         "fig6",
         6,
         "Atho Emission Model",
-        "Emission schedule derived from the current source constants: 6.25 ATHO initial subsidy, 1,680,000-block halving intervals, and a permanent 0.78125 ATHO tail reward.",
+        "Emission schedule derived from the current mainnet source constants: 5 ATHO initial subsidy, 1,260,000-block halving intervals, and a permanent 0.625 ATHO tail reward.",
         dedent(
             """
             xychart-beta
                 title "Atho emission model"
-                x-axis "Height" [0, 1680000, 3360000, 5040000, 6720000]
-                y-axis "Reward ATHO" 0 --> 7
-                line "Subsidy" [6.25, 3.125, 1.5625, 0.78125, 0.78125]
+                x-axis "Height" [0, 1260000, 2520000, 3780000, 5040000]
+                y-axis "Reward ATHO" 0 --> 6
+                line "Subsidy" [5, 2.5, 1.25, 0.625, 0.625]
             """
         ),
         "figure_06_emission_model.png",
@@ -413,7 +413,7 @@ TABLES: Dict[str, TableSpec] = {
             ["Input script must match the locked output.", "Prevents spending an output with unrelated authorization material.", "`InputOwnershipMismatch`.", "`crates/atho-storage/src/validation.rs`"],
             ["Public key digest must bind to a standard 32-byte locking script.", "Binds witness public key to address digest for standard outputs.", "`InputOwnershipMismatch`.", "`locking_script_matches_public_key`"],
             ["Coinbase outputs require 150 confirmations.", "Prevents unstable mining rewards from being spent too early.", "`InsufficientConfirmations`.", "`crates/atho-storage/src/utxo.rs`"],
-            ["Standard non-coinbase spendability uses 7 confirmations.", "Defines wallet-facing settlement convention.", "`InsufficientConfirmations`.", "`required_confirmations`"],
+            ["Standard non-coinbase spendability uses 6 confirmations.", "Defines wallet-facing settlement convention.", "`InsufficientConfirmations`.", "`required_confirmations`"],
             ["Input total must be greater than or equal to output total.", "Enforces conservation of value and derives fee.", "`FeeMismatch`.", "`validate_transaction_with_context_common_and_schedule`"],
             ["Each outpoint can be spent once per transaction and block.", "Prevents double-spend within a local candidate.", "`DuplicateInput` or `MempoolConflict`.", "`block_inputs_are_unique`"],
             ["Created UTXOs must match active network.", "Prevents cross-network replay in chainstate.", "`CrossNetworkReplay`.", "`crates/atho-storage/src/utxo.rs`"],
@@ -441,12 +441,12 @@ TABLES: Dict[str, TableSpec] = {
         [
             ["Atoms per ATHO", "1,000,000,000,000", "`crates/atho-core/src/constants.rs`", "Defines the smallest accounting unit."],
             ["Maximum supply ceiling", "None", "`constants.rs`; `consensus/params.rs`", "Atho uses permanent tail emission."],
-            ["Initial block reward", "6.25 ATHO", "`constants.rs`; `consensus/subsidy.rs`", "Genesis and early-chain subsidy."],
-            ["Halving interval", "1,680,000 blocks", "`constants.rs`; `consensus/subsidy.rs`", "Height interval for right-shift reward reduction."],
-            ["Tail block reward", "0.78125 ATHO forever", "`constants.rs`; `consensus/subsidy.rs`", "Long-term proof-of-work security budget."],
-            ["Target block time", "75 seconds", "`constants.rs`; `consensus/pow.rs`", "Expected spacing for difficulty adjustment."],
+            ["Initial block reward", "5 ATHO", "`constants.rs`; `consensus/subsidy.rs`", "Mainnet and regnet genesis and early-chain subsidy."],
+            ["Halving interval", "1,260,000 blocks", "`constants.rs`; `consensus/subsidy.rs`", "Height interval for right-shift reward reduction on mainnet and regnet."],
+            ["Tail block reward", "0.625 ATHO forever", "`constants.rs`; `consensus/subsidy.rs`", "Long-term proof-of-work security budget."],
+            ["Target block time", "100 seconds", "`constants.rs`; `consensus/pow.rs`", "Expected spacing for difficulty adjustment on mainnet and regnet."],
             ["Coinbase maturity", "150 blocks", "`constants.rs`; `storage/utxo.rs`", "Required confirmations before mined outputs are spendable."],
-            ["Standard confirmations", "7 blocks", "`constants.rs`; `storage/utxo.rs`", "Wallet-facing settlement convention for non-coinbase outputs."],
+            ["Standard confirmations", "6 blocks", "`constants.rs`; `storage/utxo.rs`", "Wallet-facing settlement convention for non-coinbase outputs."],
             ["Minimum fee", "max(500 atoms, tx_vbytes)", "`constants.rs`; `storage/validation.rs`", "Baseline anti-spam policy."],
             ["Minimum output", "1,000 atoms", "`crates/atho-core/src/constants.rs`", "Relay and wallet policy floor for normal outputs."],
         ],
@@ -1061,7 +1061,7 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             Maturity rules are also UTXO rules. Coinbase outputs require 150
-            confirmations. Standard non-coinbase spendability uses 7 confirmations
+            confirmations. Standard non-coinbase spendability uses 6 confirmations
             as the wallet-facing confirmation policy. These constants are enforced
             by `UtxoEntry::required_confirmations` and `is_spendable_at`. Change
             outputs are ordinary transaction outputs generated by the wallet and
@@ -1125,8 +1125,8 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             The proof-of-work profile is implemented in
-            `crates/atho-core/src/consensus/pow.rs`. The target block time is 75
-            seconds. Retargeting occurs every block, using a 17-block averaging
+            `crates/atho-core/src/consensus/pow.rs`. The mainnet and regnet target
+            block time is 100 seconds. Retargeting occurs every block, using a 17-block averaging
             window, an 11-block median window, a damping factor of 4, a maximum upward
             adjustment of 16%, and a maximum downward adjustment of 32%. The target
             is represented as a 48-byte value. A block is valid only if its header
@@ -1155,9 +1155,9 @@ SECTIONS: List[Dict[str, object]] = [
             """
             Atho's monetary policy is defined by source constants and subsidy
             functions. One ATHO is 1,000,000,000,000 atoms. There is no fixed max
-            supply cap. The initial subsidy is 6.25 ATHO per block, the halving
-            interval is 1,680,000 blocks, the target block time is 75 seconds, and
-            the permanent tail subsidy is 0.78125 ATHO per block forever after the
+            supply cap. The mainnet and regnet initial subsidy is 5 ATHO per block,
+            the halving interval is 1,260,000 blocks, the target block time is 100
+            seconds, and the permanent tail subsidy is 0.625 ATHO per block forever after the
             third halving. This schedule keeps a predictable proof-of-work security
             budget instead of depending only on future fee pressure.
             """
@@ -1167,7 +1167,7 @@ SECTIONS: List[Dict[str, object]] = [
             Atho changed from a fixed-cap model to permanent tail emission because a
             payment-focused proof-of-work network needs durable miner incentives
             while preserving low transaction fees for users. The inflation rate
-            naturally declines as supply grows. The tail starts at block 5,040,000,
+            naturally declines as supply grows. The tail starts at block 3,780,000,
             around year 12. Approximate supply is 18,375,000 ATHO at tail start,
             21,007,500 ATHO around year 20, and 30,862,500 ATHO around year 50. The
             annual tail issuance is 328,500 ATHO, about 1.56% around year 20 and
@@ -1627,10 +1627,11 @@ SECTIONS: List[Dict[str, object]] = [
         p(
             """
             Atho's performance target is safe throughput, not validation bypass.
-            The current documented practical estimate is about 65 to 80 transactions
+            The current documented practical estimate is about 55 to 60 transactions
             per second for small 1-input, 1-output transactions, assuming roughly
-            500 vbytes per transaction, 3,000,000-vbyte blocks, and 75-second block
-            intervals. This is a transaction-mix estimate, not a universal promise.
+            500 vbytes per transaction, 3,000,000-vbyte blocks, and 100-second block
+            intervals, yielding roughly 55 to 60 TPS for that profile. This is a
+            transaction-mix estimate, not a universal promise.
             Falcon witnesses, larger scripts, more inputs, more outputs, and network
             propagation conditions all affect realized throughput.
             """
@@ -1821,13 +1822,13 @@ APPENDICES: List[Dict[str, object]] = [
             """
             The following source-derived constants are used throughout the paper:
             `ATOMS_PER_ATHO = 1_000_000_000_000`; `TAIL_EMISSION = PERMANENT`;
-            `INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_680_000`;
-            `TAIL_REWARD_ATOMS = 781_250_000_000`; `MIN_TX_FEE_ATOMS = 500`;
+            `INITIAL_BLOCK_REWARD_ATOMS = 5_000_000_000_000`; `HALVING_INTERVAL_BLOCKS = 1_260_000`;
+            `TAIL_REWARD_ATOMS = 625_000_000_000`; `MIN_TX_FEE_ATOMS = 500`;
             `MIN_OUTPUT_AMOUNT_ATOMS = 1_000`; `MAX_STANDARD_OUTPUTS = 64`;
             `TX_POW_HASH = SHA3-256`; `TX_POW_MIN_BITS = 16`; `TX_POW_MAX_BITS = 28`;
             `TX_POW_DOMAIN = ATHO_TX_POW_V1`; `TX_SIGN_DOMAIN = ATHO_TX_SIGN_V1`;
-            `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 7`;
-            `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 75`;
+            `COINBASE_MATURITY_BLOCKS = 150`; `STANDARD_TX_CONFIRMATIONS = 6`;
+            `MIN_TX_FEE_PER_VBYTE_ATOMS = 1`; `BLOCK_TIME_SECONDS = 100`;
             `MAX_BLOCK_VBYTES = 3_000_000`; `MAX_BLOCK_RAW_BYTES = 12_000_000`;
             `MAX_TRANSACTION_RAW_BYTES = 250_000`; `MAX_TRANSACTION_VBYTES = 250_000`;
             `ADDRESS_DIGEST_BYTES = 32`; `ADDRESS_CHECKSUM_BYTES = 4`;
@@ -2157,9 +2158,9 @@ def draw_sequence(spec: FigureSpec) -> None:
 
 
 ATOMS_PER_ATHO = 1_000_000_000_000
-INITIAL_BLOCK_REWARD_ATOMS = 6_250_000_000_000
-TAIL_REWARD_ATOMS = 781_250_000_000
-HALVING_INTERVAL_BLOCKS = 1_680_000
+INITIAL_BLOCK_REWARD_ATOMS = 5_000_000_000_000
+TAIL_REWARD_ATOMS = 625_000_000_000
+HALVING_INTERVAL_BLOCKS = 1_260_000
 
 
 def block_reward_atoms(height: int) -> int:
@@ -2190,7 +2191,7 @@ def draw_emission_chart(spec: FigureSpec) -> None:
 
     csv_path = ASSET_DIR / "atho_emission_model.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
+        writer = csv.writer(fh, lineterminator="\n")
         writer.writerow(["height", "reward_atho", "cumulative_supply_million_atho"])
         for h, r, s in zip(heights, rewards, supply):
             writer.writerow([h, r, f"{s:.6f}"])
@@ -2206,8 +2207,7 @@ def draw_emission_chart(spec: FigureSpec) -> None:
     ax1.tick_params(axis="y", colors="#56d68a")
     ax1.grid(True, color="#26352b", linewidth=0.7)
     ax2 = ax1.twinx()
-    ax2.plot(heights, supply, color="#d9e3dc", linewidth=2.0, label="Cumulative supply")
-    ax2.axhline(168, color="#8ff0aa", linestyle="--", linewidth=1.5, label="168M ceiling")
+    ax2.plot(heights, supply, color="#d9e3dc", linewidth=2.0, label="Cumulative issued supply")
     ax2.set_ylabel("Cumulative supply (million ATHO)", color="#d9e3dc")
     ax2.tick_params(axis="y", colors="#d9e3dc")
     ax1.set_title("Atho Emission Model", color="#f4fff7", fontsize=15, pad=12)

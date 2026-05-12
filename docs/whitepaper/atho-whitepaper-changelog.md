@@ -10,4 +10,4 @@
 - Included code reference map and pseudocode appendices for transaction validation, block validation, mempool admission, coinbase reward validation, reorg rollback, wallet signing, and difficulty checking.
 - Added external citations for NIST PQC/FIPS status, Falcon, SHA3, Rust, proof-of-work, and quantum-signature risk.
 
-Word count reported by build script: 11914
+Word count reported by build script: 11937
