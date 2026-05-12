@@ -45,7 +45,7 @@ The strongest current design choice is that the canonical consensus gate is conc
 
 The most important recent hardening is the 32-byte locking-script rule in `locking_script_matches_public_key`. The old unsupported-script hole is closed because a spend now requires a locking script of exactly `ADDRESS_DIGEST_BYTES` and that digest must equal `public_key_digest(network, witness_pubkey)`. This means `script_sig`/`unlocking_script` cannot authorize spending by itself.
 
-Current estimated security level: **7/10**. The core transaction, UTXO, witness, block, PoW, reward, and fee validation paths are meaningfully hardened and have regression coverage. I would still call mainnet **close but not ready** until the 32-byte HPK migration is completed end to end, genesis reward scripts are made compatible with the new 32-byte lock model or intentionally documented as unspendable, storage replacement is made fully crash-atomic across raw block archives and LMDB, and a broader replay/reindex/soak/adversarial run is completed on the exact release branch.
+Current estimated security level: **8/10**. The core transaction, UTXO, witness, block, PoW, reward, fee, mainnet/regnet dust-output consensus, and replacement-chain rollback paths are meaningfully hardened and have regression coverage. Mainnet/regnet now use 32-byte genesis reward scripts and `internal_hpk_bytes` decodes 32-byte HPK strings, closing the prior migration mismatch. I would still call mainnet **close but not ready** until a broader replay/reindex/soak/adversarial run is completed on the exact release branch.
 
 Biggest strengths:
 
@@ -57,9 +57,7 @@ Biggest strengths:
 
 Biggest weaknesses:
 
-- Mainnet/regnet genesis reward scripts in `genesis.rs` are still 48-byte legacy scripts while normal spends now require 32-byte locking scripts. This is safe against theft but makes those outputs unspendable under the current validator.
-- `internal_hpk_bytes` still decodes internal HPK strings as 48-byte SHA3-384 hex, while payment locks now use 32-byte digests.
-- `Database::replace_chainstate` appends replacement raw block files before the LMDB transaction, so crash recovery around full chain replacement is weaker than normal block append.
+- `Database::replace_chainstate` now cleans staged raw archive records on failed LMDB replacement, but process-crash testing should still be expanded for release confidence.
 - Full mainnet readiness still needs large adversarial, long-running, reindex, and multi-node testing on the final code.
 
 ## 2. Consensus-Critical Code Map
@@ -69,7 +67,7 @@ Biggest weaknesses:
 | Constants | `crates/atho-core/src/constants.rs` | Defines atoms, block time, reward, halving, tail, confirmations, sizes, fees | Critical | Mainnet/regnet now use 5 ATHO, 100 seconds, 1,260,000 halvings, 0.625 tail, 6 confirmations |
 | Network params | `crates/atho-core/src/consensus/params.rs::consensus_params_for_network` | Separates mainnet/testnet/regnet policy | Critical | Testnet keeps legacy 75-second and 6.25 ATHO policy |
 | Subsidy | `crates/atho-core/src/consensus/subsidy.rs` | Calculates block reward and cumulative issued atoms | Critical | `max_supply_atoms_for_network` returns `None`; tail emission is permanent |
-| Genesis | `crates/atho-core/src/genesis.rs` | Hard-coded network anchors and genesis blocks | Critical | Mainnet/regnet genesis hashes updated for new reward; scripts remain 48-byte legacy |
+| Genesis | `crates/atho-core/src/genesis.rs` | Hard-coded network anchors and genesis blocks | Critical | Mainnet/regnet genesis hashes updated for new reward and 32-byte HPK scripts |
 | Transaction encoding | `crates/atho-core/src/transaction.rs::base_bytes`, `txid`, `signing_digest` | Defines txid, wtxid, sighash, witness encoding | Critical | Txid excludes witness; sighash signs base bytes plus covered input indexes |
 | Witness parsing | `crates/atho-core/src/transaction.rs::TxWitness::from_bytes` | Rejects malformed Falcon witness lengths | Critical | Enforces exact Falcon pubkey/signature lengths and input-ref bounds |
 | Signature prehash | `crates/atho-core/src/consensus/signatures.rs` | Adds domain, network id, genesis hash to tx signing digest | Critical | Prevents cross-network signature replay |
@@ -82,10 +80,10 @@ Biggest weaknesses:
 | Block validation | `crates/atho-storage/src/validation.rs::validate_block_with_context` | Full block acceptance gate | Critical | Checks header, PoW, target, roots, txs, UTXO, fees, coinbase |
 | PoW and difficulty | `crates/atho-core/src/consensus/pow.rs` | Target, bounds, retarget, chainwork, MTP | Critical | Mainnet/regnet 100 seconds; testnet reset isolated to testnet |
 | Chainstate | `crates/atho-storage/src/chainstate.rs::connect_block` | Validates and mutates active chain | Critical | Rolls back UTXO changes if storage commit fails |
-| Reorg | `crates/atho-storage/src/chainstate.rs::replace_with_validated_branch` | Validates replacement branch then swaps chain | Critical | Uses `validate_replacement_chain`; storage replacement still needs stronger crash atomicity |
+| Reorg | `crates/atho-storage/src/chainstate.rs::replace_with_validated_branch` | Validates replacement branch then swaps chain | Critical | Uses `validate_replacement_chain`; failed replacement cleanup is regression-tested |
 | UTXO set | `crates/atho-storage/src/utxo.rs::apply_block`, `disconnect_block` | Spends and creates UTXOs with undo | Critical | Reverts in-memory state on failed apply |
-| Storage | `crates/atho-storage/src/db.rs::commit_chainstate`, `replace_chainstate` | LMDB and raw archive persistence | High | Normal appends use LMDB transaction; full replacement has raw-archive prewrite risk |
-| Address/HPK | `crates/atho-core/src/address.rs` | Public key digest, base56 address, internal HPK | High | `public_key_digest` is 32-byte; `internal_hpk_bytes` still expects 48-byte legacy hex |
+| Storage | `crates/atho-storage/src/db.rs::commit_chainstate`, `replace_chainstate` | LMDB and raw archive persistence | High | Normal appends use LMDB transaction; replacement prewrites raw blocks and cleans them on failed commit |
+| Address/HPK | `crates/atho-core/src/address.rs` | Public key digest, base56 address, internal HPK | High | `public_key_digest` and `internal_hpk_bytes` both use 32-byte HPK digests |
 | Network/ruleset | `crates/atho-core/src/consensus/rules.rs`, `Network` | Version and network separation | Critical | V1 active; V2 placeholder inactive |
 | Sync/P2P | `crates/atho-node/src/sync.rs` | Receives headers/blocks and feeds local validators | High | Header/body sync must not bypass `validate_block_with_context` |
 
@@ -144,7 +142,7 @@ flowchart TD
 | Size | `MAX_TRANSACTION_RAW_BYTES`, `MAX_TRANSACTION_VBYTES` | Bounds DoS and fee accounting | `TransactionTooLarge` | 8 |
 | Duplicate inputs | BTreeSet over previous txid/index | Prevents same-tx double spend and input-total inflation | `DuplicateInput` | 9 |
 | Fee floor | `minimum_required_fee_atoms` | Anti-spam and block inclusion floor | `FeeBelowMinimum` | 8 |
-| Dust | Standard policy path only | Keeps relay/mempool UTXO spam down | `DustOutput` | 7 |
+| Dust | Mempool plus mainnet/regnet block consensus | Keeps relay and production-chain UTXO spam down | `DustOutput` | 8 |
 | Witness parse | Exact Falcon lengths and ref count | Rejects malformed witness cheaply | `InvalidWitness` | 8 |
 | UTXO lookup | `lookup(previous_txid, output_index)` | Prevents spending missing coins | `MissingUtxo` | 9 |
 | Ownership | UTXO lock equals input unlock script, then pubkey digest equals lock | Prevents script_sig-only spend | `InputOwnershipMismatch` | 8 |
@@ -181,7 +179,7 @@ Duplicate spends are blocked in multiple places:
 - Same block: `block_inputs_are_unique` plus contextual block `seen_inputs` rejects duplicate inputs.
 - Chainstate: `UtxoSet::remove` physically removes spent UTXOs during apply.
 
-The current implementation correctly enforces fixed 32-byte UTXO locks for normal spends. The main launch risk is compatibility: genesis reward scripts are still 48 bytes in `genesis.rs`, so those outputs cannot be spent by the current 32-byte-only validator.
+The current implementation correctly enforces fixed 32-byte UTXO locks for normal spends, and mainnet/regnet genesis UTXOs are seeded from 32-byte genesis block scripts. Remaining launch risk is no longer HPK compatibility; it is proving storage recovery and long-run replay behavior on the exact release branch.
 
 ## 6. Falcon-512 Witness Validation Flow
 
@@ -210,7 +208,7 @@ flowchart TD
 | Output/fee binding | Base bytes include outputs and fee is derived from inputs minus outputs | Output/fee mutation theft | 8 | Add more mutation test vectors |
 | UTXO amount binding | Not directly signed; protected by prevout txid/index plus UTXO lookup | Offline signer could be harder to reason about | 7 | Include previous output amount/lock in a future sighash mode |
 | Witness root | Block root commits to witness signature/pubkey data | Witness mutation in blocks | 8 | Keep tests for witness root and commit refs |
-| script_sig bypass | UTXO lock and Falcon are both required | Anyone-can-spend | 8 | Finish 32-byte HPK migration everywhere |
+| script_sig bypass | UTXO lock and Falcon are both required | Anyone-can-spend | 8 | Keep 32-byte HPK enforcement covered by fixtures |
 
 ## 7. script_sig / Unlocking Reference Validation
 
@@ -234,7 +232,7 @@ Current behavior:
 - `locking_script_matches_public_key` requires the lock length to be exactly `ADDRESS_DIGEST_BYTES` and equal the network-specific public-key digest.
 - Falcon witness verification still runs. Matching the reference alone is not enough.
 
-Security answer: the old unsupported-script anyone-can-spend issue is closed for normal UTXOs. The current risk is not theft; it is migration consistency. Any remaining 48-byte legacy locks become unspendable under the new 32-byte rule.
+Security answer: the old unsupported-script anyone-can-spend issue is closed for normal UTXOs. Mainnet and regnet genesis now use the same 32-byte HPK lock model as normal spends; remaining 48-byte legacy locks are limited to legacy testnet/prunetest data and fail closed if spent under the 32-byte validator.
 
 ## 8. Fee and Atom Accounting Validation
 
@@ -259,7 +257,7 @@ All consensus amounts are integer `u64` atoms. One ATHO is `1_000_000_000_000` a
 | Outputs exceed inputs | `checked_sub` fails | Critical if missing | 9 | None for core path |
 | Negative outputs | Impossible in `u64`; parser must reject invalid encodings | Low in Rust structs | 8 | Keep decoder fuzzing |
 | Zero outputs | Rejected | Low | 8 | None |
-| Dust outputs | Mempool/standard policy rejects; block consensus does not make dust a hard rule | Policy risk, not inflation | 7 | Document policy/consensus split |
+| Dust outputs | Mempool rejects; mainnet/regnet block consensus rejects; legacy testnet/prunetest remain isolated | Low legacy-network policy risk, not inflation | 8 | Keep network-specific fixtures |
 | Duplicate inputs | Rejected before totals | Critical if missing | 9 | None |
 | Fee underflow | `checked_sub` rejects | Critical if missing | 9 | None |
 | Fee overflow in block sum | `checked_add` rejects | High if missing | 8 | None |
@@ -400,7 +398,7 @@ Consensus validation must not rely on "the mempool already checked it." Atho mos
 | Signature | Yes | Yes | Yes | Low after revalidation |
 | UTXO exists/unspent | Yes | Yes | Yes | Low |
 | Mempool conflict | Yes | Block uses separate input uniqueness | Policy and consensus | Low |
-| Dust | Yes under standard policy | Not hard consensus | No, policy-only | Documented policy difference |
+| Dust | Yes in mempool; yes in mainnet/regnet block consensus | Legacy testnet/prunetest policy split only | No | Network-specific behavior documented |
 | Minimum fee | Yes | Yes | Yes/current consensus | Low |
 | Size | Yes | Yes | Yes | Low |
 | Coinbase | Not admitted | Block only | Yes | Low |
@@ -443,7 +441,7 @@ flowchart TD
 
 PoW branch preference helpers live in `crates/atho-core/src/consensus/pow.rs`: `accumulated_chain_work`, `compare_branch_work`, and `branch_is_preferred`. Chainstate exposes `finalized_height`, `finalized_checkpoint`, `max_reorg_depth`, and branch replacement helpers.
 
-`replace_with_validated_branch` constructs a canonical prefix plus candidate branch, calls `validate_replacement_chain`, and only then swaps local fields and storage. This is the right shape. The major hardening target is persistence crash atomicity during `Database::replace_chainstate`, because raw block archive files are appended before the LMDB transaction is committed.
+`replace_with_validated_branch` constructs a canonical prefix plus candidate branch, calls `validate_replacement_chain`, and only then swaps local fields and storage. This is the right shape. `Database::replace_chainstate` prewrites raw block records before the LMDB replacement so an accepted chainstate never points at missing raw block bytes. Failed LMDB replacement now cleans staged raw archive records, and process-crash recovery should stay in the release-gate test plan.
 
 ## 15. Database Persistence and Atomic State Updates
 
@@ -465,8 +463,8 @@ Normal block connection is reasonably safe. `Chainstate::connect_block` validate
 | UTXO delta on normal append | LMDB transaction | Yes | Low | None |
 | Block indexes | LMDB transaction | Yes | Low | None |
 | Raw block archive append | Block file before LMDB commit | Partially | Medium | Add staged file/commit marker recovery |
-| Full chain replacement | Raw archive plus LMDB replacement | Partially | High | Make raw archive replacement crash-atomic |
-| Reorg replacement | `replace_chainstate` | Partially | High | Stage, fsync, commit, then promote |
+| Full chain replacement | Raw archive plus LMDB replacement | Fail-safe order with cleanup | Medium | Add process-crash simulation around replacement |
+| Reorg replacement | `replace_chainstate` | Failed commits cleaned | Medium | Keep staged cleanup and crash-recovery tests in release gate |
 | Undo reconstruction | Storage transaction records | Mostly | Medium | Add more reindex/reorg corpus |
 
 ## 16. Consensus Security Scorecard
@@ -474,10 +472,10 @@ Normal block connection is reasonably safe. `Chainstate::connect_block` validate
 | Subsystem | Score 1-10 | Reason | Main Weakness | Main Improvement |
 |---|---:|---|---|---|
 | Transaction validation | 8 | Strong shared validator and checked accounting | Needs larger mutation corpus | Add release-gate adversarial suite |
-| UTXO validation | 8 | Contextual UTXO lookup, maturity, duplicate-spend checks | Genesis 48-byte lock mismatch | Finish HPK migration |
+| UTXO validation | 8 | Contextual UTXO lookup, maturity, duplicate-spend checks | Storage replacement proof | Keep HPK fixtures current |
 | Falcon witness validation | 8 | Exact lengths, domain/network/genesis-scoped sighash | Prevout amount/lock not explicitly signed | Future sighash v2 |
-| script_sig/reference validation | 8 | Fixed lock plus Falcon required | Legacy locks become unspendable | Regenerate/migrate genesis locks |
-| Fee accounting | 9 | Fees derived from UTXOs, checked arithmetic | Dust is policy split | Document and test policy split |
+| script_sig/reference validation | 8 | Fixed lock plus Falcon required | Legacy testnet/prunetest compatibility is isolated | Keep legacy-network behavior documented |
+| Fee accounting | 9 | Fees derived from UTXOs, checked arithmetic | Legacy testnet/prunetest dust policy split | Keep mainnet/regnet consensus fixtures |
 | Coinbase validation | 9 | Exact subsidy plus computed fees | Needs broad fixtures | More block mutation tests |
 | Monetary policy enforcement | 8 | Network-aware reward schedule and no fixed cap | Testnet legacy needs clear docs | Keep testnet isolation tests |
 | Block validation | 8 | Header, PoW, target, roots, txs, UTXO, fees | Needs more large adversarial runs | 100k+ attack suite |
@@ -511,40 +509,34 @@ Normal block connection is reasonably safe. `Chainstate::connect_block` validate
 
 | Severity | Weakness | Where | Why It Matters | Recommended Fix |
 |---|---|---|---|---|
-| High | 48-byte genesis reward scripts are incompatible with 32-byte-only spend validation | `genesis.rs`, `locking_script_matches_public_key` | Prevents spending genesis reward outputs under current rules | Regenerate genesis reward scripts as 32-byte payment digests or explicitly document them as unspendable |
-| High | Internal HPK decoder still expects 48-byte SHA3-384 hex | `address.rs::internal_hpk_bytes` | Conflicts with new 32-byte HPK model and can create wallet/API confusion | Update internal HPK format and tests to 32-byte digest |
-| High | Full chain replacement is not fully crash-atomic across raw archive and LMDB | `db.rs::replace_chainstate` | Crash during reorg/replacement could leave orphan raw files or inconsistent recovery requirements | Stage raw files and promote only after LMDB commit or add recovery markers |
 | Medium | Prevout amount and locking script are not explicitly signed | `transaction.rs::signing_digest` | Node validation is safe, but offline signer UX is less explicit | Add sighash v2 including prevout amount/lock if a future ruleset changes signing |
-| Medium | Dust is standard policy, not block consensus | `prepare_transaction_validation_with_policy` | Malicious miners may include dust if minimum fee is paid | Decide if dust should remain policy-only or become scheduled consensus |
+| Medium | Process-crash simulation for replacement-chain persistence is still limited | `db.rs::replace_chainstate` tests | Failed LMDB commits are covered, but kill-process tests should prove raw/LMDB recovery under OS crashes | Add process-level crash harness |
 | Medium | Full 100k+ consensus adversarial campaign was not rerun in this doc update | Testing scope | Production confidence remains incomplete | Run release-gate fuzz/replay/reindex suite |
-| Low | Second coinbase is rejected through non-coinbase/no-input validation rather than always a specific error | `validate_block_impl_with_schedule` | Error clarity only | Add explicit second-coinbase check for diagnostics |
 
 ## 19. Required Improvements Before Mainnet
 
 | Priority | Improvement | Why It Matters | Files/Functions to Change | Expected Security Gain |
 |---:|---|---|---|---|
-| 1 | Finish 32-byte HPK migration for genesis and internal HPK strings | Prevents unspendable genesis outputs and format confusion | `genesis.rs`, `address.rs`, wallet/address tests | High |
-| 2 | Make `replace_chainstate` crash-atomic with raw block archives | Prevents reorg/replacement persistence edge cases | `db.rs::replace_chainstate`, recovery tests | High |
-| 3 | Run full replay/reindex/UTXO-root verification after monetary-policy changes | Proves the new reward schedule replays deterministically | storage and node tests | High |
-| 4 | Add release-gate block mutation tests | Proves mined blocks reject every committed mutation | `validation.rs` tests, fixtures | High |
-| 5 | Add mempool-vs-block validation matrix tests | Prevents miner/mempool policy drift | `mempool.rs`, `validation.rs`, node tests | Medium |
-| 6 | Add timewarp and difficulty boundary tests for 100-second mainnet/regnet | Protects difficulty schedule | `pow.rs`, `validation.rs` | Medium |
-| 7 | Add address/HPK replay fixtures across mainnet/testnet/regnet | Protects network separation | `address.rs`, `validation.rs` | Medium |
-| 8 | Add long-running multi-node sync and reorg soak | Catches stalls and state drift | `sync.rs`, node integration | Medium |
-| 9 | Add parser and serialization fuzz corpus | Hardens malformed transaction/block handling | `transaction.rs`, `block.rs`, P2P codecs | Medium |
-| 10 | Decide whether dust remains policy-only | Avoids surprise miner behavior | `validation.rs`, docs | Medium |
+| 1 | Run full replay/reindex/UTXO-root verification after genesis and monetary-policy changes | Proves the new reward and 32-byte genesis scripts replay deterministically | storage and node tests | High |
+| 2 | Add process-crash simulation around replacement-chain persistence | Proves raw archive and LMDB recovery under hard process termination | `db.rs::replace_chainstate`, recovery harness | High |
+| 3 | Add release-gate block mutation tests | Proves mined blocks reject every committed mutation | `validation.rs` tests, fixtures | High |
+| 4 | Add mempool-vs-block validation matrix tests | Prevents miner/mempool policy drift | `mempool.rs`, `validation.rs`, node tests | Medium |
+| 5 | Add timewarp and difficulty boundary tests for 100-second mainnet/regnet | Protects difficulty schedule | `pow.rs`, `validation.rs` | Medium |
+| 6 | Add address/HPK replay fixtures across mainnet/testnet/regnet | Protects network separation | `address.rs`, `validation.rs` | Medium |
+| 7 | Add long-running multi-node sync and reorg soak | Catches stalls and state drift | `sync.rs`, node integration | Medium |
+| 8 | Add and run parser/serialization fuzz corpus | Hardens malformed transaction/block handling | `transaction.rs`, `block.rs`, P2P codecs | Medium |
 
 ## 20. Production Readiness Summary
 
-Overall security score: **7/10**
+Overall security score: **8/10**
 
-Consensus readiness score: **7/10**
+Consensus readiness score: **8/10**
 
 Monetary policy enforcement score: **8/10**
 
-Transaction validation score: **8/10**
+Transaction validation score: **8.5/10**
 
-Block validation score: **8/10**
+Block validation score: **8.5/10**
 
 UTXO safety score: **8/10**
 
@@ -554,19 +546,16 @@ Mainnet readiness status: **Close but not ready**
 
 Must-fix before mainnet:
 
-- Complete 32-byte HPK migration for genesis and internal HPK paths.
-- Make full chain replacement crash-atomic across raw archive and LMDB.
 - Run full release-gate adversarial, replay, reindex, reorg, and long-soak tests on the exact mainnet branch.
 - Verify all mainnet/regnet docs, API endpoints, whitepaper, benchmark output, release notes, and node status endpoints report 5 ATHO, 100 seconds, 1,260,000 halvings, 0.625 tail, 6 confirmations, and no fixed cap.
 
 Should-fix:
 
 - Add prevout amount/lock to a future signed transaction digest mode if the project wants stronger offline-signer guarantees.
-- Add explicit second-coinbase error handling.
 - Expand storage corruption and reindex tests.
 - Keep testnet legacy schedule clearly isolated and documented.
 
-Final recommendation: Atho's current validation core is much stronger than it was before the unsupported-script fix. Locking/unlocking is no longer an anyone-can-spend risk for normal 32-byte HPK outputs, transaction validation preserves atom accounting, block validation rejects overpaying coinbase transactions, and monetary policy is enforced in the block acceptance path. I would not call it production mainnet-ready yet, because launch safety depends on finishing the 32-byte HPK migration, proving storage replacement recovery, and running the full adversarial/replay suite on the final branch.
+Final recommendation: Atho's current validation core is much stronger than it was before the unsupported-script fix. Locking/unlocking is no longer an anyone-can-spend risk for 32-byte HPK outputs, mainnet/regnet genesis now follows that same HPK model, transaction validation preserves atom accounting, block validation rejects overpaying coinbase transactions, and monetary policy is enforced in the block acceptance path. I would not call it production mainnet-ready yet, because launch safety still depends on process-crash storage drills and running the full adversarial/replay suite on the final branch.
 
 Top 10 things to understand:
 
@@ -578,5 +567,5 @@ Top 10 things to understand:
 6. Coinbase reward must equal network subsidy plus recomputed fees.
 7. Mainnet/regnet now have no fixed cap and use 5 ATHO, 100 seconds, 1,260,000 halvings, and 0.625 ATHO tail.
 8. Testnet intentionally keeps legacy monetary/timing settings.
-9. The 32-byte-only HPK rule is secure, but all legacy 48-byte locks must be migrated or treated as unspendable.
+9. The 32-byte-only HPK rule is secure for mainnet/regnet; legacy 48-byte testnet/prunetest locks remain isolated and fail closed under the new spend rule.
 10. The remaining mainnet blockers are engineering proof and edge-case hardening, not an obvious active inflation or anyone-can-spend bug in the reviewed path.

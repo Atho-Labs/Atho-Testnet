@@ -350,7 +350,18 @@ fn prepare_transaction_consensus_validation(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<PreparedTransactionValidation, ValidationError> {
-    prepare_transaction_validation_with_policy(tx, fee_atoms, network, height, schedule, false)
+    prepare_transaction_validation_with_policy(
+        tx,
+        fee_atoms,
+        network,
+        height,
+        schedule,
+        consensus_enforces_standard_output_policy(network),
+    )
+}
+
+fn consensus_enforces_standard_output_policy(network: Network) -> bool {
+    matches!(network, Network::Mainnet | Network::Regnet)
 }
 
 fn prepare_transaction_validation_with_policy(
@@ -873,6 +884,14 @@ fn validate_block_impl_with_schedule(
 ) -> Result<(), ValidationError> {
     if block.transactions.is_empty() {
         return Err(ValidationError::EmptyBlock);
+    }
+    if block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(Transaction::is_coinbase)
+    {
+        return Err(ValidationError::MultipleCoinbaseTransactions);
     }
     if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
         return Err(ValidationError::InvalidBlockVersion);
@@ -1561,6 +1580,17 @@ mod tests {
     }
 
     #[test]
+    fn regnet_block_consensus_rejects_sub_dust_transaction_output() {
+        let (funding, block) =
+            solved_regnet_spend_block(b"atho-regnet-block-dust-output", 6, 99_001);
+
+        assert_eq!(
+            validate_regnet_spend_block(funding, &block),
+            Err(ValidationError::DustOutput)
+        );
+    }
+
+    #[test]
     fn test_accounting_rejects_outputs_greater_than_inputs() {
         let keypair = generate_from_seed(b"atho-deep-overspend-accounting").expect("keypair");
         let locking_script = public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec();
@@ -1782,6 +1812,51 @@ mod tests {
         assert_eq!(
             validate_block_without_pow(&block, 1, Network::Mainnet),
             Err(ValidationError::BlockWitnessRootMismatch)
+        );
+    }
+
+    #[test]
+    fn block_rejects_second_coinbase_even_when_txids_are_unique() {
+        let coinbase_a = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Mainnet, 1),
+                locking_script: vec![1],
+            }],
+            lock_time: 1,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let coinbase_b = Transaction {
+            outputs: vec![TxOutput {
+                value_atoms: 1,
+                locking_script: vec![2],
+            }],
+            lock_time: 2,
+            ..coinbase_a.clone()
+        };
+        assert_ne!(coinbase_a.txid(), coinbase_b.txid());
+        let transactions = vec![coinbase_a, coinbase_b];
+        let block = Block::new(
+            BlockHeader {
+                version: 1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 1,
+                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
+                nonce: 0,
+            },
+            transactions,
+        );
+
+        assert_eq!(
+            validate_block_without_pow(&block, 1, Network::Mainnet),
+            Err(ValidationError::MultipleCoinbaseTransactions)
         );
     }
 

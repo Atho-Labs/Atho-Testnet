@@ -1,3 +1,4 @@
+use atho_core::address::public_key_digest;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::tx_policy::solve_transaction_pow;
@@ -18,8 +19,6 @@ use atho_storage::chainstate::Chainstate as StorageChainstate;
 use atho_storage::utxo::UtxoEntry;
 
 const ATTACK_TXID: [u8; 48] = [7; 48];
-const ATTACK_UNLOCKING_SCRIPT: [u8; 4] = [1, 2, 3, 4];
-const ATTACK_OUTPUT_SCRIPT: [u8; 4] = [4, 3, 2, 1];
 
 fn main() {
     if let Err(err) = run() {
@@ -92,7 +91,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [0; 48],
-            subsidy::block_subsidy_atoms(7),
+            subsidy::block_subsidy_atoms_for_network(network, 7),
             0,
             network,
             valid_block_timestamp(network, 7),
@@ -111,7 +110,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [0; 48],
-            subsidy::block_subsidy_atoms(7).saturating_add(1),
+            subsidy::block_subsidy_atoms_for_network(network, 7).saturating_add(1),
             0,
             network,
             valid_block_timestamp(network, 7),
@@ -127,7 +126,7 @@ fn run() -> Result<(), String> {
         network,
         &miner,
         build_double_coinbase_block(network, 7, [0; 48]),
-        Err(ValidationError::NoInputs),
+        Err(ValidationError::MultipleCoinbaseTransactions),
     )? {
         passed += 1;
     }
@@ -141,7 +140,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [1; 48],
-            subsidy::block_subsidy_atoms(7),
+            subsidy::block_subsidy_atoms_for_network(network, 7),
             0,
             network,
             valid_block_timestamp(network, 7),
@@ -160,7 +159,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [0; 48],
-            subsidy::block_subsidy_atoms(7),
+            subsidy::block_subsidy_atoms_for_network(network, 7),
             0,
             other_network(network),
             valid_block_timestamp(network, 7),
@@ -179,7 +178,7 @@ fn run() -> Result<(), String> {
             network,
             8,
             [0; 48],
-            subsidy::block_subsidy_atoms(8),
+            subsidy::block_subsidy_atoms_for_network(network, 8),
             0,
             network,
             valid_block_timestamp(network, 8),
@@ -198,7 +197,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [0; 48],
-            subsidy::block_subsidy_atoms(7),
+            subsidy::block_subsidy_atoms_for_network(network, 7),
             MAX_BLOCK_SIZE_BYTES + 1,
             network,
             valid_block_timestamp(network, 7),
@@ -228,7 +227,7 @@ fn run() -> Result<(), String> {
             network,
             7,
             [0; 48],
-            subsidy::block_subsidy_atoms(7),
+            subsidy::block_subsidy_atoms_for_network(network, 7),
             0,
             network,
             genesis::genesis_state(network)
@@ -309,6 +308,8 @@ fn block_case(
         &expected,
         Ok(())
             | Err(ValidationError::CoinbaseRewardMismatch)
+            | Err(ValidationError::MultipleCoinbaseTransactions)
+            | Err(ValidationError::BlockTooLarge)
             | Err(ValidationError::BlockParentHashMismatch)
             | Err(ValidationError::NoInputs)
             | Err(ValidationError::MempoolConflict)
@@ -352,7 +353,7 @@ fn direct_storage_injection(network: Network) -> Result<bool, String> {
         network,
         7,
         [0; 48],
-        subsidy::block_subsidy_atoms(7).saturating_add(1),
+        subsidy::block_subsidy_atoms_for_network(network, 7).saturating_add(1),
         0,
         network,
         valid_block_timestamp(network, 7),
@@ -430,23 +431,24 @@ fn tx_dust_like(network: Network) -> BuiltTransaction {
 
 fn tx_duplicate_input(network: Network) -> BuiltTransaction {
     let keypair = attack_keypair();
+    let locking_script = attack_locking_script(network);
     let mut tx = Transaction {
         version: 1,
         inputs: vec![
             TxInput {
                 previous_txid: ATTACK_TXID,
                 output_index: 0,
-                unlocking_script: ATTACK_UNLOCKING_SCRIPT.to_vec(),
+                unlocking_script: locking_script.clone(),
             },
             TxInput {
                 previous_txid: ATTACK_TXID,
                 output_index: 0,
-                unlocking_script: ATTACK_UNLOCKING_SCRIPT.to_vec(),
+                unlocking_script: locking_script,
             },
         ],
         outputs: vec![TxOutput {
             value_atoms: 9_000,
-            locking_script: ATTACK_OUTPUT_SCRIPT.to_vec(),
+            locking_script: attack_output_script(network),
         }],
         lock_time: 0,
         witness: vec![],
@@ -515,19 +517,20 @@ fn make_spend_tx(
     huge_output_script: bool,
 ) -> Transaction {
     let keypair = attack_keypair();
+    let locking_script = attack_locking_script(network);
     let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             previous_txid: ATTACK_TXID,
             output_index: 0,
-            unlocking_script: ATTACK_UNLOCKING_SCRIPT.to_vec(),
+            unlocking_script: locking_script,
         }],
         outputs: vec![TxOutput {
             value_atoms: output_value,
             locking_script: if huge_output_script {
                 vec![0; MAX_TRANSACTION_SIZE_BYTES + 1]
             } else {
-                ATTACK_OUTPUT_SCRIPT.to_vec()
+                attack_output_script(network)
             },
         }],
         lock_time: 0,
@@ -593,7 +596,11 @@ fn build_coinbase_block(
         inputs: vec![],
         outputs: vec![TxOutput {
             value_atoms: coinbase_value_atoms,
-            locking_script: vec![0; script_len],
+            locking_script: if script_len == 0 {
+                attack_output_script(block_network)
+            } else {
+                vec![0; script_len]
+            },
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
@@ -624,8 +631,8 @@ fn build_double_coinbase_block(
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy::block_subsidy_atoms(height),
-            locking_script: vec![0; 4],
+            value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
+            locking_script: attack_output_script(network),
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
@@ -637,7 +644,7 @@ fn build_double_coinbase_block(
         inputs: vec![],
         outputs: vec![TxOutput {
             value_atoms: 1,
-            locking_script: vec![1; 4],
+            locking_script: attack_output_script(network),
         }],
         lock_time: u32::try_from(height).unwrap_or(u32::MAX),
         witness: vec![],
@@ -664,8 +671,8 @@ fn build_double_spend_block(network: Network) -> Block {
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy::block_subsidy_atoms(7),
-            locking_script: vec![0; 4],
+            value_atoms: subsidy::block_subsidy_atoms_for_network(network, 7),
+            locking_script: attack_output_script(network),
         }],
         lock_time: 7,
         witness: vec![],
@@ -725,7 +732,7 @@ fn immature_coinbase_spend_case(network: Network) -> Result<bool, String> {
             ATTACK_TXID,
             0,
             10_000,
-            ATTACK_UNLOCKING_SCRIPT.to_vec(),
+            attack_locking_script(network),
             0,
         )],
     )
@@ -761,7 +768,7 @@ fn seeded_node(network: Network) -> Node {
             ATTACK_TXID,
             0,
             10_000,
-            ATTACK_UNLOCKING_SCRIPT.to_vec(),
+            attack_locking_script(network),
             0,
             false,
         )],
@@ -772,6 +779,14 @@ fn seeded_node(network: Network) -> Node {
 
 fn attack_keypair() -> FalconKeypair {
     generate_from_seed(b"atho-attack-seed").expect("attack keypair")
+}
+
+fn attack_locking_script(network: Network) -> Vec<u8> {
+    public_key_digest(network, &attack_keypair().public_key.0).to_vec()
+}
+
+fn attack_output_script(network: Network) -> Vec<u8> {
+    public_key_digest(network, &attack_keypair().public_key.0).to_vec()
 }
 
 fn parse_network() -> Network {

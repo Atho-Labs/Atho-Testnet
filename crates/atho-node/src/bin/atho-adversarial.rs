@@ -1,6 +1,4 @@
-use atho_core::address::{
-    address_parts_from_public_key, decode_base56_address, internal_hpk_bytes,
-};
+use atho_core::address::{address_parts_from_public_key, decode_base56_address};
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::transaction_signing_digest;
 use atho_core::consensus::subsidy;
@@ -369,7 +367,8 @@ fn valid_coinbase(network: Network, height: u64, fee_atoms: u64) -> Transaction 
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy::block_subsidy_atoms(height).saturating_add(fee_atoms),
+            value_atoms: subsidy::block_subsidy_atoms_for_network(network, height)
+                .saturating_add(fee_atoms),
             locking_script: seeded_payment_script(network, BASE_REWARD_SEED),
         }],
         lock_time: height as u32,
@@ -1577,8 +1576,9 @@ fn persistence_attack(cases: usize, seed: u64) -> Result<CategoryReport, String>
                         atho_core::consensus::subsidy::genesis_coinbase_atoms_for_network(
                             Network::Mainnet,
                         ),
-                        internal_hpk_bytes(Network::Mainnet, &genesis.reward_address)
-                            .unwrap_or_else(|| genesis.reward_address.as_bytes().to_vec()),
+                        genesis.block.transactions[0].outputs[0]
+                            .locking_script
+                            .clone(),
                         0,
                     )];
                     db.save_chainstate_snapshot(&snapshot, &utxos)

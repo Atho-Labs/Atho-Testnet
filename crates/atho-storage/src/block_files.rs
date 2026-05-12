@@ -168,6 +168,29 @@ impl BlockFileStore {
         }
     }
 
+    pub fn truncate_from_location(&self, start: BlockFileLocation) -> Result<(), StorageError> {
+        for file_number in self.existing_file_numbers()? {
+            if file_number < start.file_number {
+                continue;
+            }
+            if file_number == start.file_number {
+                if start.record_offset == 0 {
+                    self.delete_file(file_number)?;
+                    continue;
+                }
+                let path = self.file_path(file_number);
+                match OpenOptions::new().read(true).write(true).open(path) {
+                    Ok(file) => file.set_len(start.record_offset)?,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(StorageError::Io(err)),
+                }
+            } else {
+                self.delete_file(file_number)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset(&self) -> Result<(), StorageError> {
         if self.root.exists() {
             fs::remove_dir_all(&self.root)?;

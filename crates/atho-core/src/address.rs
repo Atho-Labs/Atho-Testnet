@@ -171,7 +171,7 @@ pub fn address_parts_from_public_key(network: Network, public_key: &[u8]) -> Add
 pub fn internal_hpk_bytes(network: Network, internal_hpk: &str) -> Option<Vec<u8>> {
     let prefix = network.internal_hpk_prefix();
     let body = internal_hpk.strip_prefix(prefix)?;
-    if body.len() != crate::constants::SHA3_384_HASH_HEX_CHARS {
+    if body.len() != ADDRESS_DIGEST_BYTES * 2 {
         return None;
     }
     hex::decode(body).ok()
@@ -316,10 +316,20 @@ mod tests {
         let encoded = format!(
             "{}{}",
             Network::Mainnet.internal_hpk_prefix(),
-            "ab".repeat(crate::constants::SHA3_384_HASH_BITS / 8)
+            "ab".repeat(ADDRESS_DIGEST_BYTES)
         );
         let decoded = internal_hpk_bytes(Network::Mainnet, &encoded).unwrap();
-        assert_eq!(decoded.len(), crate::constants::SHA3_384_HASH_BITS / 8);
+        assert_eq!(decoded.len(), ADDRESS_DIGEST_BYTES);
         assert!(decoded.iter().all(|byte| *byte == 0xab));
+    }
+
+    #[test]
+    fn internal_hpk_rejects_legacy_48_byte_digest() {
+        let encoded = format!(
+            "{}{}",
+            Network::Mainnet.internal_hpk_prefix(),
+            "ab".repeat(crate::constants::SHA3_384_HASH_BITS / 8)
+        );
+        assert!(internal_hpk_bytes(Network::Mainnet, &encoded).is_none());
     }
 }

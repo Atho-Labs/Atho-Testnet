@@ -6,7 +6,6 @@ use crate::db::{
 use crate::error::StorageError;
 use crate::utxo::{BlockUndo, UtxoEntry, UtxoSet};
 use crate::validation;
-use atho_core::address::internal_hpk_bytes;
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::{pow, rules};
 use atho_core::constants::{MAX_REORG_DEPTH_BLOCKS, PRUNE_DEPTH_BLOCKS};
@@ -93,8 +92,9 @@ impl Chainstate {
         let genesis = genesis::genesis_state(network);
         let genesis_block = genesis.block;
         let genesis_header = genesis_block.header.clone();
-        let locking_script = internal_hpk_bytes(network, &genesis.reward_address)
-            .unwrap_or_else(|| genesis.reward_address.as_bytes().to_vec());
+        let locking_script = genesis_block.transactions[0].outputs[0]
+            .locking_script
+            .clone();
         let mut utxos = UtxoSet::new(network);
         utxos
             .insert(UtxoEntry::coinbase(
@@ -1720,6 +1720,26 @@ mod tests {
 
         assert_eq!(state.height, 1);
         assert!(state.tip.is_some());
+    }
+
+    #[test]
+    fn fresh_mainnet_and_regnet_seed_genesis_utxo_from_block_script() {
+        for network in [Network::Mainnet, Network::Regnet] {
+            let state = Chainstate::new(network);
+            let genesis = genesis::genesis_state(network);
+            let utxo = state
+                .utxos
+                .get(genesis.coinbase_txid, 0)
+                .expect("genesis coinbase utxo");
+            let genesis_script = genesis.block.transactions[0].outputs[0]
+                .locking_script
+                .as_slice();
+            assert_eq!(utxo.locking_script.as_slice(), genesis_script);
+            assert_eq!(
+                utxo.locking_script.len(),
+                atho_core::constants::ADDRESS_DIGEST_BYTES
+            );
+        }
     }
 
     #[test]
