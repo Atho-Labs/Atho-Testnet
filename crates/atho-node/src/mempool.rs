@@ -455,6 +455,7 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::address::public_key_digest;
     use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::solve_transaction_pow;
@@ -517,6 +518,11 @@ mod tests {
             additional_signers: vec![],
         }
         .canonical_bytes()
+    }
+
+    fn test_locking_script(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
     }
 
     #[test]
@@ -719,7 +725,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [4; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: test_locking_script(Network::Mainnet),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_500,
@@ -741,7 +747,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [5; 48],
                 output_index: 0,
-                unlocking_script: vec![3],
+                unlocking_script: test_locking_script(Network::Mainnet),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
@@ -774,7 +780,7 @@ mod tests {
                 [4; 48],
                 0,
                 10_000,
-                vec![1],
+                test_locking_script(Network::Mainnet),
                 0,
                 false,
             ),
@@ -786,7 +792,7 @@ mod tests {
                 [5; 48],
                 0,
                 10_000,
-                vec![3],
+                test_locking_script(Network::Mainnet),
                 0,
                 false,
             ),
@@ -847,7 +853,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [11; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: test_locking_script(Network::Mainnet),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
@@ -901,7 +907,7 @@ mod tests {
                 [11; 48],
                 0,
                 10_000,
-                vec![1],
+                test_locking_script(Network::Mainnet),
                 0,
                 false,
             ),

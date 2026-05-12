@@ -3,6 +3,7 @@ use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
 use crate::node::Node;
 use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+use atho_core::address::public_key_digest;
 use atho_core::block::Block;
 use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
@@ -350,7 +351,7 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
             seed_txid,
             0,
             seed_value,
-            vec![seed_script],
+            seed_locking_script(network, seed_script)?,
             0,
             false,
         )],
@@ -392,7 +393,9 @@ pub(crate) fn signed_spend_transaction(
     seed_value: u64,
     seed_script: u8,
 ) -> std::io::Result<Transaction> {
-    let keypair = signing_keypair(network, seed_txid, seed_script)?;
+    let keypair = signing_keypair(network, seed_script)?;
+    let input_locking_script = seed_locking_script(network, seed_script)?;
+    let output_locking_script = seed_locking_script(network, seed_script.saturating_add(1))?;
     let mut output_atoms = seed_value.saturating_sub(1);
     let mut last_fee = 0u64;
     for _ in 0..4 {
@@ -401,11 +404,11 @@ pub(crate) fn signed_spend_transaction(
             inputs: vec![TxInput {
                 previous_txid: seed_txid,
                 output_index: 0,
-                unlocking_script: vec![seed_script],
+                unlocking_script: input_locking_script.clone(),
             }],
             outputs: vec![TxOutput {
                 value_atoms: output_atoms,
-                locking_script: vec![seed_script.saturating_add(1)],
+                locking_script: output_locking_script.clone(),
             }],
             lock_time: 0,
             witness: vec![],
@@ -464,25 +467,25 @@ pub(crate) fn signed_spend_transaction(
     Err(std::io::Error::other("failed to stabilize dev spend fee"))
 }
 
-fn signing_keypair(
-    network: Network,
-    seed_txid: [u8; 48],
-    seed_script: u8,
-) -> std::io::Result<FalconKeypair> {
-    let mut seed = Vec::with_capacity(network.id().len() + seed_txid.len() + 1);
+fn signing_keypair(network: Network, seed_script: u8) -> std::io::Result<FalconKeypair> {
+    let mut seed = Vec::with_capacity(network.id().len() + 1);
     seed.extend_from_slice(network.id().as_bytes());
-    seed.extend_from_slice(&seed_txid);
     seed.push(seed_script);
     generate_from_seed(&seed)
         .map_err(|err| std::io::Error::other(format!("falcon-512 rs keygen failed: {err:?}")))
 }
 
+pub(crate) fn seed_locking_script(network: Network, seed_script: u8) -> std::io::Result<Vec<u8>> {
+    let keypair = signing_keypair(network, seed_script)?;
+    Ok(public_key_digest(network, &keypair.public_key.0).to_vec())
+}
+
 pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, u8) {
     match network {
-        Network::Mainnet => ([0x11; 48], 2_000, 0x11),
-        Network::Testnet => ([0x22; 48], 1_500, 0x22),
-        Network::Regnet => ([0x33; 48], 2_000, 0x33),
-        Network::Prunetest => ([0x44; 48], 2_000, 0x44),
+        Network::Mainnet => ([0x11; 48], 25_000, 0x11),
+        Network::Testnet => ([0x22; 48], 25_000, 0x22),
+        Network::Regnet => ([0x33; 48], 25_000, 0x33),
+        Network::Prunetest => ([0x44; 48], 25_000, 0x44),
     }
 }
 

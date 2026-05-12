@@ -7,6 +7,7 @@ use atho_core::network::Network;
 use std::collections::BTreeMap;
 
 const MAX_OUTSTANDING_HEADER_LOCATORS_PER_PEER: usize = 16;
+const HEADER_DIFFICULTY_CONTEXT_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncState {
@@ -17,6 +18,7 @@ pub struct SyncState {
     pub locator_hashes: Vec<Hash48>,
     pub(crate) requested_locator_hashes: Vec<Hash48>,
     pub(crate) requested_locator_hashes_by_peer: BTreeMap<String, Vec<Vec<Hash48>>>,
+    pub(crate) header_context: Vec<BlockHeader>,
 }
 
 impl SyncState {
@@ -26,6 +28,13 @@ impl SyncState {
             .last()
             .map(|block| Hash48::from(block.header.block_hash()));
         self.prime_with_locator(best_height, best_tip, block_locator(blocks));
+        self.header_context = blocks
+            .iter()
+            .rev()
+            .take(HEADER_DIFFICULTY_CONTEXT_LIMIT)
+            .map(|block| block.header.clone())
+            .collect::<Vec<_>>();
+        self.header_context.reverse();
     }
 
     pub fn prime_with_locator(
@@ -38,6 +47,7 @@ impl SyncState {
         self.best_tip = best_tip;
         self.locator_hashes = locator_hashes;
         self.clear_requested_header_locators();
+        self.header_context.clear();
         self.headers_synced = true;
         crate::audit::append_log(
             "p2p",
@@ -150,12 +160,54 @@ impl SyncState {
                 return Err(ProtocolError::InvalidHeadersSequence);
             }
         }
+        let mut difficulty_context = headers
+            .first()
+            .and_then(|first| {
+                let previous_hash = Hash48::from(first.previous_block_hash);
+                self.header_context
+                    .iter()
+                    .position(|header| Hash48::from(header.block_hash()) == previous_hash)
+                    .map(|index| self.header_context[..=index].to_vec())
+            })
+            .unwrap_or_default();
         for header in headers {
             if header.network_id != network
                 || !pow::target_within_bounds(&header.difficulty_target_or_bits)
                 || !pow::meets_target(&header.block_hash(), &header.difficulty_target_or_bits)
             {
                 return Err(ProtocolError::InvalidHeadersSequence);
+            }
+            if !difficulty_context.is_empty() {
+                let previous = difficulty_context
+                    .last()
+                    .expect("non-empty difficulty context");
+                if header.previous_block_hash != previous.block_hash()
+                    || header.height != previous.height.saturating_add(1)
+                {
+                    return Err(ProtocolError::InvalidHeadersSequence);
+                }
+                if let Some(minimum_timestamp) =
+                    pow::minimum_next_header_timestamp(&difficulty_context)
+                {
+                    if header.timestamp < minimum_timestamp {
+                        return Err(ProtocolError::InvalidHeadersSequence);
+                    }
+                }
+                let expected_target = pow::target_for_next_header_with_timestamp(
+                    network,
+                    &difficulty_context,
+                    header.timestamp,
+                );
+                if header.difficulty_target_or_bits != expected_target
+                    || !pow::meets_target(&header.block_hash(), &expected_target)
+                {
+                    return Err(ProtocolError::InvalidHeadersSequence);
+                }
+                difficulty_context.push(header.clone());
+                if difficulty_context.len() > HEADER_DIFFICULTY_CONTEXT_LIMIT {
+                    let excess = difficulty_context.len() - HEADER_DIFFICULTY_CONTEXT_LIMIT;
+                    difficulty_context.drain(0..excess);
+                }
             }
         }
         for window in headers.windows(2) {
@@ -181,6 +233,11 @@ impl SyncState {
                 self.locator_hashes
                     .insert(0, Hash48::from(last.block_hash()));
                 self.locator_hashes.truncate(32);
+            }
+            self.header_context.extend(headers.iter().cloned());
+            if self.header_context.len() > HEADER_DIFFICULTY_CONTEXT_LIMIT {
+                let excess = self.header_context.len() - HEADER_DIFFICULTY_CONTEXT_LIMIT;
+                self.header_context.drain(0..excess);
             }
             if reaches_prior_target {
                 self.headers_synced =
@@ -364,6 +421,66 @@ mod tests {
 
         assert_eq!(
             state.accept_headers(Network::Mainnet, &[header]),
+            Err(ProtocolError::InvalidHeadersSequence)
+        );
+    }
+
+    #[test]
+    fn headers_must_match_expected_difficulty_when_local_context_is_known() {
+        let context_header_0 = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 0,
+            previous_block_hash: [0; 48],
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            timestamp: 1_700_000_000,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.max_difficulty_target,
+            nonce: 0,
+        };
+        let context_header_1 = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 1,
+            previous_block_hash: context_header_0.block_hash(),
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            timestamp: 1_700_000_001,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.max_difficulty_target,
+            nonce: 1,
+        };
+        let context_header_2 = BlockHeader {
+            version: 1,
+            network_id: Network::Mainnet,
+            height: 2,
+            previous_block_hash: context_header_1.block_hash(),
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            timestamp: 1_700_000_002,
+            difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.max_difficulty_target,
+            nonce: 2,
+        };
+        let mut state = SyncState::default();
+        state.prime(&[
+            Block {
+                header: context_header_0,
+                ..Block::default()
+            },
+            Block {
+                header: context_header_1,
+                ..Block::default()
+            },
+            Block {
+                header: context_header_2.clone(),
+                ..Block::default()
+            },
+        ]);
+
+        let header_with_unexpected_easy_target =
+            solved_header(Network::Mainnet, 3, context_header_2.block_hash());
+
+        assert_eq!(
+            state.accept_headers(Network::Mainnet, &[header_with_unexpected_easy_target]),
             Err(ProtocolError::InvalidHeadersSequence)
         );
     }

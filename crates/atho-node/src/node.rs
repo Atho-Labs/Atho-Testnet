@@ -664,6 +664,7 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -727,6 +728,11 @@ mod tests {
             additional_signers: vec![],
         }
         .canonical_bytes()
+    }
+
+    fn test_locking_script(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
     }
 
     fn temp_data_dir(label: &str) -> std::path::PathBuf {
@@ -958,7 +964,7 @@ mod tests {
                 [9; 48],
                 0,
                 2_000,
-                vec![1],
+                test_locking_script(Network::Mainnet),
                 0,
                 false,
             ))
@@ -968,7 +974,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [9; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: test_locking_script(Network::Mainnet),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
@@ -1089,7 +1095,7 @@ mod tests {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
         node.chainstate.height = 6;
         for txid in [[0x31; 48], [0x32; 48]] {
-            let locking_script = vec![1];
+            let locking_script = test_locking_script(Network::Mainnet);
             let utxo = UtxoEntry::new(
                 Network::Mainnet,
                 txid,

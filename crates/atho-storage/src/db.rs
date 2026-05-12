@@ -708,13 +708,21 @@ impl Database {
             serialized_utxos.push((key, value));
         }
 
-        self.block_store.reset()?;
+        let replacement_file_floor = self
+            .block_store
+            .highest_file_number()?
+            .map(|file_number| file_number.saturating_add(1))
+            .unwrap_or(0);
         let mut archived = Vec::with_capacity(blocks.len());
         for block in blocks {
             if block.header.network_id != self.network {
                 return Err(StorageError::CrossNetworkReplay);
             }
-            archived.push((block.header.height, self.block_store.append_block(block)?));
+            archived.push((
+                block.header.height,
+                self.block_store
+                    .append_block_with_minimum_file_number(block, Some(replacement_file_floor))?,
+            ));
         }
 
         self.write_with_retry(|state| {

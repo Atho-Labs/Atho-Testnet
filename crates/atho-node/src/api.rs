@@ -1806,7 +1806,8 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    vec![seed_script],
+                    crate::dev::seed_locking_script(Network::Testnet, seed_script)
+                        .expect("seed locking script"),
                     0,
                     false,
                 )],
@@ -2182,8 +2183,8 @@ mod tests {
         });
 
         let mut fork = Node::new(NodeConfig::new(Network::Regnet));
-        mine_with_timestamp_offset(&mut fork, &miner, 10_000);
-        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 10_001);
+        mine_with_timestamp_offset(&mut fork, &miner, 1_000);
+        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 1_001);
         let fork_tip_hash = fork_block_2.header.block_hash();
         let reward_digest: [u8; 32] = fork_block_2.transactions[0].outputs[0]
             .locking_script

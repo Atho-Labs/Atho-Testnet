@@ -195,30 +195,41 @@ impl Chainstate {
             working_utxos,
         )?;
 
-        let undo = self.utxos.apply_block(block)?;
+        let mut accepted_block = block.clone();
+        let fee_atoms = validation::derived_block_fee_atoms(
+            &accepted_block,
+            block.header.height,
+            self.network,
+        )?;
+        accepted_block.fees_total_atoms = fee_atoms;
+        accepted_block.fees_miner_atoms = fee_atoms;
+
+        let undo = self.utxos.apply_block(&accepted_block)?;
         let previous_tip = self.tip.clone();
         let previous_tip_hash = self.tip_hash;
-        let next_tip_hash = block.header.block_hash();
+        let next_tip_hash = accepted_block.header.block_hash();
         if let Some(storage) = &self.storage {
             let snapshot = ChainstateSnapshot {
-                height: block.header.height,
+                height: accepted_block.header.height,
                 tip_hash: next_tip_hash,
-                tip_header: Some(block.header.clone()),
+                tip_header: Some(accepted_block.header.clone()),
             };
-            if let Err(err) =
-                storage.commit_chainstate(&snapshot, &[], Some((block.header.height, block)))
-            {
+            if let Err(err) = storage.commit_chainstate(
+                &snapshot,
+                &[],
+                Some((accepted_block.header.height, &accepted_block)),
+            ) {
                 self.utxos.disconnect_block(undo);
                 return Err(err);
             }
         }
 
-        self.tip = Some(block.header.clone());
+        self.tip = Some(accepted_block.header.clone());
         self.tip_hash = next_tip_hash;
-        self.height = block.header.height;
+        self.height = accepted_block.header.height;
         self.block_index_by_hash
             .insert(next_tip_hash, self.blocks.len());
-        self.blocks.push(block.clone());
+        self.blocks.push(accepted_block);
         self.undo_stack.push(ChainUndo {
             previous_tip,
             previous_tip_hash,
@@ -905,6 +916,13 @@ impl Chainstate {
     pub fn known_block_height(&self, block_hash: [u8; 48]) -> Option<u64> {
         if let Some(index) = self.block_index_by_hash.get(&block_hash).copied() {
             return self.blocks.get(index).map(|block| block.header.height);
+        }
+        if let Some(block) = self
+            .blocks
+            .iter()
+            .find(|block| block.header.block_hash() == block_hash)
+        {
+            return Some(block.header.height);
         }
         self.storage
             .as_ref()

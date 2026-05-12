@@ -5,9 +5,7 @@
 //!
 //! CONSENSUS: Every function here must produce identical results across nodes
 //! for the same ordered block history.
-use crate::block::Block;
-#[cfg(test)]
-use crate::block::BlockHeader;
+use crate::block::{Block, BlockHeader};
 use crate::constants::{
     POW_AVERAGING_WINDOW_BLOCKS, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
     POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_WINDOW_BLOCKS, POW_RETARGET_INTERVAL_BLOCKS,
@@ -149,7 +147,6 @@ fn median_u64(values: &[u64]) -> u64 {
     sorted[sorted.len() / 2]
 }
 
-#[cfg(test)]
 fn median_time_past_headers(headers: &[BlockHeader], index: usize) -> u64 {
     let span = POW_PROFILE.median_window_blocks as usize;
     let start = index.saturating_add(1).saturating_sub(span);
@@ -184,7 +181,6 @@ fn bounded_actual_timespan(actual_timespan: u64, target_timespan: u64) -> u64 {
     damped.clamp(min_actual, max_actual)
 }
 
-#[cfg(test)]
 fn mean_target_headers(headers: &[BlockHeader]) -> BigUint {
     let mut total = BigUint::zero();
     for header in headers {
@@ -201,7 +197,6 @@ fn mean_target_blocks(blocks: &[Block]) -> BigUint {
     total / BigUint::from(blocks.len() as u64)
 }
 
-#[cfg(test)]
 fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 48] {
     let headers = match headers {
         [first, rest @ ..] if first.height == 0 && !rest.is_empty() => rest,
@@ -234,6 +229,25 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
     let threshold =
         (average_target * BigUint::from(bounded_timespan)) / BigUint::from(expected_timespan);
     clamp_target(biguint_to_target(&threshold))
+}
+
+/// Computes the next required target from historical block headers and the
+/// candidate header timestamp.
+pub fn target_for_next_header_with_timestamp(
+    network: Network,
+    previous_headers: &[BlockHeader],
+    next_timestamp: u64,
+) -> [u8; 48] {
+    if network == Network::Testnet {
+        if let Some(previous_header) = previous_headers.last() {
+            if next_timestamp.saturating_sub(previous_header.timestamp)
+                > TESTNET_STALL_RESET_SECONDS
+            {
+                return DIFFICULTY_PROFILE.min_difficulty_target;
+            }
+        }
+    }
+    next_target_from_headers(network, previous_headers)
 }
 
 fn next_target_from_blocks(network: Network, blocks: &[Block]) -> [u8; 48] {
@@ -383,6 +397,14 @@ pub fn median_time_past_from_blocks(previous_blocks: &[Block]) -> Option<u64> {
 /// Returns the minimum valid timestamp for the next block.
 pub fn minimum_next_block_timestamp(previous_blocks: &[Block]) -> Option<u64> {
     median_time_past_from_blocks(previous_blocks).map(|timestamp| timestamp.saturating_add(1))
+}
+
+/// Returns the minimum valid timestamp for the next header.
+pub fn minimum_next_header_timestamp(previous_headers: &[BlockHeader]) -> Option<u64> {
+    if previous_headers.is_empty() {
+        return None;
+    }
+    Some(median_time_past_headers(previous_headers, previous_headers.len() - 1).saturating_add(1))
 }
 
 /// Returns `true` when the target respects the configured difficulty bounds.

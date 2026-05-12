@@ -324,20 +324,25 @@ impl NodeService {
             },
             RpcRequest::ExecuteCommand(invocation) => self.execute_command(invocation),
             RpcRequest::GetBlockTemplate => {
-                match self.orchestrator.runtime.node.build_candidate_block() {
-                    Ok(block) => {
-                        let _ = dev::append_log(
-                            "athod",
-                            &format!(
-                                "rpc template height={} mempool={} fees={}",
-                                block.header.height,
-                                self.orchestrator.runtime.node.mempool_len(),
-                                block.fees_total_atoms
-                            ),
-                        );
-                        RpcResponse::BlockTemplate(self.block_template(block))
+                let status = self.node_status();
+                if let Some(reason) = Self::mining_sync_block_reason(&status) {
+                    RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(reason))
+                } else {
+                    match self.orchestrator.runtime.node.build_candidate_block() {
+                        Ok(block) => {
+                            let _ = dev::append_log(
+                                "athod",
+                                &format!(
+                                    "rpc template height={} mempool={} fees={}",
+                                    block.header.height,
+                                    self.orchestrator.runtime.node.mempool_len(),
+                                    block.fees_total_atoms
+                                ),
+                            );
+                            RpcResponse::BlockTemplate(self.block_template(block))
+                        }
+                        Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                     }
-                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 }
             }
             RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => {
@@ -727,6 +732,22 @@ impl NodeService {
             status.headers_synced,
             status.running,
             status.network_diagnostics.peer_count
+        ))
+    }
+
+    fn mining_sync_block_reason(status: &NodeStatus) -> Option<String> {
+        if matches!(status.network, Network::Regnet | Network::Prunetest)
+            || status.network_diagnostics.safe_to_mine
+        {
+            return None;
+        }
+        Some(format!(
+            "mining template is paused until the node is fully validated and synced (status={} local_height={} sync_target_height={} validation_lag_blocks={} safe_to_mine={})",
+            status.network_diagnostics.chain_validation_status,
+            status.block_count,
+            status.sync_best_height,
+            status.network_diagnostics.validation_lag_blocks,
+            status.network_diagnostics.safe_to_mine
         ))
     }
 
@@ -2749,6 +2770,10 @@ impl NodeService {
         args: &[String],
     ) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getblocktemplate", args)?;
+        let status = self.node_status();
+        if let Some(reason) = Self::mining_sync_block_reason(&status) {
+            return Err(atho_rpc::error::RpcError::invalid_request(reason));
+        }
         let block = self
             .orchestrator
             .runtime
@@ -2761,6 +2786,10 @@ impl NodeService {
 
     fn command_gettemplateinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("gettemplateinfo", args)?;
+        let status = self.node_status();
+        if let Some(reason) = Self::mining_sync_block_reason(&status) {
+            return Err(atho_rpc::error::RpcError::invalid_request(reason));
+        }
         let block = self
             .orchestrator
             .runtime
@@ -4155,6 +4184,42 @@ mod tests {
         assert_eq!(rendered["validation_lag_blocks"], 2);
         assert!(NodeService::health_warnings(&status)
             .contains(&"block bodies are downloaded ahead of validation"));
+    }
+
+    #[test]
+    fn mining_templates_are_paused_when_sync_status_is_not_safe_to_mine() {
+        let mut status = NodeStatus {
+            network: Network::Mainnet,
+            block_count: 128,
+            tip_hash: [0x13; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x24; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 128,
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                chain_validation_status: String::from("body_download_ahead"),
+                validation_lag_blocks: 2,
+                safe_to_mine: false,
+                ..NetworkDiagnostics::default()
+            },
+        };
+
+        let reason = NodeService::mining_sync_block_reason(&status)
+            .expect("public networks must block unsafe mining templates");
+        assert!(reason.contains("safe_to_mine=false"));
+        assert!(reason.contains("validation_lag_blocks=2"));
+
+        status.network_diagnostics.safe_to_mine = true;
+        assert!(NodeService::mining_sync_block_reason(&status).is_none());
+
+        status.network_diagnostics.safe_to_mine = false;
+        status.network = Network::Regnet;
+        assert!(NodeService::mining_sync_block_reason(&status).is_none());
     }
 
     #[test]

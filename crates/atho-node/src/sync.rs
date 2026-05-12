@@ -3079,6 +3079,7 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -3234,6 +3235,11 @@ mod tests {
         .canonical_bytes()
     }
 
+    fn test_locking_script() -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-node-sync-test").expect("falcon keypair");
+        public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec()
+    }
+
     fn coinbase_block(
         network: Network,
         height: u64,
@@ -3342,6 +3348,8 @@ mod tests {
     fn mine_with_timestamp_offset(node: &mut Node, miner: &Miner, offset: u64) -> Block {
         let mut candidate = node.build_candidate_block().expect("candidate block");
         candidate.header.timestamp = candidate.header.timestamp.saturating_add(offset);
+        candidate.header.difficulty_target_or_bits =
+            node.difficulty_target_for_next_block_at(candidate.header.timestamp);
         let block = miner.solve_block(candidate);
         node.connect_block(&block).expect("connect mined block");
         block
@@ -4577,7 +4585,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = vec![1];
+        let seed_script = test_locking_script();
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -4693,7 +4701,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = vec![1];
+        let seed_script = test_locking_script();
         right
             .node
             .dev_seed_chainstate(
@@ -4779,7 +4787,8 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    vec![seed_script],
+                    crate::dev::seed_locking_script(Network::Regnet, seed_script)
+                        .expect("seed locking script"),
                     0,
                     false,
                 )],
@@ -4838,7 +4847,8 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    vec![seed_script],
+                    crate::dev::seed_locking_script(Network::Regnet, seed_script)
+                        .expect("seed locking script"),
                     0,
                     false,
                 )],
@@ -4914,7 +4924,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = vec![1];
+        let seed_script = test_locking_script();
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -5055,7 +5065,7 @@ mod tests {
 
         let seed_txid = [5; 48];
         let seed_value = 2_000u64;
-        let seed_script = vec![1];
+        let seed_script = test_locking_script();
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -5849,7 +5859,7 @@ mod tests {
 
         let mut reference = Node::new(NodeConfig::new(Network::Regnet));
         let remote_blocks = (0..4)
-            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 10_000 + index))
+            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 1_000 + index))
             .collect::<Vec<_>>();
         assert_ne!(peer.node.tip_hash(), remote_blocks[1].header.block_hash());
 

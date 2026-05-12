@@ -421,6 +421,7 @@ mod tests {
     #[test]
     fn public_gossip_rejects_private_addresses() {
         let mut manager = AddressManager::new(Network::Mainnet);
+        let now = now_unix();
         manager
             .note_gossip_addresses(
                 &[
@@ -428,13 +429,13 @@ mod tests {
                         host: String::from("127.0.0.1"),
                         port: 56000,
                         services: 0,
-                        last_seen_unix: 0,
+                        last_seen_unix: now,
                     },
                     PeerAddress {
                         host: String::from("8.8.8.8"),
-                        port: 56001,
+                        port: Network::Mainnet.p2p_port(),
                         services: 0,
-                        last_seen_unix: 0,
+                        last_seen_unix: now,
                     },
                 ],
                 true,

@@ -2002,7 +2002,8 @@ mod tests {
                         seed_txid,
                         0,
                         seed_value,
-                        vec![seed_script],
+                        crate::dev::seed_locking_script(Network::Regnet, seed_script)
+                            .expect("seed locking script"),
                         0,
                         false,
                     )],
@@ -2085,7 +2086,8 @@ mod tests {
                         seed_txid,
                         0,
                         seed_value,
-                        vec![seed_script],
+                        crate::dev::seed_locking_script(Network::Testnet, seed_script)
+                            .expect("seed locking script"),
                         0,
                         false,
                     )],
@@ -2157,7 +2159,8 @@ mod tests {
                             first_seed.0,
                             0,
                             first_seed.1,
-                            vec![first_seed.2],
+                            crate::dev::seed_locking_script(Network::Regnet, first_seed.2)
+                                .expect("first seed locking script"),
                             0,
                             false,
                         ),
@@ -2166,7 +2169,8 @@ mod tests {
                             second_seed.0,
                             0,
                             second_seed.1,
-                            vec![second_seed.2],
+                            crate::dev::seed_locking_script(Network::Regnet, second_seed.2)
+                                .expect("second seed locking script"),
                             0,
                             false,
                         ),
