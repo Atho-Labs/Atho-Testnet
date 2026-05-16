@@ -208,6 +208,38 @@ class RuntimeLauncherTests(unittest.TestCase):
                     self.assertTrue((data_dir / "db").is_dir())
                     self.assertTrue((data_dir / "logs").is_dir())
 
+    def test_startup_scripts_work_outside_repo_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release_dir = self.make_release_dir(root)
+            outside_cwd = root / "outside"
+            outside_cwd.mkdir()
+            for script_name, network in (
+                ("runmainnet.py", "mainnet"),
+                ("runtestnet.py", "testnet"),
+                ("runregnet.py", "regnet"),
+            ):
+                with self.subTest(script_name=script_name):
+                    data_dir = root / f"external-{network}-data"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(REPO_ROOT / script_name),
+                            "--dry-run",
+                            "--release-dir",
+                            str(release_dir),
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        cwd=outside_cwd,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, msg=result.stderr)
+                    self.assertIn(f"[atho-launch] network={network}", result.stdout)
+
     def test_gpu_build_help_mentions_host_requirements(self) -> None:
         message = runtime_launcher.gpu_build_help()
         self.assertTrue(message)
