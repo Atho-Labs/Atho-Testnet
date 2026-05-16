@@ -57,8 +57,8 @@ For direct `cargo run` commands, node-only operation, standalone mining, GPU bui
 
 ## Documentation
 
-- [White Paper](ATHO_WHITE_PAPER.md)
-- [Monetary Policy Attachment](ATHO_MONETARY_POLICY_AND_150_YEAR_SUPPLY_SCHEDULE.md)
+- [White Paper (PDF)](ATHO_WHITE_PAPER.pdf)
+- [Monetary Policy Attachment (PDF)](ATHO_MONETARY_POLICY_AND_150_YEAR_SUPPLY_SCHEDULE.pdf)
 - [Setup Guide](docs/setup.md)
 - [Commands](docs/commands.md)
 - [Configuration](docs/configuration.md)
