@@ -90,12 +90,19 @@ WHITEPAPER_FIGURES = [
 WHITEPAPER_TABLES = [
     "Table 1. Technical Overview of Current Code Parameters",
     "Table 2. Why Rust Fits Atho Core Infrastructure",
-    "Table 3. Falcon-512 Validation Failure Cases",
-    "Table 4. UTXO Validation Rules",
-    "Table 5. Monetary Policy Constants and Current Consensus Values",
-    "Table 6. Post-Quantum Security Comparison",
-    "Table 7. Required Test Coverage Matrix",
-    "Table 8. Protocol Constants by Network",
+    "Table 3. Rust Design Requirements for Atho Core Infrastructure",
+    "Table 4. Post-Quantum Security Comparison",
+    "Table 5. Falcon-512 Validation Failure Cases",
+    "Table 6. UTXO Validation Rules",
+    "Table 7. Mining Components and Responsibilities",
+    "Table 8. Monetary Policy Constants and Current Consensus Values",
+    "Table 9. Consensus-Critical Invalid Cases",
+    "Table 10. Address Design Tradeoffs",
+    "Table 11. Atho Threat Model",
+    "Table 12. Required Test Coverage Matrix",
+    "Table 13. Consensus-Critical Rust Review Standards",
+    "Table 14. Protocol Constants by Network",
+    "Table 15. Code Reference Map",
 ]
 
 SUPPLEMENT_TABLES = [
@@ -116,145 +123,145 @@ def base_styles():
             "TitlePageTitle",
             parent=sheet["Title"],
             fontName="Times-Bold",
-            fontSize=26,
-            leading=31,
+            fontSize=24,
+            leading=28,
             alignment=TA_CENTER,
-            spaceAfter=0.18 * inch,
+            spaceAfter=0.14 * inch,
             textColor=colors.black,
         ),
         "subtitle": ParagraphStyle(
             "TitlePageSubtitle",
             parent=sheet["Title"],
             fontName="Times-Italic",
-            fontSize=17,
-            leading=21,
+            fontSize=15.5,
+            leading=19,
             alignment=TA_CENTER,
-            spaceAfter=0.28 * inch,
+            spaceAfter=0.22 * inch,
         ),
         "title_meta": ParagraphStyle(
             "TitlePageMeta",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.5,
-            leading=17,
+            fontSize=11,
+            leading=14,
             alignment=TA_CENTER,
-            spaceAfter=0.06 * inch,
+            spaceAfter=0.045 * inch,
         ),
         "paper_heading": ParagraphStyle(
             "PaperHeading",
             parent=sheet["Heading1"],
             fontName="Times-Bold",
-            fontSize=18,
-            leading=22,
+            fontSize=16.5,
+            leading=19,
             alignment=TA_CENTER,
-            spaceBefore=0.22 * inch,
-            spaceAfter=0.12 * inch,
+            spaceBefore=0.16 * inch,
+            spaceAfter=0.08 * inch,
             keepWithNext=True,
         ),
         "subheading": ParagraphStyle(
             "PaperSubheading",
             parent=sheet["Heading2"],
             fontName="Times-Bold",
-            fontSize=13.25,
-            leading=16,
+            fontSize=11.6,
+            leading=13.4,
             alignment=TA_LEFT,
-            spaceBefore=0.14 * inch,
-            spaceAfter=0.06 * inch,
+            spaceBefore=0.1 * inch,
+            spaceAfter=0.035 * inch,
             keepWithNext=True,
         ),
         "body": ParagraphStyle(
             "PaperBody",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.25,
-            leading=18,
+            fontSize=10.65,
+            leading=14.15,
             alignment=TA_LEFT,
-            firstLineIndent=0.24 * inch,
-            spaceAfter=0.08 * inch,
+            firstLineIndent=0.18 * inch,
+            spaceAfter=0.05 * inch,
         ),
         "body_no_indent": ParagraphStyle(
             "PaperBodyNoIndent",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.25,
-            leading=18,
+            fontSize=10.65,
+            leading=14.15,
             alignment=TA_LEFT,
             firstLineIndent=0,
-            spaceAfter=0.08 * inch,
+            spaceAfter=0.05 * inch,
         ),
         "bullet": ParagraphStyle(
             "PaperBullet",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.1,
-            leading=17,
-            leftIndent=0.2 * inch,
+            fontSize=10.45,
+            leading=13.7,
+            leftIndent=0.16 * inch,
             firstLineIndent=0,
-            spaceAfter=0.04 * inch,
+            spaceAfter=0.025 * inch,
         ),
         "caption_label": ParagraphStyle(
             "CaptionLabel",
             parent=sheet["BodyText"],
             fontName="Times-Bold",
-            fontSize=12.1,
-            leading=14,
-            spaceBefore=0.08 * inch,
-            spaceAfter=0.02 * inch,
+            fontSize=10.5,
+            leading=12,
+            spaceBefore=0.055 * inch,
+            spaceAfter=0.01 * inch,
         ),
         "caption_title": ParagraphStyle(
             "CaptionTitle",
             parent=sheet["BodyText"],
             fontName="Times-Italic",
-            fontSize=12.1,
-            leading=14,
-            spaceAfter=0.08 * inch,
+            fontSize=10.5,
+            leading=12,
+            spaceAfter=0.055 * inch,
         ),
         "figure_caption": ParagraphStyle(
             "FigureCaption",
             parent=sheet["BodyText"],
             fontName="Times-Italic",
-            fontSize=11.5,
-            leading=14.5,
-            spaceBefore=0.05 * inch,
-            spaceAfter=0.12 * inch,
+            fontSize=9.9,
+            leading=12.2,
+            spaceBefore=0.03 * inch,
+            spaceAfter=0.08 * inch,
         ),
         "pre": ParagraphStyle(
             "PaperPre",
             parent=sheet["Code"],
             fontName="Courier",
-            fontSize=10.5,
-            leading=13,
-            leftIndent=0.14 * inch,
-            rightIndent=0.14 * inch,
-            spaceBefore=0.05 * inch,
-            spaceAfter=0.1 * inch,
+            fontSize=8.9,
+            leading=10.8,
+            leftIndent=0.1 * inch,
+            rightIndent=0.1 * inch,
+            spaceBefore=0.03 * inch,
+            spaceAfter=0.07 * inch,
         ),
         "toc_heading": ParagraphStyle(
             "TOCHeading",
             parent=sheet["Heading1"],
             fontName="Times-Bold",
-            fontSize=18,
-            leading=22,
+            fontSize=16.5,
+            leading=19,
             alignment=TA_CENTER,
-            spaceBefore=0.18 * inch,
-            spaceAfter=0.18 * inch,
+            spaceBefore=0.14 * inch,
+            spaceAfter=0.14 * inch,
         ),
         "toc_entry": ParagraphStyle(
             "TOCEntry",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.2,
-            leading=16,
-            leftIndent=0.1 * inch,
+            fontSize=10.5,
+            leading=12.8,
+            leftIndent=0.08 * inch,
             firstLineIndent=0,
         ),
         "list_page_entry": ParagraphStyle(
             "ListPageEntry",
             parent=sheet["BodyText"],
             fontName="Times-Roman",
-            fontSize=12.2,
-            leading=17,
-            spaceAfter=0.05 * inch,
+            fontSize=10.5,
+            leading=12.8,
+            spaceAfter=0.03 * inch,
         ),
     }
     return styles
@@ -271,14 +278,14 @@ class TocHeading(Paragraph):
 
 
 class AthoDocTemplate(BaseDocTemplate):
-    def __init__(self, filename: str, header_text: str):
+    def __init__(self, filename: str, header_text: str, document_title: str):
         super().__init__(
             filename,
             pagesize=LETTER,
-            rightMargin=0.95 * inch,
-            leftMargin=0.95 * inch,
-            topMargin=0.95 * inch,
-            bottomMargin=0.85 * inch,
+            rightMargin=0.78 * inch,
+            leftMargin=0.78 * inch,
+            topMargin=0.82 * inch,
+            bottomMargin=0.72 * inch,
         )
         frame = Frame(
             self.leftMargin,
@@ -288,6 +295,7 @@ class AthoDocTemplate(BaseDocTemplate):
             id="normal",
         )
         self.header_text = header_text
+        self.document_title = document_title
         self._bookmark_counter = 0
         template = PageTemplate(id="main", frames=[frame], onPage=self._on_page)
         self.addPageTemplates([template])
@@ -297,12 +305,16 @@ class AthoDocTemplate(BaseDocTemplate):
 
     def _on_page(self, canvas, doc):
         canvas.saveState()
-        canvas.setFont("Times-Roman", 10.5)
+        canvas.setTitle(self.document_title)
+        canvas.setAuthor(AUTHOR)
+        canvas.setSubject(TAGLINE)
+        canvas.setKeywords(KEYWORDS)
+        canvas.setFont("Times-Roman", 9.4)
         canvas.setFillColor(HEADER_COLOR)
-        canvas.drawString(doc.leftMargin, LETTER[1] - 0.55 * inch, self.header_text)
+        canvas.drawString(doc.leftMargin, LETTER[1] - 0.48 * inch, self.header_text)
         canvas.drawRightString(
             LETTER[0] - doc.rightMargin,
-            LETTER[1] - 0.55 * inch,
+            LETTER[1] - 0.48 * inch,
             str(canvas.getPageNumber()),
         )
         canvas.restoreState()
@@ -424,8 +436,8 @@ def table_flowable(rows: list[list[str]]):
         "TableHeaderCell",
         parent=STYLES["body_no_indent"],
         fontName="Times-Bold",
-        fontSize=10.8,
-        leading=13.5,
+        fontSize=9.25,
+        leading=11.2,
         textColor=colors.white,
     )
     for row_index, row in enumerate(rows):
@@ -447,13 +459,13 @@ def table_flowable(rows: list[list[str]]):
                 ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEADER_BG),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Times-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 10.8),
-                ("LEADING", (0, 0), (-1, -1), 13.5),
+                ("FONTSIZE", (0, 0), (-1, -1), 9.25),
+                ("LEADING", (0, 0), (-1, -1), 11.2),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, TABLE_ROW_ALT]),
-                ("TOPPADDING", (0, 0), (-1, -1), 7),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                 ("LINEBELOW", (0, 0), (-1, 0), 0.75, colors.black),
                 ("LINEBELOW", (0, -1), (-1, -1), 0.75, colors.black),
             ]
@@ -798,7 +810,7 @@ def clean_heading_display(title: str) -> str:
 def render_html_section(
     markdown_text: str,
     heading_context: str,
-    table_caption_map: dict[str, str],
+    table_caption_map: dict[str, str | list[str]],
     skip_figure_pre_blocks: set[str],
 ):
     html_fragment = markdown_to_html_fragment(markdown_text)
@@ -807,6 +819,14 @@ def render_html_section(
     flowables = []
     current_subheading = ""
     inserted_context_figures: set[str] = set()
+    table_caption_value = table_caption_map.get(heading_context)
+    if isinstance(table_caption_value, list):
+        table_captions = table_caption_value
+    elif table_caption_value:
+        table_captions = [table_caption_value]
+    else:
+        table_captions = []
+    table_index = 0
     for node in root.children:
         if isinstance(node, NavigableString):
             if not str(node).strip():
@@ -844,7 +864,8 @@ def render_html_section(
             flowables.append(Spacer(1, 0.05 * inch))
             continue
         if node.name == "table":
-            caption = table_caption_map.get(heading_context)
+            caption = table_captions[table_index] if table_index < len(table_captions) else None
+            table_index += 1
             parts = []
             if caption:
                 number, _, title = caption.partition(". ")
@@ -878,7 +899,11 @@ def build_whitepaper():
     sections = split_h2_sections(markdown_body)
     section_map = {title: body for title, body in sections}
 
-    doc = AthoDocTemplate(str(WHITEPAPER_PDF), "ATHO WHITE PAPER")
+    doc = AthoDocTemplate(
+        str(WHITEPAPER_PDF),
+        "ATHO WHITE PAPER",
+        "Atho White Paper",
+    )
     toc = TableOfContents()
     toc.levelStyles = [STYLES["toc_entry"]]
 
@@ -969,13 +994,18 @@ def build_whitepaper():
 
     table_caption_map = {
         "4. System Overview": WHITEPAPER_TABLES[0],
-        "6. Rust Implementation Strategy": WHITEPAPER_TABLES[1],
-        "8. Falcon-512 Implementation in Atho": WHITEPAPER_TABLES[2],
-        "10. UTXO and Accounting Rules": WHITEPAPER_TABLES[3],
-        "13. Monetary Policy and Emissions": WHITEPAPER_TABLES[4],
-        "7. Cryptographic Design": WHITEPAPER_TABLES[5],
-        "24. Testing, Auditing, and Benchmarking": WHITEPAPER_TABLES[6],
-        "Appendix B. Protocol Constants": WHITEPAPER_TABLES[7],
+        "6. Rust Implementation Strategy": [WHITEPAPER_TABLES[1], WHITEPAPER_TABLES[2]],
+        "7. Cryptographic Design": WHITEPAPER_TABLES[3],
+        "8. Falcon-512 Implementation in Atho": WHITEPAPER_TABLES[4],
+        "10. UTXO and Accounting Rules": WHITEPAPER_TABLES[5],
+        "12. Proof-of-Work and Mining": WHITEPAPER_TABLES[6],
+        "13. Monetary Policy and Emissions": WHITEPAPER_TABLES[7],
+        "15. Consensus Validation": WHITEPAPER_TABLES[8],
+        "19. Address and Encoding Design": WHITEPAPER_TABLES[9],
+        "22. Security Model": WHITEPAPER_TABLES[10],
+        "24. Testing, Auditing, and Benchmarking": [WHITEPAPER_TABLES[11], WHITEPAPER_TABLES[12]],
+        "Appendix B. Protocol Constants": WHITEPAPER_TABLES[13],
+        "Appendix C. Code Reference Map": WHITEPAPER_TABLES[14],
     }
     skip_figure_pre: set[str] = set()
 
@@ -1001,7 +1031,9 @@ def build_supplement():
     section_map = {title: body for title, body in sections}
 
     doc = AthoDocTemplate(
-        str(SUPPLEMENT_PDF), "ATHO MONETARY POLICY AND 150-YEAR SUPPLY SCHEDULE"
+        str(SUPPLEMENT_PDF),
+        "ATHO MONETARY POLICY AND 150-YEAR SUPPLY SCHEDULE",
+        "Atho Monetary Policy and 150-Year Supply Schedule",
     )
     story = []
     story.extend(

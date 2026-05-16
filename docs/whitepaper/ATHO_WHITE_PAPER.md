@@ -104,6 +104,8 @@ The overall operating model is simple to state:
 
 ### 4.1. Technical Overview of Current Code Parameters
 
+Table 1 condenses the current code-grounded protocol parameters that frame the rest of the paper.
+
 | Parameter | Current Code Value | Why It Matters |
 |---|---|---|
 | Consensus | Proof of Work | Orders blocks through locally verifiable work rather than delegated authority. |
@@ -132,6 +134,8 @@ Atho persists accepted chain truth through a hybrid storage model. Canonical raw
 Atho is a Layer 1 proof-of-work blockchain with a public UTXO ledger. Its architectural boundary is deliberately modular. `atho-core` defines protocol objects, consensus constants, network identities, addresses, and signing messages. `atho-storage` performs contextual validation and durable state application. `atho-node` composes storage, mempool, mining, RPC/API, P2P, and runtime status. `atho-wallet` owns key derivation and wallet datafiles. `atho-qt` is a client of validated node state.
 
 This separation matters because it reduces accidental consensus drift. If user-interface code changes, consensus behavior should not change with it. If explorer presentation changes, chain acceptance should remain unaffected. If mining or API code evolves, both paths should still route through the same validated state and object model.
+
+The repository also keeps several protocol-versioning facts explicit rather than implied. The active protocol version is `1`. The active ruleset version is `1`. The active block and transaction version are both `1`. A V2 ruleset placeholder exists in code with no activation height, which means future upgrade intent is visible without claiming that a second ruleset has already been deployed. The storage schema version is also fixed in code rather than inferred from opaque local state.
 
 ### 5.2. Atho Node Architecture
 
@@ -163,6 +167,17 @@ Table 2 summarizes why Rust remains a strong fit for Atho’s core infrastructur
 | Concurrency discipline | Rust’s type system makes data-race patterns harder to express incorrectly. | Parallel Falcon verification, background sync, and runtime status collection. |
 | Modularity | Cargo workspaces and crates encourage narrow protocol boundaries. | `atho-core`, `atho-storage`, `atho-node`, `atho-wallet`, `atho-crypto`, and `atho-qt`. |
 
+Table 3 captures the practical Rust safety rules that matter most for consensus and storage code in the current Atho repository.
+
+| Requirement | Reason | Enforcement Target |
+|---|---|---|
+| Strong domain types for amounts, heights, hashes, and addresses | Prevents unit confusion and wrong-context comparisons. | `atho-core` protocol types and validation APIs. |
+| `Result`-based rejection for recoverable failures | Invalid network input is normal control flow, not exceptional control flow. | Decoders, validators, wallet import/export, and API handlers. |
+| No `unsafe` in consensus-critical crates | Reduces the chance of hidden memory-unsafe behavior in the core rule path. | `atho-core`, `atho-storage`, `atho-node`, and `atho-crypto` boundaries. |
+| Canonical byte encoding only | Prevents ambiguous hashes, txids, and signature messages. | Block, transaction, witness, and address encoding. |
+| Malformed input must fail closed | Prevents peers, APIs, or wallets from smuggling partially valid state. | P2P codec, raw transaction decode, address decode, and witness parsing. |
+| Upgrade points must stay explicit | Makes protocol changes reviewable before activation. | Ruleset scheduling, block/transaction versions, and storage schema versioning. |
+
 ## 7. Cryptographic Design
 
 Atho’s cryptographic surface is intentionally narrow. SHA3-384 is used for proof-of-work hashing, block and transaction identities, signing-message derivation, and checksum-related utilities where appropriate. Falcon-512 is used for spend authorization. The design goal is not to mix multiple signature families or complex script semantics into the same ownership surface. The goal is to keep ownership proofs and hashing commitments explicit.
@@ -180,6 +195,8 @@ Cryptographic design choices in Atho should be evaluated by the following questi
 SHA3-384 produces a 384-bit digest and gives Atho a larger hashing margin than shorter digest sizes while preserving deterministic, machine-verifiable output for mining and block identification. In Atho, SHA3-384 is not a branding choice. It is the actual hash family used in consensus-facing code.
 
 ### 7.2. Post-Quantum Security Comparison
+
+Table 4 positions Atho relative to common classical and post-quantum-aware ledger designs.
 
 | System Type | Common Examples | Signature Type | Quantum Risk Profile | Atho Difference |
 |---|---|---|---|---|
@@ -199,6 +216,8 @@ Falcon-512 is the active transaction-signature profile in Atho. Public keys, sec
 
 The role of Falcon-512 in Atho is narrow and important: it proves spend authorization for a specific transaction input under a specific signing context. It is not used for proof-of-work. It is not used as a general-purpose remote-authentication layer. It is used to authorize value transfer.
 
+At the implementation level, the active wire and validation sizes are explicit: Falcon-512 public keys are fixed at `897` bytes, secret keys at `1,281` bytes, and signatures at `666` bytes. Those lengths are enforced at import and verification boundaries before the node attempts expensive witness verification. The node also rebuilds the canonical signing digest from transaction bytes and network context locally, rather than trusting wallet-supplied metadata about what was signed.
+
 ### 8.1. Signature Verification and Rejection Behavior
 
 The consensus consequences of witness verification are more important than the abstract signature primitive. The node must reject:
@@ -211,7 +230,7 @@ The consensus consequences of witness verification are more important than the a
 - missing witness components
 - replay attempts across incompatible network or ownership contexts
 
-Table 3 summarizes the expected behavior for common Falcon-512 failure cases.
+Table 5 summarizes the expected behavior for common Falcon-512 failure cases.
 
 | Failure Case | Detection Method | Expected Result |
 |---|---|---|
@@ -227,6 +246,10 @@ Table 3 summarizes the expected behavior for common Falcon-512 failure cases.
 Atho transactions consume existing UTXOs and create new UTXOs. Ownership is not inferred from a broad script interpreter. Instead, spendability flows through canonical transaction serialization, explicit input references, output value accounting, and Falcon-512 witness authorization tied to a 32-byte canonical lock digest.
 
 The transaction body is serialized deterministically. Transaction IDs derive from canonical bytes. Witnesses are stored separately from the base transaction identity so the node can preserve a stable base transaction digest while still validating the witness payload needed to authorize spends.
+
+The current implementation also applies transaction-level resource and anti-spam policy with explicit constants. Standard transactions are bounded at `250,000` raw bytes and `250,000` vbytes. The minimum relay and construction fee floor is `max(500 atoms, vbytes * 1 atom)`. Dust-like outputs below `1,000` atoms are rejected, and standard transactions are capped at `64` outputs and `1,024` inputs. These limits are policy-facing, but they shape the operational transaction model that wallets, APIs, and miners actually use.
+
+Normal non-coinbase transactions also carry wallet transaction proof-of-work in the current code. The wallet signs the transaction first, then derives a `SHA3-256` anti-spam preimage under the `ATHO_TX_POW_V1` domain, network consensus ID, and genesis hash, and solves for a nonce that satisfies the required difficulty bits. That per-transaction PoW is dynamic: testnet uses a reduced fixed value, while other networks scale the required bits based on transaction size, output count, and fee rate. The design goal is to add sender-side cost for fragmented or low-fee traffic without weakening block-level consensus proof-of-work.
 
 ### 9.1. Transaction Signing and Verification Flow
 
@@ -247,7 +270,7 @@ The UTXO set is the live accounting surface of Atho. Every accepted spend remove
 
 The current repository uses canonical lock digests rather than permissive legacy script forms. Noncanonical locking data is rejected. Oversized or malformed witness data is rejected. Coinbase outputs remain locked behind a maturity threshold before they are spendable.
 
-Table 4 summarizes the current UTXO validation rules that matter most for operators and integrators.
+Table 6 summarizes the current UTXO validation rules that matter most for operators and integrators.
 
 | Rule | Current Behavior | Why It Matters |
 |---|---|---|
@@ -264,6 +287,10 @@ Each Atho block contains a canonical header plus a transaction list headed by a 
 
 Block validation is not only about proof-of-work. The block also has to satisfy structural rules, canonical transaction decoding, coinbase placement rules, duplicate-spend rejection, UTXO validity, and monetary correctness. Valid proof-of-work alone does not rescue an invalid block.
 
+The header structure matters because it is the smallest object whose bytes affect chain ordering. Atho’s canonical header contains: block version, network ID, height, previous block hash, merkle root, witness root, founder-hash `SHA3-384`, founder-hash `SHA3-512`, timestamp, target bytes, and nonce. Nodes hash those bytes deterministically and compare the resulting digest against the target. Any disagreement about field order, digest width, or included metadata would create immediate consensus breakage.
+
+The live implementation also makes block resource limits explicit: `3,000,000` vbytes, `12,000,000` raw serialized bytes, and `12,000,000` weight units. Blocks additionally carry fee-accounting fields for total fees, miner fees, burned fees, pooled fees, and cumulative burned amount, even though the active miner path currently routes selected fees to the miner and leaves the burn-oriented fields at zero. This keeps fee accounting visible in the canonical block object rather than hiding it in side effects.
+
 ## 12. Proof-of-Work and Mining
 
 Atho uses SHA3-384 proof-of-work. Miners search the nonce space for a header hash below the active target. The node’s mining path is not supposed to create a separate private notion of validity. Candidate blocks must still pass the same validation rules that apply to blocks received from peers.
@@ -272,6 +299,8 @@ The active code uses a 100-second target block time and a 1,260,000-block halvin
 
 - ordering pending valid transactions into a candidate block
 - solving for valid proof-of-work under the current target
+
+Difficulty retargeting is also explicit rather than inferred. The current profile retargets every block using a `17`-block averaging window, an `11`-block median-time window, a damping factor of `4`, a maximum upward adjustment of `16%`, and a maximum downward adjustment of `32%`. This makes difficulty movement responsive enough for shorter block times while still bounding abrupt oscillation.
 
 ### 12.1. Mining Responsibilities
 
@@ -282,6 +311,17 @@ Mining must:
 - respect canonical block serialization
 - preserve founder-hash header metadata
 - submit solved blocks through the same full-validation path used for externally sourced blocks
+
+Table 7 summarizes the practical mining responsibilities exposed by the current codebase.
+
+| Component | Current Role | Validation Constraint |
+|---|---|---|
+| Block template builder | Selects candidate mempool transactions and constructs a coinbase. | Must use transactions that still pass node validation at template time. |
+| Coinbase builder | Pays subsidy plus allowed fees to the configured output. | Must never overpay the height-based reward plus fees. |
+| Merkle and witness commitment logic | Commits ordered transaction and witness data into the header. | Must match the validator’s recomputation exactly. |
+| Proof-of-work loop | Searches nonce space for a header hash below the current target. | Valid proof-of-work cannot rescue an invalid block body. |
+| Local block submission path | Returns solved blocks to the node. | Must re-enter the same full block validation path as peer-sourced blocks. |
+| GPU/native acceleration | Optimizes hash-search throughput where supported. | Must not alter canonical header bytes, target rules, or submission behavior. |
 
 ## 13. Monetary Policy and Emissions
 
@@ -306,7 +346,7 @@ Even without a hard cap, the current emission path matters operationally. Wallet
 
 The current reward path is halving-based for three eras and then becomes a perpetual tail reward. That means long-term issuance is eventually linear rather than capped. The active rule can be stated in plain language as **5 -> 2.5 -> 1.25 -> 0.625 ATHO**, after which the reward remains at 0.625 ATHO indefinitely unless a future consensus change says otherwise.
 
-Table 5 summarizes the policy constants used by the current implementation.
+Table 8 summarizes the policy constants used by the current implementation.
 
 | Constant | Current Value | Operational Meaning |
 |---|---|---|
@@ -337,6 +377,19 @@ An incoming transaction must pass decode, canonical structure, version rules, fe
 Consensus validation is where Atho becomes a blockchain rather than just a messaging system. The network does not accept data because a miner produced it, a wallet broadcast it, or an API submitted it. The network accepts data because the local node can prove it is valid under canonical rules.
 
 Transaction validation and block validation are related but distinct. Transaction validation checks canonical structure, ownership, spendability, fees, and witness correctness. Block validation adds header rules, proof-of-work, coinbase correctness, duplicate-spend detection, commitment verification, and atomic state transition requirements.
+
+Table 9 lists representative invalid cases that must continue to fail identically across node, mempool, mining, and API entry points.
+
+| Invalid Case | Rejection Surface | Why It Is Consensus-Critical |
+|---|---|---|
+| Wrong-network block or transaction | Header/network checks and address decode paths | Prevents cross-network acceptance and replay. |
+| Legacy or noncanonical lock format | Output lock parsing and UTXO ownership validation | Prevents ambiguous or anyone-can-spend behavior. |
+| Malformed witness, public key, or signature | Witness parser and Falcon verification | Prevents unauthorized spends and parser ambiguity. |
+| Duplicate inputs or duplicate spends | Transaction and block contextual validation | Prevents explicit double spends. |
+| Overpaid coinbase | Block monetary validation | Preserves deterministic issuance. |
+| Wrong transaction or block version | Version checks against active ruleset | Prevents unactivated rule paths from slipping into production. |
+| Bad merkle or witness commitment root | Block commitment verification | Prevents tampering with the transaction set or witness set. |
+| Oversized block or transaction | Size and weight limits | Preserves resource bounds and deterministic relay/validation rules. |
 
 ### 15.1. Block Validation Pipeline
 
@@ -390,6 +443,16 @@ That separation matters:
 - network identity is visible in the address prefix
 - decoding failures reject malformed user input before transaction construction
 
+Table 10 summarizes the design tradeoffs of the current address format.
+
+| Address Feature | Benefit | Constraint or Tradeoff |
+|---|---|---|
+| Base56 visible encoding | Avoids visually ambiguous characters and remains user-facing. | Slightly less conventional than Base58/Bech32 for outside tooling. |
+| Visible network prefix | Makes network selection human-readable at the string level. | Wallet and exchange tooling must preserve prefix checks strictly. |
+| 32-byte payment digest | Matches canonical ownership binding in validation. | Visible address is an encoding of ownership, not ownership itself. |
+| Fixed checksum suffix | Rejects malformed or mistyped input before transaction build. | Checksum is for input safety, not a substitute for consensus validation. |
+| Separate internal lock vs. visible address | Keeps consensus bytes independent from UI encoding. | Developers must avoid treating display strings as canonical ledger state. |
+
 ## 20. API and Developer Tooling
 
 The project exposes multiple developer-facing layers:
@@ -432,6 +495,17 @@ Atho’s security model combines several assumptions:
 
 The security model should be described honestly. Atho is not “quantum-proof forever.” It is a payment chain whose transaction authorization model is built around a post-quantum signature scheme and whose consensus implementation is designed to fail closed on malformed or invalid state transitions.
 
+Table 11 summarizes the main threat categories and the repository’s current defensive posture.
+
+| Threat Category | Defensive Posture | Remaining Dependency |
+|---|---|---|
+| Double-spend attempts | UTXO existence checks, duplicate-input rejection, and chain selection by validated proof-of-work. | Full nodes must remain widely deployed and honest enough to validate independently. |
+| Unauthorized spend attempts | Canonical 32-byte lock binding plus Falcon-512 verification over rebuilt signing digests. | Wallets and nodes must continue to agree on exact signing-message bytes. |
+| Wrong-network replay | Network-specific IDs, visible address prefixes, genesis anchors, and P2P magic values. | Operators must not intentionally disable network checks or mix state directories. |
+| Malformed peer or API input | Strict decoders, size bounds, and typed validation errors. | Coverage still depends on continuing regression and adversarial testing. |
+| Storage corruption or partial state drift | Hybrid block-file plus LMDB model with explicit chainstate indexing. | Crash-consistency and recovery behavior still need continuous validation. |
+| Wallet secret exposure | Local signing, zeroizing memory for key material, password-based wallet encryption support. | The current code still permits plaintext-at-rest wallet persistence when the password is empty. |
+
 ## 23. Performance and Scalability
 
 Performance in Atho comes from removing wasted work rather than weakening validation. Important hot paths include:
@@ -464,7 +538,7 @@ Atho benefits from layered verification:
 - benchmark coverage for Falcon verification, decode paths, block validation, and storage commit behavior
 - design reviews and audit reports for consensus correctness, Falcon handling, and production readiness
 
-Table 7 lists the minimum testing areas that should remain in view for public network operation.
+Table 12 lists the minimum testing areas that should remain in view for public network operation.
 
 | Test Area | What Must Hold | Why It Matters |
 |---|---|---|
@@ -474,6 +548,16 @@ Table 7 lists the minimum testing areas that should remain in view for public ne
 | Network isolation | Wrong-network addresses and blocks reject | Prevents cross-network contamination. |
 | Storage durability | Accepted state is reconstructable after restart | Preserves node trust in local chainstate. |
 | Falcon verification | Malformed signatures and keys reject safely | Preserves authorization correctness. |
+
+Rust safety requirements also deserve explicit long-form tracking because the implementation is part of the security model, not just a vehicle for the protocol. Table 13 identifies the coding standards most relevant to consensus-critical review.
+
+| Rust Review Requirement | Why It Matters | Current Application Area |
+|---|---|---|
+| `#![forbid(unsafe_code)]` or equivalent in core crates | Shrinks the memory-unsafety surface for validation and state code. | `atho-core`, `atho-storage`, `atho-node`, and related binaries. |
+| Typed enums for network and validation state | Prevents stringly typed rule branching. | Network IDs, versions, launch modes, and error surfaces. |
+| Canonical serialization functions owned by protocol types | Prevents drift between wallet, node, and storage byte layouts. | Transactions, witnesses, blocks, addresses, and digests. |
+| No panic-driven validation logic on hostile input | Keeps peer and API input from crashing the process. | P2P codec, address decode, raw transaction decode, and witness parsing. |
+| Explicit activation scheduling for future rules | Makes dormant upgrades inspectable before activation. | Ruleset V2 placeholder and version checks. |
 
 ## 25. Governance and Upgrade Philosophy
 
@@ -524,6 +608,9 @@ The value proposition is therefore clear: Atho is trying to become durable digit
 
 ## Appendix B. Protocol Constants
 
+Table 14  
+*Protocol Constants by Network*
+
 | Constant | Mainnet | Testnet | Regnet | Prunetest |
 |---|---|---|---|---|
 | Consensus identity | Distinct mainnet ID | Distinct testnet ID | Distinct regnet ID | Distinct prunetest ID |
@@ -537,19 +624,28 @@ The value proposition is therefore clear: Atho is trying to become durable digit
 
 ## Appendix C. Code Reference Map
 
-- `crates/atho-core/src/constants.rs` — consensus constants for timing, subsidy, confirmations, and units.
-- `crates/atho-core/src/network.rs` — network IDs, visible prefixes, ports, and isolation rules.
-- `crates/atho-core/src/block.rs` — canonical block header encoding, founder-hash fields, and block serialization.
-- `crates/atho-core/src/transaction.rs` — canonical transaction object model.
-- `crates/atho-core/src/address.rs` — Base56 address derivation, checksums, and decode rules.
-- `crates/atho-core/src/consensus/subsidy.rs` — reward schedule and yearly emission logic.
-- `crates/atho-core/src/consensus/pow.rs` — difficulty and proof-of-work validation rules.
-- `crates/atho-core/src/consensus/signatures.rs` — canonical signing message construction and witness verification context.
-- `crates/atho-crypto/src/falcon.rs` — Falcon-512 key and signature wrappers plus verification behavior.
-- `crates/atho-storage/src/validation.rs` — contextual transaction and block validation.
-- `crates/atho-storage/src/block_files.rs` — flat block archive layout and offsets.
-- `crates/atho-wallet/src/wallet.rs` — wallet state, address derivation, and transaction construction.
-- `crates/atho-node/src/api.rs` — node-facing API surface and reporting.
+Table 15  
+*Code Reference Map*
+
+| Module or File | Role in the Current Repository |
+|---|---|
+| `crates/atho-core/src/constants.rs` | Consensus constants for timing, subsidy, confirmations, and units. |
+| `crates/atho-core/src/network.rs` | Network IDs, visible prefixes, ports, P2P magic values, and launch policy boundaries. |
+| `crates/atho-core/src/block.rs` | Canonical block header encoding, founder-hash fields, and block serialization. |
+| `crates/atho-core/src/transaction.rs` | Canonical transaction and witness object model. |
+| `crates/atho-core/src/address.rs` | Base56 address derivation, checksum logic, and decode rules. |
+| `crates/atho-core/src/consensus/rules.rs` | Active protocol/ruleset versions and future placeholder scheduling. |
+| `crates/atho-core/src/consensus/subsidy.rs` | Reward schedule, yearly emission logic, and absence of a finite max-supply cap. |
+| `crates/atho-core/src/consensus/pow.rs` | Difficulty targeting and proof-of-work validation rules. |
+| `crates/atho-core/src/consensus/signatures.rs` | Canonical signing-message construction and witness verification context. |
+| `crates/atho-crypto/src/falcon.rs` | Falcon-512 key and signature wrappers plus verification behavior. |
+| `crates/atho-storage/src/validation.rs` | Contextual transaction and block validation against chainstate. |
+| `crates/atho-storage/src/block_files.rs` | Flat block archive layout, file rotation, and offset bookkeeping. |
+| `crates/atho-wallet/src/wallet.rs` | Wallet state, address derivation, and transaction construction. |
+| `crates/atho-node/src/api.rs` | Node-facing API surface and reporting. |
+| `crates/atho-p2p/src/config.rs` | Network bootstrap configuration and peer limits. |
+| `crates/atho-rpc` | Typed local RPC transport and request/response model. |
+| `crates/atho-installer` | Release installation and distribution tooling. |
 
 ## Appendix D. Transaction Validation Pseudocode
 
