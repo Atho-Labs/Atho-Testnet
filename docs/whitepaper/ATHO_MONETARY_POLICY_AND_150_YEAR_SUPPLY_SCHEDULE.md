@@ -57,9 +57,6 @@ In plain language:
 
 ## 4. 150-Year Supply Schedule
 
-Table 1  
-*Atho 150-Year Monetary Supply Projection Under the Current Emission Policy*
-
 | Year | Estimated Block Height | Block Reward (ATHO) | Annual Emission (ATHO) | Cumulative Supply (ATHO) | % of Enforced Max Supply | Remaining to Enforced Max Supply |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 315,360 | 5 | 1,576,800 | 1,576,800 | N/A | N/A |

@@ -62,30 +62,40 @@ class FigureSpec:
 
 
 WHITEPAPER_FIGURES = [
-    FigureSpec("4.1. System Flow", "Figure 1.", "Atho System Overview"),
+    FigureSpec("5.1. Atho System Overview", "Figure 1.", "Atho System Overview"),
+    FigureSpec("5.2. Atho Node Architecture", "Figure 2.", "Atho Node Architecture"),
     FigureSpec(
-        "8. Transaction Security",
-        "Figure 2.",
+        "9.1. Transaction Signing and Verification Flow",
+        "Figure 3.",
         "Atho Transaction Signing and Verification Flow",
     ),
+    FigureSpec("9.2. Transaction Lifecycle", "Figure 4.", "Transaction Lifecycle"),
+    FigureSpec("15.1. Block Validation Pipeline", "Figure 5.", "Block Validation Pipeline"),
+    FigureSpec("13.2. Atho Emission Model", "Figure 6.", "Atho Emission Model"),
+    FigureSpec("14.1. Mempool Admission Flow", "Figure 7.", "Mempool Admission Flow"),
     FigureSpec(
-        "6. Emission Model and 150-Year Supply Projection",
-        "Figure 3.",
-        "Atho Emission Model Under Current Consensus",
+        "16.1. Node Sync and Block Propagation Flow",
+        "Figure 8.",
+        "Node Sync and Block Propagation Flow",
     ),
-    FigureSpec("7.1. Validation Pipeline", "Figure 4.", "Block Validation Pipeline"),
-    FigureSpec("10. Network Participants", "Figure 5.", "Wallet-to-Node Interaction"),
+    FigureSpec("18.1. Wallet-to-Node Interaction", "Figure 9.", "Wallet-to-Node Interaction"),
     FigureSpec(
-        "7. Consensus and Validation",
-        "Figure 6.",
+        "15.2. Validation Pipeline and Parallel Work Distribution",
+        "Figure 10.",
         "Validation Pipeline and Parallel Work Distribution",
     ),
+    FigureSpec("17.1. Hybrid Storage Commit Model", "Figure 11.", "Hybrid Storage Commit Model"),
 ]
 
 WHITEPAPER_TABLES = [
     "Table 1. Technical Overview of Current Code Parameters",
-    "Table 2. Atho 150-Year Monetary Supply Projection Under the Current Emission Policy",
-    "Table 3. Post-Quantum Security Comparison",
+    "Table 2. Why Rust Fits Atho Core Infrastructure",
+    "Table 3. Falcon-512 Validation Failure Cases",
+    "Table 4. UTXO Validation Rules",
+    "Table 5. Monetary Policy Constants and Current Consensus Values",
+    "Table 6. Post-Quantum Security Comparison",
+    "Table 7. Required Test Coverage Matrix",
+    "Table 8. Protocol Constants by Network",
 ]
 
 SUPPLEMENT_TABLES = [
@@ -563,6 +573,47 @@ def fig_tx_signing():
     return d
 
 
+def fig_node_architecture():
+    d = Drawing(450, 160)
+    add_box(d, 18, 98, 92, 38, "P2P\nNetwork")
+    add_box(d, 130, 98, 92, 38, "API / RPC")
+    add_box(d, 242, 98, 92, 38, "Mempool")
+    add_box(d, 354, 98, 78, 38, "Miner")
+    add_box(d, 130, 28, 96, 40, "Consensus\nEngine")
+    add_box(d, 250, 28, 88, 40, "Storage")
+    add_box(d, 354, 28, 78, 40, "Wallet")
+    add_arrow(d, 110, 117, 130, 117)
+    add_arrow(d, 222, 117, 242, 117)
+    add_arrow(d, 334, 117, 354, 117)
+    add_arrow(d, 176, 98, 176, 68)
+    add_arrow(d, 290, 98, 290, 68)
+    add_arrow(d, 226, 48, 250, 48)
+    add_arrow(d, 338, 48, 354, 48)
+    add_arrow(d, 354, 117, 338, 48)
+    return d
+
+
+def fig_transaction_lifecycle():
+    d = Drawing(450, 120)
+    labels = [
+        "Wallet\nCreation",
+        "Local\nSigning",
+        "Broadcast",
+        "Mempool\nChecks",
+        "Miner\nSelection",
+        "Block\nInclusion",
+        "UTXO\nUpdate",
+        "Settlement",
+    ]
+    x = 6
+    for index, label in enumerate(labels):
+        add_box(d, x, 40, 48, 34, label)
+        if index < len(labels) - 1:
+            add_arrow(d, x + 48, 57, x + 56, 57)
+        x += 54
+    return d
+
+
 def fig_block_validation():
     d = Drawing(450, 210)
     labels = [
@@ -621,6 +672,49 @@ def fig_emission_model():
     return d
 
 
+def fig_mempool_admission():
+    d = Drawing(450, 170)
+    steps = [
+        ("Incoming\nTransaction", 132),
+        ("Decode /\nCanonicalize", 100),
+        ("Version, Size,\nFee Floor", 68),
+        ("Witness,\nUTXO, Falcon", 36),
+    ]
+    for label, y in steps:
+        add_box(d, 128, y, 194, 26, label)
+    for (_, y1), (_, y2) in zip(steps, steps[1:]):
+        add_arrow(d, 225, y1, 225, y2 + 26)
+    add_box(d, 26, 36, 74, 26, "Reject")
+    add_box(d, 350, 36, 76, 26, "Admit")
+    add_arrow(d, 128, 49, 100, 49)
+    add_arrow(d, 322, 49, 350, 49)
+    add_box(d, 168, 4, 114, 22, "Conflict Tracking")
+    add_arrow(d, 225, 36, 225, 26)
+    return d
+
+
+def fig_node_sync():
+    d = Drawing(450, 150)
+    lanes = [70, 200, 340]
+    labels = ["Local Node", "Peer", "Chainstate"]
+    for x, label in zip(lanes, labels):
+        d.add(String(x, 132, label, fontName="Times-Bold", fontSize=10, textAnchor="middle"))
+        d.add(Line(x, 26, x, 124, strokeColor=colors.black, strokeWidth=0.8))
+    arrows = [
+        (70, 118, 200, 118, "version"),
+        (200, 104, 70, 104, "verack"),
+        (70, 90, 200, 90, "getheaders"),
+        (200, 76, 70, 76, "headers"),
+        (70, 62, 200, 62, "getdata"),
+        (200, 48, 70, 48, "block"),
+        (70, 34, 340, 34, "validate and store"),
+    ]
+    for x1, y1, x2, y2, label in arrows:
+        add_arrow(d, x1, y1, x2, y2)
+        d.add(String((x1 + x2) / 2, y1 + 6, label, fontName="Times-Roman", fontSize=8, textAnchor="middle"))
+    return d
+
+
 def fig_wallet_node():
     d = Drawing(450, 150)
     add_box(d, 28, 76, 88, 36, "Mnemonic /\nSeed")
@@ -658,13 +752,34 @@ def fig_parallel_validation():
     return d
 
 
+def fig_storage_commit():
+    d = Drawing(450, 175)
+    add_box(d, 18, 118, 104, 34, "Validated\nBlock")
+    add_box(d, 146, 118, 120, 34, "Serialize Canonical\nBlock Bytes")
+    add_box(d, 292, 118, 126, 34, "Append blkNNNN.dat\nor Rotate File")
+    add_box(d, 80, 42, 120, 36, "Record File Number,\nOffset, Length")
+    add_box(d, 238, 42, 160, 36, "LMDB Write Transaction:\nmetadata, txindex, UTXO")
+    add_arrow(d, 122, 135, 146, 135)
+    add_arrow(d, 266, 135, 292, 135)
+    add_arrow(d, 355, 118, 318, 78)
+    add_arrow(d, 298, 60, 200, 60)
+    add_arrow(d, 200, 60, 200, 96)
+    add_arrow(d, 146, 135, 140, 78)
+    return d
+
+
 FIGURE_DRAWINGS = {
-    "4.1. System Flow": fig_system_overview,
-    "8. Transaction Security": fig_tx_signing,
-    "6. Emission Model and 150-Year Supply Projection": fig_emission_model,
-    "7.1. Validation Pipeline": fig_block_validation,
-    "10. Network Participants": fig_wallet_node,
-    "7. Consensus and Validation": fig_parallel_validation,
+    "5.1. Atho System Overview": fig_system_overview,
+    "5.2. Atho Node Architecture": fig_node_architecture,
+    "9.1. Transaction Signing and Verification Flow": fig_tx_signing,
+    "9.2. Transaction Lifecycle": fig_transaction_lifecycle,
+    "15.1. Block Validation Pipeline": fig_block_validation,
+    "13.2. Atho Emission Model": fig_emission_model,
+    "14.1. Mempool Admission Flow": fig_mempool_admission,
+    "16.1. Node Sync and Block Propagation Flow": fig_node_sync,
+    "18.1. Wallet-to-Node Interaction": fig_wallet_node,
+    "15.2. Validation Pipeline and Parallel Work Distribution": fig_parallel_validation,
+    "17.1. Hybrid Storage Commit Model": fig_storage_commit,
 }
 
 
@@ -772,7 +887,6 @@ def build_whitepaper():
         title_page(
             "Atho: A Post-Quantum Proof-of-Work Payment Network for the Quantum Age",
             "Digital Platinum for Quantum-Secure Public Settlement",
-            "Project: Atho",
         )
     )
 
@@ -812,7 +926,22 @@ def build_whitepaper():
             (
                 "Atho is a proof-of-work payment network built for deterministic validation, "
                 "post-quantum-aware transaction authorization, and operator-friendly reviewability. "
-                "The current repository code is the authority for this document."
+                "This edition preserves the fuller report structure of the earlier Atho white paper "
+                "while updating the underlying facts to match the live repository rather than older "
+                "planning language or marketing shorthand."
+            ),
+            STYLES["body"],
+        )
+    )
+    story.append(
+        Paragraph(
+            (
+                "In the current implementation, full nodes enforce canonical transaction decoding, "
+                "network-specific chain separation, strict Falcon-512 witness verification, "
+                "32-byte ownership-lock binding, block-subsidy correctness by height, and a "
+                "100-second target cadence with 6 standard confirmations and 100-block coinbase maturity. "
+                "The same codebase also commits founder-hash metadata directly into canonical block headers "
+                "and persists accepted chain truth through flat block archives plus LMDB-backed indexed state."
             ),
             STYLES["body"],
         )
@@ -828,22 +957,27 @@ def build_whitepaper():
     story.append(
         Paragraph(
             (
-                "In the active implementation, Atho enforces a 100-second target block time, "
-                "6 standard confirmations, 100-block coinbase maturity, a 5 ATHO opening subsidy, "
-                "a 1,260,000-block halving interval, and a 0.625 ATHO tail reward. The same code "
-                "path binds canonical ownership locks to Falcon-512 witnesses and rejects malformed "
-                "or legacy transaction forms."
+                "The paper that follows is intentionally broader than a short technical brief. "
+                "It covers protocol architecture, transaction and UTXO behavior, block and mempool validation, "
+                "networking, storage, wallet behavior, API boundaries, performance priorities, testing expectations, "
+                "and upgrade discipline so that miners, exchanges, wallet developers, node operators, and external "
+                "reviewers can understand not only what Atho claims to be, but how the current code actually behaves."
             ),
             STYLES["body"],
         )
     )
 
     table_caption_map = {
-        "4. Technical Overview": WHITEPAPER_TABLES[0],
-        "6. Emission Model and 150-Year Supply Projection": WHITEPAPER_TABLES[1],
-        "9. Post-Quantum Security Comparison": WHITEPAPER_TABLES[2],
+        "4. System Overview": WHITEPAPER_TABLES[0],
+        "6. Rust Implementation Strategy": WHITEPAPER_TABLES[1],
+        "8. Falcon-512 Implementation in Atho": WHITEPAPER_TABLES[2],
+        "10. UTXO and Accounting Rules": WHITEPAPER_TABLES[3],
+        "13. Monetary Policy and Emissions": WHITEPAPER_TABLES[4],
+        "7. Cryptographic Design": WHITEPAPER_TABLES[5],
+        "24. Testing, Auditing, and Benchmarking": WHITEPAPER_TABLES[6],
+        "Appendix B. Protocol Constants": WHITEPAPER_TABLES[7],
     }
-    skip_figure_pre = {"4.1. System Flow", "7.1. Validation Pipeline"}
+    skip_figure_pre: set[str] = set()
 
     for title, body in sections:
         if title in {"Code-Grounded Policy Note", "1. Abstract"}:
@@ -874,7 +1008,6 @@ def build_supplement():
         title_page(
             "Atho Monetary Policy and 150-Year Supply Schedule",
             "Code-Grounded Monetary Reference for the Current Network",
-            "Project: Atho",
         )
     )
 
