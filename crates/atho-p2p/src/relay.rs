@@ -432,6 +432,8 @@ mod tests {
                 previous_block_hash: [7; 48],
                 merkle_root: [1; 48],
                 witness_root: [2; 48],
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1_700_000_128,
                 difficulty_target_or_bits: [3; 48],
                 nonce: 128,

@@ -49,9 +49,9 @@ Expected result: the miner prints whether a GPU backend is usable and why if it 
 
 ## Rewards
 
-Mined blocks include a coinbase reward plus block fees. Coinbase outputs mature after 150 blocks.
+Mined blocks include a coinbase reward plus block fees. Coinbase outputs mature after 100 blocks.
 
-The current emission schedule starts at 6.25 ATHO per block, halves every 1,680,000 blocks, and uses a 0.78125 ATHO tail reward after the third halving.
+The current emission schedule starts at 5 ATHO per block, halves every 1,260,000 blocks, and uses a 0.625 ATHO tail reward after the third halving.
 
 ## Stop Mining
 

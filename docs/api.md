@@ -2,6 +2,8 @@
 
 Atho includes a local HTTP API for node status, explorer, network, block, transaction, mempool, fee, supply, and peer information.
 
+For the stricter production-facing contract, endpoint classifications, and deployment caveats, see [ATHO_PRODUCTION_API_GUIDE.md](ATHO_PRODUCTION_API_GUIDE.md).
+
 ## Start The API
 
 The API starts with `athod` by default.

@@ -29,7 +29,7 @@ use atho_core::constants::{
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
-use atho_core::transaction::{Transaction, TxWitness, WitnessInputRef, WitnessSignerGroup};
+use atho_core::transaction::{Transaction, TxWitness, WitnessInputRef};
 use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, BLK_BLOCK_TOO_LARGE, BLK_COINBASE_REWARD_MISMATCH,
@@ -120,6 +120,7 @@ pub enum ValidationError {
 }
 
 struct PreparedTransactionValidation {
+    txid: [u8; 48],
     signer_groups: Vec<PreparedSignerGroup>,
     signer_group_by_input: Vec<usize>,
 }
@@ -129,6 +130,13 @@ struct PreparedSignerGroup {
     signature: Vec<u8>,
     pubkey: Vec<u8>,
     input_refs: Vec<WitnessInputRef>,
+}
+
+#[derive(Clone, Copy)]
+struct WitnessSignerGroupRef<'a> {
+    signature: &'a [u8],
+    pubkey: &'a [u8],
+    input_refs: &'a [WitnessInputRef],
 }
 
 impl AthoErrorMeta for ValidationError {
@@ -255,48 +263,72 @@ fn verify_transaction_signature_prepared(
     prepared: PreparedTransactionValidation,
 ) -> Result<(), ValidationError> {
     for signer_group in prepared.signer_groups {
-        if signer_group.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
-            return Err(ValidationError::InvalidWitness);
-        }
-        if signer_group.signature.len() != FALCON_512_SIGNATURE_BYTES {
-            return Err(ValidationError::InvalidWitness);
-        }
-        let input_indexes = signer_group
-            .input_refs
-            .iter()
-            .map(|input_ref| input_ref.input_index)
-            .collect::<Vec<_>>();
-        let signing_digest = if input_indexes.len() == tx.inputs.len() {
-            transaction_signing_digest(network, tx)
-        } else {
-            transaction_signing_digest_for_input_indexes(network, tx, &input_indexes)
-        };
-        let verified = falcon::verify(
-            AthoSignatureDomain::Transaction,
-            &FalconPublicKey(signer_group.pubkey),
-            &signing_digest,
-            &FalconSignature(signer_group.signature),
-        )
-        .map_err(|_| ValidationError::InvalidWitness)?;
-        if !verified {
-            return Err(ValidationError::InvalidWitness);
-        }
+        verify_signer_group(
+            tx,
+            network,
+            &signer_group.pubkey,
+            &signer_group.signature,
+            &signer_group.input_refs,
+        )?;
     }
     Ok(())
 }
 
-fn witness_signer_groups(witness: &TxWitness) -> Vec<WitnessSignerGroup> {
-    if witness.is_empty() {
-        return Vec::new();
+fn verify_signer_group(
+    tx: &Transaction,
+    network: Network,
+    pubkey: &[u8],
+    signature: &[u8],
+    input_refs: &[WitnessInputRef],
+) -> Result<(), ValidationError> {
+    if pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
+        return Err(ValidationError::InvalidWitness);
     }
-    let mut groups = Vec::with_capacity(1 + witness.additional_signers.len());
-    groups.push(WitnessSignerGroup {
-        signature: witness.signature.clone(),
-        pubkey: witness.pubkey.clone(),
-        input_refs: witness.input_refs.clone(),
-    });
-    groups.extend(witness.additional_signers.clone());
-    groups
+    if signature.len() != FALCON_512_SIGNATURE_BYTES {
+        return Err(ValidationError::InvalidWitness);
+    }
+    let input_indexes = input_refs
+        .iter()
+        .map(|input_ref| input_ref.input_index)
+        .collect::<Vec<_>>();
+    let signing_digest = if input_indexes.len() == tx.inputs.len() {
+        transaction_signing_digest(network, tx)
+    } else {
+        transaction_signing_digest_for_input_indexes(network, tx, &input_indexes)
+    };
+    let verified = falcon::verify(
+        AthoSignatureDomain::Transaction,
+        &FalconPublicKey(pubkey.to_vec()),
+        &signing_digest,
+        &FalconSignature(signature.to_vec()),
+    )
+    .map_err(|_| ValidationError::InvalidWitness)?;
+    if !verified {
+        return Err(ValidationError::InvalidWitness);
+    }
+    Ok(())
+}
+
+fn witness_signer_group_refs(
+    witness: &TxWitness,
+) -> impl Iterator<Item = WitnessSignerGroupRef<'_>> + '_ {
+    (!witness.is_empty())
+        .then_some(WitnessSignerGroupRef {
+            signature: &witness.signature,
+            pubkey: &witness.pubkey,
+            input_refs: &witness.input_refs,
+        })
+        .into_iter()
+        .chain(
+            witness
+                .additional_signers
+                .iter()
+                .map(|group| WitnessSignerGroupRef {
+                    signature: &group.signature,
+                    pubkey: &group.pubkey,
+                    input_refs: &group.input_refs,
+                }),
+        )
 }
 
 fn verify_witness_signer_groups(
@@ -304,33 +336,14 @@ fn verify_witness_signer_groups(
     network: Network,
     witness: &TxWitness,
 ) -> Result<(), ValidationError> {
-    for signer_group in witness_signer_groups(witness) {
-        if signer_group.pubkey.len() != FALCON_512_PUBLIC_KEY_BYTES {
-            return Err(ValidationError::InvalidWitness);
-        }
-        if signer_group.signature.len() != FALCON_512_SIGNATURE_BYTES {
-            return Err(ValidationError::InvalidWitness);
-        }
-        let input_indexes = signer_group
-            .input_refs
-            .iter()
-            .map(|input_ref| input_ref.input_index)
-            .collect::<Vec<_>>();
-        let signing_digest = if input_indexes.len() == tx.inputs.len() {
-            transaction_signing_digest(network, tx)
-        } else {
-            transaction_signing_digest_for_input_indexes(network, tx, &input_indexes)
-        };
-        let verified = falcon::verify(
-            AthoSignatureDomain::Transaction,
-            &FalconPublicKey(signer_group.pubkey),
-            &signing_digest,
-            &FalconSignature(signer_group.signature),
-        )
-        .map_err(|_| ValidationError::InvalidWitness)?;
-        if !verified {
-            return Err(ValidationError::InvalidWitness);
-        }
+    for signer_group in witness_signer_group_refs(witness) {
+        verify_signer_group(
+            tx,
+            network,
+            signer_group.pubkey,
+            signer_group.signature,
+            signer_group.input_refs,
+        )?;
     }
     Ok(())
 }
@@ -395,11 +408,12 @@ fn prepare_transaction_validation(
         return Err(ValidationError::InvalidWitness);
     }
     let txid = tx.txid();
-    let signer_groups = witness_signer_groups(&witness);
+    let signer_group_count = witness.signer_group_count();
     let mut signer_group_by_input = vec![usize::MAX; tx.inputs.len()];
     let mut previous_first_input = None;
+    let mut prepared_signer_groups = Vec::with_capacity(signer_group_count);
 
-    for (group_index, signer_group) in signer_groups.iter().enumerate() {
+    for (group_index, signer_group) in witness_signer_group_refs(&witness).enumerate() {
         if signer_group.signature.is_empty()
             || signer_group.pubkey.is_empty()
             || signer_group.input_refs.is_empty()
@@ -417,7 +431,7 @@ fn prepare_transaction_validation(
         }
         previous_first_input = Some(first_input_index);
 
-        for input_ref in &signer_group.input_refs {
+        for input_ref in signer_group.input_refs {
             let input_index = input_ref.input_index as usize;
             if input_index >= tx.inputs.len() {
                 return Err(ValidationError::InvalidWitness);
@@ -430,25 +444,25 @@ fn prepare_transaction_validation(
                 return Err(ValidationError::WitnessInputReferenceMismatch);
             }
             let expected_short =
-                derive_sig_ref_short(&txid, &signer_group.signature, input_ref.input_index);
+                derive_sig_ref_short(&txid, signer_group.signature, input_ref.input_index);
             if input_ref.sig_ref_short != expected_short {
                 return Err(ValidationError::WitnessInputReferenceMismatch);
             }
             signer_group_by_input[input_index] = group_index;
         }
+
+        prepared_signer_groups.push(PreparedSignerGroup {
+            signature: signer_group.signature.to_vec(),
+            pubkey: signer_group.pubkey.to_vec(),
+            input_refs: signer_group.input_refs.to_vec(),
+        });
     }
     if signer_group_by_input.contains(&usize::MAX) {
         return Err(ValidationError::WitnessInputReferenceMismatch);
     }
     Ok(PreparedTransactionValidation {
-        signer_groups: signer_groups
-            .into_iter()
-            .map(|signer_group| PreparedSignerGroup {
-                signature: signer_group.signature,
-                pubkey: signer_group.pubkey,
-                input_refs: signer_group.input_refs,
-            })
-            .collect(),
+        txid,
+        signer_groups: prepared_signer_groups,
         signer_group_by_input,
     })
 }
@@ -458,15 +472,6 @@ fn canonical_payment_lock(
 ) -> Result<[u8; ADDRESS_DIGEST_BYTES], ValidationError> {
     payment_digest_from_locking_script(locking_script)
         .ok_or(ValidationError::LegacyLockFormatRejected)
-}
-
-fn locking_script_matches_public_key(
-    network: Network,
-    locking_script: &[u8],
-    public_key: &[u8],
-) -> Result<bool, ValidationError> {
-    let expected_lock = canonical_payment_lock(locking_script)?;
-    Ok(public_key_digest(network, public_key) == expected_lock)
 }
 
 /// Performs context-free transaction validation with a caller-supplied fee.
@@ -688,7 +693,7 @@ where
         // attempt to spend coins the witness does not control.
         let utxo =
             lookup(&input.previous_txid, input.output_index).ok_or(ValidationError::MissingUtxo)?;
-        canonical_payment_lock(utxo.locking_script.as_slice())?;
+        let expected_lock = canonical_payment_lock(utxo.locking_script.as_slice())?;
         canonical_payment_lock(input.unlocking_script.as_slice())?;
         if utxo.locking_script != input.unlocking_script {
             return Err(ValidationError::InputOwnershipMismatch);
@@ -696,11 +701,8 @@ where
         if utxo.network != network {
             return Err(ValidationError::InputOwnershipMismatch);
         }
-        if !locking_script_matches_public_key(
-            utxo.network,
-            &utxo.locking_script,
-            &prepared.signer_groups[prepared.signer_group_by_input[index]].pubkey,
-        )? {
+        let signer_pubkey = &prepared.signer_groups[prepared.signer_group_by_input[index]].pubkey;
+        if public_key_digest(utxo.network, signer_pubkey) != expected_lock {
             return Err(ValidationError::InputOwnershipMismatch);
         }
         if !utxo.is_spendable_at(spend_height) {
@@ -1093,7 +1095,7 @@ pub fn validate_block_with_context_and_schedule(
         .iter()
         .zip(prepared_transactions.iter())
     {
-        let txid = tx.txid();
+        let txid = prepared.txid;
         let fee_rate = minimum_required_fee_atoms(network, tx);
         let fee = validate_transaction_with_context_minimum_fee_prepared_and_schedule(
             tx,
@@ -1354,6 +1356,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -1391,6 +1395,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -1428,6 +1434,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: initial_target,
                 nonce: 0,
@@ -1475,6 +1483,8 @@ mod tests {
                 previous_block_hash: [9; 48],
                 merkle_root: [1; 48],
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: target,
                 nonce: 0,
@@ -1535,6 +1545,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(std::slice::from_ref(&coinbase_v1)),
                 witness_root: witness_root(std::slice::from_ref(&coinbase_v1)),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -1568,6 +1580,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(std::slice::from_ref(&coinbase_v2)),
                 witness_root: witness_root(std::slice::from_ref(&coinbase_v2)),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -2263,6 +2277,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 2,
                 difficulty_target_or_bits: target,
                 nonce: 0,
@@ -2305,6 +2321,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -2341,6 +2359,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
@@ -2453,6 +2473,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,

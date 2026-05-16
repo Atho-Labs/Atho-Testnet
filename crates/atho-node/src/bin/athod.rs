@@ -258,11 +258,18 @@ fn run_dev(args: &[String]) -> Result<(), String> {
             let runtime = parse_runtime_cli(&args[1..])?;
             runtime.apply_env();
             let network = runtime.network.unwrap_or_else(Network::operator_default);
-            network.operator_launch_allowed().map_err(str::to_string)?;
             let profile = genesis::regenerate_genesis_profile(network);
             println!("network={}", profile.network.id());
             println!("reward_address={}", profile.reward_address);
             println!("reward_script={}", hex::encode(profile.reward_script));
+            println!(
+                "founders_hash_sha3_384={}",
+                hex::encode(profile.founders_hash_sha3_384)
+            );
+            println!(
+                "founders_hash_sha3_512={}",
+                hex::encode(profile.founders_hash_sha3_512)
+            );
             println!("timestamp={}", profile.timestamp);
             println!("target={}", hex::encode(profile.target));
             println!("coinbase_txid={}", hex::encode(profile.coinbase_txid));

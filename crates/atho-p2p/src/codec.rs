@@ -7,7 +7,7 @@ use crate::protocol::{MessageCommand, NetworkMessage, ProtocolError};
 use atho_core::crypto::hash::sha3_256;
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, HASH_CHECKSUM_MISMATCH, NET_INVALID_MAGIC,
-    P2P_MESSAGE_TOO_SHORT, P2P_PAYLOAD_TOO_LARGE,
+    P2P_MALFORMED_PAYLOAD, P2P_MESSAGE_TOO_SHORT, P2P_PAYLOAD_TOO_LARGE,
 };
 use thiserror::Error;
 
@@ -23,6 +23,8 @@ pub enum CodecError {
     ChecksumMismatch,
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("trailing bytes after frame payload")]
+    TrailingBytes,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }
@@ -34,6 +36,7 @@ impl AthoErrorMeta for CodecError {
             Self::InvalidMagic => &NET_INVALID_MAGIC,
             Self::ChecksumMismatch => &HASH_CHECKSUM_MISMATCH,
             Self::PayloadTooLarge => &P2P_PAYLOAD_TOO_LARGE,
+            Self::TrailingBytes => &P2P_MALFORMED_PAYLOAD,
             Self::Protocol(error) => error.descriptor(),
         }
     }
@@ -79,11 +82,15 @@ impl WireCodec {
         if payload_len > network_params(network).limits.max_message_size as usize {
             return Err(CodecError::PayloadTooLarge);
         }
-        if bytes.len() < FRAME_HEADER_BYTES + payload_len {
+        let frame_len = FRAME_HEADER_BYTES + payload_len;
+        if bytes.len() < frame_len {
             return Err(CodecError::MessageTooShort);
         }
+        if bytes.len() != frame_len {
+            return Err(CodecError::TrailingBytes);
+        }
         let expected_checksum: [u8; 4] = bytes[20..24].try_into().expect("slice length");
-        let payload = &bytes[24..24 + payload_len];
+        let payload = &bytes[24..frame_len];
         if payload_checksum(payload) != expected_checksum {
             return Err(CodecError::ChecksumMismatch);
         }
@@ -134,5 +141,13 @@ mod tests {
         let mut bytes = WireCodec::encode(&message).expect("encode");
         *bytes.last_mut().expect("payload byte") ^= 0xff;
         assert_eq!(WireCodec::decode(&bytes), Err(CodecError::ChecksumMismatch));
+    }
+
+    #[test]
+    fn trailing_bytes_after_valid_frame_are_rejected() {
+        let message = NetworkMessage::new(Network::Testnet, MessagePayload::Ping { nonce: 7 });
+        let mut bytes = WireCodec::encode(&message).expect("encode");
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(WireCodec::decode(&bytes), Err(CodecError::TrailingBytes));
     }
 }

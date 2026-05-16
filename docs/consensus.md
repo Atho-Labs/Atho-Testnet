@@ -11,7 +11,7 @@ This repo disables mainnet operator launch paths. Testnet, regnet, and prunetest
 ## Proof Of Work
 
 - Block hash profile: SHA3-384
-- Target block time: 75 seconds
+- Target block time: 100 seconds
 - Retarget interval: every block
 - Averaging window: 17 blocks
 - Median-time-past window: 11 blocks
@@ -60,11 +60,12 @@ Signature domain separation is part of the consensus and wallet signing path.
 
 - Display precision: 12 decimals
 - 1 ATHO: 1,000,000,000,000 atoms
-- Initial block reward: 6.25 ATHO
-- Halving interval: 1,680,000 blocks
-- Tail reward: 0.78125 ATHO
+- Initial block reward: 5 ATHO
+- Halving interval: 1,260,000 blocks
+- Tail reward: 0.625 ATHO
 - Tail reward starts after the third halving
-- Coinbase maturity: 150 blocks
+- Coinbase maturity: 100 blocks
+- Standard transaction confirmations: 6 across all networks
 - Fixed max supply: none in the current code
 
 ## Reorgs And Forks

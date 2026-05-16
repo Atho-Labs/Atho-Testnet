@@ -390,6 +390,8 @@ mod tests {
             previous_block_hash,
             merkle_root: merkle_root(std::slice::from_ref(&tx)),
             witness_root: witness_root(std::slice::from_ref(&tx)),
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
             timestamp: 1_700_000_000 + height,
             difficulty_target_or_bits: [7; 48],
             nonce: 42 + height,

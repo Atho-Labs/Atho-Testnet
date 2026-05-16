@@ -2463,8 +2463,8 @@ mod tests {
         assert_eq!(stats["max_supply"], Value::Null);
         assert_eq!(stats["max_supply_label"], "No Fixed Cap");
         assert_eq!(stats["emission_epoch"], 0);
-        assert_eq!(stats["next_halving_height"], 1_680_000);
-        assert_eq!(stats["blocks_until_halving"], 1_680_000);
+        assert_eq!(stats["next_halving_height"], 1_260_000);
+        assert_eq!(stats["blocks_until_halving"], 1_260_000);
         assert_eq!(
             stats["latest_block_hash"],
             hex::encode(genesis::genesis_hash(Network::Regnet))
@@ -2497,11 +2497,11 @@ mod tests {
         assert_eq!(supply["max_supply_atoms"], Value::Null);
         assert_eq!(supply["max_supply"], Value::Null);
         assert_eq!(supply["max_supply_label"], "No Fixed Cap");
-        assert_eq!(supply["current_block_reward_atoms"], 6_250_000_000_000u64);
-        assert_eq!(supply["next_halving_height"], 1_680_000);
-        assert_eq!(supply["blocks_until_halving"], 1_680_000);
+        assert_eq!(supply["current_block_reward_atoms"], 5_000_000_000_000u64);
+        assert_eq!(supply["next_halving_height"], 1_260_000);
+        assert_eq!(supply["blocks_until_halving"], 1_260_000);
         assert_eq!(supply["emission_epoch"], 0);
-        assert_eq!(supply["coinbase_maturity_blocks"], 150);
+        assert_eq!(supply["coinbase_maturity_blocks"], 100);
     }
 
     #[test]

@@ -1565,6 +1565,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp,
                 difficulty_target_or_bits: state.next_difficulty_target_for_timestamp(timestamp),
                 nonce: 0,
@@ -1604,6 +1606,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: previous_timestamp.saturating_add(1),
                 difficulty_target_or_bits: [0xff; 48],
                 nonce: height,
@@ -1707,6 +1711,8 @@ mod tests {
             previous_block_hash: [0; 48],
             merkle_root: [0; 48],
             witness_root: [0; 48],
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
             timestamp: 75,
             difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                 Network::Mainnet,
@@ -1742,6 +1748,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis::genesis_state(Network::Mainnet)
                     .block
                     .header
@@ -1794,6 +1802,8 @@ mod tests {
                 previous_block_hash: [1; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis::genesis_state(Network::Mainnet)
                     .block
                     .header
@@ -1849,6 +1859,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis::genesis_state(Network::Mainnet)
                     .block
                     .header
@@ -1927,6 +1939,8 @@ mod tests {
                     previous_block_hash: state.tip_hash,
                     merkle_root: merkle_root(&transactions),
                     witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                     timestamp: genesis::genesis_state(Network::Regnet)
                         .block
                         .header
@@ -2205,6 +2219,8 @@ mod tests {
                     previous_block_hash,
                     merkle_root: merkle_root(&transactions),
                     witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                     timestamp: genesis_timestamp
                         .saturating_add(30 * 24 * 60 * 60)
                         .saturating_add(height),
@@ -2257,6 +2273,8 @@ mod tests {
                     previous_block_hash,
                     merkle_root: merkle_root(&transactions),
                     witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                     timestamp: genesis_timestamp
                         .saturating_add(30 * 24 * 60 * 60)
                         .saturating_add(height),
@@ -2303,6 +2321,8 @@ mod tests {
                 previous_block_hash: state.tip_hash,
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(1),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
@@ -2535,6 +2555,8 @@ mod tests {
                     previous_block_hash: previous_hash,
                     merkle_root: merkle_root(&transactions),
                     witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                     timestamp: previous_timestamp.saturating_add(1),
                     difficulty_target_or_bits:
                         atho_core::consensus::pow::initial_target_for_network(Network::Prunetest),
@@ -2834,6 +2856,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(1),
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                     Network::Mainnet,
@@ -2885,6 +2909,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(10_000),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
@@ -2935,6 +2961,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(10),
                 difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
                 nonce: 0,
@@ -2987,6 +3015,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(11),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
                     Network::Mainnet,
@@ -3060,6 +3090,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(1),
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                     Network::Mainnet,
@@ -3111,6 +3143,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(2),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
@@ -3159,6 +3193,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(20_000),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
@@ -3207,6 +3243,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(20_001),
                 difficulty_target_or_bits: state.next_difficulty_target(),
                 nonce: 0,
@@ -3262,6 +3300,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(10),
                 difficulty_target_or_bits: main_2.header.difficulty_target_or_bits,
                 nonce: 0,
@@ -3314,6 +3354,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(11),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
                     Network::Mainnet,
@@ -3370,6 +3412,8 @@ mod tests {
                     tx_pow_nonce: 0,
                     tx_pow_bits: 0,
                 }]),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: genesis_timestamp.saturating_add(12),
                 difficulty_target_or_bits: atho_core::consensus::pow::target_for_next_block(
                     Network::Mainnet,

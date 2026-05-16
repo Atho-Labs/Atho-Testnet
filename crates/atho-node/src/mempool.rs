@@ -629,6 +629,10 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: [0; 48],
                 witness_root: [0; 48],
+                founders_hash_sha3_384:
+                    atho_core::block::BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512:
+                    atho_core::block::BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 0,
                 difficulty_target_or_bits: [0xff; 48],
                 nonce: 0,

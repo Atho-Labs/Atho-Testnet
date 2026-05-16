@@ -9,13 +9,14 @@
 //!
 //! CONSENSUS: Header hashing and transaction commitment construction must remain
 //! byte-for-byte deterministic across all nodes.
+use crate::constants::{FOUNDERS_HASH_SHA3_384, FOUNDERS_HASH_SHA3_512};
 use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use crate::transaction::{Transaction, TxWitness};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-const HEADER_CANONICAL_SIZE_WITHOUT_NONCE: usize = 2 + 1 + 8 + 48 + 48 + 48 + 8 + 48;
+const HEADER_CANONICAL_SIZE_WITHOUT_NONCE: usize = 2 + 1 + 8 + 48 + 48 + 48 + 48 + 64 + 8 + 48;
 const HEADER_CANONICAL_SIZE: usize = HEADER_CANONICAL_SIZE_WITHOUT_NONCE + 8;
 
 /// Canonical Atho block header.
@@ -33,6 +34,10 @@ pub struct BlockHeader {
     pub merkle_root: [u8; 48],
     #[serde(with = "serde_big_array::BigArray")]
     pub witness_root: [u8; 48],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub founders_hash_sha3_384: [u8; 48],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub founders_hash_sha3_512: [u8; 64],
     pub timestamp: u64,
     #[serde(with = "serde_big_array::BigArray")]
     pub difficulty_target_or_bits: [u8; 48],
@@ -72,6 +77,8 @@ impl Default for Block {
                 previous_block_hash: [0; 48],
                 merkle_root: [0; 48],
                 witness_root: [0; 48],
+                founders_hash_sha3_384: FOUNDERS_HASH_SHA3_384,
+                founders_hash_sha3_512: FOUNDERS_HASH_SHA3_512,
                 timestamp: 0,
                 difficulty_target_or_bits: [0; 48],
                 nonce: 0,
@@ -95,6 +102,14 @@ impl BlockHeader {
         HEADER_CANONICAL_SIZE
     }
 
+    pub const fn consensus_founders_hash_sha3_384() -> [u8; 48] {
+        FOUNDERS_HASH_SHA3_384
+    }
+
+    pub const fn consensus_founders_hash_sha3_512() -> [u8; 64] {
+        FOUNDERS_HASH_SHA3_512
+    }
+
     /// Serializes the header fields that are stable while miners search nonce space.
     pub fn canonical_bytes_without_nonce(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.canonical_size_bytes_without_nonce());
@@ -104,6 +119,8 @@ impl BlockHeader {
         out.extend_from_slice(&self.previous_block_hash);
         out.extend_from_slice(&self.merkle_root);
         out.extend_from_slice(&self.witness_root);
+        out.extend_from_slice(&self.founders_hash_sha3_384);
+        out.extend_from_slice(&self.founders_hash_sha3_512);
         out.extend_from_slice(&self.timestamp.to_le_bytes());
         out.extend_from_slice(&self.difficulty_target_or_bits);
         out
@@ -118,6 +135,8 @@ impl BlockHeader {
         out.extend_from_slice(&self.previous_block_hash);
         out.extend_from_slice(&self.merkle_root);
         out.extend_from_slice(&self.witness_root);
+        out.extend_from_slice(&self.founders_hash_sha3_384);
+        out.extend_from_slice(&self.founders_hash_sha3_512);
         out.extend_from_slice(&self.timestamp.to_le_bytes());
         out.extend_from_slice(&self.difficulty_target_or_bits);
         out.extend_from_slice(&self.nonce.to_le_bytes());
@@ -143,6 +162,10 @@ impl BlockHeader {
         offset += 48;
         bytes[offset..offset + 48].copy_from_slice(&self.witness_root);
         offset += 48;
+        bytes[offset..offset + 48].copy_from_slice(&self.founders_hash_sha3_384);
+        offset += 48;
+        bytes[offset..offset + 64].copy_from_slice(&self.founders_hash_sha3_512);
+        offset += 64;
         bytes[offset..offset + 8].copy_from_slice(&self.timestamp.to_le_bytes());
         offset += 8;
         bytes[offset..offset + 48].copy_from_slice(&self.difficulty_target_or_bits);
@@ -189,6 +212,8 @@ impl BlockHeader {
         let previous_block_hash = read_array::<48>(bytes, &mut offset)?;
         let merkle_root = read_array::<48>(bytes, &mut offset)?;
         let witness_root = read_array::<48>(bytes, &mut offset)?;
+        let founders_hash_sha3_384 = read_array::<48>(bytes, &mut offset)?;
+        let founders_hash_sha3_512 = read_array::<64>(bytes, &mut offset)?;
         let timestamp = read_u64(bytes, &mut offset)?;
         let difficulty_target_or_bits = read_array::<48>(bytes, &mut offset)?;
         let nonce = read_u64(bytes, &mut offset)?;
@@ -202,6 +227,8 @@ impl BlockHeader {
             previous_block_hash,
             merkle_root,
             witness_root,
+            founders_hash_sha3_384,
+            founders_hash_sha3_512,
             timestamp,
             difficulty_target_or_bits,
             nonce,
@@ -380,6 +407,8 @@ impl Block {
             previous_block_hash: [0; 48],
             merkle_root: [0; 48],
             witness_root: [0; 48],
+            founders_hash_sha3_384: FOUNDERS_HASH_SHA3_384,
+            founders_hash_sha3_512: FOUNDERS_HASH_SHA3_512,
             timestamp: 0,
             difficulty_target_or_bits: [0; 48],
             nonce: 0,
@@ -461,6 +490,8 @@ mod tests {
             previous_block_hash: [2; 48],
             merkle_root: [3; 48],
             witness_root: [4; 48],
+            founders_hash_sha3_384: FOUNDERS_HASH_SHA3_384,
+            founders_hash_sha3_512: FOUNDERS_HASH_SHA3_512,
             timestamp: 75,
             difficulty_target_or_bits: [5; 48],
             nonce: 42,
@@ -469,7 +500,7 @@ mod tests {
         assert_eq!(header.block_hash(), header.block_hash());
         assert_eq!(
             header.canonical_bytes().len(),
-            2 + 1 + 8 + 48 + 48 + 48 + 8 + 48 + 8
+            2 + 1 + 8 + 48 + 48 + 48 + 48 + 64 + 8 + 48 + 8
         );
     }
 
@@ -521,6 +552,8 @@ mod tests {
             previous_block_hash: [2; 48],
             merkle_root: merkle_root(std::slice::from_ref(&tx)),
             witness_root: witness_root(std::slice::from_ref(&tx)),
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
             timestamp: 75,
             difficulty_target_or_bits: [5; 48],
             nonce: 42,
@@ -555,6 +588,8 @@ mod tests {
             previous_block_hash: [2; 48],
             merkle_root: merkle_root(std::slice::from_ref(&tx)),
             witness_root: witness_root(std::slice::from_ref(&tx)),
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
             timestamp: 75,
             difficulty_target_or_bits: [5; 48],
             nonce: 42,

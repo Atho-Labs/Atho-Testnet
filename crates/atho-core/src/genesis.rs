@@ -26,11 +26,11 @@ const MAINNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const MAINNET_GENESIS_LOCK_TIME: u32 = 0;
 const MAINNET_GENESIS_TIMESTAMP: u64 = 1_773_360_488;
 const MAINNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
-const MAINNET_GENESIS_NONCE: u64 = 20_164;
+const MAINNET_GENESIS_NONCE: u64 = 37_814;
 const MAINNET_GENESIS_COINBASE_TXID: [u8; 48] =
-    hex!("d5433104080b7866ca0a0e0cf4500b5312f1a97db394765eacb1f267caa1552b9ee2191704bfbdcf777cc55f2c861470");
+    hex!("af1a86a8d195d380c50c8543a217dec58597765e531f7090576954960a4785e7169235e7fe6d25bb8b71b97fc1d673d1");
 const MAINNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("000049993ab4e8874c71e35c659756c3f13d17f5e688a1271800704009017a8d0f69d9b5d8da7d7e398f720b037fd2c8");
+    hex!("0000afd5a408e816979338b63b83f04357cf130962d82d8470d619f628ba4fbfe5d13f8d19ddf79d2c3a489f8d3eadad");
 
 const TESTNET_GENESIS_REWARD_ADDRESS: &str =
     "ATHT22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -41,11 +41,11 @@ const TESTNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const TESTNET_GENESIS_LOCK_TIME: u32 = 0;
 const TESTNET_GENESIS_TIMESTAMP: u64 = 1_773_360_489;
 const TESTNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
-const TESTNET_GENESIS_NONCE: u64 = 6_632;
+const TESTNET_GENESIS_NONCE: u64 = 79_865;
 const TESTNET_GENESIS_COINBASE_TXID: [u8; 48] =
-    hex!("0da7f2bc20dff426397990d053f60534d27630e0b2e51ebdf9317a58c0507afb22c315e9ac440085944d451075caecd3");
+    hex!("8ce958b10fbe4e0dffc527ec9d3f664536922be273fcb83451020006f285b4c71b0f4a13996fa6a3059612b55a87ead6");
 const TESTNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("0000860604effa76502794b0d0f4b4d0c3a08dec8ac0fd2fe1c05e235b31efe0144d8c9003478c5495e7566edecb40be");
+    hex!("00000d3c498f42de76c5ac7392af7b809ab4822a6acfbfc34b89f500836592cecfe3d28192ec666e390ba0ac35e6f655");
 
 const REGNET_GENESIS_REWARD_ADDRESS: &str = TESTNET_GENESIS_REWARD_ADDRESS;
 const REGNET_GENESIS_REWARD_SCRIPT: [u8; 48] = TESTNET_GENESIS_REWARD_SCRIPT;
@@ -54,10 +54,10 @@ const REGNET_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const REGNET_GENESIS_LOCK_TIME: u32 = 0;
 const REGNET_GENESIS_TIMESTAMP: u64 = TESTNET_GENESIS_TIMESTAMP;
 const REGNET_GENESIS_TARGET: [u8; 48] = pow::DIFFICULTY_PROFILE.genesis_target;
-const REGNET_GENESIS_NONCE: u64 = 87_837;
+const REGNET_GENESIS_NONCE: u64 = 45_442;
 const REGNET_GENESIS_COINBASE_TXID: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
 const REGNET_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("00005f08e72e60f4f87c4e11e24fe9b01b32b591df06e7dab2a21239be7efd75d43c0aee5573f69a4067a6117cc3ffdc");
+    hex!("0000fbc1fdbb88a9da0d7fb1bbe9db61ed958b2a53b198fca601c5bcd92a0ac5f391350a1f8809e45defb8066c4a7edc");
 
 const PRUNETEST_GENESIS_REWARD_ADDRESS: &str =
     "ATHP22b5382e49b9a2dafb0d2c7b1c2afe643a3c14a23f7a90e4e5dce0162b754623eb5566c3ca1348187e5f3e92c65c76ee";
@@ -67,10 +67,10 @@ const PRUNETEST_GENESIS_TX_VERSION: u16 = TRANSACTION_VERSION_V1;
 const PRUNETEST_GENESIS_LOCK_TIME: u32 = 0;
 const PRUNETEST_GENESIS_TIMESTAMP: u64 = 1_773_360_490;
 const PRUNETEST_GENESIS_TARGET: [u8; 48] = pow::PRUNETEST_INITIAL_TARGET;
-const PRUNETEST_GENESIS_NONCE: u64 = 48_371;
+const PRUNETEST_GENESIS_NONCE: u64 = 192_521;
 const PRUNETEST_GENESIS_COINBASE_TXID: [u8; 48] = TESTNET_GENESIS_COINBASE_TXID;
 const PRUNETEST_GENESIS_BLOCK_HASH: [u8; 48] =
-    hex!("0000b4f337af0e8119b30529a5e6bde81251a7ec579cc24e397f8ee117e63279765c000bb9d881b9e571fb573b56d72d");
+    hex!("0000959977f7bc54b6357fec63691e01bf208aa44d1ad33db348f00e94e57c3e982c01a98bcef38541d3fade7868a170");
 
 /// Fully materialized genesis state for one Atho network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +89,8 @@ pub struct GenesisProfile {
     pub network: Network,
     pub reward_address: String,
     pub reward_script: [u8; 48],
+    pub founders_hash_sha3_384: [u8; 48],
+    pub founders_hash_sha3_512: [u8; 64],
     pub block_version: u16,
     pub tx_version: u16,
     pub lock_time: u32,
@@ -210,6 +212,8 @@ pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
         previous_block_hash: [0; 48],
         merkle_root,
         witness_root,
+        founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+        founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
         timestamp,
         difficulty_target_or_bits: target,
         nonce: 0,
@@ -222,6 +226,8 @@ pub fn regenerate_genesis_profile(network: Network) -> GenesisProfile {
                 network,
                 reward_address: reward_address.to_string(),
                 reward_script,
+                founders_hash_sha3_384: header.founders_hash_sha3_384,
+                founders_hash_sha3_512: header.founders_hash_sha3_512,
                 block_version,
                 tx_version,
                 lock_time,
@@ -383,6 +389,8 @@ fn genesis_state_from_parts(parts: GenesisParts) -> GenesisState {
         previous_block_hash: [0; 48],
         merkle_root,
         witness_root,
+        founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+        founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
         timestamp,
         difficulty_target_or_bits: target,
         nonce,
@@ -445,6 +453,14 @@ mod tests {
         assert_eq!(main.block.header.previous_block_hash, [0; 48]);
         assert_eq!(main.block.header.merkle_root, main.coinbase_txid);
         assert_eq!(
+            main.block.header.founders_hash_sha3_384,
+            BlockHeader::consensus_founders_hash_sha3_384()
+        );
+        assert_eq!(
+            main.block.header.founders_hash_sha3_512,
+            BlockHeader::consensus_founders_hash_sha3_512()
+        );
+        assert_eq!(
             main.block.header.difficulty_target_or_bits,
             pow::DIFFICULTY_PROFILE.genesis_target
         );
@@ -497,6 +513,14 @@ mod tests {
             assert_eq!(profile.block_hash, state.block_hash);
             assert_eq!(profile.merkle_root, state.block.header.merkle_root);
             assert_eq!(profile.witness_root, state.block.header.witness_root);
+            assert_eq!(
+                profile.founders_hash_sha3_384,
+                state.block.header.founders_hash_sha3_384
+            );
+            assert_eq!(
+                profile.founders_hash_sha3_512,
+                state.block.header.founders_hash_sha3_512
+            );
             assert_eq!(profile.nonce, state.block.header.nonce);
         }
     }

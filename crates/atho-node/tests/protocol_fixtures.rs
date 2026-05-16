@@ -7,6 +7,7 @@ use atho_core::consensus::pow;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::consensus::subsidy;
 use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
+use atho_core::constants::ADDRESS_DIGEST_BYTES;
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
@@ -66,16 +67,18 @@ fn witness_bytes(tx: &Transaction) -> Vec<u8> {
 }
 
 fn fixture_transaction() -> Transaction {
+    let spend_lock = vec![0x11; ADDRESS_DIGEST_BYTES];
+    let output_lock = vec![0x22; ADDRESS_DIGEST_BYTES];
     let tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             previous_txid: [1; 48],
             output_index: 0,
-            unlocking_script: vec![1, 2, 3],
+            unlocking_script: spend_lock,
         }],
         outputs: vec![TxOutput {
             value_atoms: 1_000,
-            locking_script: vec![4, 5],
+            locking_script: output_lock,
         }],
         lock_time: 0,
         witness: vec![],
@@ -99,7 +102,7 @@ fn fixture_block() -> Block {
         inputs: vec![],
         outputs: vec![TxOutput {
             value_atoms: subsidy::block_subsidy_atoms(0),
-            locking_script: vec![0],
+            locking_script: vec![0x33; ADDRESS_DIGEST_BYTES],
         }],
         lock_time: 0,
         witness: vec![],
@@ -116,6 +119,8 @@ fn fixture_block() -> Block {
         previous_block_hash: [2; 48],
         merkle_root: root,
         witness_root: witness_root(&transactions),
+        founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+        founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
         timestamp: 75,
         difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
         nonce: 0,
@@ -127,7 +132,7 @@ fn fixture_block() -> Block {
 fn protocol_fixture_freezes_core_parameters_and_validation() {
     let params = consensus_params_for_network(Network::Mainnet);
     assert_eq!(params.max_supply_atho, None);
-    assert_eq!(params.halving_interval_blocks, 1_680_000);
+    assert_eq!(params.halving_interval_blocks, 1_260_000);
     assert_eq!(params.min_tx_fee_atoms, 500);
     let tx = fixture_transaction();
     let minimum_fee = minimum_required_fee_atoms(Network::Mainnet, &tx)

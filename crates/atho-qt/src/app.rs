@@ -5906,6 +5906,8 @@ mod tests {
             previous_block_hash: [9; 48],
             merkle_root: merkle_root(&transactions),
             witness_root: witness_root(&transactions),
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
             timestamp: 150,
             difficulty_target_or_bits: pow::DIFFICULTY_PROFILE.min_difficulty_target,
             nonce: 0,

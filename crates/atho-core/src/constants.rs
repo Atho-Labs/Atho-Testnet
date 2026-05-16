@@ -9,13 +9,14 @@
 //! CONSENSUS: Supply, block, and witness constants here feed directly into block
 //! and transaction validation. Changes require explicit protocol coordination.
 use crate::network::Network;
+use hex_literal::hex;
 
 // Display precision only. Consensus and backend accounting use integer atoms.
 pub const DECIMALS: usize = 12;
 pub const ATOMS_PER_ATHO: u64 = 1_000_000_000_000;
-pub const HALVING_INTERVAL_BLOCKS: u64 = 1_680_000;
-pub const COINBASE_MATURITY_BLOCKS: u64 = 150;
-pub const STANDARD_TX_CONFIRMATIONS: u64 = 7;
+pub const HALVING_INTERVAL_BLOCKS: u64 = 1_260_000;
+pub const COINBASE_MATURITY_BLOCKS: u64 = 100;
+pub const STANDARD_TX_CONFIRMATIONS: u64 = 6;
 pub const MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE: u64 = 1;
 pub const MIN_TX_FEE_PER_VBYTE_ATOMS: u64 = MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE;
 pub const MIN_TX_FEE_ATOMS: u64 = 500;
@@ -29,11 +30,11 @@ pub const TX_POW_NONCE_BYTES: usize = 8;
 pub const TX_POW_BITS_BYTES: usize = 1;
 pub const TX_POW_DOMAIN: &[u8] = b"ATHO_TX_POW_V1";
 pub const TX_SIGN_DOMAIN: &[u8] = b"ATHO_TX_SIGN_V1";
-pub const BLOCK_TIME_SECONDS: u64 = 75;
+pub const BLOCK_TIME_SECONDS: u64 = 100;
 pub const TARGET_BLOCK_TIME_SECONDS: u64 = BLOCK_TIME_SECONDS;
-pub const BLOCKS_PER_YEAR: u64 = 420_480;
-pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = 6_250_000_000_000;
-pub const TAIL_REWARD_ATOMS: u64 = 781_250_000_000;
+pub const BLOCKS_PER_YEAR: u64 = 315_360;
+pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = 5_000_000_000_000;
+pub const TAIL_REWARD_ATOMS: u64 = 625_000_000_000;
 pub const GENESIS_COINBASE_ATOMS: u64 = INITIAL_BLOCK_REWARD_ATOMS;
 pub const POW_RETARGET_INTERVAL_BLOCKS: u64 = 1;
 pub const POW_AVERAGING_WINDOW_BLOCKS: u64 = 17;
@@ -77,6 +78,11 @@ pub const WITNESS_SIGNATURE_REFERENCE_BYTES: usize = 16;
 pub const INPUT_REFERENCE_BYTES: usize = WITNESS_SIGNATURE_REFERENCE_BYTES;
 
 pub const ADDRESS_ROLE_DOMAIN: &str = "ATHO_ADDR_V1";
+
+pub const FOUNDERS_HASH_SHA3_384: [u8; 48] =
+    hex!("3582d92eff98ba5e575ae721ced2b32bf7bea4628971d339dc189fde10716a40b91a67f8eb300894eaebb921754cdd86");
+pub const FOUNDERS_HASH_SHA3_512: [u8; 64] =
+    hex!("c93086ce58c4a64ef15672b00836eca94d14ea3810a584360fb11e11f065d5949aa1307f9315bce31316c820e6f58f0dace98f48111e6538a3d7a231e58e51bf");
 
 pub const BASE56_ALPHABET: &str = "23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz";
 

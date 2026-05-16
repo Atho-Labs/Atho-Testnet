@@ -398,6 +398,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 75,
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                     Network::Mainnet,
@@ -415,26 +417,27 @@ mod tests {
     }
 
     #[test]
-    fn spendability_uses_network_specific_confirmation_params() {
+    fn spendability_uses_current_confirmation_params() {
         let mainnet_coinbase = UtxoEntry::coinbase(Network::Mainnet, [1; 48], 0, 100, vec![1], 10);
         let testnet_coinbase = UtxoEntry::coinbase(Network::Testnet, [2; 48], 0, 100, vec![2], 10);
         let mainnet_payment = UtxoEntry::new(Network::Mainnet, [3; 48], 0, 100, vec![3], 10, false);
         let testnet_payment = UtxoEntry::new(Network::Testnet, [4; 48], 0, 100, vec![4], 10, false);
 
-        assert_eq!(mainnet_coinbase.required_confirmations(), 150);
-        assert!(!mainnet_coinbase.is_spendable_at(10 + 148));
-        assert!(mainnet_coinbase.is_spendable_at(10 + 149));
+        assert_eq!(mainnet_coinbase.required_confirmations(), 100);
+        assert!(!mainnet_coinbase.is_spendable_at(10 + 98));
+        assert!(mainnet_coinbase.is_spendable_at(10 + 99));
 
-        assert_eq!(testnet_coinbase.required_confirmations(), 150);
-        assert!(!testnet_coinbase.is_spendable_at(10 + 148));
-        assert!(testnet_coinbase.is_spendable_at(10 + 149));
+        assert_eq!(testnet_coinbase.required_confirmations(), 100);
+        assert!(!testnet_coinbase.is_spendable_at(10 + 98));
+        assert!(testnet_coinbase.is_spendable_at(10 + 99));
 
-        assert_eq!(mainnet_payment.required_confirmations(), 7);
-        assert!(!mainnet_payment.is_spendable_at(10 + 5));
-        assert!(mainnet_payment.is_spendable_at(10 + 6));
+        assert_eq!(mainnet_payment.required_confirmations(), 6);
+        assert!(!mainnet_payment.is_spendable_at(10 + 4));
+        assert!(mainnet_payment.is_spendable_at(10 + 5));
 
-        assert_eq!(testnet_payment.required_confirmations(), 1);
-        assert!(testnet_payment.is_spendable_at(10));
+        assert_eq!(testnet_payment.required_confirmations(), 6);
+        assert!(!testnet_payment.is_spendable_at(10 + 4));
+        assert!(testnet_payment.is_spendable_at(10 + 5));
     }
 
     #[test]
@@ -486,6 +489,8 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
                 timestamp: 75,
                 difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
                     Network::Mainnet,

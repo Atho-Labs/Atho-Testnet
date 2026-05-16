@@ -57,6 +57,8 @@ For direct `cargo run` commands, node-only operation, standalone mining, GPU bui
 
 ## Documentation
 
+- [White Paper](ATHO_WHITE_PAPER.md)
+- [Monetary Policy Attachment](ATHO_MONETARY_POLICY_AND_150_YEAR_SUPPLY_SCHEDULE.md)
 - [Setup Guide](docs/setup.md)
 - [Commands](docs/commands.md)
 - [Configuration](docs/configuration.md)
@@ -66,6 +68,8 @@ For direct `cargo run` commands, node-only operation, standalone mining, GPU bui
 - [Architecture](docs/architecture.md)
 - [Consensus](docs/consensus.md)
 - [API](docs/api.md)
+- [Production API Guide](docs/ATHO_PRODUCTION_API_GUIDE.md)
+- [Production Deployment Guide](docs/ATHO_PRODUCTION_DEPLOYMENT_GUIDE.md)
 - [Reports](docs/reports/README.md)
 
 Historical release notes live in [docs/archive/release-notes.md](docs/archive/release-notes.md). Audit and engineering reports live in [docs/reports/README.md](docs/reports/README.md).
