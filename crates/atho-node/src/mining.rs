@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Block template construction for solo mining.
 //!
 //! This module assembles candidate blocks from the current mempool and tip

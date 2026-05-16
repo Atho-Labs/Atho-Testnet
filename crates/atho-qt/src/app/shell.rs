@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use super::{
     pages, widgets, CreateWalletForm, DebugWindowTab, DesktopApp, ImportWalletForm, LaunchPage,
     NavTab,

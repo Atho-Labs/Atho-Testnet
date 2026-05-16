@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Atho contributors
+
 from __future__ import annotations
 
 import os
@@ -9,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import runtime_launcher
+from scripts import runtime_launcher
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class RuntimeLauncherTests(unittest.TestCase):
     def make_config(
-        self, root: Path, network: str = "mainnet"
+        self, root: Path, network: str = "testnet"
     ) -> runtime_launcher.LauncherConfig:
         return runtime_launcher.LauncherConfig(
             network=network,
@@ -131,10 +134,19 @@ class RuntimeLauncherTests(unittest.TestCase):
     def test_build_launch_env_sets_active_network_and_runtime_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            config = self.make_config(root, network="regnet")
+            config = self.make_config(root)
             env = runtime_launcher.build_launch_env(config)
-            self.assertEqual(env["ATHO_NETWORK"], "regnet")
+            self.assertEqual(env["ATHO_NETWORK"], "testnet")
             self.assertEqual(env["ATHO_DATA_DIR"], str(root / "runtime"))
+
+    def test_parse_launcher_args_keeps_unknown_qt_flags(self) -> None:
+        config = runtime_launcher.parse_launcher_args(
+            "testnet",
+            ["--data-dir", "/tmp/atho", "--peer", "1.2.3.4:9100"],
+        )
+        self.assertEqual(config.runtime_root, Path("/tmp/atho"))
+        self.assertEqual(config.network, "testnet")
+        self.assertEqual(config.forwarded_args, ("--peer", "1.2.3.4:9100"))
 
     def test_network_override_flag_sets_launch_env(self) -> None:
         config = runtime_launcher.parse_launcher_args(
@@ -145,102 +157,56 @@ class RuntimeLauncherTests(unittest.TestCase):
         self.assertTrue(config.network_overrides_local)
         self.assertEqual(env["ATHO_NETWORK_OVERRIDES_LOCAL"], "1")
 
-    def test_parse_launcher_args_keeps_unknown_qt_flags(self) -> None:
-        config = runtime_launcher.parse_launcher_args(
-            "mainnet",
-            ["--data-dir", "/tmp/atho", "--peer", "1.2.3.4:56000"],
-        )
-        self.assertEqual(config.runtime_root, Path("/tmp/atho"))
-        self.assertEqual(config.network, "mainnet")
-        self.assertEqual(config.forwarded_args, ("--peer", "1.2.3.4:56000"))
-
     def test_parse_launcher_args_rejects_network_override(self) -> None:
         with self.assertRaisesRegex(runtime_launcher.LauncherError, "always launches testnet"):
-            runtime_launcher.parse_launcher_args("testnet", ["mainnet"])
+            runtime_launcher.parse_launcher_args("testnet", ["atho-testnet"])
 
-        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the mainnet network"):
-            runtime_launcher.parse_launcher_args("mainnet", ["--network", "testnet"])
+        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the testnet network"):
+            runtime_launcher.parse_launcher_args("testnet", ["--network", "testnet"])
 
-        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the regnet network"):
-            runtime_launcher.parse_launcher_args("regnet", ["--network=mainnet"])
-
-    def test_parse_launcher_args_supports_regnet_wrapper_name(self) -> None:
-        config = runtime_launcher.parse_launcher_args(
-            "regnet",
-            ["--data-dir", "/tmp/atho-regnet"],
-            prog="regnet.py",
-        )
-        self.assertEqual(config.network, "regnet")
-        self.assertEqual(config.runtime_root, Path("/tmp/atho-regnet"))
+        with self.assertRaisesRegex(runtime_launcher.LauncherError, "owns the testnet network"):
+            runtime_launcher.parse_launcher_args("testnet", ["--network=testnet"])
 
     def test_startup_scripts_smoke(self) -> None:
-        cases = {
-            "mainnet": "mainnet.py",
-            "testnet": "testnet.py",
-            "regnet": "regnet.py",
-        }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             release_dir = self.make_release_dir(root)
-            for network, script_name in cases.items():
-                data_dir = root / f"{network}-data"
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-B",
-                        str(REPO_ROOT / script_name),
-                        "--dry-run",
-                        "--release-dir",
-                        str(release_dir),
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    cwd=REPO_ROOT,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    msg=f"{script_name} failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                )
-                self.assertIn(f"[atho-launch] network={network}", result.stdout)
-                self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
-                self.assertIn(f"--network {network} --local-node", result.stdout)
-                self.assertTrue((data_dir / "db").is_dir())
-                self.assertTrue((data_dir / "logs").is_dir())
-
-    def test_compatibility_wrappers_still_launch_their_networks(self) -> None:
-        cases = {
-            "runmainnet.py": ("mainnet", "prefer mainnet.py"),
-            "runtestnet.py": ("testnet", "prefer testnet.py"),
-            "runregnet.py": ("regnet", "prefer regnet.py"),
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            release_dir = self.make_release_dir(root)
-            for script_name, (network, note) in cases.items():
-                data_dir = root / f"legacy-{network}-data"
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-B",
-                        str(REPO_ROOT / script_name),
-                        "--dry-run",
-                        "--release-dir",
-                        str(release_dir),
-                        "--data-dir",
-                        str(data_dir),
-                    ],
-                    cwd=REPO_ROOT,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, msg=result.stderr)
-                self.assertIn(note, result.stdout)
-                self.assertIn(f"[atho-launch] network={network}", result.stdout)
+            for script_name, network in (
+                ("runmainnet.py", "mainnet"),
+                ("runtestnet.py", "testnet"),
+                ("runregnet.py", "regnet"),
+            ):
+                with self.subTest(script_name=script_name):
+                    data_dir = root / f"{network}-data"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(REPO_ROOT / script_name),
+                            "--dry-run",
+                            "--release-dir",
+                            str(release_dir),
+                            "--data-dir",
+                            str(data_dir),
+                        ],
+                        cwd=REPO_ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        msg=(
+                            f"{script_name} failed\nstdout:\n{result.stdout}\n"
+                            f"stderr:\n{result.stderr}"
+                        ),
+                    )
+                    self.assertIn(f"[atho-launch] network={network}", result.stdout)
+                    self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
+                    self.assertIn(f"--network {network} --local-node", result.stdout)
+                    self.assertTrue((data_dir / "db").is_dir())
+                    self.assertTrue((data_dir / "logs").is_dir())
 
     def test_gpu_build_help_mentions_host_requirements(self) -> None:
         message = runtime_launcher.gpu_build_help()
@@ -270,11 +236,11 @@ class RuntimeLauncherTests(unittest.TestCase):
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )
-            with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
-                "runtime_launcher.gpu_build_preflight_reason",
+            with mock.patch("scripts.runtime_launcher.verify_cargo_available"), mock.patch(
+                "scripts.runtime_launcher.gpu_build_preflight_reason",
                 return_value=None,
             ), mock.patch(
-                "runtime_launcher.subprocess.run",
+                "scripts.runtime_launcher.subprocess.run",
                 side_effect=[
                     subprocess.CompletedProcess(
                         args=["cargo"], returncode=1, stdout="", stderr="gpu failed"
@@ -310,11 +276,11 @@ class RuntimeLauncherTests(unittest.TestCase):
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )
-            with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
-                "runtime_launcher.gpu_build_preflight_reason",
+            with mock.patch("scripts.runtime_launcher.verify_cargo_available"), mock.patch(
+                "scripts.runtime_launcher.gpu_build_preflight_reason",
                 return_value=None,
             ), mock.patch(
-                "runtime_launcher.subprocess.run",
+                "scripts.runtime_launcher.subprocess.run",
                 return_value=subprocess.CompletedProcess(
                     args=["cargo"], returncode=0, stdout="", stderr=""
                 ),
@@ -345,11 +311,11 @@ class RuntimeLauncherTests(unittest.TestCase):
                 dry_run=False,
                 forwarded_args=config.forwarded_args,
             )
-            with mock.patch("runtime_launcher.verify_cargo_available"), mock.patch(
-                "runtime_launcher.gpu_build_preflight_reason",
+            with mock.patch("scripts.runtime_launcher.verify_cargo_available"), mock.patch(
+                "scripts.runtime_launcher.gpu_build_preflight_reason",
                 return_value="OpenCL headers not found (missing CL/cl.h)",
             ), mock.patch(
-                "runtime_launcher.subprocess.run",
+                "scripts.runtime_launcher.subprocess.run",
                 return_value=subprocess.CompletedProcess(
                     args=["cargo"], returncode=0, stdout="", stderr=""
                 ),

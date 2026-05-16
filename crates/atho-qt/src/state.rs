@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_node::mining_backend::MiningBackendKind;
 use atho_wallet::snapshot::WalletSnapshot;
 

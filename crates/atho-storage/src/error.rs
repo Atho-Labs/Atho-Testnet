@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Storage-layer errors and their `ATHO-*` registry mappings.
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, DB_BRANCH_NOT_PREFERRED, DB_CORRUPT_DATA,

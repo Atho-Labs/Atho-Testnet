@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Client-side RPC and managed local-node connection handling.
 use atho_core::network::Network;
 use atho_node::system::AthoSystem;
@@ -1851,7 +1854,7 @@ mod tests {
                             bytes_sent: 2_048,
                             bytes_received: 4_096,
                             peers: vec![NetworkPeerDiagnostics {
-                                remote_addr: String::from("74.208.219.116:56000"),
+                                remote_addr: String::from("162.222.206.163:9100"),
                                 direction: NetworkPeerDirection::Outbound,
                                 roles: vec![
                                     String::from("OUTBOUND_PEER"),
@@ -2170,7 +2173,7 @@ mod tests {
                             bytes_sent: 512,
                             bytes_received: 1_024,
                             peers: vec![NetworkPeerDiagnostics {
-                                remote_addr: String::from("74.208.219.116:56000"),
+                                remote_addr: String::from("162.222.206.163:9100"),
                                 direction: NetworkPeerDirection::Outbound,
                                 roles: vec![
                                     String::from("OUTBOUND_PEER"),
@@ -2326,9 +2329,9 @@ mod tests {
     fn rpc_status_path_uses_available_rpc_server_without_local_node_mode() {
         let _force_rpc = EnvVarGuard::set_value(ATHO_QT_FORCE_RPC_ENV, "1");
         let _local = EnvVarGuard::set_value(ATHO_QT_LOCAL_ENV, "0");
-        let (rpc_address, handle) = spawn_mock_rpc_server(Network::Mainnet, 42, 3, 55);
+        let (rpc_address, handle) = spawn_mock_rpc_server(Network::Testnet, 42, 3, 55);
 
-        let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Mainnet, rpc_address);
+        let conn = ReadOnlyNodeConnection::with_rpc_address(Network::Testnet, rpc_address);
         let status = conn.status();
         assert!(status.connected);
         assert!(status.running);
@@ -2341,10 +2344,10 @@ mod tests {
         assert_eq!(status.bytes_sent, 2_048);
         assert_eq!(status.bytes_received, 4_096);
         assert_eq!(status.peers.len(), 1);
-        assert_eq!(status.peers[0].remote_addr, "74.208.219.116:56000");
+        assert_eq!(status.peers[0].remote_addr, "162.222.206.163:9100");
         assert_eq!(
             conn.request(RpcRequest::GetNetwork),
-            RpcResponse::Network(String::from("atho-mainnet"))
+            RpcResponse::Network(String::from("atho-testnet"))
         );
 
         handle.join().expect("mock rpc server");

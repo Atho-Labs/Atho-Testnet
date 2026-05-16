@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Core Atho protocol types and consensus-facing helpers.
 //!
 //! This crate defines the canonical block, transaction, address, network, and
@@ -28,13 +31,13 @@ mod tests {
     fn carries_forward_protocol_basics() {
         assert_eq!(DECIMALS, 12);
         assert_eq!(ATOMS_PER_ATHO, 1_000_000_000_000);
-        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 5_000_000_000_000);
-        assert_eq!(TAIL_REWARD_ATOMS, 625_000_000_000);
-        assert_eq!(HALVING_INTERVAL_BLOCKS, 1_260_000);
+        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 6_250_000_000_000);
+        assert_eq!(TAIL_REWARD_ATOMS, 781_250_000_000);
+        assert_eq!(HALVING_INTERVAL_BLOCKS, 1_680_000);
         assert_eq!(COINBASE_MATURITY_BLOCKS, 150);
-        assert_eq!(STANDARD_TX_CONFIRMATIONS, 6);
+        assert_eq!(STANDARD_TX_CONFIRMATIONS, 7);
         assert_eq!(MIN_TX_FEE_ATOMS, 500);
-        assert_eq!(BLOCK_TIME_SECONDS, 100);
+        assert_eq!(BLOCK_TIME_SECONDS, 75);
         assert_eq!(MAX_BLOCK_VBYTES, 3_000_000);
         assert_eq!(MAX_BLOCK_RAW_BYTES, 12_000_000);
         assert_eq!(MAX_BLOCK_SIZE_BYTES, 3_000_000);
@@ -48,7 +51,7 @@ mod tests {
         assert_eq!(TX_WITNESS_FIXED_BYTES, 1_575);
         assert_eq!(MAX_WITNESS_INPUT_REFS, 13_796);
         assert_eq!(ADDRESS_CHECKSUM_BYTES, 4);
-        assert_eq!(GENESIS_COINBASE_ATOMS, 5_000_000_000_000);
+        assert_eq!(GENESIS_COINBASE_ATOMS, 6_250_000_000_000);
     }
 
     #[test]

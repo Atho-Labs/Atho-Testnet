@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho RPC command model, request/response types, and local transport helpers.
 //!
 //! This crate defines the structured RPC contract shared by the node, CLI, and

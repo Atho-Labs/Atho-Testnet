@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use super::models::WalletBalanceSummary;
 use atho_storage::utxo::UtxoEntry;
 

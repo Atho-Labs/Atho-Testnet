@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho peer-to-peer networking and relay logic.
 //!
 //! This crate handles handshake validation, peer management, message framing,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Serializable wallet balance and activity snapshot types.
 use serde::{Deserialize, Serialize};
 

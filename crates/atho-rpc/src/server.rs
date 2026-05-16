@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Minimal local RPC server helpers and response shaping utilities.
 use crate::error::RpcError;
 use crate::request::RpcRequest;

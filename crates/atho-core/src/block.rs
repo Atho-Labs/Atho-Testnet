@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Canonical Atho block and block-header encoding.
 //!
 //! This module defines the consensus-visible block container, the exact header

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho P2P message definitions and protocol validation.
 use crate::config::{network_params, MIN_SUPPORTED_PROTOCOL_VERSION};
 use atho_core::block::{Block, BlockHeader};

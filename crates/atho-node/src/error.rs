@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Node-layer errors that wrap runtime, storage, validation, and RPC failures.
 use crate::runtime::RuntimeError;
 use crate::validation::ValidationError;

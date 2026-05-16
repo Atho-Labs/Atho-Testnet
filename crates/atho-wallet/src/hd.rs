@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Deterministic HD derivation for Atho wallet seeds.
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,9 +19,15 @@ pub struct DerivationPath {
     pub index: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
+#[derive(Clone, PartialEq, Eq, Zeroize)]
 #[zeroize(drop)]
 pub struct WalletSeed(pub [u8; 32]);
+
+impl fmt::Debug for WalletSeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WalletSeed(<redacted>)")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HdWallet {
@@ -96,5 +106,12 @@ mod tests {
         assert_eq!(receive1.index, 1);
         assert_eq!(change0.index, 0);
         assert_eq!(wallet.seed(), &[7; 32]);
+    }
+
+    #[test]
+    fn wallet_seed_debug_is_redacted() {
+        let rendered = format!("{:?}", WalletSeed([0x41; 32]));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("WalletSeed(["));
     }
 }

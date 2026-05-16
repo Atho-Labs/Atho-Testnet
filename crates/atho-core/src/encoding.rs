@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 pub fn compact_size_len(value: usize) -> usize {
     match value as u64 {
         0..=0xfc => 1,

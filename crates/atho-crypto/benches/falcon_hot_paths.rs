@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput};

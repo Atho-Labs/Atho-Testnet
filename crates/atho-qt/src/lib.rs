@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho Qt-style desktop client built on `eframe`/`egui`.
 //!
 //! The GUI crate provides the wallet operator experience, node diagnostics,

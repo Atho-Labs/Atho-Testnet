@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Shared Atho RPC command registry and permission model.
 //!
 //! The registry in this module is the single source of truth for the CLI, GUI
@@ -251,10 +254,10 @@ pub const COMMANDS: &[CommandDefinition] = &[
     CommandDefinition {
         name: "geterrorcodes",
         group: CommandGroup::Control,
-        description: "Return the Atho structured error-code registry.",
-        usage: "geterrorcodes",
-        args_schema: "no arguments",
-        result_schema: "array of error-code descriptors",
+        description: "Return the Atho structured error-code registry, or explain one code.",
+        usage: "geterrorcodes [ATHO-CATEGORY-NNN]",
+        args_schema: "optional error code",
+        result_schema: "array of error-code descriptors or one descriptor",
         permission: CommandPermission::PublicRead,
         mainnet_allowed: true,
         wallet_required: false,
@@ -262,7 +265,7 @@ pub const COMMANDS: &[CommandDefinition] = &[
         dangerous: false,
         test_only: false,
         audit_log_required: false,
-        examples: &["geterrorcodes"],
+        examples: &["geterrorcodes", "geterrorcodes ATHO-RPC-002"],
     },
     CommandDefinition {
         name: "getrpcinfo",
@@ -911,6 +914,23 @@ pub const COMMANDS: &[CommandDefinition] = &[
         test_only: false,
         audit_log_required: false,
         examples: &["getrawtransaction 0000abcd..."],
+    },
+    CommandDefinition {
+        name: "sendrawtransaction",
+        group: CommandGroup::RawTransactions,
+        description:
+            "Broadcast a signed canonical raw transaction to the local mempool and relay network.",
+        usage: "sendrawtransaction <raw_tx_hex>",
+        args_schema: "canonical full transaction bytes as hex",
+        result_schema: "broadcast acceptance object with txid, fee, size, and relay status",
+        permission: CommandPermission::LocalWrite,
+        mainnet_allowed: true,
+        wallet_required: false,
+        auth_required: false,
+        dangerous: false,
+        test_only: false,
+        audit_log_required: true,
+        examples: &["sendrawtransaction 020000000001..."],
     },
     CommandDefinition {
         name: "validateathoaddress",

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Wire framing and checksum validation for Atho P2P messages.
 use crate::config::{network_from_magic, network_params};
 use crate::protocol::{MessageCommand, NetworkMessage, ProtocolError};

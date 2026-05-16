@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::network::Network;
 use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
 use atho_rpc::request::RpcRequest;
@@ -5,6 +8,7 @@ use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MinerCli {
@@ -14,6 +18,8 @@ struct MinerCli {
     cores: Option<usize>,
     backend: Option<MiningBackendKind>,
     probe_gpu: bool,
+    continuous: bool,
+    retry_delay_secs: u64,
 }
 
 impl MinerCli {
@@ -55,6 +61,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let network = cli.network.unwrap_or_else(default_network);
+    network.operator_launch_allowed().map_err(str::to_string)?;
     let cores = cli.cores.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|p| p.get())
@@ -86,6 +93,47 @@ fn run() -> Result<(), String> {
     if !matches!(controller.backend(), MiningBackendKind::Cpu) {
         println!("{}", gpu_info.summary());
     }
+
+    let mut round = 0u64;
+    loop {
+        round = round.saturating_add(1);
+        if cli.continuous {
+            println!("mining_round={round}");
+        }
+        match mine_once(&client, &controller, network, &rpc_address, cores) {
+            Ok(()) => {}
+            Err(err) if cli.continuous => {
+                eprintln!(
+                    "mining round {round} failed: {err}; retrying in {}s",
+                    cli.retry_delay_secs
+                );
+                let _ = atho_node::dev::append_log(
+                    "miner",
+                    &format!(
+                        "cli mining round failed round={} error={} retry_secs={}",
+                        round, err, cli.retry_delay_secs
+                    ),
+                );
+                std::thread::sleep(Duration::from_secs(cli.retry_delay_secs.max(1)));
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+        if !cli.continuous {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+fn mine_once(
+    client: &RpcClient,
+    controller: &MiningController,
+    network: Network,
+    rpc_address: &str,
+    cores: usize,
+) -> Result<(), String> {
     println!("requesting block template...");
     let template = match client.call(&RpcRequest::GetBlockTemplate) {
         Ok(RpcResponse::BlockTemplate(template)) => template,
@@ -201,8 +249,7 @@ fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "mainnet" | "testnet" | "regnet" | "regtest" | "prunetest" | "prune-test"
-            | "prune_test" => {
+            "testnet" | "regnet" | "regtest" | "prunetest" | "prune-test" | "prune_test" => {
                 cli.network = parse_network(&args[i]);
                 i += 1;
             }
@@ -259,10 +306,30 @@ fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
                 cli.probe_gpu = true;
                 i += 1;
             }
+            "--loop" | "--continuous" => {
+                cli.continuous = true;
+                i += 1;
+            }
+            "--retry-delay" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "missing retry delay value".to_string())?;
+                let secs = value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid retry delay".to_string())?;
+                if secs == 0 {
+                    return Err("retry delay must be at least 1 second".to_string());
+                }
+                cli.retry_delay_secs = secs;
+                i += 2;
+            }
             value => {
                 return Err(format!("unrecognized argument {value}"));
             }
         }
+    }
+    if cli.retry_delay_secs == 0 {
+        cli.retry_delay_secs = 5;
     }
     Ok(cli)
 }
@@ -272,14 +339,16 @@ fn parse_network(value: &str) -> Option<Network> {
 }
 
 fn default_network() -> Network {
-    Network::parse(&std::env::var("ATHO_NETWORK").unwrap_or_else(|_| String::from("mainnet")))
-        .unwrap_or(Network::Mainnet)
+    std::env::var("ATHO_NETWORK")
+        .ok()
+        .and_then(|raw| Network::parse(&raw))
+        .unwrap_or_else(Network::operator_default)
 }
 
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  atho-mine [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH] [--backend <cpu|gpu|auto>] [--probe-gpu]  (default backend: auto)"
+        "  atho-mine [--network <testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH] [--backend <cpu|gpu|auto>] [--probe-gpu] [--loop] [--retry-delay SECS]  (default backend: auto)"
     );
 }
 
@@ -323,11 +392,24 @@ mod tests {
     fn miner_cli_parses_probe_gpu_flag() {
         let cli = parse_cli(&[String::from("--probe-gpu")]).unwrap();
         assert!(cli.probe_gpu);
+        assert_eq!(cli.retry_delay_secs, 5);
     }
 
     #[test]
     fn miner_cli_accepts_prunetest_shorthand() {
         let cli = parse_cli(&[String::from("prune-test")]).unwrap();
         assert_eq!(cli.network, Some(Network::Prunetest));
+    }
+
+    #[test]
+    fn miner_cli_parses_continuous_loop_flags() {
+        let cli = parse_cli(&[
+            String::from("--loop"),
+            String::from("--retry-delay"),
+            String::from("7"),
+        ])
+        .unwrap();
+        assert!(cli.continuous);
+        assert_eq!(cli.retry_delay_secs, 7);
     }
 }

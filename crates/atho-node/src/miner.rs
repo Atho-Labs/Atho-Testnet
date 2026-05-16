@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Reference CPU nonce-search implementation.
 use crate::dev;
 use atho_core::block::{Block, BlockHeader};
@@ -82,7 +85,16 @@ impl Miner {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count)
             .build()
-            .expect("rayon pool");
+            .map_err(|err| {
+                let _ = dev::append_log(
+                    "miner",
+                    &format!(
+                        "rayon worker pool unavailable height={} cores={} error={err}",
+                        header.height, worker_count
+                    ),
+                );
+                MiningInterrupted
+            })?;
         let worker_stop = Arc::clone(&stop_requested);
         pool.install(|| {
             (0..worker_count).into_par_iter().for_each(|worker_index| {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Mnemonic phrase parsing, validation, and seed derivation.
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, WALLET_INVALID_ENTROPY_LENGTH,
@@ -7,6 +10,7 @@ use atho_errors::{
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -77,10 +81,19 @@ impl AthoErrorMeta for MnemonicError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub struct MnemonicPhrase {
     words: Vec<String>,
+}
+
+impl fmt::Debug for MnemonicPhrase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MnemonicPhrase")
+            .field("word_count", &self.words.len())
+            .field("words", &"<redacted>")
+            .finish()
+    }
 }
 
 impl MnemonicPhrase {
@@ -295,5 +308,21 @@ mod tests {
             MnemonicPhrase::parse(&altered),
             Err(MnemonicError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn mnemonic_debug_is_redacted() {
+        let phrase = MnemonicPhrase::from_entropy(&[0x11; 32], MnemonicLength::Words24).unwrap();
+        let sentence = phrase.as_sentence();
+        let first_word = sentence
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let rendered = format!("{phrase:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("word_count"));
+        assert!(!rendered.contains(&first_word));
     }
 }

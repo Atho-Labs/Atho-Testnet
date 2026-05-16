@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Core in-process full-node state machine.
 use crate::config::NodeConfig;
 use crate::dev;
@@ -10,6 +13,8 @@ use crate::validation::ValidationError;
 use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
+#[cfg(test)]
+use atho_core::constants::ADDRESS_DIGEST_BYTES;
 use atho_core::genesis;
 use atho_core::transaction::Transaction;
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
@@ -664,7 +669,6 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
-    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -730,11 +734,6 @@ mod tests {
         .canonical_bytes()
     }
 
-    fn test_locking_script(network: Network) -> Vec<u8> {
-        let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
-        public_key_digest(network, &keypair.public_key.0).to_vec()
-    }
-
     fn temp_data_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "atho-node-{label}-{}-{}",
@@ -757,7 +756,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
-                locking_script: vec![salt, height as u8],
+                locking_script: vec![salt ^ height as u8; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: height as u32,
             witness: vec![],
@@ -842,7 +841,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![0],
+                locking_script: vec![0; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -854,11 +853,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_500,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -904,7 +903,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![0],
+                locking_script: vec![0; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -916,11 +915,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -964,7 +963,7 @@ mod tests {
                 [9; 48],
                 0,
                 2_000,
-                test_locking_script(Network::Mainnet),
+                vec![1],
                 0,
                 false,
             ))
@@ -974,11 +973,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [9; 48],
                 output_index: 0,
-                unlocking_script: test_locking_script(Network::Mainnet),
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -995,7 +994,7 @@ mod tests {
         let tx = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: 2_000 - fee_atoms,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             ..Transaction {
                 witness: vec![],
@@ -1040,11 +1039,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [0x19; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -1095,7 +1094,7 @@ mod tests {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
         node.chainstate.height = 6;
         for txid in [[0x31; 48], [0x32; 48]] {
-            let locking_script = test_locking_script(Network::Mainnet);
+            let locking_script = vec![1];
             let utxo = UtxoEntry::new(
                 Network::Mainnet,
                 txid,
@@ -1115,7 +1114,7 @@ mod tests {
                 }],
                 outputs: vec![TxOutput {
                     value_atoms: DUST_RELAY_VALUE_ATOMS,
-                    locking_script: vec![2],
+                    locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 0,
                 witness: vec![],

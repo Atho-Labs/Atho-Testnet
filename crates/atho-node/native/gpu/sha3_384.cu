@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 #include <cuda_runtime.h>
 
 #include <algorithm>

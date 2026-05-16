@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::network::Network;
 use atho_rpc::command::{help_payload, parse_command_line};
 use atho_rpc::request::RpcRequest;

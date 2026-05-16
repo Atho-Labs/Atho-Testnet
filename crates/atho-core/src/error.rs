@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Core protocol error types and their `ATHO-*` registry mappings.
 //!
 //! The errors in this module stay close to the protocol primitives so higher

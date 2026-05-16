@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::app::{widgets, AddressPoolFilter, DesktopApp, ReceivePageTab};
 use crate::resources;
 use eframe::egui;

@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 
 use atho_core::address::public_key_digest;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};

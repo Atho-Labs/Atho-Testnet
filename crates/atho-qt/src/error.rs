@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! GUI-layer errors surfaced to desktop users.
 use atho_errors::{AthoError, AthoErrorDescriptor, AthoErrorMeta, RPC_QT_UNEXPECTED};
 use atho_rpc::error::RpcError;

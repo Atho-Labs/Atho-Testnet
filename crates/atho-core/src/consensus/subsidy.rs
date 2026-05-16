@@ -1,12 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::constants::{
     BLOCKS_PER_YEAR, HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, TAIL_REWARD_ATOMS,
 };
 use crate::network::Network;
-
-const LEGACY_TESTNET_BLOCKS_PER_YEAR: u64 = 420_480;
-const LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS: u64 = 1_680_000;
-const LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS: u64 = 6_250_000_000_000;
-const LEGACY_TESTNET_TAIL_REWARD_ATOMS: u64 = 781_250_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmissionSchedule {
@@ -26,88 +24,68 @@ pub const EMISSION_SCHEDULE: EmissionSchedule = EmissionSchedule {
 pub const TAIL_EMISSION_START_HEIGHT: u64 = EMISSION_SCHEDULE.halving_interval_blocks * 3;
 pub const YEAR_20_HEIGHT: u64 = EMISSION_SCHEDULE.blocks_per_year * 20;
 
-pub const fn emission_schedule_for_network(network: Network) -> EmissionSchedule {
-    match network {
-        Network::Mainnet | Network::Regnet => EMISSION_SCHEDULE,
-        Network::Testnet | Network::Prunetest => EmissionSchedule {
-            initial_block_reward_atoms: LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS,
-            tail_reward_atoms: LEGACY_TESTNET_TAIL_REWARD_ATOMS,
-            halving_interval_blocks: LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS,
-            blocks_per_year: LEGACY_TESTNET_BLOCKS_PER_YEAR,
-        },
-    }
-}
-
-fn block_reward_atoms_for_schedule(height: u64, schedule: EmissionSchedule) -> u64 {
-    let halvings = height / schedule.halving_interval_blocks;
+pub fn get_block_reward_atoms(height: u64) -> u64 {
+    let halvings = height / HALVING_INTERVAL_BLOCKS;
     let reward = if halvings >= 64 {
         0
     } else {
-        schedule.initial_block_reward_atoms >> halvings
+        INITIAL_BLOCK_REWARD_ATOMS >> halvings
     };
 
-    if reward < schedule.tail_reward_atoms {
-        schedule.tail_reward_atoms
+    if reward < TAIL_REWARD_ATOMS {
+        TAIL_REWARD_ATOMS
     } else {
         reward
     }
-}
-
-pub fn get_block_reward_atoms(height: u64) -> u64 {
-    block_reward_atoms_for_schedule(height, EMISSION_SCHEDULE)
 }
 
 pub fn block_subsidy_atoms(height: u64) -> u64 {
     get_block_reward_atoms(height)
 }
 
-pub fn block_subsidy_atoms_for_network(network: Network, height: u64) -> u64 {
-    block_reward_atoms_for_schedule(height, emission_schedule_for_network(network))
+pub fn block_subsidy_atoms_for_network(_network: Network, height: u64) -> u64 {
+    get_block_reward_atoms(height)
 }
 
-pub fn genesis_coinbase_atoms_for_network(network: Network) -> u64 {
-    block_subsidy_atoms_for_network(network, 0)
+pub fn genesis_coinbase_atoms_for_network(_network: Network) -> u64 {
+    get_block_reward_atoms(0)
 }
 
-fn cumulative_issued_before_height_for_schedule(height: u64, schedule: EmissionSchedule) -> u128 {
+pub fn cumulative_issued_before_height(height: u64) -> u128 {
     if height == 0 {
         return 0;
     }
 
     let mut remaining_blocks = height;
     let mut issued = 0u128;
-    let mut reward = schedule.initial_block_reward_atoms;
+    let mut reward = INITIAL_BLOCK_REWARD_ATOMS;
 
     while remaining_blocks > 0 {
-        let era_blocks = remaining_blocks.min(schedule.halving_interval_blocks);
-        let effective_reward = reward.max(schedule.tail_reward_atoms);
+        let era_blocks = remaining_blocks.min(HALVING_INTERVAL_BLOCKS);
+        let effective_reward = reward.max(TAIL_REWARD_ATOMS);
         issued = issued.saturating_add((era_blocks as u128) * (effective_reward as u128));
         remaining_blocks -= era_blocks;
 
-        if reward > schedule.tail_reward_atoms {
-            reward = (reward / 2).max(schedule.tail_reward_atoms);
+        if reward > TAIL_REWARD_ATOMS {
+            reward = (reward / 2).max(TAIL_REWARD_ATOMS);
         } else {
-            reward = schedule.tail_reward_atoms;
+            reward = TAIL_REWARD_ATOMS;
         }
     }
 
     issued
 }
 
-pub fn cumulative_issued_before_height(height: u64) -> u128 {
-    cumulative_issued_before_height_for_schedule(height, EMISSION_SCHEDULE)
-}
-
 pub fn cumulative_issued_through_height(height: u64) -> u128 {
     cumulative_issued_before_height(height.saturating_add(1))
 }
 
-pub fn cumulative_issued_before_height_for_network(network: Network, height: u64) -> u128 {
-    cumulative_issued_before_height_for_schedule(height, emission_schedule_for_network(network))
+pub fn cumulative_issued_before_height_for_network(_network: Network, height: u64) -> u128 {
+    cumulative_issued_before_height(height)
 }
 
-pub fn cumulative_issued_through_height_for_network(network: Network, height: u64) -> u128 {
-    cumulative_issued_before_height_for_network(network, height.saturating_add(1))
+pub fn cumulative_issued_through_height_for_network(_network: Network, height: u64) -> u128 {
+    cumulative_issued_through_height(height)
 }
 
 pub fn max_supply_atoms_for_network(_network: Network) -> Option<u128> {
@@ -120,73 +98,45 @@ mod tests {
 
     #[test]
     fn reward_schedule_matches_requested_boundaries() {
-        assert_eq!(get_block_reward_atoms(0), 5_000_000_000_000);
-        assert_eq!(get_block_reward_atoms(1_259_999), 5_000_000_000_000);
-        assert_eq!(get_block_reward_atoms(1_260_000), 2_500_000_000_000);
-        assert_eq!(get_block_reward_atoms(2_519_999), 2_500_000_000_000);
-        assert_eq!(get_block_reward_atoms(2_520_000), 1_250_000_000_000);
-        assert_eq!(get_block_reward_atoms(3_779_999), 1_250_000_000_000);
-        assert_eq!(get_block_reward_atoms(3_780_000), 625_000_000_000);
-        assert_eq!(get_block_reward_atoms(10_000_000), 625_000_000_000);
+        assert_eq!(get_block_reward_atoms(0), 6_250_000_000_000);
+        assert_eq!(get_block_reward_atoms(1_679_999), 6_250_000_000_000);
+        assert_eq!(get_block_reward_atoms(1_680_000), 3_125_000_000_000);
+        assert_eq!(get_block_reward_atoms(3_359_999), 3_125_000_000_000);
+        assert_eq!(get_block_reward_atoms(3_360_000), 1_562_500_000_000);
+        assert_eq!(get_block_reward_atoms(5_039_999), 1_562_500_000_000);
+        assert_eq!(get_block_reward_atoms(5_040_000), 781_250_000_000);
+        assert_eq!(get_block_reward_atoms(10_000_000), 781_250_000_000);
     }
 
     #[test]
     fn cumulative_supply_matches_requested_checkpoints() {
         assert_eq!(cumulative_issued_before_height(0), 0);
         assert_eq!(
-            cumulative_issued_before_height(1_260_000),
-            6_300_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+            cumulative_issued_before_height(1_680_000),
+            10_500_000u128 * crate::constants::ATOMS_PER_ATHO as u128
         );
         assert_eq!(
-            cumulative_issued_before_height(2_520_000),
-            9_450_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+            cumulative_issued_before_height(3_360_000),
+            15_750_000u128 * crate::constants::ATOMS_PER_ATHO as u128
         );
         assert_eq!(
-            cumulative_issued_before_height(3_780_000),
-            11_025_000u128 * crate::constants::ATOMS_PER_ATHO as u128
+            cumulative_issued_before_height(5_040_000),
+            18_375_000u128 * crate::constants::ATOMS_PER_ATHO as u128
         );
         assert_eq!(
-            cumulative_issued_before_height(6_307_200),
-            12_604_500u128 * crate::constants::ATOMS_PER_ATHO as u128
+            cumulative_issued_before_height(8_409_600),
+            21_007_500u128 * crate::constants::ATOMS_PER_ATHO as u128
         );
     }
 
     #[test]
     fn tail_emission_identity_matches_requested_targets() {
-        assert_eq!(EMISSION_SCHEDULE.blocks_per_year, 315_360);
-        assert_eq!(TAIL_EMISSION_START_HEIGHT, 3_780_000);
-        assert_eq!(YEAR_20_HEIGHT, 6_307_200);
+        assert_eq!(EMISSION_SCHEDULE.blocks_per_year, 420_480);
+        assert_eq!(TAIL_EMISSION_START_HEIGHT, 5_040_000);
+        assert_eq!(YEAR_20_HEIGHT, 8_409_600);
         assert_eq!(
             cumulative_issued_before_height(YEAR_20_HEIGHT),
-            12_604_500u128 * crate::constants::ATOMS_PER_ATHO as u128
-        );
-    }
-
-    #[test]
-    fn testnet_and_prunetest_keep_legacy_emission_schedule() {
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Mainnet, 0),
-            5_000_000_000_000
-        );
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Regnet, 0),
-            5_000_000_000_000
-        );
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Testnet, 0),
-            6_250_000_000_000
-        );
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Prunetest, 0),
-            6_250_000_000_000
-        );
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Testnet, 1_680_000),
-            3_125_000_000_000
-        );
-        assert_eq!(
-            block_subsidy_atoms_for_network(Network::Mainnet, 1_260_000),
-            2_500_000_000_000
+            21_007_500u128 * crate::constants::ATOMS_PER_ATHO as u128
         );
     }
 

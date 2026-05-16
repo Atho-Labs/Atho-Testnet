@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::address::{address_parts_from_public_key, decode_base56_address};
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::transaction_signing_digest;
@@ -5,8 +8,8 @@ use atho_core::consensus::subsidy;
 use atho_core::consensus::tx_policy::solve_transaction_pow;
 use atho_core::consensus::{pow, rules};
 use atho_core::constants::{
-    COINBASE_MATURITY_BLOCKS, MAX_TRANSACTION_SIZE_BYTES, MIN_TX_FEE_PER_VBYTE_ATOMS,
-    STANDARD_TX_CONFIRMATIONS,
+    ADDRESS_DIGEST_BYTES, COINBASE_MATURITY_BLOCKS, MAX_TRANSACTION_SIZE_BYTES,
+    MIN_TX_FEE_PER_VBYTE_ATOMS, STANDARD_TX_CONFIRMATIONS,
 };
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -45,8 +48,9 @@ const BASE_TX_VALUE: u64 = 100_000;
 const BASE_TX_OUTPUT: u64 = 90_000;
 const BASE_TX_FEE: u64 = BASE_TX_VALUE - BASE_TX_OUTPUT;
 const BASE_TXID: [u8; 48] = [7; 48];
-const BASE_REWARD_SEED: &[u8] = b"atho-adversarial-reward";
-const BASE_OUTPUT_SEED: &[u8] = b"atho-adversarial-output";
+const BASE_UNLOCKING_SCRIPT: [u8; 4] = [1, 2, 3, 4];
+const BASE_LOCKING_SCRIPT: [u8; 4] = [4, 3, 2, 1];
+const BASE_REWARD_SCRIPT: [u8; 4] = [9, 9, 9, 9];
 
 fn main() {
     if let Err(err) = run() {
@@ -286,34 +290,17 @@ impl Drop for EnvVarGuard {
     }
 }
 
-fn payment_script(network: Network, keypair: &FalconKeypair) -> Vec<u8> {
-    address_parts_from_public_key(network, &keypair.public_key.0)
-        .payment_digest
-        .to_vec()
-}
-
-fn seeded_payment_script(network: Network, seed: &[u8]) -> Vec<u8> {
-    let keypair = generate_from_seed(seed).expect("keypair");
-    payment_script(network, &keypair)
-}
-
-fn signed_base_tx(
-    network: Network,
-    keypair: &FalconKeypair,
-    input_txid: [u8; 48],
-    input_locking_script: Vec<u8>,
-    output_value: u64,
-) -> Transaction {
+fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u64) -> Transaction {
     let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             previous_txid: input_txid,
             output_index: 0,
-            unlocking_script: input_locking_script,
+            unlocking_script: BASE_UNLOCKING_SCRIPT.to_vec(),
         }],
         outputs: vec![TxOutput {
             value_atoms: output_value,
-            locking_script: seeded_payment_script(network, BASE_OUTPUT_SEED),
+            locking_script: BASE_LOCKING_SCRIPT.to_vec(),
         }],
         lock_time: 0,
         witness: Vec::new(),
@@ -323,7 +310,7 @@ fn signed_base_tx(
     let signature = sign(
         atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
         &keypair.secret_key,
-        &transaction_signing_digest(network, &tx),
+        &transaction_signing_digest(Network::Mainnet, &tx),
     )
     .expect("falcon signature");
     let sig_bytes = signature.0.clone();
@@ -345,31 +332,25 @@ fn finalize_tx_for_block(tx: &Transaction, witness_root: [u8; 48]) -> Transactio
     finalize_witness_commit_refs(tx, witness_root)
 }
 
-fn valid_utxo(
-    network: Network,
-    created_height: u64,
-    value_atoms: u64,
-    locking_script: Vec<u8>,
-) -> UtxoEntry {
+fn valid_utxo(network: Network, created_height: u64, value_atoms: u64) -> UtxoEntry {
     UtxoEntry::new(
         network,
         BASE_TXID,
         0,
         value_atoms,
-        locking_script,
+        BASE_UNLOCKING_SCRIPT.to_vec(),
         created_height,
         false,
     )
 }
 
-fn valid_coinbase(network: Network, height: u64, fee_atoms: u64) -> Transaction {
+fn valid_coinbase(_network: Network, height: u64, fee_atoms: u64) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
-            value_atoms: subsidy::block_subsidy_atoms_for_network(network, height)
-                .saturating_add(fee_atoms),
-            locking_script: seeded_payment_script(network, BASE_REWARD_SEED),
+            value_atoms: subsidy::block_subsidy_atoms(height).saturating_add(fee_atoms),
+            locking_script: BASE_REWARD_SCRIPT.to_vec(),
         }],
         lock_time: height as u32,
         witness: vec![],
@@ -400,28 +381,20 @@ fn valid_block(network: Network, height: u64, txs: Vec<Transaction>) -> Block {
 
 fn valid_spend_fixture() -> (FalconKeypair, UtxoEntry, Transaction, u64) {
     let keypair = generate_from_seed(b"atho-adversarial-spend").expect("keypair");
-    let locking_script = payment_script(Network::Mainnet, &keypair);
-    let utxo = valid_utxo(Network::Mainnet, 0, BASE_TX_VALUE, locking_script.clone());
-    let mut tx = signed_base_tx(
-        Network::Mainnet,
-        &keypair,
-        utxo.txid,
-        locking_script,
-        BASE_TX_OUTPUT,
-    );
+    let utxo = valid_utxo(Network::Mainnet, 0, BASE_TX_VALUE);
+    let mut tx = signed_base_tx(&keypair, utxo.txid, BASE_TX_OUTPUT);
     solve_transaction_pow(Network::Mainnet, &mut tx, BASE_TX_FEE);
     (keypair, utxo, tx, BASE_TX_FEE)
 }
 
 fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Transaction, u64) {
     let keypair = generate_from_seed(b"atho-adversarial-spend-two").expect("keypair");
-    let locking_script = payment_script(Network::Mainnet, &keypair);
     let utxo_a = UtxoEntry::new(
         Network::Mainnet,
         [8; 48],
         0,
         u64::MAX / 2,
-        locking_script.clone(),
+        BASE_UNLOCKING_SCRIPT.to_vec(),
         0,
         false,
     );
@@ -430,7 +403,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         [9; 48],
         1,
         u64::MAX / 2,
-        locking_script,
+        BASE_UNLOCKING_SCRIPT.to_vec(),
         0,
         false,
     );
@@ -450,7 +423,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         ],
         outputs: vec![TxOutput {
             value_atoms: u64::MAX / 2 - 10,
-            locking_script: seeded_payment_script(Network::Mainnet, BASE_OUTPUT_SEED),
+            locking_script: BASE_LOCKING_SCRIPT.to_vec(),
         }],
         lock_time: 0,
         witness: vec![],
@@ -1022,12 +995,12 @@ fn fee_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
             }
             6 => {
                 assert_eq!(
-                    subsidy::get_block_reward_atoms(1_259_999),
-                    5_000_000_000_000
+                    subsidy::get_block_reward_atoms(1_679_999),
+                    6_250_000_000_000
                 );
                 assert_eq!(
-                    subsidy::get_block_reward_atoms(1_260_000),
-                    2_500_000_000_000
+                    subsidy::get_block_reward_atoms(1_680_000),
+                    3_125_000_000_000
                 );
             }
             _ => {
@@ -1077,7 +1050,7 @@ fn coinbase_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
                 let mut coinbase = valid_coinbase(Network::Mainnet, height, 0);
                 coinbase.outputs.push(TxOutput {
                     value_atoms: 1,
-                    locking_script: vec![1],
+                    locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                 });
                 let block = valid_block(Network::Mainnet, height, vec![coinbase]);
                 assert!(validate_block_without_pow(&block, height, Network::Mainnet).is_err());
@@ -1270,36 +1243,33 @@ fn header_pow_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> 
 
 fn chain_acceptance_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
     let mut report = CategoryReport::new("chain_acceptance_rollback");
-    let network = Network::Prunetest;
-    let height = 1;
-    let mut solved_valid_block =
-        valid_block(network, height, vec![valid_coinbase(network, height, 0)]);
-    solved_valid_block.header.previous_block_hash = genesis::genesis_state(network).block_hash;
-    solved_valid_block.header.merkle_root = merkle_root(&solved_valid_block.transactions);
-    solved_valid_block.header.witness_root = witness_root(&solved_valid_block.transactions);
-    let solved_valid_block = Miner::new(1).solve_block(solved_valid_block);
     for i in 0..cases {
         report.cases += 1;
         let kind = hash_seed(seed, i as u64) as usize % 6;
+        let height = 1;
+        let mut block = valid_block(
+            Network::Mainnet,
+            height,
+            vec![valid_coinbase(Network::Mainnet, height, 0)],
+        );
+        block.header.previous_block_hash = genesis::genesis_state(Network::Mainnet).block_hash;
+        match kind {
+            0 => block.transactions[0].outputs[0].value_atoms += 1,
+            1 => block.header.timestamp = 0,
+            2 => block.header.network_id = Network::Testnet,
+            3 => block.header.previous_block_hash = [1; 48],
+            4 => block.header.height = 2,
+            _ => {}
+        }
+        block.header.merkle_root = merkle_root(&block.transactions);
+        block.header.witness_root = witness_root(&block.transactions);
         let block = if kind == 5 {
-            solved_valid_block.clone()
+            Miner::new(1).solve_block(block)
         } else {
-            let mut block = valid_block(network, height, vec![valid_coinbase(network, height, 0)]);
-            block.header.previous_block_hash = genesis::genesis_state(network).block_hash;
-            match kind {
-                0 => block.transactions[0].outputs[0].value_atoms += 1,
-                1 => block.header.timestamp = 0,
-                2 => block.header.network_id = Network::Testnet,
-                3 => block.header.previous_block_hash = [1; 48],
-                4 => block.header.height = 2,
-                _ => {}
-            }
-            block.header.merkle_root = merkle_root(&block.transactions);
-            block.header.witness_root = witness_root(&block.transactions);
             block
         };
 
-        let mut node = Node::new(atho_node::config::NodeConfig::new(network));
+        let mut node = Node::new(atho_node::config::NodeConfig::new(Network::Mainnet));
         let node_before = (node.height(), node.tip_hash());
         let node_result = catch_unwind(AssertUnwindSafe(|| node.submit_block(&block)));
         match node_result {
@@ -1327,7 +1297,7 @@ fn chain_acceptance_attack(cases: usize, seed: u64) -> Result<CategoryReport, St
             Err(_) => report.fail_panic(format!("case={i} kind={kind} panic in node path")),
         }
 
-        let mut storage = StorageChainstate::new(network);
+        let mut storage = StorageChainstate::new(Network::Mainnet);
         let storage_result = catch_unwind(AssertUnwindSafe(|| storage.connect_block(&block)));
         match storage_result {
             Ok(Ok(())) => {

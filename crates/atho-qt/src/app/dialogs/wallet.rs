@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Wallet creation, import, and recovery dialogs.
 use crate::app::{mnemonic_ui, widgets, DesktopApp, LaunchPage, MnemonicWalletPreparationRequest};
 use atho_wallet::mnemonic::MnemonicPhrase;

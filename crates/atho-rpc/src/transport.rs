@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Length-delimited RPC transport framing.
 use crate::request::RpcRequest;
 use crate::response::RpcResponse;

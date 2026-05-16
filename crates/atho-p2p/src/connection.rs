@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Live peer connection state and event reporting.
 use crate::address_manager::{format_remote_addr, AddressManager};
 use crate::banlist::BanList;
@@ -307,6 +310,12 @@ impl ConnectionManager {
     pub fn note_peer_tip(&mut self, remote_addr: &str, height: u64, tip_hash: Hash48) {
         if let Some(session) = self.sessions.get_mut(remote_addr) {
             session.handshake.note_remote_tip(height, tip_hash);
+        }
+    }
+
+    pub fn replace_peer_tip(&mut self, remote_addr: &str, height: u64, tip_hash: Hash48) {
+        if let Some(session) = self.sessions.get_mut(remote_addr) {
+            session.handshake.replace_remote_tip(height, tip_hash);
         }
     }
 

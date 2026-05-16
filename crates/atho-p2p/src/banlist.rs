@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Peer banlist and temporary network isolation state.
 use crate::config::network_params;
 use atho_core::network::Network;

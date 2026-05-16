@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! RPC request types accepted by the Atho node service.
 use crate::command::CommandInvocation;
 use atho_core::block::Block;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use std::path::Path;
 
 use atho_core::network::Network;
@@ -251,10 +254,10 @@ fn default_renderer_choice(is_windows: bool) -> RendererChoice {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  atho-qt [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
+        "  atho-qt [--network <testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
     );
     eprintln!(
-        "  atho-qt --local-node [--network <mainnet|testnet|regnet|prunetest>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
+        "  atho-qt --local-node [--network <testnet|regnet|prunetest>] [--peer HOST:PORT] [--p2p-addr HOST:PORT] [--data-dir PATH] [--renderer <glow|wgpu>]"
     );
     eprintln!("    --local-node starts a managed athod child process over RPC");
 }

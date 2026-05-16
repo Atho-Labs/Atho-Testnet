@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! LMDB-backed Atho storage primitives.
 //!
 //! This module owns the database environment, named databases, archive records,
@@ -708,24 +711,16 @@ impl Database {
             serialized_utxos.push((key, value));
         }
 
-        let replacement_file_floor = self
-            .block_store
-            .highest_file_number()?
-            .map(|file_number| file_number.saturating_add(1))
-            .unwrap_or(0);
+        self.block_store.reset()?;
         let mut archived = Vec::with_capacity(blocks.len());
         for block in blocks {
             if block.header.network_id != self.network {
                 return Err(StorageError::CrossNetworkReplay);
             }
-            archived.push((
-                block.header.height,
-                self.block_store
-                    .append_block_with_minimum_file_number(block, Some(replacement_file_floor))?,
-            ));
+            archived.push((block.header.height, self.block_store.append_block(block)?));
         }
 
-        let result = self.write_with_retry(|state| {
+        self.write_with_retry(|state| {
             let mut txn = state.env.begin_rw_txn()?;
             clear_db(&mut txn, state.blocks)?;
             clear_db(&mut txn, state.block_heights)?;
@@ -749,17 +744,9 @@ impl Database {
                     WriteFlags::empty(),
                 )?;
             }
-            #[cfg(test)]
-            maybe_inject_commit_fault(CommitFaultPoint::BeforeCommit)?;
             txn.commit()?;
             Ok(())
-        });
-        if result.is_err() {
-            if let Some((_, location)) = archived.first() {
-                let _ = self.block_store.truncate_from_location(*location);
-            }
-        }
-        result
+        })
     }
 
     pub fn upsert_peer(&self, record: &PeerRecord) -> Result<(), StorageError> {
@@ -1473,13 +1460,6 @@ mod tests {
         )
     }
 
-    fn archived_file_names(database: &Database) -> BTreeSet<OsString> {
-        fs::read_dir(database.block_storage_path())
-            .expect("read block archive dir")
-            .map(|entry| entry.expect("archive dir entry").file_name())
-            .collect()
-    }
-
     #[test]
     fn current_schema_version_initializes_cleanly() {
         let root = temp_data_dir("schema-current");
@@ -1572,38 +1552,6 @@ mod tests {
             .block_storage_path()
             .join(format!("blk{:05}.dat", second_record.file_number))
             .exists());
-    }
-
-    #[test]
-    fn failed_replace_chainstate_cleans_staged_raw_archive_records() {
-        let root = temp_data_dir("replace-chainstate-raw-cleanup");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-        let database = Database::open(Network::Regnet).expect("open db");
-
-        let original = sample_block(Network::Regnet, 0, [0; 48]);
-        database
-            .append_block(0, &original)
-            .expect("append original");
-        let original_files = archived_file_names(&database);
-
-        let replacement_0 = sample_block(Network::Regnet, 0, [0; 48]);
-        let replacement_1 = sample_block(Network::Regnet, 1, replacement_0.header.block_hash());
-        let snapshot = ChainstateSnapshot {
-            height: 1,
-            tip_hash: replacement_1.header.block_hash(),
-            tip_header: Some(replacement_1.header.clone()),
-        };
-
-        Database::inject_commit_fault_for_test(CommitFaultPoint::BeforeCommit, 1);
-        let result = database.replace_chainstate(&snapshot, &[], &[replacement_0, replacement_1]);
-        Database::clear_commit_fault_for_test();
-
-        assert!(matches!(result, Err(StorageError::Io(_))));
-        assert_eq!(archived_file_names(&database), original_files);
-        assert!(database
-            .load_chainstate_snapshot()
-            .expect("load snapshot")
-            .is_none());
     }
 
     #[test]

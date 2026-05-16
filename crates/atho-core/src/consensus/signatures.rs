@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::block::Block;
 use crate::crypto::hash::sha3_384;
 use crate::genesis::genesis_hash;

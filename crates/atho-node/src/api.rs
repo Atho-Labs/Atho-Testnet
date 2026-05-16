@@ -1,9 +1,12 @@
-//! Read-only HTTP API layer for explorer and node-status use cases.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
+//! HTTP API layer for explorer, node-status, and optional transaction broadcast use cases.
 //!
-//! The public surface here is intentionally narrow: GET endpoints only, local
-//! bind by default, explicit CORS allowlist, and no wallet/admin/mining write
-//! paths. HTTP callers read through the existing node service boundary rather
-//! than touching LMDB state directly.
+//! The public surface here stays narrow by default: local bind, explicit CORS
+//! allowlist, rate limits, and read-only routes unless wallet write support is
+//! explicitly enabled. HTTP callers read through the existing node service
+//! boundary rather than touching LMDB state directly.
 use crate::config::ApiConfig;
 use crate::dev;
 use crate::mempool::MempoolEntry;
@@ -11,8 +14,9 @@ use crate::service::NodeService;
 use atho_core::address::decode_base56_address;
 use atho_core::consensus::{params::consensus_params_for_network, subsidy};
 use atho_core::constants::{
-    ATOMS_PER_ATHO, MAX_STANDARD_OUTPUTS, MIN_OUTPUT_AMOUNT_ATOMS,
-    MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE, MIN_TX_FEE_ATOMS, TX_POW_MAX_BITS, TX_POW_MIN_BITS,
+    ATOMS_PER_ATHO, BLOCKS_PER_YEAR, MAX_STANDARD_INPUTS, MAX_STANDARD_OUTPUTS,
+    MAX_TRANSACTION_RAW_BYTES, MIN_OUTPUT_AMOUNT_ATOMS, MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE,
+    MIN_TX_FEE_ATOMS, TX_POW_MAX_BITS, TX_POW_MIN_BITS,
 };
 use atho_core::network::Network;
 use atho_rpc::command::CommandInvocation;
@@ -21,6 +25,7 @@ use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -29,6 +34,7 @@ const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
 const MAX_QUERY_PARAMS: usize = 16;
 const MAX_QUERY_KEY_BYTES: usize = 64;
 const MAX_QUERY_VALUE_BYTES: usize = 256;
+const MAX_TX_BROADCAST_BODY_BYTES: usize = MAX_TRANSACTION_RAW_BYTES * 2 + 4096;
 
 pub fn bind_http_server(config: &ApiConfig) -> Result<Server, String> {
     Server::http(config.bind_address()).map_err(|err| err.to_string())
@@ -99,7 +105,7 @@ struct SupplySnapshot {
 }
 
 impl HttpApiState {
-    fn handle_request(&self, request: Request) {
+    fn handle_request(&self, mut request: Request) {
         let method = request.method().clone();
         let url = request.url().to_string();
         let remote_ip = request
@@ -112,10 +118,22 @@ impl HttpApiState {
             .and_then(|origin| self.resolve_allowed_origin(origin));
 
         let (path, query) = split_url(&url);
-        let reply = match self.dispatch(
+        let body = if method == Method::Post {
+            match read_limited_body(&mut request, MAX_TX_BROADCAST_BODY_BYTES) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    let reply = self.error_reply(self.config.explorer.network, error, allow_origin);
+                    return self.respond(request, reply, &remote_ip, &method, &path);
+                }
+            }
+        } else {
+            None
+        };
+        let reply = match self.dispatch_with_body(
             &method,
             &path,
             &query,
+            body.as_deref(),
             &remote_ip,
             origin.is_some(),
             allow_origin.clone(),
@@ -124,6 +142,17 @@ impl HttpApiState {
             Err(error) => self.error_reply(self.config.explorer.network, error, allow_origin),
         };
 
+        self.respond(request, reply, &remote_ip, &method, &path);
+    }
+
+    fn respond(
+        &self,
+        request: Request,
+        reply: ApiReply,
+        remote_ip: &str,
+        method: &Method,
+        path: &str,
+    ) {
         let body = match serde_json::to_vec(&reply.body) {
             Ok(body) => body,
             Err(_) => serde_json::to_vec(&api_error_body(
@@ -147,7 +176,15 @@ impl HttpApiState {
             if let Ok(header) = Header::from_bytes("Vary", "Origin") {
                 response = response.with_header(header);
             }
-            if let Ok(header) = Header::from_bytes("Access-Control-Allow-Methods", "GET, OPTIONS") {
+            let methods = if self.config.wallet_enabled {
+                "GET, POST, OPTIONS"
+            } else {
+                "GET, OPTIONS"
+            };
+            if let Ok(header) = Header::from_bytes("Access-Control-Allow-Methods", methods) {
+                response = response.with_header(header);
+            }
+            if let Ok(header) = Header::from_bytes("Access-Control-Allow-Headers", "Content-Type") {
                 response = response.with_header(header);
             }
         }
@@ -159,11 +196,33 @@ impl HttpApiState {
         );
     }
 
+    #[cfg(test)]
     fn dispatch(
         &self,
         method: &Method,
         path: &str,
         query: &BTreeMap<String, String>,
+        remote_ip: &str,
+        origin_present: bool,
+        allow_origin: Option<String>,
+    ) -> Result<ApiReply, ApiError> {
+        self.dispatch_with_body(
+            method,
+            path,
+            query,
+            None,
+            remote_ip,
+            origin_present,
+            allow_origin,
+        )
+    }
+
+    fn dispatch_with_body(
+        &self,
+        method: &Method,
+        path: &str,
+        query: &BTreeMap<String, String>,
+        body: Option<&str>,
         remote_ip: &str,
         origin_present: bool,
         allow_origin: Option<String>,
@@ -188,7 +247,13 @@ impl HttpApiState {
                 });
         }
 
-        if method != &Method::Get {
+        if method != &Method::Get && method != &Method::Post {
+            return Err(ApiError {
+                status: 405,
+                code: "method_not_allowed",
+            });
+        }
+        if method == &Method::Post && !is_transaction_broadcast_path(path) {
             return Err(ApiError {
                 status: 405,
                 code: "method_not_allowed",
@@ -206,26 +271,51 @@ impl HttpApiState {
             .lock()
             .expect("http api node service mutex poisoned");
         let network = service.network();
-        if !self.config.public_read_only {
+        if method == &Method::Get && !self.config.public_read_only {
             return Err(ApiError {
                 status: 403,
                 code: "public_read_only_required",
             });
         }
 
-        let data = match route_request(&self.config, &mut service, network, path, query) {
-            Ok(data) => data,
-            Err(error) => {
-                let _ = dev::append_log(
-                    "api",
-                    &format!(
-                        "request failed network={} path={} error={}",
-                        network.domain_tag(),
-                        path,
-                        error.code
-                    ),
-                );
-                return Err(error);
+        let data = if method == &Method::Post {
+            match route_post_request(
+                &self.config,
+                &mut service,
+                network,
+                path,
+                query,
+                body.unwrap_or_default(),
+            ) {
+                Ok(data) => data,
+                Err(error) => {
+                    let _ = dev::append_log(
+                        "api",
+                        &format!(
+                            "request failed network={} path={} error={}",
+                            network.domain_tag(),
+                            path,
+                            error.code
+                        ),
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            match route_request(&self.config, &mut service, network, path, query) {
+                Ok(data) => data,
+                Err(error) => {
+                    let _ = dev::append_log(
+                        "api",
+                        &format!(
+                            "request failed network={} path={} error={}",
+                            network.domain_tag(),
+                            path,
+                            error.code
+                        ),
+                    );
+                    return Err(error);
+                }
             }
         };
 
@@ -346,7 +436,6 @@ fn route_request(
     path: &str,
     query: &BTreeMap<String, String>,
 ) -> Result<Value, ApiError> {
-    service.refresh_api_views();
     let parts = path
         .trim_start_matches('/')
         .split('/')
@@ -357,6 +446,12 @@ fn route_request(
             status: 404,
             code: "not_found",
         });
+    }
+
+    if endpoint_requires_explorer_refresh(&parts) {
+        service.refresh_api_views();
+    } else {
+        service.refresh_api_light_views();
     }
 
     match parts.get(2).copied() {
@@ -413,6 +508,100 @@ fn route_request(
             status: 404,
             code: "not_found",
         }),
+    }
+}
+
+fn route_post_request(
+    config: &ApiConfig,
+    service: &mut NodeService,
+    _network: Network,
+    path: &str,
+    query: &BTreeMap<String, String>,
+    body: &str,
+) -> Result<Value, ApiError> {
+    if !config.wallet_enabled {
+        return Err(ApiError {
+            status: 403,
+            code: "wallet_api_disabled",
+        });
+    }
+    if !query.is_empty() {
+        return Err(ApiError {
+            status: 400,
+            code: "invalid_input",
+        });
+    }
+
+    match path {
+        "/api/v1/tx/broadcast" | "/api/v1/tx/sendraw" | "/api/v1/sendrawtransaction" => {
+            let raw_tx_hex = parse_raw_transaction_request_body(body)?;
+            service
+                .broadcast_raw_transaction_hex_value(&raw_tx_hex)
+                .map_err(map_broadcast_rpc_error)
+        }
+        _ => Err(ApiError {
+            status: 405,
+            code: "method_not_allowed",
+        }),
+    }
+}
+
+fn is_transaction_broadcast_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/v1/tx/broadcast" | "/api/v1/tx/sendraw" | "/api/v1/sendrawtransaction"
+    )
+}
+
+fn parse_raw_transaction_request_body(body: &str) -> Result<String, ApiError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError {
+            status: 400,
+            code: "invalid_input",
+        });
+    }
+    if trimmed.starts_with('{') {
+        let value: Value = serde_json::from_str(trimmed).map_err(|_| ApiError {
+            status: 400,
+            code: "invalid_input",
+        })?;
+        for key in [
+            "raw_tx_hex",
+            "transaction_hex",
+            "tx_hex",
+            "raw_transaction_hex",
+        ] {
+            if let Some(raw) = value.get(key).and_then(Value::as_str) {
+                if raw.trim().is_empty() {
+                    break;
+                }
+                return Ok(raw.to_string());
+            }
+        }
+        return Err(ApiError {
+            status: 400,
+            code: "invalid_input",
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+fn map_broadcast_rpc_error(error: RpcError) -> ApiError {
+    let lowered = error
+        .details
+        .as_deref()
+        .unwrap_or(error.message.as_str())
+        .to_ascii_lowercase();
+    if lowered.contains("transaction submission is paused") {
+        return ApiError {
+            status: 503,
+            code: "node_not_synced",
+        };
+    }
+    ApiError {
+        status: 400,
+        code: "rejected_transaction",
     }
 }
 
@@ -729,6 +918,7 @@ fn fees_value(service: &NodeService, network: Network) -> Result<Value, ApiError
         "minimum_tx_fee_atoms": MIN_TX_FEE_ATOMS,
         "minimum_relay_fee_rate_atoms_per_vbyte": MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE,
         "minimum_output_amount_atoms": MIN_OUTPUT_AMOUNT_ATOMS,
+        "max_standard_inputs": MAX_STANDARD_INPUTS,
         "max_standard_outputs": MAX_STANDARD_OUTPUTS,
         "transaction_pow": {
             "hash": "SHA3-256",
@@ -751,9 +941,9 @@ fn fees_value(service: &NodeService, network: Network) -> Result<Value, ApiError
 
 fn supply_value(service: &NodeService, network: Network) -> Result<Value, ApiError> {
     let supply = supply_snapshot(service, network);
-    let schedule = subsidy::emission_schedule_for_network(network);
-    let tail_height = schedule.halving_interval_blocks.saturating_mul(3);
-    let annual_tail_atoms = schedule.blocks_per_year as u128 * schedule.tail_reward_atoms as u128;
+    let tail_height = subsidy::TAIL_EMISSION_START_HEIGHT;
+    let annual_tail_atoms = subsidy::EMISSION_SCHEDULE.blocks_per_year as u128
+        * subsidy::EMISSION_SCHEDULE.tail_reward_atoms as u128;
     Ok(json!({
         "height": supply.height,
         "network_id": network.id(),
@@ -776,10 +966,10 @@ fn supply_value(service: &NodeService, network: Network) -> Result<Value, ApiErr
         "blocks_until_halving": supply.blocks_until_halving,
         "emission_epoch": supply.emission_epoch,
         "coinbase_maturity_blocks": supply.coinbase_maturity_blocks,
-        "initial_block_reward_atoms": schedule.initial_block_reward_atoms,
-        "tail_reward_atoms": schedule.tail_reward_atoms,
+        "initial_block_reward_atoms": subsidy::EMISSION_SCHEDULE.initial_block_reward_atoms,
+        "tail_reward_atoms": subsidy::EMISSION_SCHEDULE.tail_reward_atoms,
         "tail_emission_start_height": tail_height,
-        "blocks_per_year": schedule.blocks_per_year,
+        "blocks_per_year": BLOCKS_PER_YEAR,
         "annual_tail_issuance_atoms": annual_tail_atoms.to_string(),
         "annual_tail_issuance_atho": format_u128_atoms_decimal(annual_tail_atoms),
     }))
@@ -788,6 +978,7 @@ fn supply_value(service: &NodeService, network: Network) -> Result<Value, ApiErr
 fn peers_summary_value(service: &NodeService) -> Result<Value, ApiError> {
     let diagnostics = service.network_diagnostics();
     let network = service.network();
+    let known_peer_addresses = known_peer_addresses_value(service, 128)?;
     Ok(json!({
         "network_id": network.id(),
         "network_name": network.domain_tag(),
@@ -822,6 +1013,7 @@ fn peers_summary_value(service: &NodeService) -> Result<Value, ApiError> {
         "safe_to_serve": diagnostics.safe_to_serve,
         "validation_lag_blocks": diagnostics.validation_lag_blocks,
         "connecting_peer_count": diagnostics.connecting_peer_count,
+        "known_peer_addresses": known_peer_addresses,
         "bytes_sent": diagnostics.bytes_sent,
         "bytes_received": diagnostics.bytes_received,
         "peers": diagnostics.peers.iter().map(|peer| json!({
@@ -973,6 +1165,7 @@ fn network_uptime_value(service: &NodeService) -> Result<Value, ApiError> {
 fn network_peers_value(service: &NodeService) -> Result<Value, ApiError> {
     let diagnostics = service.network_diagnostics();
     let network = service.network();
+    let known_peer_addresses = known_peer_addresses_value(service, 128)?;
     Ok(json!({
         "network_id": network.id(),
         "network_name": network.domain_tag(),
@@ -997,9 +1190,14 @@ fn network_peers_value(service: &NodeService) -> Result<Value, ApiError> {
         "untrusted_downloaded_blocks": diagnostics.untrusted_downloaded_blocks,
         "connecting_peers": diagnostics.connecting_peer_count,
         "known_nodes": service.known_node_count(),
+        "known_peer_addresses": known_peer_addresses,
         "bytes_sent": diagnostics.bytes_sent,
         "bytes_received": diagnostics.bytes_received,
     }))
+}
+
+fn known_peer_addresses_value(service: &NodeService, limit: usize) -> Result<Value, ApiError> {
+    command_value(service, "getnodeaddresses", vec![limit.to_string()])
 }
 
 fn network_difficulty_value(service: &NodeService) -> Result<Value, ApiError> {
@@ -1072,17 +1270,17 @@ fn supply_snapshot(service: &NodeService, network: Network) -> SupplySnapshot {
     let max_supply_atoms = subsidy::max_supply_atoms_for_network(network);
     let current_block_reward_atoms =
         subsidy::block_subsidy_atoms_for_network(network, height.saturating_add(1));
-    let schedule = subsidy::emission_schedule_for_network(network);
-    let tail_emission_start_height = schedule.halving_interval_blocks.saturating_mul(3);
-    let tail_epoch = tail_emission_start_height / schedule.halving_interval_blocks;
-    let emission_epoch = (height / schedule.halving_interval_blocks).min(tail_epoch);
-    let next_halving_height = if height >= tail_emission_start_height {
+    let tail_epoch =
+        subsidy::TAIL_EMISSION_START_HEIGHT / subsidy::EMISSION_SCHEDULE.halving_interval_blocks;
+    let emission_epoch =
+        (height / subsidy::EMISSION_SCHEDULE.halving_interval_blocks).min(tail_epoch);
+    let next_halving_height = if height >= subsidy::TAIL_EMISSION_START_HEIGHT {
         None
     } else {
         Some(
             emission_epoch
                 .saturating_add(1)
-                .saturating_mul(schedule.halving_interval_blocks),
+                .saturating_mul(subsidy::EMISSION_SCHEDULE.halving_interval_blocks),
         )
     };
     let blocks_until_halving = next_halving_height.map(|next| next.saturating_sub(height));
@@ -1176,6 +1374,10 @@ fn ensure_explorer_index_available(service: &NodeService) -> Result<(), ApiError
     Ok(())
 }
 
+fn endpoint_requires_explorer_refresh(parts: &[&str]) -> bool {
+    matches!(parts.get(2).copied(), Some("address"))
+}
+
 fn parse_hash48_value(value: &str) -> Result<[u8; 48], ApiError> {
     let bytes = hex::decode(value).map_err(|_| ApiError {
         status: 400,
@@ -1209,6 +1411,38 @@ fn split_url(url: &str) -> (String, BTreeMap<String, String>) {
     let path = parts.next().unwrap_or("/").to_string();
     let query = parts.next().map(parse_query_string).unwrap_or_default();
     (path, query)
+}
+
+fn read_limited_body(request: &mut Request, max_bytes: usize) -> Result<String, ApiError> {
+    if request
+        .body_length()
+        .is_some_and(|body_length| body_length > max_bytes)
+    {
+        return Err(ApiError {
+            status: 413,
+            code: "request_too_large",
+        });
+    }
+
+    let mut bytes = Vec::new();
+    request
+        .as_reader()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApiError {
+            status: 400,
+            code: "invalid_input",
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(ApiError {
+            status: 413,
+            code: "request_too_large",
+        });
+    }
+    String::from_utf8(bytes).map_err(|_| ApiError {
+        status: 400,
+        code: "invalid_input",
+    })
 }
 
 fn parse_query_string(query: &str) -> BTreeMap<String, String> {
@@ -1806,17 +2040,20 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    crate::dev::seed_locking_script(Network::Testnet, seed_script)
-                        .expect("seed locking script"),
+                    seed_script.clone(),
                     0,
                     false,
                 )],
             )
             .expect("seed chainstate");
 
-            let tx1 =
-                signed_spend_transaction(Network::Testnet, seed_txid, seed_value, seed_script)
-                    .expect("signed first spend");
+            let tx1 = signed_spend_transaction(
+                Network::Testnet,
+                seed_txid,
+                seed_value,
+                seed_script.clone(),
+            )
+            .expect("signed first spend");
             let tx1id = tx1.txid();
             let tx1_fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx1);
             let tx1_output_value = tx1.outputs[0].value_atoms;
@@ -1829,7 +2066,7 @@ mod tests {
                 Network::Testnet,
                 tx1id,
                 tx1_output_value,
-                seed_script.saturating_add(1),
+                seed_script.clone(),
             )
             .expect("signed second spend");
             let fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx2);
@@ -2045,6 +2282,101 @@ mod tests {
     }
 
     #[test]
+    fn transaction_broadcast_route_is_disabled_by_default() {
+        let (state, _guard) = test_state(Network::Regnet);
+        let err = state
+            .dispatch_with_body(
+                &Method::Post,
+                "/api/v1/tx/broadcast",
+                &BTreeMap::new(),
+                Some(r#"{"raw_tx_hex":"00"}"#),
+                "127.0.0.1",
+                true,
+                Some(String::from("https://atho.io")),
+            )
+            .unwrap_err();
+        assert_eq!(err.status, 403);
+        assert_eq!(err.code, "wallet_api_disabled");
+    }
+
+    #[test]
+    fn transaction_broadcast_route_accepts_signed_raw_transaction_when_enabled() {
+        let (mut service, _guard) = test_service(Network::Regnet);
+        let mut config = NodeConfig::new(Network::Regnet).api;
+        config.wallet_enabled = true;
+
+        let (seed_txid, seed_value, seed_script) = seed_utxo(Network::Regnet);
+        service.sandbox_with_node_mut(|node| {
+            node.dev_seed_chainstate(
+                6,
+                node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    seed_script.clone(),
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed spendable utxo");
+        });
+        let transaction =
+            signed_spend_transaction(Network::Regnet, seed_txid, seed_value, seed_script)
+                .expect("signed transaction");
+        let txid = transaction.txid();
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &transaction);
+        let body = json!({
+            "raw_tx_hex": hex::encode(transaction.full_bytes()),
+        })
+        .to_string();
+        let state = HttpApiState {
+            shared: Arc::new(Mutex::new(service)),
+            config,
+            rate_limiter: Mutex::new(RateLimiter::default()),
+        };
+
+        let reply = state
+            .dispatch_with_body(
+                &Method::Post,
+                "/api/v1/tx/broadcast",
+                &BTreeMap::new(),
+                Some(&body),
+                "127.0.0.1",
+                true,
+                Some(String::from("https://atho.io")),
+            )
+            .expect("broadcast response");
+
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body["success"], true);
+        assert_eq!(reply.body["data"]["accepted"], true);
+        assert_eq!(reply.body["data"]["txid"], hex::encode(txid));
+        assert_eq!(reply.body["data"]["fee_atoms"], fee_atoms);
+        let guard = state.shared.lock().expect("state");
+        assert!(guard.node_ref().mempool_contains(&txid));
+    }
+
+    #[test]
+    fn transaction_broadcast_body_accepts_json_or_plain_hex() {
+        assert_eq!(
+            parse_raw_transaction_request_body(r#"{"raw_tx_hex":"0abc"}"#).unwrap(),
+            "0abc"
+        );
+        assert_eq!(
+            parse_raw_transaction_request_body("0abc\n").unwrap(),
+            "0abc"
+        );
+        assert_eq!(
+            parse_raw_transaction_request_body(r#"{"fee_atoms":500}"#)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+    }
+
+    #[test]
     fn query_validation_and_response_cap_fail_safely() {
         let (service, _guard) = test_service(Network::Regnet);
         let mut config = NodeConfig::new(Network::Regnet).api;
@@ -2131,8 +2463,8 @@ mod tests {
         assert_eq!(stats["max_supply"], Value::Null);
         assert_eq!(stats["max_supply_label"], "No Fixed Cap");
         assert_eq!(stats["emission_epoch"], 0);
-        assert_eq!(stats["next_halving_height"], 1_260_000);
-        assert_eq!(stats["blocks_until_halving"], 1_260_000);
+        assert_eq!(stats["next_halving_height"], 1_680_000);
+        assert_eq!(stats["blocks_until_halving"], 1_680_000);
         assert_eq!(
             stats["latest_block_hash"],
             hex::encode(genesis::genesis_hash(Network::Regnet))
@@ -2165,9 +2497,9 @@ mod tests {
         assert_eq!(supply["max_supply_atoms"], Value::Null);
         assert_eq!(supply["max_supply"], Value::Null);
         assert_eq!(supply["max_supply_label"], "No Fixed Cap");
-        assert_eq!(supply["current_block_reward_atoms"], 5_000_000_000_000u64);
-        assert_eq!(supply["next_halving_height"], 1_260_000);
-        assert_eq!(supply["blocks_until_halving"], 1_260_000);
+        assert_eq!(supply["current_block_reward_atoms"], 6_250_000_000_000u64);
+        assert_eq!(supply["next_halving_height"], 1_680_000);
+        assert_eq!(supply["blocks_until_halving"], 1_680_000);
         assert_eq!(supply["emission_epoch"], 0);
         assert_eq!(supply["coinbase_maturity_blocks"], 150);
     }
@@ -2183,8 +2515,8 @@ mod tests {
         });
 
         let mut fork = Node::new(NodeConfig::new(Network::Regnet));
-        mine_with_timestamp_offset(&mut fork, &miner, 1_000);
-        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 1_001);
+        mine_with_timestamp_offset(&mut fork, &miner, 10_000);
+        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 10_001);
         let fork_tip_hash = fork_block_2.header.block_hash();
         let reward_digest: [u8; 32] = fork_block_2.transactions[0].outputs[0]
             .locking_script

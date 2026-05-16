@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Canonical Atho transaction and witness encoding.
 //!
 //! This module defines the transaction body, the attached witness payload, and

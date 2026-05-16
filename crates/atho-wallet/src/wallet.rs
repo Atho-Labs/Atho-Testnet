@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! High-level Atho wallet model.
 //!
 //! The wallet combines deterministic seed derivation, HD address generation,
@@ -11,7 +14,7 @@ use crate::hd::{AddressKind, DerivationPath, HdWallet, WalletSeed};
 use crate::keypool::Keypool;
 use crate::mnemonic::MnemonicPhrase;
 use crate::snapshot::WalletSnapshot;
-use atho_core::address::address_parts_from_public_key;
+use atho_core::address::{address_parts_from_public_key, is_canonical_payment_locking_script};
 use atho_core::consensus::signatures::{
     transaction_signing_digest_for_input_indexes, AthoSignatureDomain,
 };
@@ -31,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub const DEFAULT_RESTORE_GAP_LIMIT: usize = 1_000;
 pub const WALLET_DATAFILE_NAME: &str = ".datafile";
@@ -95,6 +99,8 @@ pub enum WalletSpendBuildError {
     WrongNetwork,
     #[error("selected inputs do not belong to the requested spend address")]
     InputOwnershipMismatch,
+    #[error("selected input uses a non-canonical locking script")]
+    NonCanonicalLockingScript,
     #[error("amount must be at least the minimum spendable output")]
     AmountBelowMinimumOutput,
     #[error("amount must exceed the network fee")]
@@ -153,8 +159,8 @@ impl Wallet {
     where
         F: FnMut(usize, usize),
     {
-        let root_seed = mnemonic.root_seed(passphrase);
-        let wallet_seed = WalletSeed(sha3_256(&root_seed));
+        let root_seed = Zeroizing::new(mnemonic.root_seed(passphrase));
+        let wallet_seed = WalletSeed(sha3_256(root_seed.as_ref()));
         let mut wallet = Self {
             network,
             mnemonic: Some(mnemonic),
@@ -307,7 +313,9 @@ impl Wallet {
     /// WALLET SECURITY: The derivation mixes the network tag and path so keys
     /// are not silently reused across networks or address roles.
     pub fn keypair_for_path(&self, path: DerivationPath) -> FalconKeypair {
-        let mut bytes = Vec::with_capacity(32 + 4 + 1 + 4 + 1 + self.network.id().len());
+        let mut bytes = Zeroizing::new(Vec::with_capacity(
+            32 + 4 + 1 + 4 + 1 + self.network.id().len(),
+        ));
         bytes.extend_from_slice(self.hd_wallet.seed());
         bytes.extend_from_slice(self.network.domain_tag().as_bytes());
         bytes.extend_from_slice(&path.account.to_le_bytes());
@@ -316,7 +324,7 @@ impl Wallet {
             AddressKind::Change => 1,
         });
         bytes.extend_from_slice(&path.index.to_le_bytes());
-        falcon::generate_from_seed(&sha3_384(&bytes)).expect("falcon keygen available")
+        falcon::generate_from_seed(&sha3_384(bytes.as_ref())).expect("falcon keygen available")
     }
 
     pub fn build_signed_payment_transaction(
@@ -803,6 +811,9 @@ impl Wallet {
             .collect::<BTreeMap<_, _>>();
         let mut grouped_inputs = BTreeMap::<Vec<u8>, Vec<u32>>::new();
         for (input_index, utxo) in selected_utxos.iter().enumerate() {
+            if !is_canonical_payment_locking_script(utxo.locking_script.as_slice()) {
+                return Err(WalletSpendBuildError::NonCanonicalLockingScript);
+            }
             grouped_inputs
                 .entry(utxo.locking_script.clone())
                 .or_default()
@@ -1212,6 +1223,23 @@ mod tests {
     }
 
     #[test]
+    fn signer_input_groups_reject_noncanonical_selected_locking_script() {
+        let mut wallet = Wallet::from_mnemonic(phrase(), "", Network::Regnet);
+        let funded_address = wallet.checkout_receive_address();
+        let selected_utxos = vec![WalletSpendUtxo {
+            previous_txid: [0x78; 48],
+            output_index: 0,
+            value_atoms: 10_000,
+            locking_script: funded_address.payment_digest[..31].to_vec(),
+        }];
+
+        let err = wallet
+            .signer_input_groups(&selected_utxos)
+            .expect_err("legacy lock should be rejected before signer selection");
+        assert_eq!(err, WalletSpendBuildError::NonCanonicalLockingScript);
+    }
+
+    #[test]
     fn wallet_exposes_mnemonic_sentence_when_present() {
         let wallet = Wallet::from_mnemonic(phrase(), "", Network::Mainnet);
         assert!(wallet.mnemonic_phrase().is_some());
@@ -1219,6 +1247,19 @@ mod tests {
             wallet.mnemonic_sentence(),
             Some(wallet.mnemonic_phrase().unwrap().as_sentence())
         );
+    }
+
+    #[test]
+    fn wallet_debug_does_not_expose_mnemonic_or_seed_material() {
+        let phrase = phrase();
+        let sentence = phrase.as_sentence();
+        let wallet = Wallet::from_mnemonic(phrase, "pass", Network::Mainnet);
+        let rendered = format!("{wallet:?}");
+
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&sentence));
+        assert!(!rendered.contains("WalletSeed(["));
+        assert!(!rendered.contains("SecretBytes(["));
     }
 
     #[test]

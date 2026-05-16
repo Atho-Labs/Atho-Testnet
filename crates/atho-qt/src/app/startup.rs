@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Startup and first-run screens for the desktop client.
 use super::{dialogs, widgets, DesktopApp, LaunchPage};
 use crate::resources;

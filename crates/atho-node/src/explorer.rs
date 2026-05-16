@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Read-only explorer index derived from canonical chainstate data.
 //!
 //! The explorer index avoids full-chain scans on every address lookup by

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Consensus configuration and deterministic validation helpers.
 //!
 //! Submodules in this namespace define protocol versions, proof-of-work rules,

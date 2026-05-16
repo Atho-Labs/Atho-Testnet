@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Top-level desktop application state and event handling.
 use crate::connection::{ConnectionStatus, ReadOnlyNodeConnection, StatusMonitor};
 use crate::error::QtError;
@@ -82,6 +85,11 @@ const MAX_WALLET_DISCOVERY_SCAN_LIMIT: usize = 20_000;
 const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
 const WALLET_PREPARATION_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const WALLET_SCAN_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+const WALLET_SCAN_MAX_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+const WALLET_SCAN_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const WALLET_SCAN_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const MINING_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const MINING_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const MINING_TEMPLATE_WATCH_INTERVAL: Duration = Duration::from_millis(500);
 const MINING_TEMPLATE_WATCH_SLEEP_SLICE: Duration = Duration::from_millis(50);
 const QR_EXPORT_MODULE_BLACK: [u8; 4] = [24, 24, 24, 255];
@@ -143,10 +151,14 @@ pub struct DesktopApp {
     wallet_preparation_total: usize,
     wallet_scan_job: Option<WalletScanJob>,
     wallet_readiness_gate_active: bool,
+    wallet_scan_retry_after: Option<Instant>,
+    wallet_scan_failure_count: u32,
     mining_status: String,
     mining_accelerator_info: MiningAcceleratorInfo,
     mining_job: Option<MiningJob>,
     pending_mining_restart: Option<u32>,
+    mining_retry_after: Option<Instant>,
+    mining_failure_count: u32,
     last_mined_height: Option<u64>,
     last_mined_block_hash: Option<[u8; 48]>,
     last_mined_at_unix: Option<u64>,
@@ -281,6 +293,7 @@ struct WalletRegistryEntry {
 #[derive(Debug)]
 struct WalletScanJob {
     started_at: Instant,
+    scan_limit: usize,
     cancel_requested: Arc<AtomicBool>,
     receiver: mpsc::Receiver<Result<WalletScanOutcome, String>>,
 }
@@ -421,10 +434,14 @@ impl DesktopApp {
             wallet_preparation_total: 0,
             wallet_scan_job: None,
             wallet_readiness_gate_active: false,
+            wallet_scan_retry_after: None,
+            wallet_scan_failure_count: 0,
             mining_status: String::from("Idle"),
             mining_accelerator_info: MiningAcceleratorInfo::unavailable("probe pending"),
             mining_job: None,
             pending_mining_restart: None,
+            mining_retry_after: None,
+            mining_failure_count: 0,
             last_mined_height: None,
             last_mined_block_hash: None,
             last_mined_at_unix: None,
@@ -910,6 +927,8 @@ impl DesktopApp {
         self.wallet_balance_cache = 0;
         self.wallet_cache_dirty = true;
         self.wallet_readiness_gate_active = false;
+        self.wallet_scan_retry_after = None;
+        self.wallet_scan_failure_count = 0;
         self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
         self.wallet_discovery_scan_limit = WALLET_DISCOVERY_SCAN_STEPS[0];
         self.wallet_discovery_scan_limit_cached = 0;
@@ -923,6 +942,8 @@ impl DesktopApp {
         self.send_include_fee_in_total = false;
         self.send_status = String::from("Enter a destination address and amount.");
         self.mining_status = String::from("Idle");
+        self.mining_retry_after = None;
+        self.mining_failure_count = 0;
         self.last_mined_height = None;
         self.last_mined_block_hash = None;
         self.last_mined_at_unix = None;
@@ -1486,6 +1507,7 @@ impl DesktopApp {
 
         self.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now(),
+            scan_limit,
             cancel_requested,
             receiver,
         });
@@ -1522,6 +1544,8 @@ impl DesktopApp {
         self.wallet_balance_cache = outcome.wallet_balance_cache;
         self.wallet_balance_summary_cache = outcome.wallet_balance_summary_cache;
         self.wallet_activity_cache = outcome.wallet_activity_cache;
+        self.wallet_scan_retry_after = None;
+        self.wallet_scan_failure_count = 0;
         self.refresh_receive_address_rows();
         let continue_scanning = if Self::should_expand_wallet_discovery_scan_limit(
             self.wallet_discovery_scan_limit,
@@ -1575,7 +1599,7 @@ impl DesktopApp {
                 {
                     self.wallet_cache_dirty = true;
                     self.release_wallet_readiness_gate("wallet scan deferred");
-                    self.last_wallet_refresh_at = Instant::now();
+                    self.schedule_wallet_scan_retry("wallet scan deferred");
                     let _ = atho_node::dev::append_log(
                         "atho-qt",
                         &format!("wallet scan deferred error={err}"),
@@ -1584,6 +1608,7 @@ impl DesktopApp {
                 }
                 self.wallet_cache_dirty = true;
                 self.wallet_readiness_gate_active = false;
+                self.schedule_wallet_scan_retry("wallet scan worker failed");
                 self.last_error = Some(err.clone());
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -1591,15 +1616,20 @@ impl DesktopApp {
                 );
             }
             Err(mpsc::TryRecvError::Empty) => {
-                if job.started_at.elapsed() >= WALLET_SCAN_STALL_TIMEOUT {
+                let timeout = Self::wallet_scan_stall_timeout(job.scan_limit);
+                if job.started_at.elapsed() >= timeout {
+                    job.cancel_requested.store(true, Ordering::Release);
                     self.wallet_cache_dirty = true;
                     self.wallet_readiness_gate_active = false;
+                    self.schedule_wallet_scan_retry("wallet scan timed out");
                     self.last_error = Some(String::from("wallet scan timed out"));
                     let _ = atho_node::dev::append_log(
                         "atho-qt",
                         &format!(
-                            "wallet scan timed out elapsed_ms={}",
-                            job.started_at.elapsed().as_millis()
+                            "wallet scan timed out scan_limit={} elapsed_ms={} timeout_ms={}",
+                            job.scan_limit,
+                            job.started_at.elapsed().as_millis(),
+                            timeout.as_millis()
                         ),
                     );
                     return;
@@ -1610,6 +1640,7 @@ impl DesktopApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.wallet_cache_dirty = true;
                 self.wallet_readiness_gate_active = false;
+                self.schedule_wallet_scan_retry("wallet scan worker disconnected");
                 self.last_error = Some(String::from("wallet scan worker disconnected"));
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
@@ -1637,10 +1668,44 @@ impl DesktopApp {
             self.release_wallet_readiness_gate("wallet scan RPC not ready");
             return;
         }
+        if let Some(retry_after) = self.wallet_scan_retry_after {
+            if Instant::now() < retry_after {
+                return;
+            }
+            self.wallet_scan_retry_after = None;
+        }
         if self.last_wallet_refresh_at.elapsed() < Duration::from_millis(250) {
             return;
         }
         self.start_wallet_scan_job();
+    }
+
+    fn wallet_scan_stall_timeout(scan_limit: usize) -> Duration {
+        let extra_secs = ((scan_limit.saturating_sub(1) / 500) as u64).saturating_mul(5);
+        WALLET_SCAN_STALL_TIMEOUT
+            .saturating_add(Duration::from_secs(extra_secs))
+            .min(WALLET_SCAN_MAX_STALL_TIMEOUT)
+    }
+
+    fn schedule_wallet_scan_retry(&mut self, reason: &str) {
+        self.wallet_scan_failure_count = self.wallet_scan_failure_count.saturating_add(1);
+        let shift = self.wallet_scan_failure_count.saturating_sub(1).min(5);
+        let factor = 1u32 << shift;
+        let delay = WALLET_SCAN_BACKOFF_BASE
+            .checked_mul(factor)
+            .unwrap_or(WALLET_SCAN_BACKOFF_MAX)
+            .min(WALLET_SCAN_BACKOFF_MAX);
+        self.wallet_scan_retry_after = Instant::now().checked_add(delay);
+        self.last_wallet_refresh_at = Instant::now();
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "wallet scan retry scheduled reason={} delay_ms={} failures={}",
+                reason,
+                delay.as_millis(),
+                self.wallet_scan_failure_count
+            ),
+        );
     }
 
     fn release_wallet_readiness_gate(&mut self, reason: &str) {
@@ -1972,6 +2037,8 @@ impl DesktopApp {
                 self.last_mined_height = Some(outcome.height);
                 self.last_mined_block_hash = Some(outcome.block_hash);
                 self.last_mined_at_unix = Some(current_unix_seconds());
+                self.mining_retry_after = None;
+                self.mining_failure_count = 0;
                 let mut backend_parts = vec![format!("backend={}", outcome.backend_used)];
                 if let Some(accelerator) = outcome.accelerator_label.as_deref() {
                     backend_parts.push(format!("device={accelerator}"));
@@ -2080,26 +2147,50 @@ impl DesktopApp {
                 }
             }
             Ok(MiningJobResult::Failed(err)) => {
-                self.mining_status = format!("Mining failed: {err}");
-                self.last_error = Some(err.clone());
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     &format!("mining worker failed error={err}"),
                 );
                 self.pending_mining_restart = None;
+                if self.ui_state.generate_coins
+                    && !job.stop_requested.load(Ordering::Acquire)
+                    && mining_error_is_retryable(&err)
+                {
+                    let delay = self.schedule_mining_retry(&err);
+                    self.mining_status = format!(
+                        "Mining paused after transient error: {err}; retrying in {}s",
+                        delay.as_secs().max(1)
+                    );
+                    self.last_error = Some(err.clone());
+                } else {
+                    self.mining_status = format!("Mining failed: {err}");
+                    self.last_error = Some(err.clone());
+                    self.mining_retry_after = None;
+                    self.mining_failure_count = 0;
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {
                 self.mining_job = Some(job);
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.mining_status = String::from("Mining worker disconnected");
                 self.last_error = Some(String::from("mining worker disconnected"));
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     "mining worker disconnected error=channel closed",
                 );
                 self.pending_mining_restart = None;
+                if self.ui_state.generate_coins && !job.stop_requested.load(Ordering::Acquire) {
+                    let delay = self.schedule_mining_retry("mining worker disconnected");
+                    self.mining_status = format!(
+                        "Mining worker disconnected; retrying in {}s",
+                        delay.as_secs().max(1)
+                    );
+                } else {
+                    self.mining_status = String::from("Mining worker disconnected");
+                    self.mining_retry_after = None;
+                    self.mining_failure_count = 0;
+                }
             }
         }
 
@@ -2107,6 +2198,43 @@ impl DesktopApp {
             let elapsed = job.started_at.elapsed();
             self.mining_status = format!("{} ({}s)", self.mining_status, elapsed.as_secs());
         }
+    }
+
+    fn poll_mining_retry(&mut self) {
+        let Some(retry_after) = self.mining_retry_after else {
+            return;
+        };
+        if self.mining_job.is_some() || !self.ui_state.generate_coins {
+            return;
+        }
+        if Instant::now() < retry_after {
+            return;
+        }
+        self.mining_retry_after = None;
+        if self.ui_state.connected && self.wallet.is_some() {
+            self.start_mining_job();
+        }
+    }
+
+    fn schedule_mining_retry(&mut self, reason: &str) -> Duration {
+        self.mining_failure_count = self.mining_failure_count.saturating_add(1);
+        let shift = self.mining_failure_count.saturating_sub(1).min(5);
+        let factor = 1u32 << shift;
+        let delay = MINING_RETRY_BACKOFF_BASE
+            .checked_mul(factor)
+            .unwrap_or(MINING_RETRY_BACKOFF_MAX)
+            .min(MINING_RETRY_BACKOFF_MAX);
+        self.mining_retry_after = Instant::now().checked_add(delay);
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "mining retry scheduled reason={} delay_ms={} failures={}",
+                reason,
+                delay.as_millis(),
+                self.mining_failure_count
+            ),
+        );
+        delay
     }
 
     fn poll_send_job(&mut self) {
@@ -2204,10 +2332,12 @@ impl DesktopApp {
             self.mining_status = String::from("Mining already running");
             return;
         }
+        self.mining_retry_after = None;
         if let Some(reason) = self.wallet_mining_block_reason() {
             self.ui_state.generate_coins = false;
             self.mining_status = reason.clone();
             self.last_error = Some(reason);
+            self.mining_failure_count = 0;
             return;
         }
 
@@ -2307,6 +2437,8 @@ impl DesktopApp {
 
     fn stop_mining_job(&mut self) {
         self.pending_mining_restart = None;
+        self.mining_retry_after = None;
+        self.mining_failure_count = 0;
         self.ui_state.generate_coins = false;
         self.last_error = None;
         if let Some(job) = &self.mining_job {
@@ -2323,6 +2455,8 @@ impl DesktopApp {
         let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
         self.ui_state.mining_cores = cores;
         self.last_error = None;
+        self.mining_retry_after = None;
+        self.mining_failure_count = 0;
         self.refresh_mining_accelerator_info();
         let requested_backend = self.mining_backend_status_hint();
         if self.mining_job.is_some() {
@@ -3982,8 +4116,9 @@ impl DesktopApp {
             return;
         }
         let timestamp_unix = current_unix_seconds();
+        let executable_line = debug_console_executable_line(&line);
 
-        let parsed = match parse_command_line(&line) {
+        let parsed = match parse_command_line(&executable_line) {
             Ok(parsed) => parsed,
             Err(err) => {
                 self.record_debug_console_problem(line, err, Vec::new(), None);
@@ -4582,12 +4717,16 @@ impl eframe::App for DesktopApp {
         self.drain_status_updates();
         self.poll_send_job();
         self.poll_mining_job();
+        self.poll_mining_retry();
         self.poll_wallet_preparation_job();
         self.refresh_wallet_cache_if_needed();
         let repaint_after =
             if self.wallet_preparation_job.is_some() || self.wallet_readiness_gate_active {
                 Duration::from_millis(50)
-            } else if self.mining_job.is_some() || self.send_job.is_some() {
+            } else if self.mining_job.is_some()
+                || self.mining_retry_after.is_some()
+                || self.send_job.is_some()
+            {
                 Duration::from_millis(150)
             } else if self.wallet_cache_dirty || self.active_tab == NavTab::Overview {
                 Duration::from_millis(400)
@@ -4613,6 +4752,27 @@ impl DesktopApp {
             self.apply_connection_status(status);
         }
     }
+}
+
+fn debug_console_executable_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if looks_like_atho_error_code(trimmed) {
+        format!("geterrorcodes {}", trimmed.to_ascii_uppercase())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn looks_like_atho_error_code(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].eq_ignore_ascii_case("ATHO")
+        && !parts[1].is_empty()
+        && parts[1].bytes().all(|byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_lowercase() || byte.is_ascii_digit()
+        })
+        && parts[2].len() == 3
+        && parts[2].bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn default_wallet_path(network: Network) -> PathBuf {
@@ -5194,6 +5354,22 @@ fn mined_block_submit_error_result(
         }
     }
     MiningJobResult::Failed(error.to_string())
+}
+
+fn mining_error_is_retryable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out")
+        || error.contains("timeout")
+        || error.contains("connection refused")
+        || error.contains("connection reset")
+        || error.contains("broken pipe")
+        || error.contains("transport")
+        || error.contains("rpc")
+        || error.contains("not ready")
+        || error.contains("temporar")
+        || error.contains("stale")
+        || error.contains("invalid block height")
+        || error.contains("unexpected rpc response")
 }
 
 fn spawn_mining_template_watcher(
@@ -5779,7 +5955,7 @@ mod tests {
             bytes_sent: 8_192,
             bytes_received: 16_384,
             peers: vec![NetworkPeerDiagnostics {
-                remote_addr: String::from("74.208.219.116:56000"),
+                remote_addr: String::from("162.222.206.163:9100"),
                 direction: NetworkPeerDirection::Outbound,
                 roles: vec![
                     String::from("OUTBOUND_PEER"),
@@ -5832,7 +6008,7 @@ mod tests {
         assert_eq!(app.view_model.bytes_sent, 8_192);
         assert_eq!(app.view_model.bytes_received, 16_384);
         assert_eq!(app.view_model.peers.len(), 1);
-        assert_eq!(app.view_model.peers[0].remote_addr, "74.208.219.116:56000");
+        assert_eq!(app.view_model.peers[0].remote_addr, "162.222.206.163:9100");
         assert_eq!(app.view_model.connecting_peers.len(), 1);
         assert_eq!(
             app.view_model.connecting_peers[0].remote_addr,
@@ -7162,6 +7338,7 @@ mod tests {
         let cancel_requested = Arc::new(AtomicBool::new(false));
         app.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now(),
+            scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
             cancel_requested: Arc::clone(&cancel_requested),
             receiver,
         });
@@ -7207,11 +7384,13 @@ mod tests {
     fn wallet_scan_timeout_releases_readiness_gate() {
         let mut app = DesktopApp::new(Network::Regnet);
         let (_sender, receiver) = mpsc::channel();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
         app.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now()
                 .checked_sub(WALLET_SCAN_STALL_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
-            cancel_requested: Arc::new(AtomicBool::new(false)),
+            scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
+            cancel_requested: Arc::clone(&cancel_requested),
             receiver,
         });
         app.wallet_readiness_gate_active = true;
@@ -7220,6 +7399,8 @@ mod tests {
 
         assert!(app.wallet_scan_job.is_none());
         assert!(!app.wallet_readiness_gate_active);
+        assert!(cancel_requested.load(Ordering::Acquire));
+        assert!(app.wallet_scan_retry_after.is_some());
         assert_eq!(app.last_error.as_deref(), Some("wallet scan timed out"));
     }
 
@@ -7266,6 +7447,7 @@ mod tests {
             .expect("send deferred scan result");
         app.wallet_scan_job = Some(WalletScanJob {
             started_at: Instant::now(),
+            scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
             cancel_requested: Arc::new(AtomicBool::new(false)),
             receiver,
         });
@@ -7275,6 +7457,7 @@ mod tests {
         assert!(app.wallet_scan_job.is_none());
         assert!(app.wallet_cache_dirty);
         assert!(!app.wallet_readiness_gate_active);
+        assert!(app.wallet_scan_retry_after.is_some());
     }
 
     #[test]
@@ -7694,6 +7877,31 @@ mod tests {
         assert_eq!(entry.command_name, "getstatus");
         assert!(entry.output.contains("\"network\""));
         assert_eq!(entry.network_label, "atho-regnet");
+    }
+
+    #[test]
+    fn debug_console_explains_raw_error_code_input() {
+        let root = temp_sandbox_root("debug-console-error-code");
+        let home = root.join("home");
+        let data = root.join("data");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&data).expect("data");
+        let _home = EnvVarGuard::set_path("HOME", &home);
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &data);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let _force_rpc = EnvVarGuard::set_value("ATHO_QT_FORCE_RPC", "0");
+
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.debug_console_input = String::from("ATHO-RPC-002");
+        app.run_debug_console_command();
+
+        assert!(app.last_error.is_none());
+        let entry = app.debug_console_entries.last().expect("console entry");
+        assert!(entry.success);
+        assert_eq!(entry.command_name, "geterrorcodes");
+        assert_eq!(entry.command_line, "ATHO-RPC-002");
+        assert!(entry.output.contains("ATHO-RPC-002"));
+        assert!(entry.output.contains("\"category\""));
     }
 
     #[test]

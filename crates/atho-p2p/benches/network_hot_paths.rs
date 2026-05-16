@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::consensus::rules;
 use atho_core::genesis;
 use atho_core::network::Network;

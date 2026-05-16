@@ -1,4 +1,7 @@
 #![no_main]
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 
 use bincode::Options;
 use libfuzzer_sys::fuzz_target;

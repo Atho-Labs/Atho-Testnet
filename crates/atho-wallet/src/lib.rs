@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho wallet key management, address derivation, and encrypted persistence.
 //!
 //! The wallet crate is responsible for deterministic seed handling, HD address

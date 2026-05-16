@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusRules {
     pub protocol_version: u32,

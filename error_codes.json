@@ -16,7 +16,7 @@
     "severity": "error",
     "title": "Invalid Address Prefix",
     "explanation": "The address prefix does not match the expected Atho network format.",
-    "common_cause": "A mainnet, testnet, or regnet address was used in the wrong context.",
+    "common_cause": "An address was used in the wrong network context.",
     "suggested_fix": "Use an address generated for the active network.",
     "user_facing": true,
     "consensus_critical": false
@@ -61,7 +61,7 @@
     "title": "Invalid Network Selection",
     "explanation": "The requested Atho network mode is not recognized.",
     "common_cause": "An invalid network name was provided through the CLI or environment.",
-    "suggested_fix": "Use one of atho-mainnet, atho-testnet, or atho-regnet.",
+    "suggested_fix": "Use atho-testnet in this repository.",
     "user_facing": true,
     "consensus_critical": false
   },
@@ -71,7 +71,7 @@
     "severity": "critical",
     "title": "Wrong Block Network",
     "explanation": "The block belongs to a different Atho network than the active node.",
-    "common_cause": "A mainnet, testnet, or regnet artifact was submitted to the wrong node.",
+    "common_cause": "A block from a different network context was submitted to this node.",
     "suggested_fix": "Submit the block to a node running the same network.",
     "user_facing": true,
     "consensus_critical": true
@@ -918,7 +918,7 @@
     "severity": "fatal",
     "title": "Persisted Genesis Mismatch",
     "explanation": "The stored genesis state does not match the active network.",
-    "common_cause": "A mainnet, testnet, or regnet database was reused for another network.",
+    "common_cause": "A database from a different network context was reused here.",
     "suggested_fix": "Use a network-specific data directory and resync the chainstate.",
     "user_facing": true,
     "consensus_critical": false

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Desktop installer entry point for packaged Atho releases.
 //!
 //! The installer unpacks a signed release bundle, chooses the platform-specific

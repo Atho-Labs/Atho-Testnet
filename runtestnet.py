@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for the clearer `testnet.py` launcher."""
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Atho contributors
 
-from runtime_launcher import main
+"""Launch Atho testnet with the desktop client and managed local node."""
+
+from scripts.runtime_launcher import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        main(
-            "testnet",
-            prog="runtestnet.py",
-            compatibility_note="runtestnet.py is kept for compatibility; prefer testnet.py.",
-        )
-    )
+    raise SystemExit(main("testnet", prog="runtestnet.py"))

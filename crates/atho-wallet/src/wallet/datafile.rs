@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Encrypted wallet `.datafile` persistence.
 use super::{PersistedWalletState, Wallet};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -13,6 +16,8 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -248,14 +253,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WalletDatafileError> {
     let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
     {
         let mut file = File::create(&tmp_path)?;
+        restrict_owner_only_permissions(&tmp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
+    restrict_owner_only_permissions(path)?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
         }
+    }
+    Ok(())
+}
+
+fn restrict_owner_only_permissions(path: &Path) -> Result<(), WalletDatafileError> {
+    #[cfg(unix)]
+    {
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)?;
     }
     Ok(())
 }
@@ -354,7 +370,7 @@ mod tests {
     use crate::wallet::WALLET_DATAFILE_NAME;
     use atho_errors::AthoErrorMeta;
     use std::env;
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     const TEST_ITERATIONS: u32 = 10_000;
 
@@ -443,5 +459,25 @@ mod tests {
         let error = WalletDatafileError::InvalidPassword.to_atho_error();
         assert_eq!(error.code().as_str(), "ATHO-WALLET-011");
         assert!(!error.to_string().contains("hunter2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_datafile_permissions_are_owner_only() {
+        let path = env::temp_dir().join(format!(
+            "atho-wallet-perms-{}-{}.datafile",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let wallet = wallet();
+        save_impl(&wallet, "password", &path, TEST_ITERATIONS).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_file(&path);
     }
 }

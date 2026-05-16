@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 mod registry;
 
 use serde::{Deserialize, Serialize};
@@ -35,11 +38,12 @@ pub use registry::{
     SIG_CRYPTO_OPERATION_FAILED, SIG_INVALID_KEY_LENGTH, SIG_INVALID_WITNESS,
     SIG_WITNESS_INPUT_REF_MISMATCH, TX_DUPLICATE_INPUT, TX_FEE_BELOW_MINIMUM, TX_FEE_MISMATCH,
     TX_INPUT_OWNERSHIP_MISMATCH, TX_INSUFFICIENT_CONFIRMATIONS, TX_INVALID_POW_NONCE,
-    TX_INVALID_VERSION, TX_MISSING_UTXO, TX_NO_INPUTS, TX_NO_OUTPUTS, TX_TOO_LARGE,
-    TX_TOO_MANY_OUTPUTS, TX_WRONG_POW_BITS, TX_ZERO_VALUE_OUTPUT, UTXO_DUPLICATE, UTXO_MISSING,
-    WALLET_INVALID_ENTROPY_LENGTH, WALLET_INVALID_HEADER, WALLET_INVALID_MNEMONIC_CHECKSUM,
-    WALLET_INVALID_MNEMONIC_WORD, WALLET_INVALID_MNEMONIC_WORD_COUNT, WALLET_INVALID_PASSWORD,
-    WALLET_IO, WALLET_RANDOMNESS_FAILURE, WALLET_SERIALIZATION, WALLET_UNSUPPORTED_ENCRYPTION_MODE,
+    TX_INVALID_VERSION, TX_LEGACY_LOCK_FORMAT_REJECTED, TX_MISSING_UTXO, TX_NO_INPUTS,
+    TX_NO_OUTPUTS, TX_TOO_LARGE, TX_TOO_MANY_OUTPUTS, TX_WRONG_POW_BITS, TX_ZERO_VALUE_OUTPUT,
+    UTXO_DUPLICATE, UTXO_MISSING, WALLET_INVALID_ENTROPY_LENGTH, WALLET_INVALID_HEADER,
+    WALLET_INVALID_MNEMONIC_CHECKSUM, WALLET_INVALID_MNEMONIC_WORD,
+    WALLET_INVALID_MNEMONIC_WORD_COUNT, WALLET_INVALID_PASSWORD, WALLET_IO,
+    WALLET_RANDOMNESS_FAILURE, WALLET_SERIALIZATION, WALLET_UNSUPPORTED_ENCRYPTION_MODE,
     WALLET_UNSUPPORTED_VERSION,
 };
 
@@ -355,12 +359,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_documents_match_generated_output() {
+    fn registry_json_document_matches_generated_output() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let markdown =
-            fs::read_to_string(root.join("docs/ATHO_ERROR_CODES.md")).expect("error code markdown");
         let json = fs::read_to_string(root.join("error_codes.json")).expect("error code json");
-        assert_eq!(markdown, render_markdown_registry());
         assert_eq!(json, render_json_registry().expect("render json"));
     }
 }

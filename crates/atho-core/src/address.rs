@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho address encoding, decoding, and hashed-public-key helpers.
 //!
 //! Atho addresses are user-facing base56 strings derived from a 32-byte payment
@@ -167,11 +170,26 @@ pub fn address_parts_from_public_key(network: Network, public_key: &[u8]) -> Add
     }
 }
 
+/// Decodes one canonical Atho payment lock into its 32-byte digest form.
+///
+/// CONSENSUS: Spendable Atho outputs are identified by a fixed-width payment
+/// digest. Alternate lock lengths are not canonical payment locks.
+pub fn payment_digest_from_locking_script(
+    locking_script: &[u8],
+) -> Option<[u8; ADDRESS_DIGEST_BYTES]> {
+    locking_script.try_into().ok()
+}
+
+/// Returns `true` when the locking script is the canonical Atho payment lock.
+pub fn is_canonical_payment_locking_script(locking_script: &[u8]) -> bool {
+    payment_digest_from_locking_script(locking_script).is_some()
+}
+
 /// Decodes an internal hashed-public-key string into raw digest bytes.
 pub fn internal_hpk_bytes(network: Network, internal_hpk: &str) -> Option<Vec<u8>> {
     let prefix = network.internal_hpk_prefix();
     let body = internal_hpk.strip_prefix(prefix)?;
-    if body.len() != ADDRESS_DIGEST_BYTES * 2 {
+    if body.len() != crate::constants::SHA3_384_HASH_HEX_CHARS {
         return None;
     }
     hex::decode(body).ok()
@@ -316,20 +334,10 @@ mod tests {
         let encoded = format!(
             "{}{}",
             Network::Mainnet.internal_hpk_prefix(),
-            "ab".repeat(ADDRESS_DIGEST_BYTES)
-        );
-        let decoded = internal_hpk_bytes(Network::Mainnet, &encoded).unwrap();
-        assert_eq!(decoded.len(), ADDRESS_DIGEST_BYTES);
-        assert!(decoded.iter().all(|byte| *byte == 0xab));
-    }
-
-    #[test]
-    fn internal_hpk_rejects_legacy_48_byte_digest() {
-        let encoded = format!(
-            "{}{}",
-            Network::Mainnet.internal_hpk_prefix(),
             "ab".repeat(crate::constants::SHA3_384_HASH_BITS / 8)
         );
-        assert!(internal_hpk_bytes(Network::Mainnet, &encoded).is_none());
+        let decoded = internal_hpk_bytes(Network::Mainnet, &encoded).unwrap();
+        assert_eq!(decoded.len(), crate::constants::SHA3_384_HASH_BITS / 8);
+        assert!(decoded.iter().all(|byte| *byte == 0xab));
     }
 }

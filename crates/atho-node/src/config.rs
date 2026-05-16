@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Node configuration defaults and runtime selection helpers.
 use atho_core::network::Network;
 

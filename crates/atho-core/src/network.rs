@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho network identity and isolation parameters.
 //!
 //! This module keeps the runtime names, consensus ids, ports, and address
@@ -148,14 +151,22 @@ impl Network {
     }
 
     /// Returns whether this repository may launch operator-facing runtime flows.
+    ///
+    /// The Atho-Testnet repository keeps mainnet network types available for
+    /// parsing, fixtures, and cross-network validation tests, but it does not
+    /// ship mainnet operator launch paths.
     pub fn operator_launch_allowed(self) -> Result<(), &'static str> {
-        let _ = self;
-        Ok(())
+        match self {
+            Self::Mainnet => {
+                Err("the selected network is disabled in this repository; use testnet here")
+            }
+            Self::Testnet | Self::Regnet | Self::Prunetest => Ok(()),
+        }
     }
 
-    /// Returns the default operator network for this repository.
+    /// Returns the default operator network for this testnet-only repository.
     pub fn operator_default() -> Self {
-        Self::Mainnet
+        Self::Testnet
     }
 }
 
@@ -188,7 +199,8 @@ mod tests {
         assert_eq!(Network::Testnet.utxo_flag(), "TEST-UTXO");
         assert_eq!(Network::Regnet.utxo_flag(), "REG-UTXO");
         assert_eq!(Network::Prunetest.utxo_flag(), "PRUNE-UTXO");
-        assert_eq!(Network::Mainnet.operator_launch_allowed(), Ok(()));
-        assert_eq!(Network::operator_default(), Network::Mainnet);
+        assert!(Network::Mainnet.operator_launch_allowed().is_err());
+        assert_eq!(Network::Testnet.operator_launch_allowed(), Ok(()));
+        assert_eq!(Network::operator_default(), Network::Testnet);
     }
 }

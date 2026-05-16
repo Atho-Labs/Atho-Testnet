@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use sha3::{Digest, Sha3_256, Sha3_384};
 
 pub fn sha3_256(data: &[u8]) -> [u8; 32] {

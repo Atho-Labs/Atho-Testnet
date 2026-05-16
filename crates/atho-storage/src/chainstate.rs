@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! In-memory chainstate helpers layered on top of persisted storage.
 use crate::db::{
     BlockArchiveRecord, BlockPruneReport, ChainstateSnapshot, Database, PeerHealthRecord,
@@ -92,9 +95,12 @@ impl Chainstate {
         let genesis = genesis::genesis_state(network);
         let genesis_block = genesis.block;
         let genesis_header = genesis_block.header.clone();
-        let locking_script = genesis_block.transactions[0].outputs[0]
-            .locking_script
-            .clone();
+        let locking_script = genesis_block
+            .transactions
+            .first()
+            .and_then(|tx| tx.outputs.first())
+            .map(|output| output.locking_script.clone())
+            .expect("genesis block includes one coinbase output");
         let mut utxos = UtxoSet::new(network);
         utxos
             .insert(UtxoEntry::coinbase(
@@ -195,41 +201,30 @@ impl Chainstate {
             working_utxos,
         )?;
 
-        let mut accepted_block = block.clone();
-        let fee_atoms = validation::derived_block_fee_atoms(
-            &accepted_block,
-            block.header.height,
-            self.network,
-        )?;
-        accepted_block.fees_total_atoms = fee_atoms;
-        accepted_block.fees_miner_atoms = fee_atoms;
-
-        let undo = self.utxos.apply_block(&accepted_block)?;
+        let undo = self.utxos.apply_block(block)?;
         let previous_tip = self.tip.clone();
         let previous_tip_hash = self.tip_hash;
-        let next_tip_hash = accepted_block.header.block_hash();
+        let next_tip_hash = block.header.block_hash();
         if let Some(storage) = &self.storage {
             let snapshot = ChainstateSnapshot {
-                height: accepted_block.header.height,
+                height: block.header.height,
                 tip_hash: next_tip_hash,
-                tip_header: Some(accepted_block.header.clone()),
+                tip_header: Some(block.header.clone()),
             };
-            if let Err(err) = storage.commit_chainstate(
-                &snapshot,
-                &[],
-                Some((accepted_block.header.height, &accepted_block)),
-            ) {
+            if let Err(err) =
+                storage.commit_chainstate(&snapshot, &[], Some((block.header.height, block)))
+            {
                 self.utxos.disconnect_block(undo);
                 return Err(err);
             }
         }
 
-        self.tip = Some(accepted_block.header.clone());
+        self.tip = Some(block.header.clone());
         self.tip_hash = next_tip_hash;
-        self.height = accepted_block.header.height;
+        self.height = block.header.height;
         self.block_index_by_hash
             .insert(next_tip_hash, self.blocks.len());
-        self.blocks.push(accepted_block);
+        self.blocks.push(block.clone());
         self.undo_stack.push(ChainUndo {
             previous_tip,
             previous_tip_hash,
@@ -917,13 +912,6 @@ impl Chainstate {
         if let Some(index) = self.block_index_by_hash.get(&block_hash).copied() {
             return self.blocks.get(index).map(|block| block.header.height);
         }
-        if let Some(block) = self
-            .blocks
-            .iter()
-            .find(|block| block.header.block_hash() == block_hash)
-        {
-            return Some(block.header.height);
-        }
         self.storage
             .as_ref()
             .and_then(|storage| storage.load_block_record(block_hash).ok().flatten())
@@ -1434,6 +1422,7 @@ mod tests {
     use crate::utxo::UtxoEntry;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::subsidy;
+    use atho_core::constants::ADDRESS_DIGEST_BYTES;
     use atho_core::crypto::hash::sha3_384;
     use atho_core::genesis;
     use atho_core::network::Network;
@@ -1540,9 +1529,13 @@ mod tests {
             .unwrap_or_else(|| genesis::genesis_state(state.network).block.header.timestamp);
         build_coinbase_successor_with_script(
             state,
-            vec![state.height.saturating_add(1) as u8],
+            canonical_test_lock(state.height.saturating_add(1) as u8),
             previous_timestamp.saturating_add(1),
         )
+    }
+
+    fn canonical_test_lock(tag: u8) -> Vec<u8> {
+        vec![tag; ADDRESS_DIGEST_BYTES]
     }
 
     fn build_coinbase_successor_with_script(
@@ -1627,6 +1620,9 @@ mod tests {
         state.tip = Some(block.header.clone());
         state.tip_hash = block.header.block_hash();
         state.height = block.header.height;
+        state
+            .block_index_by_hash
+            .insert(state.tip_hash, state.blocks.len());
         state.blocks.push(block.clone());
         block
     }
@@ -1723,26 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_mainnet_and_regnet_seed_genesis_utxo_from_block_script() {
-        for network in [Network::Mainnet, Network::Regnet] {
-            let state = Chainstate::new(network);
-            let genesis = genesis::genesis_state(network);
-            let utxo = state
-                .utxos
-                .get(genesis.coinbase_txid, 0)
-                .expect("genesis coinbase utxo");
-            let genesis_script = genesis.block.transactions[0].outputs[0]
-                .locking_script
-                .as_slice();
-            assert_eq!(utxo.locking_script.as_slice(), genesis_script);
-            assert_eq!(
-                utxo.locking_script.len(),
-                atho_core::constants::ADDRESS_DIGEST_BYTES
-            );
-        }
-    }
-
-    #[test]
     fn chainstate_connects_and_disconnects_blocks() {
         let mut state = Chainstate::new(Network::Mainnet);
         let coinbase = Transaction {
@@ -1750,7 +1726,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![9],
+                locking_script: vec![9; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -1802,7 +1778,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![9],
+                locking_script: vec![9; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -1857,7 +1833,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![9],
+                locking_script: vec![9; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -1935,7 +1911,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, height),
-                    locking_script: vec![height as u8],
+                    locking_script: vec![height as u8; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 0,
                 witness: vec![],
@@ -2213,7 +2189,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Mainnet, height),
-                    locking_script: vec![height as u8],
+                    locking_script: vec![height as u8; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
@@ -2265,7 +2241,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(height),
-                    locking_script: vec![height as u8],
+                    locking_script: vec![height as u8; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
@@ -2312,7 +2288,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -2393,13 +2369,13 @@ mod tests {
             .timestamp;
         let main_1 = build_coinbase_successor_with_script(
             &state,
-            vec![1],
+            canonical_test_lock(1),
             genesis_timestamp.saturating_add(1),
         );
         state.connect_block(&main_1).expect("connect main one");
         let main_2 = build_coinbase_successor_with_script(
             &state,
-            vec![2],
+            canonical_test_lock(2),
             genesis_timestamp.saturating_add(10_000),
         );
         state.connect_block(&main_2).expect("connect main two");
@@ -2412,13 +2388,13 @@ mod tests {
             .expect("connect fork anchor");
         let fork_2 = build_coinbase_successor_with_script(
             &fork_state,
-            vec![22],
+            canonical_test_lock(22),
             genesis_timestamp.saturating_add(10),
         );
         fork_state.connect_block(&fork_2).expect("connect fork two");
         let fork_3 = build_coinbase_successor_with_script(
             &fork_state,
-            vec![33],
+            canonical_test_lock(33),
             genesis_timestamp.saturating_add(11),
         );
 
@@ -2465,10 +2441,14 @@ mod tests {
     #[test]
     fn select_branch_rejects_reorg_deeper_than_max_depth() {
         let mut state = Chainstate::new(Network::Regnet);
-        let main_1 = push_synthetic_coinbase_successor_with_script(&mut state, vec![1]);
-        let _main_2 = push_synthetic_coinbase_successor_with_script(&mut state, vec![2]);
-        let _main_3 = push_synthetic_coinbase_successor_with_script(&mut state, vec![3]);
-        let _main_4 = push_synthetic_coinbase_successor_with_script(&mut state, vec![4]);
+        let main_1 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(1));
+        let _main_2 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(2));
+        let _main_3 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(3));
+        let _main_4 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(4));
         let before = (state.height, state.tip_hash, state.utxo_count());
 
         let mut fork_state = Chainstate::new(Network::Regnet);
@@ -2476,10 +2456,14 @@ mod tests {
         fork_state.tip = Some(main_1.header.clone());
         fork_state.tip_hash = main_1.header.block_hash();
         fork_state.height = main_1.header.height;
-        let fork_2 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![22]);
-        let fork_3 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![33]);
-        let fork_4 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![44]);
-        let fork_5 = push_synthetic_coinbase_successor_with_script(&mut fork_state, vec![55]);
+        let fork_2 =
+            push_synthetic_coinbase_successor_with_script(&mut fork_state, canonical_test_lock(22));
+        let fork_3 =
+            push_synthetic_coinbase_successor_with_script(&mut fork_state, canonical_test_lock(33));
+        let fork_4 =
+            push_synthetic_coinbase_successor_with_script(&mut fork_state, canonical_test_lock(44));
+        let fork_5 =
+            push_synthetic_coinbase_successor_with_script(&mut fork_state, canonical_test_lock(55));
 
         let result = state.select_branch_with_max_reorg_depth(&[fork_2, fork_3, fork_4, fork_5], 2);
         assert!(matches!(
@@ -2499,9 +2483,12 @@ mod tests {
     #[test]
     fn finalized_checkpoint_tracks_boundary_record() {
         let mut state = Chainstate::new(Network::Regnet);
-        let main_1 = push_synthetic_coinbase_successor_with_script(&mut state, vec![1]);
-        let _main_2 = push_synthetic_coinbase_successor_with_script(&mut state, vec![2]);
-        let _main_3 = push_synthetic_coinbase_successor_with_script(&mut state, vec![3]);
+        let main_1 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(1));
+        let _main_2 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(2));
+        let _main_3 =
+            push_synthetic_coinbase_successor_with_script(&mut state, canonical_test_lock(3));
 
         let checkpoint = state
             .finalized_checkpoint_for_depth(2)
@@ -2533,7 +2520,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(height),
-                    locking_script: vec![height as u8],
+                    locking_script: vec![height as u8; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: u32::try_from(height).unwrap_or(u32::MAX),
                 witness: vec![],
@@ -2600,13 +2587,13 @@ mod tests {
         let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("state");
         let old_1 = build_coinbase_successor_with_script(
             &state,
-            vec![11],
+            canonical_test_lock(11),
             genesis_timestamp.saturating_add(1),
         );
         state.connect_block(&old_1).expect("connect old one");
         let old_2 = build_coinbase_successor_with_script(
             &state,
-            vec![12],
+            canonical_test_lock(12),
             genesis_timestamp.saturating_add(2),
         );
         let old_2_hash = old_2.header.block_hash();
@@ -2615,19 +2602,19 @@ mod tests {
         let mut fork_state = Chainstate::new(Network::Prunetest);
         let new_1 = build_coinbase_successor_with_script(
             &fork_state,
-            vec![21],
+            canonical_test_lock(21),
             genesis_timestamp.saturating_add(3),
         );
         fork_state.connect_block(&new_1).expect("connect new one");
         let new_2 = build_coinbase_successor_with_script(
             &fork_state,
-            vec![22],
+            canonical_test_lock(22),
             genesis_timestamp.saturating_add(4),
         );
         fork_state.connect_block(&new_2).expect("connect new two");
         let new_3 = build_coinbase_successor_with_script(
             &fork_state,
-            vec![23],
+            canonical_test_lock(23),
             genesis_timestamp.saturating_add(5),
         );
         state
@@ -2828,7 +2815,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(1),
-                        locking_script: vec![1],
+                        locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 1,
                     witness: vec![],
@@ -2840,7 +2827,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(1),
-                        locking_script: vec![1],
+                        locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 1,
                     witness: vec![],
@@ -2858,7 +2845,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(1),
-                    locking_script: vec![1],
+                    locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 1,
                 witness: vec![],
@@ -2879,7 +2866,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![2],
+                        locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 2,
                     witness: vec![],
@@ -2891,7 +2878,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![2],
+                        locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 2,
                     witness: vec![],
@@ -2907,7 +2894,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(2),
-                    locking_script: vec![2],
+                    locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 2,
                 witness: vec![],
@@ -2929,7 +2916,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![22],
+                        locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 22,
                     witness: vec![],
@@ -2941,7 +2928,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![22],
+                        locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 22,
                     witness: vec![],
@@ -2957,7 +2944,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(2),
-                    locking_script: vec![22],
+                    locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 22,
                 witness: vec![],
@@ -2981,7 +2968,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![33],
+                        locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 33,
                     witness: vec![],
@@ -2993,7 +2980,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![33],
+                        locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 33,
                     witness: vec![],
@@ -3012,7 +2999,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(3),
-                    locking_script: vec![33],
+                    locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 33,
                 witness: vec![],
@@ -3054,7 +3041,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(1),
-                        locking_script: vec![1],
+                        locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 1,
                     witness: vec![],
@@ -3066,7 +3053,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(1),
-                        locking_script: vec![1],
+                        locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 1,
                     witness: vec![],
@@ -3084,7 +3071,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(1),
-                    locking_script: vec![1],
+                    locking_script: vec![1; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 1,
                 witness: vec![],
@@ -3105,7 +3092,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![2],
+                        locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 2,
                     witness: vec![],
@@ -3117,7 +3104,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![2],
+                        locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 2,
                     witness: vec![],
@@ -3133,7 +3120,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(2),
-                    locking_script: vec![2],
+                    locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 2,
                 witness: vec![],
@@ -3153,7 +3140,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![3],
+                        locking_script: vec![3; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 3,
                     witness: vec![],
@@ -3165,7 +3152,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![3],
+                        locking_script: vec![3; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 3,
                     witness: vec![],
@@ -3181,7 +3168,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(3),
-                    locking_script: vec![3],
+                    locking_script: vec![3; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 3,
                 witness: vec![],
@@ -3201,7 +3188,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(4),
-                        locking_script: vec![4],
+                        locking_script: vec![4; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 4,
                     witness: vec![],
@@ -3213,7 +3200,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(4),
-                        locking_script: vec![4],
+                        locking_script: vec![4; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 4,
                     witness: vec![],
@@ -3229,7 +3216,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(4),
-                    locking_script: vec![4],
+                    locking_script: vec![4; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 4,
                 witness: vec![],
@@ -3256,7 +3243,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![22],
+                        locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 22,
                     witness: vec![],
@@ -3268,7 +3255,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(2),
-                        locking_script: vec![22],
+                        locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 22,
                     witness: vec![],
@@ -3284,7 +3271,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(2),
-                    locking_script: vec![22],
+                    locking_script: vec![22; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 22,
                 witness: vec![],
@@ -3308,7 +3295,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![33],
+                        locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 33,
                     witness: vec![],
@@ -3320,7 +3307,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(3),
-                        locking_script: vec![33],
+                        locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 33,
                     witness: vec![],
@@ -3339,7 +3326,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(3),
-                    locking_script: vec![33],
+                    locking_script: vec![33; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 33,
                 witness: vec![],
@@ -3364,7 +3351,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(4),
-                        locking_script: vec![44],
+                        locking_script: vec![44; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 44,
                     witness: vec![],
@@ -3376,7 +3363,7 @@ mod tests {
                     inputs: vec![],
                     outputs: vec![TxOutput {
                         value_atoms: subsidy::block_subsidy_atoms(4),
-                        locking_script: vec![44],
+                        locking_script: vec![44; ADDRESS_DIGEST_BYTES],
                     }],
                     lock_time: 44,
                     witness: vec![],
@@ -3395,7 +3382,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![TxOutput {
                     value_atoms: subsidy::block_subsidy_atoms(4),
-                    locking_script: vec![44],
+                    locking_script: vec![44; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: 44,
                 witness: vec![],

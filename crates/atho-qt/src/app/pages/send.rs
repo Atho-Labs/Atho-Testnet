@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::app::{widgets, DesktopApp};
 use crate::resources;
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;

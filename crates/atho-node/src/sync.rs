@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Node sync notices and background synchronization bookkeeping.
 use crate::dev;
 use crate::error::NodeError;
@@ -5,6 +8,8 @@ use crate::node::Node;
 use crate::validation::{finalize_witness_commit_refs, ValidationError};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
+#[cfg(test)]
+use atho_core::constants::ADDRESS_DIGEST_BYTES;
 use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT};
 use atho_core::network::Network;
 use atho_p2p::config::network_params;
@@ -600,6 +605,9 @@ impl NodeSync {
         self.update_sync_progress_watchdog(node);
         self.prune_completed_download_work(node);
         self.log_sync_metrics_if_due(node);
+        if self.maybe_drop_stale_unreachable_sync_target(node) {
+            self.refresh_header_locator_from_node_if_needed(node);
+        }
         if let Some(event) = self.header_timeout_disconnect_event(remote_addr, node) {
             outbound.push(event);
             return Ok(outbound);
@@ -966,6 +974,68 @@ impl NodeSync {
         );
     }
 
+    fn maybe_drop_stale_unreachable_sync_target(&mut self, node: &Node) -> bool {
+        let target_height = self.sync_state().best_height;
+        if node.height() >= target_height {
+            return false;
+        }
+
+        let live_peer_best_height = self
+            .connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+            .filter_map(|peer| peer.best_height)
+            .max();
+        let Some(live_best_height) = live_peer_best_height else {
+            return false;
+        };
+        if live_best_height >= target_height {
+            return false;
+        }
+
+        let stats = self.downloader.stats();
+        if stats.pending_blocks != 0
+            || stats.inflight_blocks != 0
+            || !self.pending_header_blocks.is_empty()
+            || !self.pending_compact_blocks.is_empty()
+            || !self.side_branches.is_empty()
+        {
+            return false;
+        }
+
+        let now = now_unix();
+        let last_network_progress = self
+            .last_block_progress_unix
+            .max(self.last_block_body_received_unix);
+        let stale_after = self
+            .block_request_retry_timeout()
+            .as_secs()
+            .saturating_mul(8)
+            .max(60);
+        if now.saturating_sub(last_network_progress) < stale_after {
+            return false;
+        }
+
+        self.relay.reset_sync_target_at(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            Some(live_best_height),
+        );
+        self.reseed_locator_from_node(node);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "dropped stale unreachable sync target old_target={} live_peer_target={} local_height={} stale_secs={}",
+                target_height,
+                live_best_height,
+                node.height(),
+                now.saturating_sub(last_network_progress)
+            ),
+        );
+        true
+    }
+
     fn maybe_trigger_stale_recovery(
         &mut self,
         remote_addr: &str,
@@ -1204,7 +1274,9 @@ impl NodeSync {
                     return Ok(());
                 }
                 if let Some(last_header) = headers.last() {
-                    self.note_observed_peer_tip(peer, last_header, node);
+                    let terminal_batch =
+                        header_count < network_params(self.network).limits.max_headers_per_message;
+                    self.note_observed_peer_tip(peer, last_header, node, terminal_batch);
                 }
                 let headers_synced = self.relay.sync_state().headers_synced;
                 let _ = dev::append_log(
@@ -1476,13 +1548,24 @@ impl NodeSync {
         true
     }
 
-    fn note_observed_peer_tip(&mut self, peer: &str, header: &BlockHeader, node: &Node) {
+    fn note_observed_peer_tip(
+        &mut self,
+        peer: &str,
+        header: &BlockHeader,
+        node: &Node,
+        terminal_headers_batch: bool,
+    ) {
         if header.network_id != self.network {
             return;
         }
         let observed_tip = header.block_hash();
-        self.connections
-            .note_peer_tip(peer, header.height, Hash48::from(observed_tip));
+        if terminal_headers_batch {
+            self.connections
+                .replace_peer_tip(peer, header.height, Hash48::from(observed_tip));
+        } else {
+            self.connections
+                .note_peer_tip(peer, header.height, Hash48::from(observed_tip));
+        }
         let previous_target = self.sync_state().best_height;
         let previous_headers_synced = self.sync_state().headers_synced;
         self.relay.note_observed_tip_at(
@@ -1859,7 +1942,7 @@ impl NodeSync {
         }
 
         let block_hash = header.block_hash();
-        self.note_observed_peer_tip(peer, header, node);
+        self.note_observed_peer_tip(peer, header, node, false);
         self.queue_getheaders_if_needed(peer, node, outbound);
         let _ = dev::append_log(
             "p2p",
@@ -1947,7 +2030,7 @@ impl NodeSync {
             );
             match node.submit_block(&block) {
                 Ok(()) => {
-                    self.note_observed_peer_tip(peer, &block.header, node);
+                    self.note_observed_peer_tip(peer, &block.header, node, false);
                     self.note_local_chain_progress(node);
                     self.mark_block_state(
                         block_hash,
@@ -2020,7 +2103,7 @@ impl NodeSync {
             }
         }
 
-        self.note_observed_peer_tip(peer, &block.header, node);
+        self.note_observed_peer_tip(peer, &block.header, node, false);
         self.queue_getheaders_if_needed(peer, node, outbound);
         let previous_hash = block.header.previous_block_hash;
         if p2p_trace_messages_enabled() {
@@ -2521,7 +2604,33 @@ impl NodeSync {
                         return Ok(1);
                     }
                 }
-                Err(err) if Self::recoverable_branch_error(&err) => return Ok(0),
+                Err(err) if Self::recoverable_branch_error(&err) => {
+                    let tip = candidate_hashes
+                        .last()
+                        .copied()
+                        .map(|hash| short_hash(&hash))
+                        .unwrap_or_else(|| String::from("<empty>"));
+                    let _ = dev::append_log(
+                        "p2p",
+                        &format!(
+                            "dropping structurally invalid complete side branch tip={} error={}",
+                            tip, err
+                        ),
+                    );
+                    for hash in &candidate_hashes {
+                        let hash = *hash;
+                        let height = self
+                            .block_validation_heights
+                            .get(&hash)
+                            .copied()
+                            .unwrap_or_default();
+                        self.mark_block_state(hash, height, BlockValidationState::Invalid);
+                        self.downloader.note_block_received(hash);
+                        self.pending_compact_blocks.remove(&hash);
+                        self.side_branches.remove(&hash);
+                    }
+                    return Ok(candidate_count.max(1));
+                }
                 Err(err) => {
                     let tip = candidate_hashes
                         .last()
@@ -2633,7 +2742,7 @@ impl NodeSync {
                 self.handle_received_block(peer, block, node, outbound)?;
             }
             CompactBlockReconstruction::Missing { indexes, .. } => {
-                self.note_observed_peer_tip(peer, &message.header, node);
+                self.note_observed_peer_tip(peer, &message.header, node, false);
                 self.pending_compact_blocks.insert(
                     block_hash,
                     PendingCompactBlock {
@@ -3079,7 +3188,6 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
-    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -3235,11 +3343,6 @@ mod tests {
         .canonical_bytes()
     }
 
-    fn test_locking_script() -> Vec<u8> {
-        let keypair = generate_from_seed(b"atho-node-sync-test").expect("falcon keypair");
-        public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec()
-    }
-
     fn coinbase_block(
         network: Network,
         height: u64,
@@ -3252,7 +3355,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: height as u32,
             witness: vec![],
@@ -3287,7 +3390,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms_for_network(network, height),
-                locking_script: vec![salt, height as u8],
+                locking_script: vec![salt ^ height as u8; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: height as u32,
             witness: vec![],
@@ -3348,8 +3451,6 @@ mod tests {
     fn mine_with_timestamp_offset(node: &mut Node, miner: &Miner, offset: u64) -> Block {
         let mut candidate = node.build_candidate_block().expect("candidate block");
         candidate.header.timestamp = candidate.header.timestamp.saturating_add(offset);
-        candidate.header.difficulty_target_or_bits =
-            node.difficulty_target_for_next_block_at(candidate.header.timestamp);
         let block = miner.solve_block(candidate);
         node.connect_block(&block).expect("connect mined block");
         block
@@ -3361,11 +3462,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid,
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -4585,7 +4686,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = test_locking_script();
+        let seed_script = vec![1];
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -4614,7 +4715,7 @@ mod tests {
             }],
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(1),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -4631,7 +4732,7 @@ mod tests {
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             ..Transaction {
                 witness: vec![],
@@ -4701,7 +4802,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = test_locking_script();
+        let seed_script = vec![1];
         right
             .node
             .dev_seed_chainstate(
@@ -4728,7 +4829,7 @@ mod tests {
             }],
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(1),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -4745,7 +4846,7 @@ mod tests {
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             ..Transaction {
                 witness: vec![],
@@ -4787,8 +4888,7 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    crate::dev::seed_locking_script(Network::Regnet, seed_script)
-                        .expect("seed locking script"),
+                    seed_script.clone(),
                     0,
                     false,
                 )],
@@ -4817,7 +4917,7 @@ mod tests {
         )
         .header;
         left.sync
-            .note_observed_peer_tip(&right.id, &future_header, &left.node);
+            .note_observed_peer_tip(&right.id, &future_header, &left.node, false);
         assert!(!left.sync.chain_synced(&left.node));
         assert!(left.node.mempool_contains(&txid));
 
@@ -4847,8 +4947,7 @@ mod tests {
                     seed_txid,
                     0,
                     seed_value,
-                    crate::dev::seed_locking_script(Network::Regnet, seed_script)
-                        .expect("seed locking script"),
+                    seed_script.clone(),
                     0,
                     false,
                 )],
@@ -4876,7 +4975,7 @@ mod tests {
         )
         .header;
         peer.sync
-            .note_observed_peer_tip("remote", &future_header, &peer.node);
+            .note_observed_peer_tip("remote", &future_header, &peer.node, false);
         assert!(!peer.sync.chain_synced(&peer.node));
 
         let mut outbound = Vec::new();
@@ -4924,7 +5023,7 @@ mod tests {
 
         let seed_txid = [7; 48];
         let seed_value = 2_000u64;
-        let seed_script = test_locking_script();
+        let seed_script = vec![1];
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -4953,7 +5052,7 @@ mod tests {
             }],
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(1),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -4970,7 +5069,7 @@ mod tests {
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             ..Transaction {
                 witness: vec![],
@@ -5065,7 +5164,7 @@ mod tests {
 
         let seed_txid = [5; 48];
         let seed_value = 2_000u64;
-        let seed_script = test_locking_script();
+        let seed_script = vec![1];
         for peer in [&mut left, &mut right] {
             peer.node
                 .dev_seed_chainstate(
@@ -5094,7 +5193,7 @@ mod tests {
             }],
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(1),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -5111,7 +5210,7 @@ mod tests {
         let signed = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: seed_value.saturating_sub(fee_atoms),
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             ..Transaction {
                 witness: vec![],
@@ -5171,11 +5270,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [4; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: Vec::new(),
@@ -5479,11 +5578,11 @@ mod tests {
                 inputs: vec![TxInput {
                     previous_txid: [height as u8; 48],
                     output_index: 0,
-                    unlocking_script: vec![1],
+                    unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
                 }],
                 outputs: vec![TxOutput {
                     value_atoms: 1_000,
-                    locking_script: vec![2],
+                    locking_script: vec![2; ADDRESS_DIGEST_BYTES],
                 }],
                 lock_time: height as u32,
                 witness: Vec::new(),
@@ -5859,7 +5958,7 @@ mod tests {
 
         let mut reference = Node::new(NodeConfig::new(Network::Regnet));
         let remote_blocks = (0..4)
-            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 1_000 + index))
+            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 10_000 + index))
             .collect::<Vec<_>>();
         assert_ne!(peer.node.tip_hash(), remote_blocks[1].header.block_hash());
 
@@ -5907,6 +6006,122 @@ mod tests {
 
         assert!(outbound_getdata_hashes(&outbound).contains(&arbitrary_tip));
         assert_eq!(peer.sync.side_branches.len(), 1);
+    }
+
+    #[test]
+    fn complete_invalid_side_branch_is_evicted_without_disconnect() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        let miner = Miner::new(1);
+        mine_with_timestamp_offset(&mut peer.node, &miner, 0);
+        peer.sync.prime(&peer.node);
+        peer.sync.downloader.note_peer_ready("remote");
+
+        let invalid_height_block = miner.solve_block(coinbase_block(
+            Network::Regnet,
+            peer.node.height() + 2,
+            peer.node.tip_hash(),
+            pow::target_for_height(Network::Regnet, peer.node.height() + 2),
+            1_700_000_444,
+        ));
+        let invalid_hash = invalid_height_block.header.block_hash();
+
+        let mut outbound = Vec::new();
+        peer.sync
+            .handle_received_block(
+                "remote",
+                invalid_height_block,
+                &mut peer.node,
+                &mut outbound,
+            )
+            .expect("structural branch error should not disconnect the peer");
+
+        assert!(peer.sync.side_branches.is_empty());
+        assert_eq!(
+            peer.sync.block_validation_states.get(&invalid_hash),
+            Some(&BlockValidationState::Invalid)
+        );
+    }
+
+    #[test]
+    fn terminal_headers_response_can_lower_stale_peer_tip_height() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut remote = SandboxPeer::new("remote", Network::Regnet);
+        remote
+            .node
+            .dev_seed_chainstate(10, [10; 48], Vec::<UtxoEntry>::new())
+            .expect("advertise stale height");
+        remote.sync.prime(&remote.node);
+        let _ = connect_handshake_only(&mut local, &mut remote);
+        assert_eq!(
+            local.sync.connections().remote_best_height(&remote.id),
+            Some(10)
+        );
+
+        let headers = mine_reference_blocks(Network::Regnet, 2)
+            .into_iter()
+            .map(|block| block.header)
+            .collect::<Vec<_>>();
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .handle_message(
+                &remote.id,
+                NetworkMessage::new(Network::Regnet, MessagePayload::Headers { headers }),
+                &mut local.node,
+                &mut outbound,
+            )
+            .expect("terminal headers response");
+
+        assert_eq!(
+            local.sync.connections().remote_best_height(&remote.id),
+            Some(2),
+            "short getheaders responses are the peer's current tip and must be allowed to correct stale fork heights"
+        );
+    }
+
+    #[test]
+    fn stale_unreachable_sync_target_decays_to_live_peer_height() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut remote = SandboxPeer::new("remote", Network::Regnet);
+        let miner = Miner::new(1);
+        remote
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("remote block 1");
+        remote
+            .node
+            .mine_and_connect_candidate_block(&miner)
+            .expect("remote block 2");
+        remote.sync.prime(&remote.node);
+        let _ = connect_handshake_only(&mut local, &mut remote);
+
+        local.sync.relay.reset_sync_target_at(
+            local.node.height(),
+            Some(Hash48::from(local.node.tip_hash())),
+            Some(10),
+        );
+        local.sync.relay.mark_headers_unsynced();
+        local.sync.last_block_progress_unix = now_unix().saturating_sub(3_600);
+        local.sync.last_block_body_received_unix = 0;
+        local.sync.header_requests_started.clear();
+
+        let events = local
+            .sync
+            .maintain_peer_sync(&remote.id, &local.node)
+            .expect("maintenance");
+
+        assert_eq!(local.sync.sync_state().best_height, remote.node.height());
+        assert!(!local.sync.sync_state().headers_synced);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ConnectionEvent::Send {
+                peer,
+                message: NetworkMessage {
+                    payload: MessagePayload::GetHeaders(_),
+                    ..
+                },
+            } if peer == &remote.id
+        )));
     }
 
     #[test]

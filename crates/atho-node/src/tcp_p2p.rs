@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! TCP-backed P2P runtime integration for the Atho node.
 use crate::config::NodeConfig;
 use crate::dev;
@@ -19,7 +22,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -34,6 +37,19 @@ const PEER_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FRAME_READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const PEER_QUALITY_MAX_SCORE: u32 = 100;
 const PEER_QUALITY_FAILURE_PENALTY: u32 = 15;
+
+fn lock_runtime_state(state: &Arc<Mutex<NodeService>>) -> MutexGuard<'_, NodeService> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let _ = dev::append_log(
+                "p2p",
+                "recovering poisoned p2p runtime state lock after worker panic",
+            );
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TcpP2pError {
@@ -110,7 +126,7 @@ impl TcpP2pRuntime {
         bind_addr: impl AsRef<str>,
     ) -> Result<Self, TcpP2pError> {
         {
-            let mut service = state.lock().expect("p2p runtime state poisoned");
+            let mut service = lock_runtime_state(&state);
             if !service.is_running() {
                 service.start();
             } else {
@@ -255,7 +271,7 @@ impl TcpP2pRuntime {
     }
 
     pub fn snapshot(&self) -> TcpP2pSnapshot {
-        let state = self.state.lock().expect("p2p runtime state poisoned");
+        let state = lock_runtime_state(&self.state);
         TcpP2pSnapshot {
             network: self.network,
             bind_addr: self.bind_addr,
@@ -269,7 +285,7 @@ impl TcpP2pRuntime {
 
     #[cfg(test)]
     pub fn mine_local_block(&self) -> Result<[u8; 48], NodeError> {
-        let mut state = self.state.lock().expect("p2p runtime state poisoned");
+        let mut state = lock_runtime_state(&self.state);
         state.p2p_mine_local_block()
     }
 
@@ -336,7 +352,7 @@ fn spawn_outbound_maintainer(
     thread::spawn(move || {
         let _target_guard = OutboundTargetGuard::new(Arc::clone(&outbound_targets), target_key);
         let network = {
-            let state = state.lock().expect("p2p runtime state poisoned");
+            let state = lock_runtime_state(&state);
             state.network()
         };
         let mut last_failure = None::<String>;
@@ -344,7 +360,7 @@ fn spawn_outbound_maintainer(
             let mut health = load_peer_health_snapshot(&state, network, &remote_addr);
             let now_unix = unix_timestamp();
             let connected_peer_count = {
-                let state = state.lock().expect("p2p runtime state poisoned");
+                let state = lock_runtime_state(&state);
                 state.p2p_peer_count()
             };
             if let Some(remaining) =
@@ -357,7 +373,7 @@ fn spawn_outbound_maintainer(
             // Keep configured outbound peers sticky. This closes the common startup-order race
             // where one node launches before another and would otherwise never retry.
             let already_connected = {
-                let state = state.lock().expect("p2p runtime state poisoned");
+                let state = lock_runtime_state(&state);
                 state.p2p_has_peer(&remote_addr)
             };
             if already_connected {
@@ -379,7 +395,7 @@ fn spawn_outbound_maintainer(
                     let failure = err.to_string();
                     health.consecutive_failures = health.consecutive_failures.saturating_add(1);
                     let connected_peer_count = {
-                        let state = state.lock().expect("p2p runtime state poisoned");
+                        let state = lock_runtime_state(&state);
                         state.p2p_peer_count()
                     };
                     let retry_delay = if connected_peer_count == 0 {
@@ -468,7 +484,7 @@ fn spawn_peer_discovery(
             .max(8);
         while !stop_requested.load(Ordering::Acquire) {
             let candidates = {
-                let mut state = state.lock().expect("p2p runtime state poisoned");
+                let mut state = lock_runtime_state(&state);
                 state.p2p_bootstrap_peers(candidate_limit)
             };
             for remote_addr in candidates {
@@ -587,14 +603,14 @@ fn spawn_peer_thread(
 
             match role {
                 ConnectionRole::Inbound => {
-                    let mut state = state.lock().expect("p2p runtime state poisoned");
+                    let mut state = lock_runtime_state(&state);
                     if let Err(err) = state.p2p_accept_inbound(peer_id.clone()) {
                         return format!("accept inbound rejected peer={peer_id} error={err}");
                     }
                 }
                 ConnectionRole::Outbound => {
                     let events = {
-                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        let mut state = lock_runtime_state(&state);
                         match state.p2p_open_outbound(peer_id.clone()) {
                             Ok(events) => events,
                             Err(err) => {
@@ -611,14 +627,14 @@ fn spawn_peer_thread(
                         }
                     };
                     if bytes_sent > 0 {
-                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        let mut state = lock_runtime_state(&state);
                         state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                     }
                 }
             }
 
             let mut last_announced_tip = {
-                let state = state.lock().expect("p2p runtime state poisoned");
+                let state = lock_runtime_state(&state);
                 state.tip_hash()
             };
             let mut last_announced_mempool = None;
@@ -626,7 +642,7 @@ fn spawn_peer_thread(
             let mut last_activity = SystemTime::now();
             let mut last_inbound_activity = last_activity;
             let peer_network = {
-                let state = state.lock().expect("p2p runtime state poisoned");
+                let state = lock_runtime_state(&state);
                 state.network()
             };
             let handshake_timeout =
@@ -644,7 +660,7 @@ fn spawn_peer_thread(
                         >= sync_maintenance_interval(peer_network)
                 {
                     let events = {
-                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        let mut state = lock_runtime_state(&state);
                         match state.p2p_maintain_peer_sync(&peer_id) {
                             Ok(events) => events,
                             Err(err) => {
@@ -668,7 +684,7 @@ fn spawn_peer_thread(
                         }
                     };
                     if bytes_sent > 0 {
-                        let mut state = state.lock().expect("p2p runtime state poisoned");
+                        let mut state = lock_runtime_state(&state);
                         state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                         last_activity = SystemTime::now();
                     }
@@ -677,7 +693,7 @@ fn spawn_peer_thread(
                 let message = match read_message(&mut stream, peer_network) {
                     Ok(Some((message, bytes_received))) => {
                         if bytes_received > 0 {
-                            let mut state = state.lock().expect("p2p runtime state poisoned");
+                            let mut state = lock_runtime_state(&state);
                             state.p2p_note_bytes_received(&peer_id, bytes_received);
                             last_activity = SystemTime::now();
                             last_inbound_activity = last_activity;
@@ -706,8 +722,7 @@ fn spawn_peer_thread(
                                     }
                                 };
                                 if bytes_sent > 0 {
-                                    let mut state =
-                                        state.lock().expect("p2p runtime state poisoned");
+                                    let mut state = lock_runtime_state(&state);
                                     state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                                     last_activity = SystemTime::now();
                                 }
@@ -728,8 +743,7 @@ fn spawn_peer_thread(
                                     }
                                 };
                                 if bytes_sent > 0 {
-                                    let mut state =
-                                        state.lock().expect("p2p runtime state poisoned");
+                                    let mut state = lock_runtime_state(&state);
                                     state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                                     last_activity = SystemTime::now();
                                 }
@@ -766,7 +780,7 @@ fn spawn_peer_thread(
                                 }
                             };
                             if bytes_sent > 0 {
-                                let mut state = state.lock().expect("p2p runtime state poisoned");
+                                let mut state = lock_runtime_state(&state);
                                 state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                                 last_activity = SystemTime::now();
                                 if std::env::var_os("ATHO_P2P_TRACE_MESSAGES").is_some() {
@@ -785,7 +799,7 @@ fn spawn_peer_thread(
                     }
                 };
                 let (events, notices) = {
-                    let mut state = state.lock().expect("p2p runtime state poisoned");
+                    let mut state = lock_runtime_state(&state);
                     match state.p2p_receive(&peer_id, message) {
                         Ok(result) => result,
                         Err(err) => {
@@ -814,7 +828,7 @@ fn spawn_peer_thread(
                     }
                 };
                 if bytes_sent > 0 {
-                    let mut state = state.lock().expect("p2p runtime state poisoned");
+                    let mut state = lock_runtime_state(&state);
                     state.p2p_note_bytes_sent(&peer_id, bytes_sent);
                     last_activity = SystemTime::now();
                 }
@@ -827,7 +841,7 @@ fn spawn_peer_thread(
             let _ = dev::append_log("p2p", &disconnect_reason);
         }
         let disconnect_notice = {
-            let mut state = state.lock().expect("p2p runtime state poisoned");
+            let mut state = lock_runtime_state(&state);
             state.p2p_disconnect_peer(&peer_id, disconnect_reason)
         };
         if let Some(SyncNotice::Disconnected { peer, reason }) = disconnect_notice {
@@ -845,7 +859,7 @@ fn poll_tip_announcements(
     state: &Arc<Mutex<NodeService>>,
     last_announced_tip: &mut [u8; 48],
 ) -> Option<Vec<NetworkMessage>> {
-    let state = state.lock().expect("p2p runtime state poisoned");
+    let state = lock_runtime_state(state);
     let tip_hash = state.tip_hash();
     if !state.p2p_block_relay_ready() {
         *last_announced_tip = tip_hash;
@@ -865,7 +879,7 @@ fn poll_mempool_announcements(
     announced_txids: &mut BTreeSet<[u8; 48]>,
 ) -> Option<Vec<NetworkMessage>> {
     let (network, txids, fingerprint) = {
-        let state = state.lock().expect("p2p runtime state poisoned");
+        let state = lock_runtime_state(state);
         if !state.p2p_transaction_relay_ready() {
             *last_announced_fingerprint = None;
             announced_txids.clear();
@@ -1147,7 +1161,7 @@ fn load_peer_health_snapshot(
     network: Network,
     remote_addr: &str,
 ) -> PeerHealthRecord {
-    let mut state = state.lock().expect("p2p runtime state poisoned");
+    let mut state = lock_runtime_state(state);
     state
         .p2p_peer_health(remote_addr)
         .unwrap_or(PeerHealthRecord {
@@ -1162,7 +1176,7 @@ fn load_peer_health_snapshot(
 }
 
 fn persist_peer_health(state: &Arc<Mutex<NodeService>>, health: &PeerHealthRecord) {
-    let mut state = state.lock().expect("p2p runtime state poisoned");
+    let mut state = lock_runtime_state(state);
     state.p2p_save_peer_health(health);
 }
 
@@ -1313,6 +1327,28 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn poisoned_runtime_state_lock_is_recovered() {
+        let _lock = acquire_global_test_lock();
+        let service = Arc::new(Mutex::new(NodeService::new_ephemeral(NodeConfig::new(
+            Network::Regnet,
+        ))));
+        let poisoned_service = Arc::clone(&service);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = thread::spawn(move || {
+            let _guard = poisoned_service.lock().expect("initial lock");
+            panic!("poison runtime state for recovery test");
+        })
+        .join();
+        std::panic::set_hook(previous_hook);
+        assert!(result.is_err());
+
+        let state = lock_runtime_state(&service);
+
+        assert_eq!(state.network(), Network::Regnet);
     }
 
     fn wait_until(label: &str, timeout: Duration, predicate: impl Fn() -> bool) {
@@ -2002,8 +2038,7 @@ mod tests {
                         seed_txid,
                         0,
                         seed_value,
-                        crate::dev::seed_locking_script(Network::Regnet, seed_script)
-                            .expect("seed locking script"),
+                        seed_script.clone(),
                         0,
                         false,
                     )],
@@ -2069,7 +2104,7 @@ mod tests {
             Network::Testnet,
             seed_txid,
             seed_value,
-            seed_script,
+            seed_script.clone(),
         )
         .expect("signed transaction");
         let txid = transaction.txid();
@@ -2086,8 +2121,7 @@ mod tests {
                         seed_txid,
                         0,
                         seed_value,
-                        crate::dev::seed_locking_script(Network::Testnet, seed_script)
-                            .expect("seed locking script"),
+                        seed_script.clone(),
                         0,
                         false,
                     )],
@@ -2127,19 +2161,23 @@ mod tests {
             Network::Regnet,
         ))));
         let first_seed = crate::dev::seed_utxo(Network::Regnet);
-        let second_seed = ([0x34; 48], first_seed.1, 0x34);
+        let second_seed = (
+            [0x34; 48],
+            first_seed.1,
+            crate::dev::locking_script_for_seed(Network::Regnet, [0x34; 48]),
+        );
         let first_tx = crate::dev::signed_spend_transaction(
             Network::Regnet,
             first_seed.0,
             first_seed.1,
-            first_seed.2,
+            first_seed.2.clone(),
         )
         .expect("first signed transaction");
         let second_tx = crate::dev::signed_spend_transaction(
             Network::Regnet,
             second_seed.0,
             second_seed.1,
-            second_seed.2,
+            second_seed.2.clone(),
         )
         .expect("second signed transaction");
         let first_txid = first_tx.txid();
@@ -2159,8 +2197,7 @@ mod tests {
                             first_seed.0,
                             0,
                             first_seed.1,
-                            crate::dev::seed_locking_script(Network::Regnet, first_seed.2)
-                                .expect("first seed locking script"),
+                            first_seed.2.clone(),
                             0,
                             false,
                         ),
@@ -2169,8 +2206,7 @@ mod tests {
                             second_seed.0,
                             0,
                             second_seed.1,
-                            crate::dev::seed_locking_script(Network::Regnet, second_seed.2)
-                                .expect("second seed locking script"),
+                            second_seed.2.clone(),
                             0,
                             false,
                         ),

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Peer handshake state machine.
 //!
 //! This module validates the Atho version/verack exchange and only marks a peer
@@ -82,6 +85,15 @@ impl HandshakeState {
                 version.best_height = height;
                 version.tip_hash = tip_hash;
             }
+        }
+    }
+
+    /// Replaces the remembered remote tip when a terminal headers response proves
+    /// the peer's active branch is shorter than its stale handshake advertisement.
+    pub fn replace_remote_tip(&mut self, height: u64, tip_hash: Hash48) {
+        if let Some(version) = self.remote_version.as_mut() {
+            version.best_height = height;
+            version.tip_hash = tip_hash;
         }
     }
 

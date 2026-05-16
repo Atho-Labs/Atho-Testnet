@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::app::{widgets, DebugWindowTab, DesktopApp};
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;

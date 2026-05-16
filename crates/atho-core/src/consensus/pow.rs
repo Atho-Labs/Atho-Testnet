@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho proof-of-work difficulty and chainwork utilities.
 //!
 //! This module implements the deterministic target retargeting rules, target
@@ -5,7 +8,9 @@
 //!
 //! CONSENSUS: Every function here must produce identical results across nodes
 //! for the same ordered block history.
-use crate::block::{Block, BlockHeader};
+use crate::block::Block;
+#[cfg(test)]
+use crate::block::BlockHeader;
 use crate::constants::{
     POW_AVERAGING_WINDOW_BLOCKS, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
     POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_WINDOW_BLOCKS, POW_RETARGET_INTERVAL_BLOCKS,
@@ -51,7 +56,6 @@ pub const POW_PROFILE: ProofOfWork = ProofOfWork {
 pub const SHA3_384_HASH_BITS: usize = 384;
 pub const SHA3_384_HASH_HEX_CHARS: usize = 96;
 pub const TESTNET_STALL_RESET_SECONDS: u64 = 600;
-const LEGACY_TESTNET_TARGET_BLOCK_TIME_SECONDS: u64 = 75;
 
 pub const DIFFICULTY_PROFILE: DifficultyTargetProfile = DifficultyTargetProfile {
     genesis_target: hex!("0000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
@@ -73,18 +77,6 @@ pub fn expected_timespan_seconds() -> u64 {
 fn expected_timespan_seconds_for_window(window_blocks: usize) -> u64 {
     POW_PROFILE
         .target_block_time_seconds
-        .saturating_mul(window_blocks.saturating_sub(1) as u64)
-}
-
-fn target_block_time_seconds_for_network(network: Network) -> u64 {
-    match network {
-        Network::Mainnet | Network::Regnet => POW_PROFILE.target_block_time_seconds,
-        Network::Testnet | Network::Prunetest => LEGACY_TESTNET_TARGET_BLOCK_TIME_SECONDS,
-    }
-}
-
-fn expected_timespan_seconds_for_window_and_network(network: Network, window_blocks: usize) -> u64 {
-    target_block_time_seconds_for_network(network)
         .saturating_mul(window_blocks.saturating_sub(1) as u64)
 }
 
@@ -160,6 +152,7 @@ fn median_u64(values: &[u64]) -> u64 {
     sorted[sorted.len() / 2]
 }
 
+#[cfg(test)]
 fn median_time_past_headers(headers: &[BlockHeader], index: usize) -> u64 {
     let span = POW_PROFILE.median_window_blocks as usize;
     let start = index.saturating_add(1).saturating_sub(span);
@@ -194,6 +187,7 @@ fn bounded_actual_timespan(actual_timespan: u64, target_timespan: u64) -> u64 {
     damped.clamp(min_actual, max_actual)
 }
 
+#[cfg(test)]
 fn mean_target_headers(headers: &[BlockHeader]) -> BigUint {
     let mut total = BigUint::zero();
     for header in headers {
@@ -210,6 +204,7 @@ fn mean_target_blocks(blocks: &[Block]) -> BigUint {
     total / BigUint::from(blocks.len() as u64)
 }
 
+#[cfg(test)]
 fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 48] {
     let headers = match headers {
         [first, rest @ ..] if first.height == 0 && !rest.is_empty() => rest,
@@ -236,31 +231,12 @@ fn next_target_from_headers(network: Network, headers: &[BlockHeader]) -> [u8; 4
         let old_mtp = median_time_past_headers(headers, old_index);
         tip_mtp.saturating_sub(old_mtp)
     };
-    let expected_timespan = expected_timespan_seconds_for_window_and_network(network, window_len);
+    let expected_timespan = expected_timespan_seconds_for_window(window_len);
     let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
     let average_target = mean_target_headers(window);
     let threshold =
         (average_target * BigUint::from(bounded_timespan)) / BigUint::from(expected_timespan);
     clamp_target(biguint_to_target(&threshold))
-}
-
-/// Computes the next required target from historical block headers and the
-/// candidate header timestamp.
-pub fn target_for_next_header_with_timestamp(
-    network: Network,
-    previous_headers: &[BlockHeader],
-    next_timestamp: u64,
-) -> [u8; 48] {
-    if network == Network::Testnet {
-        if let Some(previous_header) = previous_headers.last() {
-            if next_timestamp.saturating_sub(previous_header.timestamp)
-                > TESTNET_STALL_RESET_SECONDS
-            {
-                return DIFFICULTY_PROFILE.min_difficulty_target;
-            }
-        }
-    }
-    next_target_from_headers(network, previous_headers)
 }
 
 fn next_target_from_blocks(network: Network, blocks: &[Block]) -> [u8; 48] {
@@ -287,7 +263,7 @@ fn next_target_from_blocks(network: Network, blocks: &[Block]) -> [u8; 48] {
         let old_mtp = median_time_past_blocks(blocks, old_index);
         tip_mtp.saturating_sub(old_mtp)
     };
-    let expected_timespan = expected_timespan_seconds_for_window_and_network(network, window_len);
+    let expected_timespan = expected_timespan_seconds_for_window(window_len);
     let bounded_timespan = bounded_actual_timespan(actual_timespan, expected_timespan);
     let average_target = mean_target_blocks(window);
     let threshold =
@@ -303,7 +279,7 @@ pub fn target_for_next_block(network: Network, previous_blocks: &[Block]) -> [u8
             block
                 .header
                 .timestamp
-                .saturating_add(target_block_time_seconds_for_network(network))
+                .saturating_add(POW_PROFILE.target_block_time_seconds)
         })
         .unwrap_or_default();
     target_for_next_block_with_timestamp(network, previous_blocks, next_timestamp)
@@ -412,14 +388,6 @@ pub fn minimum_next_block_timestamp(previous_blocks: &[Block]) -> Option<u64> {
     median_time_past_from_blocks(previous_blocks).map(|timestamp| timestamp.saturating_add(1))
 }
 
-/// Returns the minimum valid timestamp for the next header.
-pub fn minimum_next_header_timestamp(previous_headers: &[BlockHeader]) -> Option<u64> {
-    if previous_headers.is_empty() {
-        return None;
-    }
-    Some(median_time_past_headers(previous_headers, previous_headers.len() - 1).saturating_add(1))
-}
-
 /// Returns `true` when the target respects the configured difficulty bounds.
 pub fn target_within_bounds(target: &[u8; 48]) -> bool {
     target >= &DIFFICULTY_PROFILE.max_difficulty_target
@@ -450,7 +418,7 @@ mod tests {
 
     #[test]
     fn pow_profile_matches_reference_timing() {
-        assert_eq!(POW_PROFILE.target_block_time_seconds, 100);
+        assert_eq!(POW_PROFILE.target_block_time_seconds, 75);
         assert_eq!(POW_PROFILE.retarget_interval_blocks, 1);
         assert_eq!(POW_PROFILE.averaging_window_blocks, 17);
         assert_eq!(POW_PROFILE.median_window_blocks, 11);
@@ -467,15 +435,7 @@ mod tests {
 
     #[test]
     fn expected_timespan_is_derived_from_target_block_time() {
-        assert_eq!(expected_timespan_seconds(), 1_600);
-        assert_eq!(
-            expected_timespan_seconds_for_window_and_network(Network::Testnet, 17),
-            1_200
-        );
-        assert_eq!(
-            expected_timespan_seconds_for_window_and_network(Network::Regnet, 17),
-            1_600
-        );
+        assert_eq!(expected_timespan_seconds(), 1_200);
     }
 
     #[test]

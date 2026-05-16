@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Node service layer for RPC, CLI, and GUI command execution.
 //!
 //! This module converts high-level operator requests into validated node
@@ -20,6 +23,7 @@ use crate::wallet_history;
 use atho_core::address::{decode_base56_address, encode_base56_address};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::{params::consensus_params_for_network, pow, rules, subsidy};
+use atho_core::constants::MAX_TRANSACTION_RAW_BYTES;
 use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -324,25 +328,20 @@ impl NodeService {
             },
             RpcRequest::ExecuteCommand(invocation) => self.execute_command(invocation),
             RpcRequest::GetBlockTemplate => {
-                let status = self.node_status();
-                if let Some(reason) = Self::mining_sync_block_reason(&status) {
-                    RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(reason))
-                } else {
-                    match self.orchestrator.runtime.node.build_candidate_block() {
-                        Ok(block) => {
-                            let _ = dev::append_log(
-                                "athod",
-                                &format!(
-                                    "rpc template height={} mempool={} fees={}",
-                                    block.header.height,
-                                    self.orchestrator.runtime.node.mempool_len(),
-                                    block.fees_total_atoms
-                                ),
-                            );
-                            RpcResponse::BlockTemplate(self.block_template(block))
-                        }
-                        Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
+                match self.orchestrator.runtime.node.build_candidate_block() {
+                    Ok(block) => {
+                        let _ = dev::append_log(
+                            "athod",
+                            &format!(
+                                "rpc template height={} mempool={} fees={}",
+                                block.header.height,
+                                self.orchestrator.runtime.node.mempool_len(),
+                                block.fees_total_atoms
+                            ),
+                        );
+                        RpcResponse::BlockTemplate(self.block_template(block))
                     }
+                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 }
             }
             RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => {
@@ -630,6 +629,7 @@ impl NodeService {
             "stop" => self.command_stop(args),
             "addnode" => self.command_addnode(args),
             "disconnectnode" => self.command_disconnectnode(args),
+            "sendrawtransaction" => self.command_sendrawtransaction(args),
             _ => Err(atho_rpc::error::RpcError::method_not_found()),
         }
     }
@@ -732,22 +732,6 @@ impl NodeService {
             status.headers_synced,
             status.running,
             status.network_diagnostics.peer_count
-        ))
-    }
-
-    fn mining_sync_block_reason(status: &NodeStatus) -> Option<String> {
-        if matches!(status.network, Network::Regnet | Network::Prunetest)
-            || status.network_diagnostics.safe_to_mine
-        {
-            return None;
-        }
-        Some(format!(
-            "mining template is paused until the node is fully validated and synced (status={} local_height={} sync_target_height={} validation_lag_blocks={} safe_to_mine={})",
-            status.network_diagnostics.chain_validation_status,
-            status.block_count,
-            status.sync_best_height,
-            status.network_diagnostics.validation_lag_blocks,
-            status.network_diagnostics.safe_to_mine
         ))
     }
 
@@ -1439,6 +1423,11 @@ impl NodeService {
         self.persist_api_snapshot_if_enabled();
     }
 
+    pub(crate) fn refresh_api_light_views(&mut self) {
+        self.refresh_mempool_summary();
+        self.refresh_chain_stats();
+    }
+
     fn refresh_explorer_index(&mut self) {
         if !self.explorer_index_enabled() {
             self.explorer_index_ready = false;
@@ -2077,7 +2066,24 @@ impl NodeService {
     }
 
     fn command_geterrorcodes(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
-        self.expect_no_args("geterrorcodes", args)?;
+        if args.len() > 1 {
+            return Err(atho_rpc::error::RpcError::invalid_request(
+                "geterrorcodes accepts at most one optional error code",
+            ));
+        }
+        if let Some(query) = args.first() {
+            let normalized = query.trim().to_ascii_uppercase();
+            let descriptor = atho_errors::REGISTRY
+                .iter()
+                .find(|descriptor| descriptor.code.as_str().eq_ignore_ascii_case(&normalized))
+                .ok_or_else(|| {
+                    atho_rpc::error::RpcError::invalid_request(format!(
+                        "unknown Atho error code {query}"
+                    ))
+                })?;
+            return serde_json::to_value(descriptor)
+                .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()));
+        }
         let rendered = atho_errors::render_json_registry()
             .map_err(|err| atho_rpc::error::RpcError::invalid_request(err.to_string()))?;
         serde_json::from_str(&rendered)
@@ -2770,10 +2776,6 @@ impl NodeService {
         args: &[String],
     ) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getblocktemplate", args)?;
-        let status = self.node_status();
-        if let Some(reason) = Self::mining_sync_block_reason(&status) {
-            return Err(atho_rpc::error::RpcError::invalid_request(reason));
-        }
         let block = self
             .orchestrator
             .runtime
@@ -2786,10 +2788,6 @@ impl NodeService {
 
     fn command_gettemplateinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("gettemplateinfo", args)?;
-        let status = self.node_status();
-        if let Some(reason) = Self::mining_sync_block_reason(&status) {
-            return Err(atho_rpc::error::RpcError::invalid_request(reason));
-        }
         let block = self
             .orchestrator
             .runtime
@@ -2965,6 +2963,92 @@ impl NodeService {
         Err(atho_rpc::error::RpcError::invalid_request(
             "unknown transaction txid",
         ))
+    }
+
+    fn command_sendrawtransaction(
+        &mut self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        let raw_tx_hex = self.parse_single_string_arg("sendrawtransaction", args, "raw_tx_hex")?;
+        self.broadcast_raw_transaction_hex_value(&raw_tx_hex)
+    }
+
+    pub(crate) fn broadcast_raw_transaction_hex_value(
+        &mut self,
+        raw_tx_hex: &str,
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        let transaction = parse_raw_transaction_hex(raw_tx_hex)?;
+        self.broadcast_transaction_value(transaction)
+    }
+
+    fn broadcast_transaction_value(
+        &mut self,
+        transaction: Transaction,
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        let txid = transaction.txid();
+        let wtxid = transaction.wtxid();
+        let size_bytes = transaction.full_size_bytes();
+        let vsize_bytes = transaction.vsize_bytes().max(1);
+        let tx_summary = dev::summarize_transaction(&transaction, None);
+        let status = self.node_status();
+        if let Some(reason) = Self::transaction_submission_sync_block_reason(&status) {
+            let _ = dev::append_log(
+                "athod",
+                &format!("raw tx rejected before admission error={reason} {tx_summary}"),
+            );
+            return Err(atho_rpc::error::RpcError::invalid_request(reason));
+        }
+
+        match self
+            .orchestrator
+            .runtime
+            .node
+            .accept_relayed_transaction(transaction)
+        {
+            Ok(submitted) => {
+                self.refresh_runtime_views();
+                let entry = self
+                    .orchestrator
+                    .runtime
+                    .node
+                    .mempool_entry(&submitted)
+                    .ok_or_else(atho_rpc::error::RpcError::internal)?;
+                let fee_atoms = entry.fee_atoms;
+                let feerate_atoms_per_vbyte = entry.feerate_atoms_per_vbyte();
+                let relay_ready = self.p2p_transaction_relay_ready();
+                let _ = dev::append_log(
+                    "athod",
+                    &format!(
+                        "raw tx submitted txid={} fee_atoms={} mempool={} relay_ready={} {tx_summary}",
+                        hex::encode(submitted),
+                        fee_atoms,
+                        self.orchestrator.runtime.node.mempool_len(),
+                        relay_ready
+                    ),
+                );
+                Ok(json!({
+                    "accepted": true,
+                    "txid": hex::encode(txid),
+                    "wtxid": hex::encode(wtxid),
+                    "fee_atoms": fee_atoms,
+                    "fee_atho": format_atoms_decimal(self.network(), fee_atoms),
+                    "size_bytes": size_bytes,
+                    "vsize_bytes": vsize_bytes,
+                    "feerate_atoms_per_vbyte": feerate_atoms_per_vbyte,
+                    "mempool_count": self.orchestrator.runtime.node.mempool_len(),
+                    "relay_ready": relay_ready,
+                    "relay_status": if relay_ready { "ready" } else { "accepted_pending_sync" },
+                }))
+            }
+            Err(err) => {
+                let rpc_error = rpc_error_from_node(err);
+                let _ = dev::append_log(
+                    "athod",
+                    &format!("raw tx rejected error={rpc_error} {tx_summary}"),
+                );
+                Err(rpc_error)
+            }
+        }
     }
 
     fn estimate_transaction_fee_atoms(&self, tx: &Transaction) -> Option<u64> {
@@ -3616,6 +3700,7 @@ mod tests {
     use crate::mempool::MempoolEntry;
     use crate::test_support::acquire_global_test_lock;
     use atho_core::address::encode_base56_address;
+    use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
     use atho_core::network::Network;
     use atho_core::transaction::Transaction;
     use atho_rpc::request::RpcRequest;
@@ -3692,6 +3777,89 @@ mod tests {
             pruned: false,
             persisted_unix: timestamp,
         }
+    }
+
+    fn sign_seed_spend_with_output_lock(
+        network: Network,
+        seed_txid: [u8; 48],
+        seed_value: u64,
+        seed_script: Vec<u8>,
+        output_locking_script: Vec<u8>,
+    ) -> Transaction {
+        let mut seed = Vec::with_capacity(network.id().len() + seed_txid.len());
+        seed.extend_from_slice(network.id().as_bytes());
+        seed.extend_from_slice(&seed_txid);
+        let keypair = atho_crypto::falcon::generate_from_seed(&seed).expect("seed keypair");
+        let mut output_atoms = seed_value.saturating_sub(1);
+
+        for _ in 0..4 {
+            let mut tx = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    previous_txid: seed_txid,
+                    output_index: 0,
+                    unlocking_script: seed_script.clone(),
+                }],
+                outputs: vec![TxOutput {
+                    value_atoms: output_atoms,
+                    locking_script: output_locking_script.clone(),
+                }],
+                lock_time: 0,
+                witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            };
+            let digest = atho_core::consensus::signatures::transaction_signing_digest(network, &tx);
+            let signature = atho_crypto::falcon::sign(
+                atho_core::consensus::signatures::AthoSignatureDomain::Transaction,
+                &keypair.secret_key,
+                &digest,
+            )
+            .expect("signature");
+            let sig_bytes = signature.0.clone();
+            tx.witness = atho_core::transaction::TxWitness {
+                signature: sig_bytes.clone(),
+                pubkey: keypair.public_key.0.clone(),
+                input_refs: vec![atho_core::transaction::WitnessInputRef {
+                    input_index: 0,
+                    sig_ref_short: crate::validation::derive_sig_ref_short(
+                        &tx.txid(),
+                        &sig_bytes,
+                        0,
+                    ),
+                    witness_commit_ref: [0; 16],
+                }],
+                additional_signers: vec![],
+            }
+            .canonical_bytes();
+            let fee_atoms = minimum_required_fee_atoms(network, &tx);
+            if seed_value.saturating_sub(fee_atoms) == output_atoms {
+                let txid = tx.txid();
+                let witness_root = tx.witness_commitment_hash();
+                tx.witness = atho_core::transaction::TxWitness {
+                    signature: sig_bytes.clone(),
+                    pubkey: keypair.public_key.0.clone(),
+                    input_refs: vec![atho_core::transaction::WitnessInputRef {
+                        input_index: 0,
+                        sig_ref_short: crate::validation::derive_sig_ref_short(
+                            &txid, &sig_bytes, 0,
+                        ),
+                        witness_commit_ref: crate::validation::derive_witness_commit_ref(
+                            &txid,
+                            &witness_root,
+                            0,
+                        ),
+                    }],
+                    additional_signers: vec![],
+                }
+                .canonical_bytes();
+                atho_core::consensus::tx_policy::solve_transaction_pow(network, &mut tx, fee_atoms);
+                return tx;
+            }
+            output_atoms = seed_value.saturating_sub(fee_atoms);
+        }
+
+        panic!("failed to stabilize legacy-lock test spend fee");
     }
 
     #[test]
@@ -4061,6 +4229,25 @@ mod tests {
     }
 
     #[test]
+    fn execute_command_geterrorcodes_can_explain_one_code() {
+        let root = temp_data_dir("command-errorcodes");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let response = service.handle(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "geterrorcodes",
+            vec![String::from("ATHO-RPC-002")],
+        )));
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(command.command, "geterrorcodes");
+        assert_eq!(command.data["code"], "ATHO-RPC-002");
+        assert_eq!(command.data["category"], "rpc");
+    }
+
+    #[test]
     fn execute_command_getblockchaininfo_reports_active_network() {
         let root = temp_data_dir("command-blockchaininfo");
         fs::create_dir_all(&root).expect("root");
@@ -4187,42 +4374,6 @@ mod tests {
     }
 
     #[test]
-    fn mining_templates_are_paused_when_sync_status_is_not_safe_to_mine() {
-        let mut status = NodeStatus {
-            network: Network::Mainnet,
-            block_count: 128,
-            tip_hash: [0x13; 48],
-            tip_timestamp: 1_777_416_445,
-            estimated_hashrate_hps: 0,
-            mempool_count: 0,
-            mempool_total_fee_atoms: 0,
-            mempool_fingerprint: [0x24; 32],
-            running: true,
-            headers_synced: true,
-            sync_best_height: 128,
-            network_diagnostics: NetworkDiagnostics {
-                peer_count: 1,
-                chain_validation_status: String::from("body_download_ahead"),
-                validation_lag_blocks: 2,
-                safe_to_mine: false,
-                ..NetworkDiagnostics::default()
-            },
-        };
-
-        let reason = NodeService::mining_sync_block_reason(&status)
-            .expect("public networks must block unsafe mining templates");
-        assert!(reason.contains("safe_to_mine=false"));
-        assert!(reason.contains("validation_lag_blocks=2"));
-
-        status.network_diagnostics.safe_to_mine = true;
-        assert!(NodeService::mining_sync_block_reason(&status).is_none());
-
-        status.network_diagnostics.safe_to_mine = false;
-        status.network = Network::Regnet;
-        assert!(NodeService::mining_sync_block_reason(&status).is_none());
-    }
-
-    #[test]
     fn transaction_submission_is_paused_until_chain_is_synced() {
         let mut status = NodeStatus {
             network: Network::Mainnet,
@@ -4281,6 +4432,153 @@ mod tests {
         let mut regnet = status;
         regnet.network = Network::Regnet;
         assert!(NodeService::transaction_submission_sync_block_reason(&regnet).is_none());
+    }
+
+    #[test]
+    fn sendrawtransaction_accepts_canonical_raw_transaction_and_computes_fee() {
+        let root = temp_data_dir("sendrawtransaction-accept");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+        service.sandbox_with_node_mut(|node| {
+            node.dev_seed_chainstate(
+                6,
+                node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    seed_script.clone(),
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed spendable utxo");
+        });
+
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed raw transaction");
+        let txid = transaction.txid();
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &transaction);
+        let raw_tx_hex = hex::encode(transaction.full_bytes());
+        let response = service.handle_mut(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "sendrawtransaction",
+            vec![raw_tx_hex],
+        )));
+
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected sendrawtransaction response: {response:?}");
+        };
+        assert_eq!(command.command, "sendrawtransaction");
+        assert_eq!(command.data["accepted"], true);
+        assert_eq!(command.data["txid"], hex::encode(txid));
+        assert_eq!(command.data["fee_atoms"], fee_atoms);
+        assert_eq!(service.node_ref().mempool_len(), 1);
+        assert!(service.node_ref().mempool_contains(&txid));
+    }
+
+    #[test]
+    fn parse_raw_transaction_hex_rejects_trailing_bytes_noncanonical_encoding() {
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+        let transaction = crate::dev::signed_spend_transaction(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+        )
+        .expect("signed transaction");
+        let mut raw = transaction.full_bytes();
+        raw.push(0);
+
+        let error = parse_raw_transaction_hex(&hex::encode(raw)).unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("not valid canonical full transaction bytes")
+                || rendered.contains("not canonical full transaction encoding"),
+            "unexpected raw transaction parse error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sendrawtransaction_rejects_noncanonical_raw_transaction_bytes() {
+        let root = temp_data_dir("sendrawtransaction-reject");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
+        let response = service.handle_mut(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "sendrawtransaction",
+            vec![String::from("0001")],
+        )));
+
+        let RpcResponse::Error(error) = response else {
+            panic!("unexpected noncanonical tx response: {response:?}");
+        };
+        assert!(error
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .contains("raw transaction"));
+        assert_eq!(service.node_ref().mempool_len(), 0);
+    }
+
+    #[test]
+    fn sendrawtransaction_rejects_legacy_lock_format() {
+        let root = temp_data_dir("sendrawtransaction-legacy-lock");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
+        let (seed_txid, seed_value, seed_script) = crate::dev::seed_utxo(Network::Regnet);
+        service.sandbox_with_node_mut(|node| {
+            node.dev_seed_chainstate(
+                6,
+                node.tip_hash(),
+                [UtxoEntry::new(
+                    Network::Regnet,
+                    seed_txid,
+                    0,
+                    seed_value,
+                    seed_script.clone(),
+                    0,
+                    false,
+                )],
+            )
+            .expect("seed spendable utxo");
+        });
+
+        let transaction = sign_seed_spend_with_output_lock(
+            Network::Regnet,
+            seed_txid,
+            seed_value,
+            seed_script,
+            vec![0x99],
+        );
+        let raw_tx_hex = hex::encode(transaction.full_bytes());
+        let response = service.handle_mut(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "sendrawtransaction",
+            vec![raw_tx_hex],
+        )));
+
+        let RpcResponse::Error(error) = response else {
+            panic!("unexpected legacy-lock response: {response:?}");
+        };
+        let details = error.details.as_deref().unwrap_or_default();
+        assert!(
+            details.contains("ATHO-TX-015")
+                || details.contains("legacy lock format rejected")
+                || details.contains("Legacy Lock Format Rejected"),
+            "unexpected legacy-lock rejection details: {details}"
+        );
+        assert_eq!(service.node_ref().mempool_len(), 0);
     }
 
     #[test]
@@ -4569,4 +4867,44 @@ fn parse_hash48(value: &str) -> Result<[u8; 48], atho_rpc::error::RpcError> {
     let mut hash = [0u8; 48];
     hash.copy_from_slice(&bytes);
     Ok(hash)
+}
+
+fn parse_raw_transaction_hex(raw_tx_hex: &str) -> Result<Transaction, atho_rpc::error::RpcError> {
+    let trimmed = raw_tx_hex.trim();
+    let hex_value = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if hex_value.is_empty() {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "raw transaction hex is empty",
+        ));
+    }
+    if hex_value.len() % 2 != 0 {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "raw transaction hex must contain whole bytes",
+        ));
+    }
+    if hex_value.len() / 2 > MAX_TRANSACTION_RAW_BYTES {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "raw transaction exceeds maximum standard transaction size",
+        ));
+    }
+    if !hex_value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "raw transaction contains non-hex characters",
+        ));
+    }
+
+    let bytes = hex::decode(hex_value).map_err(|_| {
+        atho_rpc::error::RpcError::invalid_request("raw transaction contains invalid hex")
+    })?;
+    let transaction = Transaction::from_full_bytes(&bytes).ok_or_else(|| {
+        atho_rpc::error::RpcError::invalid_request(
+            "raw transaction is not valid canonical full transaction bytes",
+        )
+    })?;
+    if transaction.full_bytes() != bytes {
+        return Err(atho_rpc::error::RpcError::invalid_request(
+            "raw transaction is not canonical full transaction encoding",
+        ));
+    }
+    Ok(transaction)
 }

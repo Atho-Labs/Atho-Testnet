@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_errors::{
     AthoErrorDescriptor, AthoErrorMeta, SIG_BACKEND_UNAVAILABLE, SIG_CRYPTO_OPERATION_FAILED,
     SIG_INVALID_KEY_LENGTH,

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Atho contributors
+
 #
 # Copyright (c) 2014-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying

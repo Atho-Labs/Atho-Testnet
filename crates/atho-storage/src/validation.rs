@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Transaction and block validation against chainstate context.
 //!
 //! This module bridges the pure protocol types in `atho-core` with the live
@@ -8,7 +11,7 @@
 //! witness references, and wrong-network blocks are rejected here before the
 //! chainstate mutates.
 use crate::utxo::{UtxoEntry, UtxoSet};
-use atho_core::address::public_key_digest;
+use atho_core::address::{payment_digest_from_locking_script, public_key_digest};
 use atho_core::block::Block;
 use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{
@@ -22,7 +25,7 @@ use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{
     ADDRESS_DIGEST_BYTES, DUST_RELAY_VALUE_ATOMS, FALCON_512_PUBLIC_KEY_BYTES,
     FALCON_512_SIGNATURE_BYTES, MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT,
-    MAX_FUTURE_BLOCK_TIME_SECONDS, MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES,
+    MAX_STANDARD_INPUTS, MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -36,12 +39,11 @@ use atho_errors::{
     MEM_DUST_OUTPUT, MEM_MEMPOOL_CONFLICT, NET_BLOCK_NETWORK_MISMATCH, SIG_INVALID_WITNESS,
     SIG_WITNESS_INPUT_REF_MISMATCH, TX_DUPLICATE_INPUT, TX_FEE_BELOW_MINIMUM, TX_FEE_MISMATCH,
     TX_INPUT_OWNERSHIP_MISMATCH, TX_INSUFFICIENT_CONFIRMATIONS, TX_INVALID_POW_NONCE,
-    TX_INVALID_VERSION, TX_MISSING_UTXO, TX_NO_INPUTS, TX_NO_OUTPUTS, TX_TOO_LARGE,
-    TX_TOO_MANY_OUTPUTS, TX_WRONG_POW_BITS, TX_ZERO_VALUE_OUTPUT,
+    TX_INVALID_VERSION, TX_LEGACY_LOCK_FORMAT_REJECTED, TX_MISSING_UTXO, TX_NO_INPUTS,
+    TX_NO_OUTPUTS, TX_TOO_LARGE, TX_TOO_MANY_OUTPUTS, TX_WRONG_POW_BITS, TX_ZERO_VALUE_OUTPUT,
 };
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Validation failures raised while checking transactions or blocks.
@@ -57,8 +59,6 @@ pub enum ValidationError {
     TransactionTooLarge,
     #[error("invalid transaction version")]
     InvalidTransactionVersion,
-    #[error("invalid transaction lock time")]
-    InvalidLockTime,
     #[error("duplicate transaction input")]
     DuplicateInput,
     #[error("zero-value output")]
@@ -67,6 +67,8 @@ pub enum ValidationError {
     DustOutput,
     #[error("transaction has too many outputs")]
     TooManyOutputs,
+    #[error("legacy lock format rejected")]
+    LegacyLockFormatRejected,
     #[error("invalid witness")]
     InvalidWitness,
     #[error("wrong transaction pow bits")]
@@ -137,11 +139,11 @@ impl AthoErrorMeta for ValidationError {
             Self::FeeBelowMinimum => &TX_FEE_BELOW_MINIMUM,
             Self::TransactionTooLarge => &TX_TOO_LARGE,
             Self::InvalidTransactionVersion => &TX_INVALID_VERSION,
-            Self::InvalidLockTime => &TX_INVALID_VERSION,
             Self::DuplicateInput => &TX_DUPLICATE_INPUT,
             Self::ZeroValueOutput => &TX_ZERO_VALUE_OUTPUT,
             Self::DustOutput => &MEM_DUST_OUTPUT,
             Self::TooManyOutputs => &TX_TOO_MANY_OUTPUTS,
+            Self::LegacyLockFormatRejected => &TX_LEGACY_LOCK_FORMAT_REJECTED,
             Self::InvalidWitness => &SIG_INVALID_WITNESS,
             Self::WrongTransactionPowBits => &TX_WRONG_POW_BITS,
             Self::InvalidTransactionPowNonce => &TX_INVALID_POW_NONCE,
@@ -340,38 +342,6 @@ fn prepare_transaction_validation(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<PreparedTransactionValidation, ValidationError> {
-    prepare_transaction_validation_with_policy(tx, fee_atoms, network, height, schedule, true)
-}
-
-fn prepare_transaction_consensus_validation(
-    tx: &Transaction,
-    fee_atoms: u64,
-    network: Network,
-    height: u64,
-    schedule: &[rules::ScheduledActivation],
-) -> Result<PreparedTransactionValidation, ValidationError> {
-    prepare_transaction_validation_with_policy(
-        tx,
-        fee_atoms,
-        network,
-        height,
-        schedule,
-        consensus_enforces_standard_output_policy(network),
-    )
-}
-
-fn consensus_enforces_standard_output_policy(network: Network) -> bool {
-    matches!(network, Network::Mainnet | Network::Regnet)
-}
-
-fn prepare_transaction_validation_with_policy(
-    tx: &Transaction,
-    fee_atoms: u64,
-    network: Network,
-    height: u64,
-    schedule: &[rules::ScheduledActivation],
-    enforce_standard_policy: bool,
-) -> Result<PreparedTransactionValidation, ValidationError> {
     if tx.is_coinbase() {
         return Err(ValidationError::NoInputs);
     }
@@ -380,13 +350,10 @@ fn prepare_transaction_validation_with_policy(
     if !supported_version {
         return Err(ValidationError::InvalidTransactionVersion);
     }
-    if tx.lock_time != 0 && u64::from(tx.lock_time) > height {
-        return Err(ValidationError::InvalidLockTime);
-    }
     if tx.outputs.is_empty() {
         return Err(ValidationError::NoOutputs);
     }
-    if enforce_standard_policy && tx.outputs.len() > maximum_standard_outputs(network, tx) {
+    if tx.outputs.len() > maximum_standard_outputs(network, tx) {
         return Err(ValidationError::TooManyOutputs);
     }
     let raw_size_bytes = tx.full_size_bytes();
@@ -407,15 +374,16 @@ fn prepare_transaction_validation_with_policy(
     if fee_atoms < minimum_fee {
         return Err(ValidationError::FeeBelowMinimum);
     }
-    if enforce_standard_policy {
-        let dust_floor = minimum_output_amount_atoms(network, tx);
-        if tx
-            .outputs
-            .iter()
-            .any(|output| output.value_atoms < dust_floor)
-        {
-            return Err(ValidationError::DustOutput);
-        }
+    let dust_floor = minimum_output_amount_atoms(network, tx);
+    if tx
+        .outputs
+        .iter()
+        .any(|output| output.value_atoms < dust_floor)
+    {
+        return Err(ValidationError::DustOutput);
+    }
+    for output in &tx.outputs {
+        canonical_payment_lock(output.locking_script.as_slice())?;
     }
     let witness = tx
         .witness_payload()
@@ -485,13 +453,20 @@ fn prepare_transaction_validation_with_policy(
     })
 }
 
+fn canonical_payment_lock(
+    locking_script: &[u8],
+) -> Result<[u8; ADDRESS_DIGEST_BYTES], ValidationError> {
+    payment_digest_from_locking_script(locking_script)
+        .ok_or(ValidationError::LegacyLockFormatRejected)
+}
+
 fn locking_script_matches_public_key(
     network: Network,
     locking_script: &[u8],
     public_key: &[u8],
-) -> bool {
-    locking_script.len() == ADDRESS_DIGEST_BYTES
-        && public_key_digest(network, public_key).as_slice() == locking_script
+) -> Result<bool, ValidationError> {
+    let expected_lock = canonical_payment_lock(locking_script)?;
+    Ok(public_key_digest(network, public_key) == expected_lock)
 }
 
 /// Performs context-free transaction validation with a caller-supplied fee.
@@ -518,8 +493,8 @@ pub fn validate_transaction_standard_policy(
     tx: &Transaction,
     network: Network,
 ) -> Result<(), ValidationError> {
-    if tx.outputs.len() > maximum_standard_outputs(network, tx) {
-        return Err(ValidationError::TooManyOutputs);
+    if tx.inputs.len() > MAX_STANDARD_INPUTS {
+        return Err(ValidationError::TransactionTooLarge);
     }
     let dust_floor = minimum_output_amount_atoms(network, tx);
     if tx
@@ -593,9 +568,57 @@ where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
     let prepared = prepare_transaction_validation(tx, fee_atoms, network, spend_height, schedule)?;
-    let actual_fee = validate_transaction_with_context_common_and_schedule(
+    validate_transaction_with_context_exact_fee_prepared_and_schedule(
         tx,
         &prepared,
+        fee_atoms,
+        network,
+        spend_height,
+        lookup,
+        schedule,
+    )
+}
+
+/// Validates a transaction against UTXO context with a minimum fee floor.
+pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
+    tx: &Transaction,
+    minimum_fee_atoms: u64,
+    network: Network,
+    spend_height: u64,
+    lookup: F,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    let prepared =
+        prepare_transaction_validation(tx, minimum_fee_atoms, network, spend_height, schedule)?;
+    validate_transaction_with_context_minimum_fee_prepared_and_schedule(
+        tx,
+        &prepared,
+        minimum_fee_atoms,
+        network,
+        spend_height,
+        lookup,
+        schedule,
+    )
+}
+
+fn validate_transaction_with_context_exact_fee_prepared_and_schedule<F>(
+    tx: &Transaction,
+    prepared: &PreparedTransactionValidation,
+    fee_atoms: u64,
+    network: Network,
+    spend_height: u64,
+    lookup: F,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<u64, ValidationError>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
+{
+    let actual_fee = validate_transaction_with_context_common_and_schedule(
+        tx,
+        prepared,
         network,
         spend_height,
         lookup,
@@ -614,9 +637,9 @@ where
     Ok(actual_fee)
 }
 
-/// Validates a transaction against UTXO context with a minimum fee floor.
-pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
+fn validate_transaction_with_context_minimum_fee_prepared_and_schedule<F>(
     tx: &Transaction,
+    prepared: &PreparedTransactionValidation,
     minimum_fee_atoms: u64,
     network: Network,
     spend_height: u64,
@@ -626,50 +649,9 @@ pub fn validate_transaction_with_context_minimum_fee_and_schedule<F>(
 where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
-    let prepared =
-        prepare_transaction_validation(tx, minimum_fee_atoms, network, spend_height, schedule)?;
     let actual_fee = validate_transaction_with_context_common_and_schedule(
         tx,
-        &prepared,
-        network,
-        spend_height,
-        lookup,
-        schedule,
-    )?;
-    if actual_fee < minimum_fee_atoms {
-        return Err(ValidationError::FeeBelowMinimum);
-    }
-    let required_bits = required_tx_pow_bits(network, tx, actual_fee);
-    if tx.tx_pow_bits != required_bits {
-        return Err(ValidationError::WrongTransactionPowBits);
-    }
-    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
-        return Err(ValidationError::InvalidTransactionPowNonce);
-    }
-    Ok(actual_fee)
-}
-
-fn validate_transaction_with_context_minimum_fee_consensus_and_schedule<F>(
-    tx: &Transaction,
-    minimum_fee_atoms: u64,
-    network: Network,
-    spend_height: u64,
-    lookup: F,
-    schedule: &[rules::ScheduledActivation],
-) -> Result<u64, ValidationError>
-where
-    F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
-{
-    let prepared = prepare_transaction_consensus_validation(
-        tx,
-        minimum_fee_atoms,
-        network,
-        spend_height,
-        schedule,
-    )?;
-    let actual_fee = validate_transaction_with_context_common_and_schedule(
-        tx,
-        &prepared,
+        prepared,
         network,
         spend_height,
         lookup,
@@ -706,6 +688,8 @@ where
         // attempt to spend coins the witness does not control.
         let utxo =
             lookup(&input.previous_txid, input.output_index).ok_or(ValidationError::MissingUtxo)?;
+        canonical_payment_lock(utxo.locking_script.as_slice())?;
+        canonical_payment_lock(input.unlocking_script.as_slice())?;
         if utxo.locking_script != input.unlocking_script {
             return Err(ValidationError::InputOwnershipMismatch);
         }
@@ -716,7 +700,7 @@ where
             utxo.network,
             &utxo.locking_script,
             &prepared.signer_groups[prepared.signer_group_by_input[index]].pubkey,
-        ) {
+        )? {
             return Err(ValidationError::InputOwnershipMismatch);
         }
         if !utxo.is_spendable_at(spend_height) {
@@ -787,24 +771,15 @@ where
     F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
 {
     let prepared = prepare_transaction_validation(tx, fee_atoms, network, spend_height, schedule)?;
-    let actual_fee = validate_transaction_with_context_common_and_schedule(
+    let actual_fee = validate_transaction_with_context_exact_fee_prepared_and_schedule(
         tx,
         &prepared,
+        fee_atoms,
         network,
         spend_height,
         lookup,
         schedule,
     )?;
-    if actual_fee != fee_atoms {
-        return Err(ValidationError::FeeMismatch);
-    }
-    let required_bits = required_tx_pow_bits(network, tx, actual_fee);
-    if tx.tx_pow_bits != required_bits {
-        return Err(ValidationError::WrongTransactionPowBits);
-    }
-    if !transaction_pow_is_valid_for_bits(network, tx, required_bits) {
-        return Err(ValidationError::InvalidTransactionPowNonce);
-    }
     verify_transaction_signature_prepared(tx, network, prepared)?;
     Ok(actual_fee)
 }
@@ -830,21 +805,6 @@ pub fn validate_coinbase_transaction_with_schedule(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
-    validate_coinbase_transaction_shape_with_schedule(tx, height, schedule)?;
-    let output_total = tx
-        .checked_output_value_atoms()
-        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
-    if output_total != expected_reward_atoms {
-        return Err(ValidationError::CoinbaseRewardMismatch);
-    }
-    Ok(())
-}
-
-fn validate_coinbase_transaction_shape_with_schedule(
-    tx: &Transaction,
-    height: u64,
-    schedule: &[rules::ScheduledActivation],
-) -> Result<(), ValidationError> {
     if !tx.is_coinbase() {
         return Err(ValidationError::InvalidCoinbase);
     }
@@ -854,10 +814,122 @@ fn validate_coinbase_transaction_shape_with_schedule(
     if tx.outputs.len() != 1 {
         return Err(ValidationError::InvalidCoinbase);
     }
-    let _ = tx
+    canonical_payment_lock(tx.outputs[0].locking_script.as_slice())?;
+    let output_total = tx
         .checked_output_value_atoms()
         .ok_or(ValidationError::CoinbaseRewardMismatch)?;
+    if output_total != expected_reward_atoms {
+        return Err(ValidationError::CoinbaseRewardMismatch);
+    }
     Ok(())
+}
+
+fn validate_block_size_metrics(block: &Block) -> Result<(), ValidationError> {
+    let size_metrics = block.size_metrics();
+    if size_metrics.raw_size_bytes > MAX_BLOCK_RAW_BYTES
+        || size_metrics.vsize_bytes > MAX_BLOCK_VBYTES
+        || size_metrics.weight_bytes > MAX_BLOCK_WEIGHT
+    {
+        return Err(ValidationError::BlockTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_block_common_header_with_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    if block.transactions.is_empty() {
+        return Err(ValidationError::EmptyBlock);
+    }
+    if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
+        return Err(ValidationError::InvalidBlockVersion);
+    }
+    if block.header.network_id != network {
+        return Err(ValidationError::BlockNetworkMismatch);
+    }
+    if block.header.height != height {
+        return Err(ValidationError::InvalidBlockHeight);
+    }
+    if block.header.timestamp == 0 {
+        return Err(ValidationError::InvalidBlockTimestamp);
+    }
+    Ok(())
+}
+
+fn validate_block_static_header_precheck_with_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    validate_block_common_header_with_schedule(block, height, network, schedule)?;
+    validate_block_size_metrics(block)?;
+    let target = block.header.difficulty_target_or_bits;
+    if !pow::target_within_bounds(&target) {
+        return Err(ValidationError::BlockTargetOutOfBounds);
+    }
+    Ok(())
+}
+
+fn validate_block_body_commitments(block: &Block) -> Result<(), ValidationError> {
+    if block.merkle_root() != block.header.merkle_root {
+        return Err(ValidationError::BlockMerkleRootMismatch);
+    }
+    let computed_witness_root = block.compute_witness_root();
+    if computed_witness_root != block.header.witness_root {
+        return Err(ValidationError::BlockWitnessRootMismatch);
+    }
+    Ok(())
+}
+
+fn validate_block_header_shape_with_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
+    validate_block_static_header_precheck_with_schedule(block, height, network, schedule)?;
+    validate_block_body_commitments(block)?;
+    Ok(())
+}
+
+fn collect_prepared_block_transactions_with_schedule(
+    block: &Block,
+    height: u64,
+    network: Network,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<Vec<PreparedTransactionValidation>, ValidationError> {
+    let subsidy = subsidy::block_subsidy_atoms_for_network(network, height);
+    let expected_coinbase_reward = subsidy
+        .checked_add(block.fees_miner_atoms)
+        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
+    validate_coinbase_transaction_with_schedule(
+        &block.transactions[0],
+        expected_coinbase_reward,
+        height,
+        schedule,
+    )?;
+    if !txids_are_unique(&block.transactions) {
+        return Err(ValidationError::DuplicateTransactionId);
+    }
+    if !block_inputs_are_unique(&block.transactions) {
+        return Err(ValidationError::MempoolConflict);
+    }
+
+    let mut prepared = Vec::with_capacity(block.transactions.len().saturating_sub(1));
+    for tx in &block.transactions[1..] {
+        prepared.push(prepare_transaction_validation(
+            tx,
+            minimum_required_fee_atoms(network, tx),
+            network,
+            height,
+            schedule,
+        )?);
+    }
+    Ok(prepared)
 }
 
 fn validate_block_impl(
@@ -882,100 +954,32 @@ fn validate_block_impl_with_schedule(
     skip_pow: bool,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
-    if block.transactions.is_empty() {
-        return Err(ValidationError::EmptyBlock);
-    }
-    if block
-        .transactions
-        .iter()
-        .skip(1)
-        .any(Transaction::is_coinbase)
-    {
-        return Err(ValidationError::MultipleCoinbaseTransactions);
-    }
-    if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
-        return Err(ValidationError::InvalidBlockVersion);
-    }
-    if block.header.network_id != network {
-        return Err(ValidationError::BlockNetworkMismatch);
-    }
-    if block.header.height != height {
-        return Err(ValidationError::InvalidBlockHeight);
-    }
-    if block.header.timestamp == 0 {
-        return Err(ValidationError::InvalidBlockTimestamp);
-    }
-    validate_block_timestamp_not_far_future(block.header.timestamp, current_unix_timestamp())?;
-    let size_metrics = block.size_metrics();
-    if size_metrics.raw_size_bytes > MAX_BLOCK_RAW_BYTES
-        || size_metrics.vsize_bytes > MAX_BLOCK_VBYTES
-        || size_metrics.weight_bytes > MAX_BLOCK_WEIGHT
-    {
-        return Err(ValidationError::BlockTooLarge);
-    }
-    if block.merkle_root() != block.header.merkle_root {
-        return Err(ValidationError::BlockMerkleRootMismatch);
-    }
-    let computed_witness_root = block.compute_witness_root();
-    if computed_witness_root != block.header.witness_root {
-        return Err(ValidationError::BlockWitnessRootMismatch);
-    }
+    validate_block_header_shape_with_schedule(block, height, network, schedule)?;
     let target = block.header.difficulty_target_or_bits;
-    if !pow::target_within_bounds(&target) {
-        return Err(ValidationError::BlockTargetOutOfBounds);
-    }
     if !skip_pow && !pow::meets_target(&block.header.block_hash(), &target) {
         return Err(ValidationError::ProofOfWorkInvalid);
     }
 
-    let subsidy = subsidy::block_subsidy_atoms_for_network(network, height);
-    if block.transactions.len() == 1 {
-        validate_coinbase_transaction_with_schedule(
-            &block.transactions[0],
-            subsidy,
-            height,
-            schedule,
-        )?;
-    } else {
-        // Context-free checks cannot derive fees from spent UTXOs. Do not trust
-        // the block's uncommitted fee metadata here; contextual validation
-        // below verifies coinbase reward against locally computed fees.
-        validate_coinbase_transaction_shape_with_schedule(
-            &block.transactions[0],
-            height,
-            schedule,
-        )?;
-    }
-    if !txids_are_unique(&block.transactions) {
-        return Err(ValidationError::DuplicateTransactionId);
-    }
-    if !block_inputs_are_unique(&block.transactions) {
-        return Err(ValidationError::MempoolConflict);
-    }
-    if block.transactions.len() > 1 {
-        for tx in &block.transactions[1..] {
-            let _ = prepare_transaction_consensus_validation(
-                tx,
-                minimum_required_fee_atoms(network, tx),
-                network,
-                height,
-                schedule,
-            )?;
-        }
-    }
-    if block.transactions.len() > 1 {
-        verify_transaction_signatures_parallel(network, &block.transactions[1..])?;
-    }
+    let prepared_transactions =
+        collect_prepared_block_transactions_with_schedule(block, height, network, schedule)?;
+    verify_transaction_signatures_parallel_prepared(
+        network,
+        &block.transactions[1..],
+        prepared_transactions,
+    )?;
     Ok(())
 }
 
-fn verify_transaction_signatures_parallel(
+fn verify_transaction_signatures_parallel_prepared(
     network: Network,
     transactions: &[Transaction],
+    prepared_transactions: Vec<PreparedTransactionValidation>,
 ) -> Result<(), ValidationError> {
+    debug_assert_eq!(transactions.len(), prepared_transactions.len());
     let results: Vec<Result<(), ValidationError>> = transactions
         .par_iter()
-        .map(|tx| verify_transaction_signature(tx, network))
+        .zip(prepared_transactions.into_par_iter())
+        .map(|(tx, prepared)| verify_transaction_signature_prepared(tx, network, prepared))
         .collect();
     for result in results {
         result?;
@@ -1006,29 +1010,6 @@ fn block_inputs_are_unique(transactions: &[Transaction]) -> bool {
 /// Validates a block under the current rule schedule and performs PoW checks.
 pub fn validate_block(block: &Block, height: u64, network: Network) -> Result<(), ValidationError> {
     validate_block_impl(block, height, network, false)
-}
-
-/// Derives the miner fee total from the validated coinbase output.
-///
-/// SECURITY: Fee metadata carried on [`Block`] is not committed by the block
-/// hash. Consensus code must derive fees from UTXO validation and/or the checked
-/// coinbase reward rather than trusting uncommitted metadata supplied by peers.
-pub fn derived_block_fee_atoms(
-    block: &Block,
-    height: u64,
-    network: Network,
-) -> Result<u64, ValidationError> {
-    let coinbase = block
-        .transactions
-        .first()
-        .ok_or(ValidationError::EmptyBlock)?;
-    let output_total = coinbase
-        .checked_output_value_atoms()
-        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
-    let subsidy = subsidy::block_subsidy_atoms_for_network(network, height);
-    output_total
-        .checked_sub(subsidy)
-        .ok_or(ValidationError::CoinbaseRewardMismatch)
 }
 
 /// Validates a block while skipping PoW checks for internal tooling.
@@ -1092,31 +1073,31 @@ pub fn validate_block_with_context_and_schedule(
         mut utxos,
     } = context;
 
+    validate_block_static_header_precheck_with_schedule(block, height, network, schedule)?;
     validate_contextual_header_precheck(
         block,
-        height,
-        network,
         expected_previous_hash,
         expected_target,
         previous_blocks,
-        schedule,
     )?;
-    validate_block_impl_with_schedule(block, height, network, true, schedule)?;
+    validate_block_body_commitments(block)?;
+    let prepared_transactions =
+        collect_prepared_block_transactions_with_schedule(block, height, network, schedule)?;
 
     let block_witness_root = block.header.witness_root;
     // INVARIANT: No input may be spent twice within one block.
     let mut seen_inputs = BTreeSet::new();
     let mut sum_fees = 0u64;
 
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
-        if tx_index == 0 {
-            continue;
-        }
-
+    for (tx, prepared) in block.transactions[1..]
+        .iter()
+        .zip(prepared_transactions.iter())
+    {
         let txid = tx.txid();
         let fee_rate = minimum_required_fee_atoms(network, tx);
-        let fee = validate_transaction_with_context_minimum_fee_consensus_and_schedule(
+        let fee = validate_transaction_with_context_minimum_fee_prepared_and_schedule(
             tx,
+            prepared,
             fee_rate,
             network,
             height,
@@ -1133,11 +1114,8 @@ pub fn validate_block_with_context_and_schedule(
                 .map_err(|_| ValidationError::MissingUtxo)?;
         }
 
-        let witness = tx
-            .witness_payload()
-            .ok_or(ValidationError::InvalidWitness)?;
-        for signer_group in witness_signer_groups(&witness) {
-            for input_ref in signer_group.input_refs {
+        for signer_group in &prepared.signer_groups {
+            for input_ref in &signer_group.input_refs {
                 let expected_commit =
                     derive_witness_commit_ref(&txid, &block_witness_root, input_ref.input_index);
                 if input_ref.witness_commit_ref != expected_commit {
@@ -1164,46 +1142,26 @@ pub fn validate_block_with_context_and_schedule(
         }
     }
 
-    let expected_coinbase_reward = subsidy::block_subsidy_atoms_for_network(network, height)
-        .checked_add(sum_fees)
-        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
-    validate_coinbase_transaction_with_schedule(
-        &block.transactions[0],
-        expected_coinbase_reward,
-        height,
-        schedule,
+    if sum_fees != block.fees_total_atoms {
+        return Err(ValidationError::FeeMismatch);
+    }
+    if block.fees_total_atoms != block.fees_miner_atoms {
+        return Err(ValidationError::FeeMismatch);
+    }
+    verify_transaction_signatures_parallel_prepared(
+        network,
+        &block.transactions[1..],
+        prepared_transactions,
     )?;
     Ok(())
 }
 
 fn validate_contextual_header_precheck(
     block: &Block,
-    height: u64,
-    network: Network,
     expected_previous_hash: [u8; 48],
     expected_target: [u8; 48],
     previous_blocks: &[Block],
-    schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
-    if block.transactions.is_empty() {
-        return Err(ValidationError::EmptyBlock);
-    }
-    if !rules::is_supported_block_version_with_schedule(block.header.version, height, schedule) {
-        return Err(ValidationError::InvalidBlockVersion);
-    }
-    if block.header.network_id != network {
-        return Err(ValidationError::BlockNetworkMismatch);
-    }
-    if block.header.height != height {
-        return Err(ValidationError::InvalidBlockHeight);
-    }
-    if block.header.timestamp == 0 {
-        return Err(ValidationError::InvalidBlockTimestamp);
-    }
-    validate_block_timestamp_not_far_future(block.header.timestamp, current_unix_timestamp())?;
-    if !pow::target_within_bounds(&block.header.difficulty_target_or_bits) {
-        return Err(ValidationError::BlockTargetOutOfBounds);
-    }
     // CONSENSUS: The parent hash check binds this block to one exact chain tip.
     if block.header.previous_block_hash != expected_previous_hash {
         return Err(ValidationError::BlockParentHashMismatch);
@@ -1222,23 +1180,6 @@ fn validate_contextual_header_precheck(
     Ok(())
 }
 
-fn validate_block_timestamp_not_far_future(
-    timestamp: u64,
-    now_unix: u64,
-) -> Result<(), ValidationError> {
-    if timestamp > now_unix.saturating_add(MAX_FUTURE_BLOCK_TIME_SECONDS) {
-        return Err(ValidationError::InvalidBlockTimestamp);
-    }
-    Ok(())
-}
-
-fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1253,7 +1194,7 @@ mod tests {
         minimum_required_fee_atoms, solve_transaction_pow, transaction_pow_is_valid,
     };
     use atho_core::constants::{
-        DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_RAW_BYTES, MAX_TRANSACTION_RAW_BYTES,
+        DUST_RELAY_VALUE_ATOMS, MAX_BLOCK_RAW_BYTES, MAX_STANDARD_INPUTS, MAX_TRANSACTION_RAW_BYTES,
     };
     use atho_core::crypto::hash::sha3_384;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
@@ -1337,282 +1278,24 @@ mod tests {
         (utxo, tx, fee_atoms)
     }
 
-    fn solved_regnet_spend_block(seed: &[u8], height: u64, fee_atoms: u64) -> (UtxoEntry, Block) {
-        let funding_keypair = generate_from_seed(seed).expect("funding keypair");
-        let funding_script =
-            public_key_digest(Network::Regnet, &funding_keypair.public_key.0).to_vec();
-        let funding = UtxoEntry::new(
-            Network::Regnet,
-            sha3_384(seed),
-            0,
-            100_000,
-            funding_script.clone(),
-            0,
-            false,
-        );
-        let output_value_atoms = funding
-            .value_atoms
-            .checked_sub(fee_atoms)
-            .expect("test fee below funding value");
-        let mut tx = Transaction {
-            version: TRANSACTION_VERSION_V1,
-            inputs: vec![TxInput {
-                previous_txid: funding.txid,
-                output_index: funding.output_index,
-                unlocking_script: funding_script,
-            }],
-            outputs: vec![TxOutput {
-                value_atoms: output_value_atoms,
-                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
-            }],
-            lock_time: 0,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let signature = sign(
-            AthoSignatureDomain::Transaction,
-            &funding_keypair.secret_key,
-            &transaction_signing_digest(Network::Regnet, &tx),
-        )
-        .expect("signature")
-        .0;
-        let staged_tx = Transaction {
-            witness: TxWitness {
-                signature: signature.clone(),
-                pubkey: funding_keypair.public_key.0.clone(),
-                input_refs: vec![WitnessInputRef {
-                    input_index: 0,
-                    sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature, 0),
-                    witness_commit_ref: [0; 16],
-                }],
-                additional_signers: vec![],
-            }
-            .canonical_bytes(),
-            ..tx.clone()
-        };
-        let coinbase = Transaction {
-            version: TRANSACTION_VERSION_V1,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, height)
-                    .saturating_add(fee_atoms),
-                locking_script: vec![1],
-            }],
-            lock_time: 0,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let staged_transactions = vec![coinbase.clone(), staged_tx];
-        let block_witness_root = witness_root(&staged_transactions);
-        tx.witness = TxWitness {
-            signature: signature.clone(),
-            pubkey: funding_keypair.public_key.0.clone(),
-            input_refs: vec![WitnessInputRef {
-                input_index: 0,
-                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature, 0),
-                witness_commit_ref: derive_witness_commit_ref(&tx.txid(), &block_witness_root, 0),
-            }],
-            additional_signers: vec![],
-        }
-        .canonical_bytes();
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_atoms);
-
-        let transactions = vec![coinbase, tx];
-        let block = solve_block(Block::new(
-            BlockHeader {
-                version: BLOCK_VERSION_V1,
-                network_id: Network::Regnet,
-                height,
-                previous_block_hash: [0; 48],
-                merkle_root: merkle_root(&transactions),
-                witness_root: witness_root(&transactions),
-                timestamp: 1,
-                difficulty_target_or_bits: pow::initial_target_for_network(Network::Regnet),
-                nonce: 0,
-            },
-            transactions,
-        ));
-        (funding, block)
-    }
-
-    fn validate_regnet_spend_block(
-        funding: UtxoEntry,
-        block: &Block,
-    ) -> Result<(), ValidationError> {
-        let mut utxos = UtxoSet::new(Network::Regnet);
-        utxos.insert(funding).expect("insert funding utxo");
-        validate_block_with_context(
-            block,
-            block.header.height,
-            Network::Regnet,
-            [0; 48],
-            pow::initial_target_for_network(Network::Regnet),
-            &[],
-            utxos,
-        )
-    }
-
-    #[test]
-    fn test_block_rejects_every_header_mutation_after_mining() {
-        let (funding, block) = solved_regnet_spend_block(b"atho-deep-header-mutations", 6, 1_000);
-        assert_eq!(validate_regnet_spend_block(funding.clone(), &block), Ok(()));
-
-        let target = pow::initial_target_for_network(Network::Regnet);
-        let mut nonce_mutation = block.clone();
-        loop {
-            nonce_mutation.header.nonce = nonce_mutation.header.nonce.wrapping_add(1);
-            if !pow::meets_target(&nonce_mutation.header.block_hash(), &target) {
-                break;
-            }
-        }
-
-        let mut timestamp_mutation = block.clone();
-        timestamp_mutation.header.timestamp = current_unix_timestamp()
-            .saturating_add(MAX_FUTURE_BLOCK_TIME_SECONDS)
-            .saturating_add(1);
-
-        let mut parent_mutation = block.clone();
-        parent_mutation.header.previous_block_hash[0] ^= 0x80;
-
-        let mut height_mutation = block.clone();
-        height_mutation.header.height = height_mutation.header.height.saturating_add(1);
-
-        let mut network_mutation = block.clone();
-        network_mutation.header.network_id = Network::Testnet;
-
-        let mut version_mutation = block.clone();
-        version_mutation.header.version = BLOCK_VERSION_V2_PLACEHOLDER;
-
-        let mut target_mutation = block.clone();
-        target_mutation.header.difficulty_target_or_bits[0] ^= 0x01;
-
-        for (name, mutated) in [
-            ("nonce", nonce_mutation),
-            ("timestamp", timestamp_mutation),
-            ("parent", parent_mutation),
-            ("height", height_mutation),
-            ("network", network_mutation),
-            ("version", version_mutation),
-            ("target", target_mutation),
-        ] {
-            assert!(
-                validate_regnet_spend_block(funding.clone(), &mutated).is_err(),
-                "{name} header mutation was accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn test_block_rejects_every_transaction_mutation_after_merkle_root() {
-        let (funding, mut block) = solved_regnet_spend_block(b"atho-deep-tx-mutation", 6, 1_000);
-        assert_eq!(validate_regnet_spend_block(funding.clone(), &block), Ok(()));
-
-        block.transactions[1].outputs[0].value_atoms = block.transactions[1].outputs[0]
-            .value_atoms
-            .saturating_sub(1);
-
-        assert_eq!(
-            validate_regnet_spend_block(funding, &block),
-            Err(ValidationError::BlockMerkleRootMismatch)
-        );
-    }
-
-    #[test]
-    fn test_block_rejects_coinbase_mutation_after_mining() {
-        let (funding, mut block) =
-            solved_regnet_spend_block(b"atho-deep-coinbase-mutation", 6, 1_000);
-        assert_eq!(validate_regnet_spend_block(funding.clone(), &block), Ok(()));
-
-        block.transactions[0].outputs[0].value_atoms = block.transactions[0].outputs[0]
-            .value_atoms
-            .saturating_add(1);
-
-        assert_eq!(
-            validate_regnet_spend_block(funding, &block),
-            Err(ValidationError::BlockMerkleRootMismatch)
-        );
-    }
-
-    #[test]
-    fn test_block_rejects_witness_mutation_after_witness_root() {
-        let (funding, mut block) =
-            solved_regnet_spend_block(b"atho-deep-witness-mutation", 6, 1_000);
-        assert_eq!(validate_regnet_spend_block(funding.clone(), &block), Ok(()));
-
-        let witness_byte = block.transactions[1]
-            .witness
-            .last_mut()
-            .expect("test transaction witness");
-        *witness_byte ^= 0x01;
-
-        assert_eq!(
-            validate_regnet_spend_block(funding, &block),
-            Err(ValidationError::BlockWitnessRootMismatch)
-        );
-    }
-
-    #[test]
-    fn test_accounting_rejects_fee_double_count_in_coinbase() {
-        let (funding, mut block) =
-            solved_regnet_spend_block(b"atho-deep-fee-double-count", 6, 1_000);
-        assert_eq!(validate_regnet_spend_block(funding.clone(), &block), Ok(()));
-
-        block.transactions[0].outputs[0].value_atoms = block.transactions[0].outputs[0]
-            .value_atoms
-            .saturating_add(1);
-        let updated_witness_root = witness_root(&block.transactions);
-        let txid = block.transactions[1].txid();
-        let mut witness = block.transactions[1].witness_payload().expect("witness");
-        witness.input_refs[0].witness_commit_ref =
-            derive_witness_commit_ref(&txid, &updated_witness_root, 0);
-        block.transactions[1].witness = witness.canonical_bytes();
-        block.header.merkle_root = merkle_root(&block.transactions);
-        block.header.witness_root = witness_root(&block.transactions);
-        block.header.nonce = 0;
-        let block = solve_block(block);
-
-        assert_eq!(
-            validate_regnet_spend_block(funding, &block),
-            Err(ValidationError::CoinbaseRewardMismatch)
-        );
-    }
-
-    #[test]
-    fn regnet_block_consensus_rejects_sub_dust_transaction_output() {
-        let (funding, block) =
-            solved_regnet_spend_block(b"atho-regnet-block-dust-output", 6, 99_001);
-
-        assert_eq!(
-            validate_regnet_spend_block(funding, &block),
-            Err(ValidationError::DustOutput)
-        );
-    }
-
-    #[test]
-    fn test_accounting_rejects_outputs_greater_than_inputs() {
-        let keypair = generate_from_seed(b"atho-deep-overspend-accounting").expect("keypair");
-        let locking_script = public_key_digest(Network::Regnet, &keypair.public_key.0).to_vec();
-        let utxo = UtxoEntry::new(
-            Network::Regnet,
-            [0x76; 48],
-            0,
-            100_000,
-            locking_script.clone(),
-            10,
-            false,
-        );
+    fn sign_single_input_transaction(
+        network: Network,
+        utxo: &UtxoEntry,
+        output_locking_script: Vec<u8>,
+        output_value_atoms: u64,
+        seed: &[u8],
+    ) -> (Transaction, u64) {
+        let keypair = generate_from_seed(seed).expect("keypair");
         let mut tx = Transaction {
             version: TRANSACTION_VERSION_V1,
             inputs: vec![TxInput {
                 previous_txid: utxo.txid,
                 output_index: utxo.output_index,
-                unlocking_script: locking_script,
+                unlocking_script: utxo.locking_script.clone(),
             }],
             outputs: vec![TxOutput {
-                value_atoms: utxo.value_atoms.saturating_add(1),
-                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+                value_atoms: output_value_atoms,
+                locking_script: output_locking_script,
             }],
             lock_time: 0,
             witness: vec![],
@@ -1622,160 +1305,30 @@ mod tests {
         let signature = sign(
             AthoSignatureDomain::Transaction,
             &keypair.secret_key,
-            &transaction_signing_digest(Network::Regnet, &tx),
+            &transaction_signing_digest(network, &tx),
         )
-        .expect("signature")
-        .0;
+        .expect("signature");
+        let signature_bytes = signature.0.clone();
         tx.witness = TxWitness {
-            signature: signature.clone(),
+            signature: signature_bytes.clone(),
             pubkey: keypair.public_key.0.clone(),
             input_refs: vec![WitnessInputRef {
                 input_index: 0,
-                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature, 0),
+                sig_ref_short: derive_sig_ref_short(&tx.txid(), &signature_bytes, 0),
                 witness_commit_ref: [0; 16],
             }],
             additional_signers: vec![],
         }
         .canonical_bytes();
-        let fee_floor = minimum_required_fee_atoms(Network::Regnet, &tx);
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_floor);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert_eq!(
-            validate_transaction_with_context(&tx, fee_floor, Network::Regnet, 20, lookup),
-            Err(ValidationError::FeeMismatch)
-        );
-    }
-
-    #[test]
-    fn test_tx_rejects_output_amount_mutation_after_signing() {
-        let (utxo, mut tx, _old_fee_atoms) = regnet_part2_spend(1, 90_000);
-        tx.outputs[0].value_atoms = tx.outputs[0].value_atoms.saturating_sub(1);
-        let mutated_fee = utxo.value_atoms - tx.checked_output_value_atoms().expect("outputs");
-        solve_transaction_pow(Network::Regnet, &mut tx, mutated_fee);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert!(
-            validate_transaction_with_context(&tx, mutated_fee, Network::Regnet, 20, lookup)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_tx_rejects_recipient_mutation_after_signing() {
-        let (utxo, mut tx, fee_atoms) = regnet_part2_spend(1, 90_000);
-        tx.outputs[0].locking_script[0] ^= 0x01;
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_atoms);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert!(
-            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup).is_err()
-        );
-    }
-
-    #[test]
-    fn test_tx_rejects_input_reference_mutation_after_signing() {
-        let (utxo, mut tx, fee_atoms) = regnet_part2_spend(1, 90_000);
-        tx.inputs[0].previous_txid[0] ^= 0x01;
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_atoms);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert!(
-            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup).is_err()
-        );
-    }
-
-    #[test]
-    fn test_sigwit_txid_unchanged_by_witness_mutation() {
-        let (_utxo, mut tx, _fee_atoms) = regnet_part2_spend(1, 90_000);
-        let txid = tx.txid();
-        let witness_byte = tx.witness.last_mut().expect("witness byte");
-        *witness_byte ^= 0x01;
-
-        assert_eq!(tx.txid(), txid);
-        assert_ne!(tx.wtxid(), txid);
-    }
-
-    #[test]
-    fn test_sigwit_invalid_witness_still_rejects_transaction() {
-        let (utxo, mut tx, fee_atoms) = regnet_part2_spend(1, 90_000);
-        let witness_byte = tx.witness.last_mut().expect("witness byte");
-        *witness_byte ^= 0x01;
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_atoms);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert!(
-            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup).is_err()
-        );
-    }
-
-    #[test]
-    fn test_sigwit_rejects_full_falcon_signature_in_script_sig() {
-        let (utxo, mut tx, fee_atoms) = regnet_part2_spend(1, 90_000);
-        let witness = tx.witness_payload().expect("witness");
-        tx.inputs[0].unlocking_script = witness.signature;
-        solve_transaction_pow(Network::Regnet, &mut tx, fee_atoms);
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert!(
-            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup).is_err()
-        );
-    }
-
-    #[test]
-    fn test_block_time_future_drift_boundary() {
-        let now = 1_700_000_000u64;
-        assert_eq!(
-            validate_block_timestamp_not_far_future(
-                now.saturating_add(MAX_FUTURE_BLOCK_TIME_SECONDS),
-                now
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            validate_block_timestamp_not_far_future(
-                now.saturating_add(MAX_FUTURE_BLOCK_TIME_SECONDS)
-                    .saturating_add(1),
-                now
-            ),
-            Err(ValidationError::InvalidBlockTimestamp)
-        );
+        let fee_atoms = utxo
+            .value_atoms
+            .checked_sub(
+                tx.checked_output_value_atoms()
+                    .expect("test transaction output total"),
+            )
+            .expect("test fee atoms");
+        solve_transaction_pow(network, &mut tx, fee_atoms);
+        (tx, fee_atoms)
     }
 
     #[test]
@@ -1785,7 +1338,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -1816,58 +1369,13 @@ mod tests {
     }
 
     #[test]
-    fn block_rejects_second_coinbase_even_when_txids_are_unique() {
-        let coinbase_a = Transaction {
-            version: 1,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Mainnet, 1),
-                locking_script: vec![1],
-            }],
-            lock_time: 1,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let coinbase_b = Transaction {
-            outputs: vec![TxOutput {
-                value_atoms: 1,
-                locking_script: vec![2],
-            }],
-            lock_time: 2,
-            ..coinbase_a.clone()
-        };
-        assert_ne!(coinbase_a.txid(), coinbase_b.txid());
-        let transactions = vec![coinbase_a, coinbase_b];
-        let block = Block::new(
-            BlockHeader {
-                version: 1,
-                network_id: Network::Mainnet,
-                height: 1,
-                previous_block_hash: [0; 48],
-                merkle_root: merkle_root(&transactions),
-                witness_root: witness_root(&transactions),
-                timestamp: 1,
-                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
-                nonce: 0,
-            },
-            transactions,
-        );
-
-        assert_eq!(
-            validate_block_without_pow(&block, 1, Network::Mainnet),
-            Err(ValidationError::MultipleCoinbaseTransactions)
-        );
-    }
-
-    #[test]
     fn future_block_version_is_rejected_before_activation() {
         let coinbase = Transaction {
             version: 1,
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -1903,7 +1411,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -1950,7 +1458,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -2012,7 +1520,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(11),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 1,
             witness: vec![],
@@ -2048,7 +1556,7 @@ mod tests {
             version: TRANSACTION_VERSION_V2_PLACEHOLDER,
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(12),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             ..coinbase_v1.clone()
         };
@@ -2103,7 +1611,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1,
@@ -2147,7 +1655,7 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
@@ -2163,6 +1671,33 @@ mod tests {
         assert_eq!(
             validate_transaction_standard_policy(&tx, Network::Regnet),
             Err(ValidationError::DustOutput)
+        );
+    }
+
+    #[test]
+    fn standard_policy_rejects_input_fan_in_that_would_stall_relay() {
+        let tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: (0..MAX_STANDARD_INPUTS + 1)
+                .map(|index| TxInput {
+                    previous_txid: [index as u8; 48],
+                    output_index: index as u32,
+                    unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                })
+                .collect(),
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS,
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+
+        assert_eq!(
+            validate_transaction_standard_policy(&tx, Network::Regnet),
+            Err(ValidationError::TransactionTooLarge)
         );
     }
 
@@ -2301,24 +1836,6 @@ mod tests {
         assert_eq!(
             validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup,),
             Err(ValidationError::InvalidTransactionPowNonce)
-        );
-    }
-
-    #[test]
-    fn future_lock_time_is_rejected_contextually() {
-        let (utxo, mut tx, fee_atoms) = regnet_part2_spend(2, 10_000);
-        tx.lock_time = 21;
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
-
-        assert_eq!(
-            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 20, lookup),
-            Err(ValidationError::InvalidLockTime)
         );
     }
 
@@ -2599,118 +2116,79 @@ mod tests {
     }
 
     #[test]
-    fn legacy_48_byte_locking_script_is_rejected_even_with_matching_public_key() {
-        let funding =
-            generate_from_seed(b"atho-validation-legacy-funding").expect("funding keypair");
-        let lock_script = sha3_384(&funding.public_key.0).to_vec();
-        let utxo = UtxoEntry::new(
-            Network::Mainnet,
-            [0x73; 48],
-            0,
-            10_000,
-            lock_script.clone(),
-            1,
-            false,
-        );
-        let mut tx = Transaction {
+    fn noncanonical_output_lock_is_rejected_before_witness_verification() {
+        let tx = Transaction {
             version: TRANSACTION_VERSION_V1,
             inputs: vec![TxInput {
-                previous_txid: utxo.txid,
-                output_index: utxo.output_index,
-                unlocking_script: lock_script.clone(),
+                previous_txid: [0x11; 48],
+                output_index: 0,
+                unlocking_script: vec![0x22; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
-                value_atoms: 9_000,
-                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+                value_atoms: DUST_RELAY_VALUE_ATOMS,
+                locking_script: vec![0x33],
             }],
             lock_time: 0,
             witness: vec![],
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
         };
-        let signature = sign(
-            AthoSignatureDomain::Transaction,
-            &funding.secret_key,
-            &transaction_signing_digest(Network::Mainnet, &tx),
-        )
-        .expect("signature");
-        let sig_bytes = signature.0.clone();
-        tx.witness = TxWitness {
-            signature: sig_bytes.clone(),
-            pubkey: funding.public_key.0.clone(),
-            input_refs: vec![WitnessInputRef {
-                input_index: 0,
-                sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, 0),
-                witness_commit_ref: [0; 16],
-            }],
-            additional_signers: vec![],
-        }
-        .canonical_bytes();
-        solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);
-
-        let lookup = |txid: &[u8; 48], output_index: u32| {
-            if *txid == utxo.txid && output_index == utxo.output_index {
-                Some(utxo.clone())
-            } else {
-                None
-            }
-        };
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &tx);
 
         assert_eq!(
-            validate_transaction_with_context(&tx, 1_000, Network::Mainnet, 1, lookup),
-            Err(ValidationError::InputOwnershipMismatch)
+            validate_transaction_structure_for_height_with_schedule(
+                &tx,
+                fee_atoms,
+                Network::Regnet,
+                1,
+                &rules::SCHEDULED_ACTIVATIONS,
+            ),
+            Err(ValidationError::LegacyLockFormatRejected)
         );
     }
 
     #[test]
-    fn unsupported_locking_script_form_is_not_spendable_by_exact_script_only() {
-        let signer = generate_from_seed(b"atho-validation-unsupported-script").expect("keypair");
-        let lock_script = vec![0xaa; 16];
-        let utxo = UtxoEntry::new(
-            Network::Mainnet,
-            [0x74; 48],
-            0,
-            10_000,
-            lock_script.clone(),
-            1,
-            false,
-        );
-        let mut tx = Transaction {
+    fn empty_output_lock_is_rejected_before_witness_verification() {
+        let tx = Transaction {
             version: TRANSACTION_VERSION_V1,
             inputs: vec![TxInput {
-                previous_txid: utxo.txid,
-                output_index: utxo.output_index,
-                unlocking_script: lock_script,
+                previous_txid: [0x12; 48],
+                output_index: 0,
+                unlocking_script: vec![0x44; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
-                value_atoms: 9_000,
-                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
+                value_atoms: DUST_RELAY_VALUE_ATOMS,
+                locking_script: vec![],
             }],
             lock_time: 0,
             witness: vec![],
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
         };
-        let signature = sign(
-            AthoSignatureDomain::Transaction,
-            &signer.secret_key,
-            &transaction_signing_digest(Network::Mainnet, &tx),
-        )
-        .expect("signature");
-        let sig_bytes = signature.0.clone();
-        tx.witness = TxWitness {
-            signature: sig_bytes.clone(),
-            pubkey: signer.public_key.0.clone(),
-            input_refs: vec![WitnessInputRef {
-                input_index: 0,
-                sig_ref_short: derive_sig_ref_short(&tx.txid(), &sig_bytes, 0),
-                witness_commit_ref: [0; 16],
-            }],
-            additional_signers: vec![],
-        }
-        .canonical_bytes();
-        solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);
+        let fee_atoms = minimum_required_fee_atoms(Network::Regnet, &tx);
 
+        assert_eq!(
+            validate_transaction_structure_for_height_with_schedule(
+                &tx,
+                fee_atoms,
+                Network::Regnet,
+                1,
+                &rules::SCHEDULED_ACTIVATIONS,
+            ),
+            Err(ValidationError::LegacyLockFormatRejected)
+        );
+    }
+
+    #[test]
+    fn spending_legacy_locking_script_utxo_is_rejected() {
+        let utxo = UtxoEntry::new(Network::Regnet, [0x51; 48], 0, 20_000, vec![0x77], 1, false);
+        let (tx, fee_atoms) = sign_single_input_transaction(
+            Network::Regnet,
+            &utxo,
+            vec![0x55; ADDRESS_DIGEST_BYTES],
+            19_000,
+            b"atho-validation-legacy-utxo",
+        );
         let lookup = |txid: &[u8; 48], output_index: u32| {
             if *txid == utxo.txid && output_index == utxo.output_index {
                 Some(utxo.clone())
@@ -2720,8 +2198,87 @@ mod tests {
         };
 
         assert_eq!(
-            validate_transaction_with_context(&tx, 1_000, Network::Mainnet, 1, lookup),
-            Err(ValidationError::InputOwnershipMismatch)
+            validate_transaction_with_context(&tx, fee_atoms, Network::Regnet, 10, lookup),
+            Err(ValidationError::LegacyLockFormatRejected)
+        );
+    }
+
+    #[test]
+    fn coinbase_with_legacy_lock_is_rejected() {
+        let tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 1),
+                locking_script: vec![0x66],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+
+        assert_eq!(
+            validate_coinbase_transaction_with_schedule(
+                &tx,
+                subsidy::block_subsidy_atoms_for_network(Network::Regnet, 1),
+                1,
+                &rules::SCHEDULED_ACTIVATIONS,
+            ),
+            Err(ValidationError::LegacyLockFormatRejected)
+        );
+    }
+
+    #[test]
+    fn block_spending_legacy_locking_script_utxo_is_rejected() {
+        let utxo = UtxoEntry::new(Network::Regnet, [0x52; 48], 0, 20_000, vec![0x88], 1, false);
+        let (spend_tx, fee_atoms) = sign_single_input_transaction(
+            Network::Regnet,
+            &utxo,
+            vec![0x55; ADDRESS_DIGEST_BYTES],
+            19_000,
+            b"atho-validation-legacy-block",
+        );
+        let coinbase = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 2)
+                    .checked_add(fee_atoms)
+                    .expect("coinbase reward"),
+                locking_script: vec![0x99; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let transactions = vec![coinbase, spend_tx];
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let mut block = solve_block(Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Regnet,
+                height: 2,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                timestamp: 2,
+                difficulty_target_or_bits: target,
+                nonce: 0,
+            },
+            transactions,
+        ));
+        block.fees_total_atoms = fee_atoms;
+        block.fees_miner_atoms = fee_atoms;
+        let mut utxos = UtxoSet::new(Network::Regnet);
+        utxos
+            .insert(utxo)
+            .expect("seed legacy utxo for block validation");
+
+        assert_eq!(
+            validate_block_with_context(&block, 2, Network::Regnet, [0; 48], target, &[], utxos,),
+            Err(ValidationError::LegacyLockFormatRejected)
         );
     }
 
@@ -2762,15 +2319,15 @@ mod tests {
     }
 
     #[test]
-    fn far_future_block_timestamp_is_rejected() {
+    fn oversized_block_is_rejected_before_contextual_pow_checks() {
         let coinbase = Transaction {
             version: TRANSACTION_VERSION_V1,
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![1],
+                locking_script: vec![0; MAX_BLOCK_RAW_BYTES + 1],
             }],
-            lock_time: 0,
+            lock_time: 1,
             witness: vec![],
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
@@ -2784,9 +2341,7 @@ mod tests {
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
-                timestamp: current_unix_timestamp()
-                    .saturating_add(MAX_FUTURE_BLOCK_TIME_SECONDS)
-                    .saturating_add(1),
+                timestamp: 1,
                 difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
                 nonce: 0,
             },
@@ -2794,8 +2349,16 @@ mod tests {
         );
 
         assert_eq!(
-            validate_block_without_pow(&block, 1, Network::Mainnet),
-            Err(ValidationError::InvalidBlockTimestamp)
+            validate_block_with_context(
+                &block,
+                1,
+                Network::Mainnet,
+                [0; 48],
+                pow::initial_target_for_network(Network::Mainnet),
+                &[],
+                UtxoSet::new(Network::Mainnet),
+            ),
+            Err(ValidationError::BlockTooLarge)
         );
     }
 
@@ -2836,7 +2399,7 @@ mod tests {
             inputs: vec![],
             outputs: vec![TxOutput {
                 value_atoms: subsidy::block_subsidy_atoms(6).saturating_add(1_000),
-                locking_script: vec![1],
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -2914,122 +2477,6 @@ mod tests {
                 utxos,
             ),
             Ok(())
-        );
-    }
-
-    #[test]
-    fn uncommitted_block_fee_metadata_is_ignored_during_context_validation() {
-        let funding_keypair =
-            generate_from_seed(b"atho-validation-fee-metadata").expect("funding keypair");
-        let funding_script =
-            public_key_digest(Network::Mainnet, &funding_keypair.public_key.0).to_vec();
-        let funding = UtxoEntry::new(
-            Network::Mainnet,
-            [0x75; 48],
-            0,
-            10_000,
-            funding_script.clone(),
-            0,
-            false,
-        );
-        let mut tx = Transaction {
-            version: TRANSACTION_VERSION_V1,
-            inputs: vec![TxInput {
-                previous_txid: funding.txid,
-                output_index: funding.output_index,
-                unlocking_script: funding_script,
-            }],
-            outputs: vec![TxOutput {
-                value_atoms: 9_000,
-                locking_script: vec![7; ADDRESS_DIGEST_BYTES],
-            }],
-            lock_time: 0,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let staged_signature = sign(
-            AthoSignatureDomain::Transaction,
-            &funding_keypair.secret_key,
-            &transaction_signing_digest(Network::Mainnet, &tx),
-        )
-        .expect("signature")
-        .0;
-        let staged_tx = Transaction {
-            witness: TxWitness {
-                signature: staged_signature.clone(),
-                pubkey: funding_keypair.public_key.0.clone(),
-                input_refs: vec![WitnessInputRef {
-                    input_index: 0,
-                    sig_ref_short: derive_sig_ref_short(&tx.txid(), &staged_signature, 0),
-                    witness_commit_ref: [0; 16],
-                }],
-                additional_signers: vec![],
-            }
-            .canonical_bytes(),
-            ..tx.clone()
-        };
-        let coinbase = Transaction {
-            version: TRANSACTION_VERSION_V1,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(6).saturating_add(1_000),
-                locking_script: vec![1],
-            }],
-            lock_time: 0,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let staged_transactions = vec![coinbase.clone(), staged_tx];
-        let block_witness_root = witness_root(&staged_transactions);
-        tx.witness = TxWitness {
-            signature: staged_signature.clone(),
-            pubkey: funding_keypair.public_key.0.clone(),
-            input_refs: vec![WitnessInputRef {
-                input_index: 0,
-                sig_ref_short: derive_sig_ref_short(&tx.txid(), &staged_signature, 0),
-                witness_commit_ref: derive_witness_commit_ref(&tx.txid(), &block_witness_root, 0),
-            }],
-            additional_signers: vec![],
-        }
-        .canonical_bytes();
-        solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);
-        let transactions = vec![coinbase, tx];
-        let mut block = solve_block(Block::new(
-            BlockHeader {
-                version: BLOCK_VERSION_V1,
-                network_id: Network::Mainnet,
-                height: 6,
-                previous_block_hash: [0; 48],
-                merkle_root: merkle_root(&transactions),
-                witness_root: witness_root(&transactions),
-                timestamp: 1,
-                difficulty_target_or_bits: pow::initial_target_for_network(Network::Mainnet),
-                nonce: 0,
-            },
-            transactions,
-        ));
-        block.fees_total_atoms = 999_999;
-        block.fees_miner_atoms = 0;
-        let mut utxos = UtxoSet::new(Network::Mainnet);
-        utxos.insert(funding).unwrap();
-
-        assert_eq!(
-            validate_block_with_context(
-                &block,
-                6,
-                Network::Mainnet,
-                [0; 48],
-                pow::initial_target_for_network(Network::Mainnet),
-                &[],
-                utxos,
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            derived_block_fee_atoms(&block, 6, Network::Mainnet),
-            Ok(1_000)
         );
     }
 

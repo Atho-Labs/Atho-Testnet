@@ -1,4 +1,7 @@
 #![no_main]
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 
 use atho_core::address::{decode_base56_address, encode_base56_address};
 use libfuzzer_sys::fuzz_target;

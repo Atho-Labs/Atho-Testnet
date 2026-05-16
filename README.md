@@ -1,281 +1,79 @@
 # Atho
 
-Atho is a from-scratch Rust blockchain payment stack built around a small trusted core, explicit consensus rules, durable chainstate, a thin desktop client, and a Bitcoin-style operational model adapted to Atho’s own hashing, signature, and address choices.
+Atho is a post-quantum payment-focused blockchain built around Proof-of-Work, UTXO accounting, Falcon-512 signatures, and SHA3 hashing.
 
-## Status
+This repository contains the desktop client, node, wallet, miner, API, and validation code for Atho.
 
-Atho is beyond prototype stage, but it is not a finished production network.
+## What Is Atho?
 
-Current posture:
+Atho is a Rust blockchain implementation for payment infrastructure. It uses a UTXO transaction model, Proof-of-Work block production, Falcon transaction signatures, a desktop wallet, local RPC, a read-only HTTP API, and P2P networking.
 
-- local consensus, storage, wallet, miner, RPC, and Qt lifecycle paths have strong sandbox coverage
-- the node, miner, and desktop client now have a cleaner operator command model
-- `athod status` now reports peer counts, per-peer direction, and byte counters
-- the Qt settings page now includes Bitcoin-Core-style peer and traffic diagnostics
-- the default runtime root is OS-native instead of working-directory driven
-- the live TCP peer runtime exists and is sandbox-tested over real sockets
-- the public VPS node path now has live restart/recovery and one-block propagation coverage
-- mainnet and testnet now resolve their configured DNS seed first and keep a static fallback peer as a last resort
+## Quick Build
 
-Production-readiness summary:
-
-- overall readiness: `8/10`
-- local core lifecycle: `strong`
-- public-network hardening: `materially improved, but still needs longer multi-peer soak coverage`
-
-Detailed status lives in:
-
-- [`docs/production-readiness/current-status.md`](docs/production-readiness/current-status.md)
-- [`docs/production-readiness/roadmap.md`](docs/production-readiness/roadmap.md)
-
-## Quick Start
-
-Use the short operator guide first:
-
-- [`quickstart.md`](quickstart.md)
-
-If you are using a packaged release, run the native installer first:
-
-- Windows: `Atho Setup.exe`
-- macOS: `Atho Setup.app`
-- Linux: `Atho Setup`
-
-## Design Principles
-
-- keep the trusted core small
-- keep consensus deterministic and explicit
-- keep validation on one canonical path
-- keep the GUI thin and backend-owned
-- keep storage durable and fail-closed
-- keep runtime commands boring and predictable
-- keep protocol evolution explicit through versioning and activation heights
-
-## How To Run Atho
-
-There are three primary binaries:
-
-1. `athod`
-2. `atho-mine`
-3. `atho-qt`
-
-Recommended roles:
-
-- `athod`: full node / daemon / VPS node
-- `atho-mine`: standalone miner process
-- `atho-qt`: desktop wallet and client
-
-### Main Entry Commands
-
-Choose the top-level launcher for the network you want to run:
+Install Rust first if `cargo` is missing:
 
 ```bash
-python mainnet.py
-python testnet.py
-python regnet.py
+curl https://sh.rustup.rs -sSf | sh
 ```
 
-The launcher:
-
-- tries a GPU-enabled build of `athod`, `atho-mine`, and `atho-qt` first when binaries are missing or stale
-- reuses existing release binaries when they are current
-- prepares the runtime root
-- launches `atho-qt` in managed-local-node mode
-- leaves the Rust client and Rust node as the real runtime path
-
-If the GPU-native build fails because the host is missing the native prerequisites, the launcher prints a clear OS-specific warning and falls back to a CPU-only release build.
-GPU-native builds typically need:
-
-- macOS: Xcode Command Line Tools
-- Linux: a C/C++ compiler plus OpenCL headers/runtime
-- Windows: Visual Studio Build Tools with C++ support plus the vendor OpenCL runtime
-
-Because the Python wrapper replaces itself with `atho-qt`, it does not stay in the blockchain hot path.
-
-### Full Node
+Build the project:
 
 ```bash
-cargo run -p atho-node --bin athod -- --network testnet
+cargo build
 ```
 
-Testnet resolves the configured DNS seed first and keeps the static fallback peer as a last resort when no explicit peers are supplied.
-Use `--peer HOST:PORT` only when you want to override or add peers manually.
-
-### Desktop Client
+Launch mainnet:
 
 ```bash
-cargo run -p atho-qt --bin atho-qt -- --network testnet --local-node
+python3 runmainnet.py
 ```
 
-For the simplest production-style local flow, prefer the matching launcher:
+That launcher starts the desktop client and a managed local node. If binaries are missing or stale, it rebuilds them before handing off to `atho-qt`.
+
+You can mine from the client after sync. Standalone miner, GPU build, and operator commands live in the docs instead of the main README.
+
+## Other Networks
+
+Public testnet:
 
 ```bash
-python testnet.py
+python3 runtestnet.py
 ```
 
-Testnet ATHO is distributed manually by the Atho founders or development team. Contact the Atho team to request testnet funds.
-
-For repeated local launches after the first build, run the binary directly:
+Local regnet:
 
 ```bash
-cargo build --release -p atho-node -p atho-qt
-./target/release/atho-qt --network mainnet --local-node
+python3 runregnet.py
 ```
 
-### Miner
+## Power Users
 
-```bash
-cargo run -p atho-node --bin atho-mine -- --network regnet --rpc-addr 127.0.0.1:9210
-```
+For direct `cargo run` commands, node-only operation, standalone mining, GPU builds, CLI usage, and testing commands, use:
 
-More commands and operator notes live in [`docs/operations/commands.md`](docs/operations/commands.md).
+- [Setup Guide](docs/setup.md)
+- [Commands](docs/commands.md)
+- [Mining](docs/mining.md)
+- [Testing](docs/testing.md)
 
-## Release Packaging
+## Documentation
 
-Build and stage a local release bundle for the current host with:
+- [Setup Guide](docs/setup.md)
+- [Commands](docs/commands.md)
+- [Configuration](docs/configuration.md)
+- [Mining](docs/mining.md)
+- [Testing](docs/testing.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Architecture](docs/architecture.md)
+- [Consensus](docs/consensus.md)
+- [API](docs/api.md)
+- [Reports](docs/reports/README.md)
 
-```bash
-python3 scripts/release.py
-```
+Historical release notes live in [docs/archive/release-notes.md](docs/archive/release-notes.md). Audit and engineering reports live in [docs/reports/README.md](docs/reports/README.md).
 
-Windows:
+## Security Notice
 
-```powershell
-py -3 scripts\release.py
-```
+Never commit private keys, wallet files, seed phrases, local databases, node identity files, API tokens, RPC cookies, `.env` files, production secrets, or generated chain data. The repo `.gitignore` excludes these local artifacts by default.
 
-The packaging guide is in [`docs/build-deployment/packaging.md`](docs/build-deployment/packaging.md).
+## License
 
-The shareable release tree is `desktop/`, which mirrors each built bundle under `desktop/releases/<version>/<platform>-<arch>/`.
-The root `desktop/install.sh` and `desktop/install.ps1` scripts dispatch to `desktop/latest/<platform>-<arch>/` for the current OS, and the active bundle contains the native `Atho Setup` installer front-end plus the platform client launcher (`Atho.exe` on Windows or `Atho.app` on macOS).
-
-GitHub release publishing is automated by [`.github/workflows/publish-packages.yml`](.github/workflows/publish-packages.yml). It builds Windows, macOS, and Linux packages and publishes the matching archive for each OS to GitHub Releases.
-
-GitHub Releases also gets one combined download named `Atho-<version>-desktop.zip`. That archive contains the full `desktop/` tree with every platform bundle, so you can download one file, extract it, and run the installer for your OS from inside the folder.
-
-The release assets also include a direct installer download for the current host platform:
-
-- Windows: `Atho Setup.exe`
-- macOS: `Atho Setup-arm64.dmg` or `Atho Setup-x86_64.dmg`
-- Linux: use the platform archive and run `Atho Setup` from inside the extracted folder
-On Windows, the installed client launcher is `Atho.exe`.
-
-Before running a direct installer, verify the matching `checksums.sha256` file from the same release. The Windows `.exe` and macOS `.dmg` also verify their embedded payload checksums before installing.
-On Windows, the installer also asks for an install location, creates Start Menu and Desktop shortcuts to `Atho.exe`, and launches the client after install.
-On macOS, the installer installs the bundled `Atho.app` client and opens it after install when requested.
-
-## Runtime Roots
-
-Default runtime root:
-
-- macOS: `~/Library/Application Support/Atho`
-- Linux: `${XDG_DATA_HOME:-~/.local/share}/Atho`
-- Windows: `%APPDATA%\\Atho`
-
-Override it explicitly:
-
-```bash
---data-dir /absolute/path
-```
-
-or:
-
-```bash
-export ATHO_DATA_DIR=/absolute/path
-```
-
-## Windows Quick Start
-
-Shortest path:
-
-1. install Rust with the MSVC toolchain
-2. install Visual Studio Build Tools with C++ support
-3. run:
-
-```powershell
-git clone https://github.com/Atho-Labs/Atho-Alpha.git
-cd Atho-Alpha
-cargo build --release -p atho-node -p atho-qt
-.\target\release\atho-qt.exe --network regnet --local-node
-```
-
-Full Windows instructions:
-
-- [`docs/operations/linux-quick-start.md`](docs/operations/linux-quick-start.md)
-- [`docs/operations/macos-quick-start.md`](docs/operations/macos-quick-start.md)
-- [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
-- [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)
-
-## VPS Full Node
-
-Recommended command shape:
-
-```bash
-./athod --network mainnet --data-dir /var/lib/atho
-```
-
-Important defaults:
-
-- RPC stays on loopback
-- P2P listens publicly
-- mainnet and testnet resolve their configured DNS seed first and keep the static fallback peer as a last resort unless you pass explicit `--peer` values
-
-Full VPS guidance:
-
-- [`docs/operations/vps-full-node.md`](docs/operations/vps-full-node.md)
-
-## Repository Layout
-
-```text
-crates/
-  atho-core/      protocol types, consensus rules, genesis, blocks, txs, addresses
-  atho-crypto/    Falcon boundary and secret handling
-  atho-storage/   LMDB storage, chainstate, validation, UTXO state
-  atho-wallet/    HD wallet, mnemonic, keypool, encrypted wallet datafiles
-  atho-p2p/       wire protocol, handshake, peer/session logic, sync scaffolding
-  atho-rpc/       local RPC request/response and transport
-  atho-node/      runtime, service, miner, mempool, orchestration
-  atho-qt/        thin desktop client
-  atho-installer/ native installer front-end
-docs/             documentation, operator guides, readiness notes, whitepaper
-scripts/          build and packaging helpers
-dev/              optional repo-local sandbox workspace when explicitly selected
-dist/             staged release artifacts
-desktop/          shareable desktop release tree
-```
-
-## Documentation Map
-
-Start here:
-
-- [`About Atho`](docs/overview/about-atho.md)
-- [`docs/index.md`](docs/index.md)
-
-Key sections:
-
-- [`docs/operations/runtime-model.md`](docs/operations/runtime-model.md)
-- [`docs/operations/commands.md`](docs/operations/commands.md)
-- [`docs/operations/linux-quick-start.md`](docs/operations/linux-quick-start.md)
-- [`docs/operations/macos-quick-start.md`](docs/operations/macos-quick-start.md)
-- [`docs/operations/windows-quick-start.md`](docs/operations/windows-quick-start.md)
-- [`docs/operations/vps-full-node.md`](docs/operations/vps-full-node.md)
-- [`docs/operations/launch-checklist.md`](docs/operations/launch-checklist.md)
-- [`docs/node-runtime/node-runtime-and-p2p.md`](docs/node-runtime/node-runtime-and-p2p.md)
-- [`docs/node-runtime/rpc-and-client.md`](docs/node-runtime/rpc-and-client.md)
-- [`docs/gui-client/qt-client.md`](docs/gui-client/qt-client.md)
-- [`docs/testing-audits/testing-and-hardening.md`](docs/testing-audits/testing-and-hardening.md)
-- [`docs/whitepaper/atho-whitepaper-apa.md`](docs/whitepaper/atho-whitepaper-apa.md)
-
-## Production Notes
-
-The strongest parts of the stack today are the canonical validation core, storage integrity, replay/restart handling, miner flow, RPC-driven Qt behavior, and the cleaner operator launch model.
-
-The weakest parts are still:
-
-- peer-served snapshot sync
-- deeper pruning coverage
-- broader migration/upgrade coverage
-- long-run public-network soak coverage
-- OS-level Qt automation in CI
-- broader release/distribution hardening
-
-Those gaps are documented explicitly instead of being hidden.
+Atho is licensed under the Apache License 2.0. See [LICENSE](LICENSE).

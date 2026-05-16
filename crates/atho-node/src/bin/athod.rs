@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_node::config::NodeConfig;
@@ -16,7 +19,6 @@ struct RuntimeCli {
     network_overrides_local: bool,
     all: bool,
     include_wallets: bool,
-    dangerously_allow_mainnet: bool,
 }
 
 impl RuntimeCli {
@@ -216,24 +218,6 @@ fn show_status(args: &[String]) -> Result<(), String> {
         "peer_count_outbound={}",
         status.network_diagnostics.outbound_peer_count
     );
-    println!(
-        "peer_count_block_relay={}",
-        status.network_diagnostics.block_relay_peer_count
-    );
-    println!(
-        "peer_count_sync={}",
-        status.network_diagnostics.sync_peer_count
-    );
-    println!(
-        "topology_health_score={}",
-        status.network_diagnostics.topology_health_score
-    );
-    if !status.network_diagnostics.topology_warnings.is_empty() {
-        println!(
-            "topology_warnings={}",
-            status.network_diagnostics.topology_warnings.join("; ")
-        );
-    }
     println!("bytes_sent={}", status.network_diagnostics.bytes_sent);
     println!(
         "bytes_received={}",
@@ -243,10 +227,9 @@ fn show_status(args: &[String]) -> Result<(), String> {
         println!("peers:");
         for peer in &status.network_diagnostics.peers {
             println!(
-                "- {} dir={:?} roles={} ready={} height={:?} proto={:?} sent={} recv={} quality={:?}",
+                "- {} dir={:?} ready={} height={:?} proto={:?} sent={} recv={} quality={:?}",
                 peer.remote_addr,
                 peer.direction,
-                peer.roles.join(","),
                 peer.handshake_ready,
                 peer.best_height,
                 peer.protocol_version,
@@ -355,10 +338,8 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
     runtime.apply_env();
     let network = runtime
         .network
-        .ok_or_else(|| "wipe requires --network <mainnet|testnet|regnet>".to_string())?;
-    if network == Network::Mainnet && !runtime.dangerously_allow_mainnet {
-        return Err("refusing to wipe mainnet without --dangerously-allow-mainnet".to_string());
-    }
+        .ok_or_else(|| "wipe requires --network <testnet|regnet|prunetest>".to_string())?;
+    network.operator_launch_allowed().map_err(str::to_string)?;
     if !runtime.all {
         return Err("wipe requires --all".to_string());
     }
@@ -581,10 +562,6 @@ fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
                 runtime.include_wallets = true;
                 i += 1;
             }
-            "--dangerously-allow-mainnet" => {
-                runtime.dangerously_allow_mainnet = true;
-                i += 1;
-            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -642,10 +619,10 @@ fn parse_network(value: &str) -> Option<Network> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");
-    eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets] [--dangerously-allow-mainnet]");
-    eprintln!("  athod status [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
-    eprintln!("  athod verify [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH]");
+    eprintln!("  athod [--network <testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");
+    eprintln!("  athod wipe --network <testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets]");
+    eprintln!("  athod status [--network <testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
+    eprintln!("  athod verify [--network <testnet|regnet|prunetest>] [--data-dir PATH]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine> [options]");
     eprintln!();
     eprintln!("legacy compatibility:");
@@ -712,7 +689,7 @@ mod tests {
 
     #[test]
     fn wipe_flags_parse_explicit_sandbox_guard() {
-        let args = [
+        let args = vec![
             String::from("wipe"),
             String::from("--network"),
             String::from("regnet"),
@@ -720,14 +697,12 @@ mod tests {
             String::from("/tmp/atho-dev"),
             String::from("--all"),
             String::from("--include-wallets"),
-            String::from("--dangerously-allow-mainnet"),
         ];
         let parsed = parse_runtime_cli(&args[1..]).expect("parse");
         assert_eq!(parsed.network, Some(Network::Regnet));
         assert_eq!(parsed.data_dir.as_deref(), Some("/tmp/atho-dev"));
         assert!(parsed.all);
         assert!(parsed.include_wallets);
-        assert!(parsed.dangerously_allow_mainnet);
     }
 
     #[test]

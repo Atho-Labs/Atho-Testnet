@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Receive/change keypool reservation and recycling.
 use crate::hd::{AddressKind, DerivationPath, HdWallet};
 use serde::{Deserialize, Serialize};

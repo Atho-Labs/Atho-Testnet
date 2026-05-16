@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho cryptographic backends and secret-handling primitives.
 //!
 //! The current production path uses Falcon-512 for transaction signatures and

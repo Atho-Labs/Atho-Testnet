@@ -1,13 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use crate::constants::{
     ATOMS_PER_ATHO, BLOCK_TIME_SECONDS, COINBASE_MATURITY_BLOCKS, DECIMALS,
     HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, MIN_TX_FEE_ATOMS,
     STANDARD_TX_CONFIRMATIONS,
 };
 use crate::network::Network;
-
-const LEGACY_TESTNET_BLOCK_TIME_SECONDS: u64 = 75;
-const LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS: u64 = 1_680_000;
-const LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS: u64 = 6_250_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusParams {
@@ -38,20 +37,11 @@ pub const fn consensus_params_for_network(network: Network) -> ConsensusParams {
     match network {
         Network::Mainnet => CONSENSUS_PARAMS,
         Network::Testnet => ConsensusParams {
-            initial_block_reward_atoms: LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS,
-            halving_interval_blocks: LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS,
             coinbase_maturity_blocks: COINBASE_MATURITY_BLOCKS,
             standard_tx_confirmations: 1,
-            block_time_seconds: LEGACY_TESTNET_BLOCK_TIME_SECONDS,
             ..CONSENSUS_PARAMS
         },
-        Network::Regnet => CONSENSUS_PARAMS,
-        Network::Prunetest => ConsensusParams {
-            initial_block_reward_atoms: LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS,
-            halving_interval_blocks: LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS,
-            block_time_seconds: LEGACY_TESTNET_BLOCK_TIME_SECONDS,
-            ..CONSENSUS_PARAMS
-        },
+        Network::Regnet | Network::Prunetest => CONSENSUS_PARAMS,
     }
 }
 
@@ -69,15 +59,15 @@ mod tests {
             params.initial_block_reward_atoms,
             INITIAL_BLOCK_REWARD_ATOMS
         );
-        assert_eq!(params.halving_interval_blocks, 1_260_000);
+        assert_eq!(params.halving_interval_blocks, 1_680_000);
         assert_eq!(params.coinbase_maturity_blocks, 150);
-        assert_eq!(params.standard_tx_confirmations, 6);
+        assert_eq!(params.standard_tx_confirmations, 7);
         assert_eq!(params.min_tx_fee_atoms, 500);
-        assert_eq!(params.block_time_seconds, 100);
+        assert_eq!(params.block_time_seconds, 75);
     }
 
     #[test]
-    fn testnet_preserves_legacy_monetary_policy_without_touching_fast_confirmations() {
+    fn testnet_restores_mainnet_coinbase_maturity_without_touching_fast_standard_confirms() {
         let mainnet = consensus_params_for_network(Network::Mainnet);
         let testnet = consensus_params_for_network(Network::Testnet);
 
@@ -87,24 +77,11 @@ mod tests {
         assert_eq!(testnet.standard_tx_confirmations, 1);
         assert_eq!(
             testnet.initial_block_reward_atoms,
-            LEGACY_TESTNET_INITIAL_BLOCK_REWARD_ATOMS
-        );
-        assert_eq!(
-            testnet.halving_interval_blocks,
-            LEGACY_TESTNET_HALVING_INTERVAL_BLOCKS
-        );
-        assert_eq!(
-            testnet.block_time_seconds,
-            LEGACY_TESTNET_BLOCK_TIME_SECONDS
-        );
-        assert_ne!(
-            testnet.initial_block_reward_atoms,
             mainnet.initial_block_reward_atoms
         );
-        assert_ne!(
+        assert_eq!(
             testnet.halving_interval_blocks,
             mainnet.halving_interval_blocks
         );
-        assert_ne!(testnet.block_time_seconds, mainnet.block_time_seconds);
     }
 }

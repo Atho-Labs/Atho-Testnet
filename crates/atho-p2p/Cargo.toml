@@ -2,7 +2,7 @@
 name = "atho-p2p"
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+license = "Apache-2.0"
 
 [dependencies]
 atho-core = { path = "../atho-core" }

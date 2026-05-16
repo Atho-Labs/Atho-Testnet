@@ -1,66 +1,118 @@
-# Build artifacts
-target/
+# Rust build output
+/target/
 **/target/
 
-# Logs
-*.log
-**/logs/
-
-# IDE and editor files
-.idea/
-*.iml
-.vscode/
-*~
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Python cache files
+# Python caches and test output
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Local Git metadata backups created while repairing downloaded archives
-.git.empty-backup-*/
-
-# Miscellaneous
-tmp/
-**/tmp/
-*~
-#*#
-wallet.data
-wallet.data.bak
-wallet.data.old
-wallet.data.backup
-wallet.data.*   
-wallet.dat
-**/wallet.dat
-
-blockchain.data
-blockchain.data.bak
-blockchain.data.old
-blockchain.data.backup  
-
-# Local runtime output
+# Local logs and process output
+*.log
+**/logs/
+*.out
+*.err
+*.trace
+*.pid
+*.pid.lock
 node.output
 node_output.txt
-# Ignore dev directories and their contents
-**/dev/
 
-# Ignore document files that are not needed in the repo
-*.pdf
+# Atho runtime data
+/runtime/
+/data/
+/node-data/
+/db/
+/chain/
+/wallet/
+/wallets/
+/audit/
+/quarantine/
+/peerdb/
+/mainnet/
+/testnet/
+/regnet/
+/prunetest/
+/dev/db/
+/dev/chain/
+/dev/wallet/
+/dev/audit/
+/dev/quarantine/
+/dev/mainnet/
+/dev/testnet/
+/dev/regnet/
+/dev/prunetest/
+/crates/*/dev/db/
+/crates/*/dev/chain/
+/crates/*/dev/wallet/
+/crates/*/dev/audit/
+/crates/*/dev/quarantine/
+/crates/*/dev/mainnet/
+/crates/*/dev/testnet/
+/crates/*/dev/regnet/
+/crates/*/dev/prunetest/
+data.mdb
+lock.mdb
+*.lmdb
+*.mdb
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+explorer-api-snapshot.bin
+*-storage-recovery-notice.txt
 
-# Ignore specific directories that are not part of the source
-dist/
-desktop/
-build/
-target/
-dev/logs
+# Wallets, keys, local identities, and secrets
+wallet.dat
+wallet.data
+wallet.data.*
+*.wallet
+*.seed
+*.mnemonic
+*.secret
+*.token
+*.cookie
+rpc.cookie
+node_identity*
+peer_key*
+miner_key*
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+
+# Native/build/package artifacts
+/build/
+/dist/
+/desktop/
+*.profraw
+*.profdata
+
+# Editor, OS, and temporary files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+#*#
+*.tmp
+*.bak
+*.old
+*.backup
+*.orig
+/tmp/
+**/tmp/
+.git.empty-backup-*/
+
+# Cargo-fuzz generates this lock file locally.
 fuzz/Cargo.lock
-
-
-
-
-# Ignore lock files if you don't want to track them (optional, but common for Cargo)
-# Cargo.lock

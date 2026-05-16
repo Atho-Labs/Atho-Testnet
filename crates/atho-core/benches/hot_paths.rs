@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::consensus::subsidy;

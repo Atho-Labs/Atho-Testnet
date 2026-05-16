@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Atho full-node runtime, orchestration, and operator-facing services.
 //!
 //! This crate owns the production node lifecycle: startup, mempool handling,

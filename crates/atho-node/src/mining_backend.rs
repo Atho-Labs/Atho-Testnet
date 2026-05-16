@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Mining backend selection and CPU/GPU fallback policy.
 use crate::miner::{Miner, MiningInterrupted};
 use atho_core::block::Block;

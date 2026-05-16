@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Process-level node runtime and RPC/P2P bind orchestration.
 //!
 //! The runtime owns the running `Node`, binds loopback RPC and public P2P
@@ -405,10 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn config_loader_defaults_to_mainnet() {
+    fn config_loader_defaults_to_testnet() {
         std::env::remove_var("ATHO_NETWORK");
         let config = load_config_from_env().expect("config");
-        assert_eq!(config.network, Network::Mainnet);
+        assert_eq!(config.network, Network::Testnet);
     }
 
     #[test]
@@ -427,7 +430,6 @@ mod tests {
     #[test]
     fn initial_outbound_peers_deduplicate_targets_that_resolve_to_the_same_socket() {
         std::env::remove_var("ATHO_P2P_PEERS");
-        std::env::remove_var("ATHO_MAINNET_PEER");
 
         let peers = initial_outbound_peers(
             Network::Regnet,
@@ -446,14 +448,13 @@ mod tests {
     #[test]
     fn initial_outbound_peers_try_discovered_anchors_before_static_bootstrap() {
         std::env::remove_var("ATHO_P2P_PEERS");
-        std::env::remove_var("ATHO_MAINNET_PEER");
 
-        let peers = initial_outbound_peers(Network::Mainnet, vec![String::from("8.8.8.8:56000")]);
+        let peers = initial_outbound_peers(Network::Testnet, vec![String::from("8.8.8.8:9100")]);
 
-        assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:56000"));
+        assert_eq!(peers.first().map(String::as_str), Some("8.8.8.8:9100"));
         assert!(peers
             .iter()
-            .any(|peer| peer == "mainnet-node1.atho.io:56000"));
+            .any(|peer| peer == "testnet-node1.atho.io:9100"));
     }
 
     #[test]

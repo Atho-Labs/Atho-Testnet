@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Lightweight logging configuration for node processes and local tooling.
 use atho_core::network::Network;
 

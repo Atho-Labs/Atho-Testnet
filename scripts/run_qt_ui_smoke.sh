@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Atho contributors
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NETWORK="${ATHO_UI_NETWORK:-regnet}"
+NETWORK="${ATHO_UI_NETWORK:-testnet}"
 APP_NAME="${ATHO_UI_APP_NAME:-Atho}"
 APP_PROCESS_NAME="${ATHO_UI_PROCESS_NAME:-atho-qt}"
 LOG_FILE="${ATHO_UI_LOG_FILE:-/tmp/atho-qt-ui-smoke.log}"

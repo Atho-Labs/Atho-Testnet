@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Per-peer state tracked by the P2P runtime.
 use crate::address_manager::{format_remote_addr, parse_remote_addr};
 use crate::config::network_params;

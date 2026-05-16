@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Shared mnemonic and recovery-phrase UI widgets.
 use super::widgets;
 use atho_wallet::mnemonic::{normalize_mnemonic_words, DEFAULT_MNEMONIC_WORD_COUNT};

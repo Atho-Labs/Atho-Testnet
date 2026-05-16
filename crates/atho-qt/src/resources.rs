@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use eframe::egui::{self, IconData, Image};
 
 fn sized_icon(source: egui::ImageSource<'static>, size: f32) -> Image<'static> {

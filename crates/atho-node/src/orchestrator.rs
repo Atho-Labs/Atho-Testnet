@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Coordination layer joining runtime, sync, and RPC services.
 use crate::config::NodeConfig;
 use crate::dev;

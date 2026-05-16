@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! In-memory mempool admission and conflict tracking.
 //!
 //! The mempool keeps policy-accepted transactions that are not yet mined and
@@ -7,6 +10,8 @@
 //! fee-floor checks happen here before transactions are mined into templates.
 use crate::dev;
 use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
+#[cfg(test)]
+use atho_core::constants::ADDRESS_DIGEST_BYTES;
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
@@ -455,7 +460,6 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::address::public_key_digest;
     use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::solve_transaction_pow;
@@ -520,11 +524,6 @@ mod tests {
         .canonical_bytes()
     }
 
-    fn test_locking_script(network: Network) -> Vec<u8> {
-        let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
-        public_key_digest(network, &keypair.public_key.0).to_vec()
-    }
-
     #[test]
     fn mempool_admits_valid_transactions() {
         let mut mempool = Mempool::new();
@@ -533,11 +532,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [2; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -566,11 +565,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [2; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -601,11 +600,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [0x55; 48],
                 output_index: 0,
-                unlocking_script: vec![0x55],
+                unlocking_script: vec![0x55; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![0x56],
+                locking_script: vec![0x56; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -653,11 +652,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [6; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -689,11 +688,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [16; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -725,11 +724,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [4; 48],
                 output_index: 0,
-                unlocking_script: test_locking_script(Network::Mainnet),
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_500,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -747,11 +746,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [5; 48],
                 output_index: 0,
-                unlocking_script: test_locking_script(Network::Mainnet),
+                unlocking_script: vec![3; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![4],
+                locking_script: vec![4; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -780,7 +779,7 @@ mod tests {
                 [4; 48],
                 0,
                 10_000,
-                test_locking_script(Network::Mainnet),
+                vec![1],
                 0,
                 false,
             ),
@@ -792,7 +791,7 @@ mod tests {
                 [5; 48],
                 0,
                 10_000,
-                test_locking_script(Network::Mainnet),
+                vec![3],
                 0,
                 false,
             ),
@@ -817,11 +816,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1],
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_500,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -853,11 +852,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [11; 48],
                 output_index: 0,
-                unlocking_script: test_locking_script(Network::Mainnet),
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![2],
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -875,11 +874,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [12; 48],
                 output_index: 0,
-                unlocking_script: vec![3],
+                unlocking_script: vec![3; ADDRESS_DIGEST_BYTES],
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![4],
+                locking_script: vec![4; ADDRESS_DIGEST_BYTES],
             }],
             lock_time: 0,
             witness: vec![],
@@ -907,7 +906,7 @@ mod tests {
                 [11; 48],
                 0,
                 10_000,
-                test_locking_script(Network::Mainnet),
+                vec![1],
                 0,
                 false,
             ),

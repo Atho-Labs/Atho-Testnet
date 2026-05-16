@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Derived Qt view state computed from node status snapshots.
 use crate::state::UiState;
 use atho_rpc::response::{NetworkPeerDiagnostics, RpcResponse};

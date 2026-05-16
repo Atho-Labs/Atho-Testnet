@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use atho_core::address::{address_checksum, decode_base56_address, hashed_public_key_from_digest};
 use atho_core::constants::ADDRESS_CHECKSUM_BASE56_CHARS;
 use atho_core::network::Network;

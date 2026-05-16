@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Persistent chainstate, block archive, and UTXO storage for Atho.
 //!
 //! The storage crate wraps LMDB-backed persistence and exposes the canonical

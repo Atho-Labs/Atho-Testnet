@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Structured RPC errors and safe user-facing serialization.
 use atho_errors::{
     AthoError, AthoErrorDescriptor, AthoSeverity, RPC_INTERNAL, RPC_INVALID_REQUEST,

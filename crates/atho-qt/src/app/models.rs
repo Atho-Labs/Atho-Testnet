@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 use super::{default_wallet_name, default_wallet_path, suggested_wallet_path};
 use atho_core::network::Network;
 use atho_rpc::command::{CommandGroup, CommandPermission};

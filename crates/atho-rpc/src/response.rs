@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! RPC response payloads returned by the Atho node service.
 use crate::command::CommandResponse;
 use crate::error::RpcError;

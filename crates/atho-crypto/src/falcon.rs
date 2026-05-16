@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Falcon-512 key generation and signature verification for Atho.
 //!
 //! This module wraps the `fn-dsa` Falcon implementation with Atho-specific
@@ -16,6 +19,7 @@ use fn_dsa::{
 };
 use getrandom::getrandom;
 use std::cmp::min;
+use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const FALCON_512_LOGN: u32 = FN_DSA_LOGN_512;
@@ -31,15 +35,25 @@ impl FalconPublicKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        decode_verifying_key(bytes)?;
+        Ok(Self(bytes.to_vec()))
+    }
 }
 
 /// Falcon-512 secret signing key stored in zeroizing memory.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct FalconSecretKey(pub SecretBytes);
 
 impl FalconSecretKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0 .0
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        decode_signing_key(bytes)?;
+        Ok(Self(SecretBytes(bytes.to_vec())))
     }
 }
 
@@ -51,13 +65,35 @@ impl FalconSignature {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        if !signature_len_ok(bytes.len()) {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
 }
 
 /// Public/secret Falcon keypair used by wallet code and tests.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct FalconKeypair {
     pub public_key: FalconPublicKey,
     pub secret_key: FalconSecretKey,
+}
+
+impl fmt::Debug for FalconSecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FalconSecretKey(<redacted>)")
+    }
+}
+
+impl fmt::Debug for FalconKeypair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FalconKeypair")
+            .field("public_key", &self.public_key)
+            .field("secret_key", &self.secret_key)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -175,6 +211,20 @@ pub fn validate_key_lengths(public_key: &[u8], secret_key: &[u8]) -> Result<(), 
     }
 }
 
+fn decode_signing_key(bytes: &[u8]) -> Result<SigningKey512, CryptoError> {
+    if !secret_key_len_ok(bytes.len()) {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    SigningKey512::decode(bytes).ok_or(CryptoError::OperationFailed)
+}
+
+fn decode_verifying_key(bytes: &[u8]) -> Result<VerifyingKey512, CryptoError> {
+    if !public_key_len_ok(bytes.len()) {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    VerifyingKey512::decode(bytes).ok_or(CryptoError::OperationFailed)
+}
+
 fn falcon_seed(seed: &[u8]) -> [u8; 48] {
     let mut out = [0u8; 48];
     if seed.len() == 48 {
@@ -231,12 +281,7 @@ pub fn sign(
     secret_key: &FalconSecretKey,
     message: &[u8],
 ) -> Result<FalconSignature, CryptoError> {
-    if !secret_key_len_ok(secret_key.as_bytes().len()) {
-        return Err(CryptoError::InvalidKeyLength);
-    }
-
-    let mut signing_key =
-        SigningKey512::decode(secret_key.as_bytes()).ok_or(CryptoError::OperationFailed)?;
+    let mut signing_key = decode_signing_key(secret_key.as_bytes())?;
     let mut seed = [0u8; 48];
     getrandom(&mut seed).map_err(|_| CryptoError::BackendUnavailable)?;
     let mut rng = init_rng(&seed);
@@ -260,16 +305,14 @@ pub fn verify(
     message: &[u8],
     signature: &FalconSignature,
 ) -> Result<bool, CryptoError> {
-    if !public_key_len_ok(public_key.as_bytes().len())
-        || !signature_len_ok(signature.as_bytes().len())
-    {
+    let verifying_key = match decode_verifying_key(public_key.as_bytes()) {
+        Ok(key) => key,
+        Err(CryptoError::InvalidKeyLength | CryptoError::OperationFailed) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if !signature_len_ok(signature.as_bytes().len()) {
         return Ok(false);
     }
-
-    let verifying_key = match VerifyingKey512::decode(public_key.as_bytes()) {
-        Some(key) => key,
-        None => return Ok(false),
-    };
 
     Ok(verifying_key.verify(
         signature.as_bytes(),
@@ -282,7 +325,10 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+    use atho_core::consensus::signatures::{
+        transaction_signing_digest, transaction_signing_digest_for_input_indexes,
+        AthoSignatureDomain,
+    };
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput};
 
@@ -404,6 +450,79 @@ mod tests {
     }
 
     #[test]
+    fn falcon_verify_rejects_malformed_inputs_without_panicking() {
+        let keypair = generate_from_seed(b"atho-falcon-malformed-inputs").unwrap();
+        let message = b"atho malformed falcon audit message";
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            message,
+        )
+        .unwrap();
+
+        let truncated_signature =
+            FalconSignature(signature.as_bytes()[..FALCON_512_SIGNATURE_BYTES - 1].to_vec());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            message,
+            &truncated_signature,
+        )
+        .unwrap());
+
+        let mut oversized_signature_bytes = signature.as_bytes().to_vec();
+        oversized_signature_bytes.push(0);
+        let oversized_signature = FalconSignature(oversized_signature_bytes);
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            message,
+            &oversized_signature,
+        )
+        .unwrap());
+
+        let truncated_public_key = FalconPublicKey(
+            keypair.public_key.as_bytes()[..FALCON_512_PUBLIC_KEY_BYTES - 1].to_vec(),
+        );
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &truncated_public_key,
+            message,
+            &signature,
+        )
+        .unwrap());
+
+        let mut malformed_public_key_bytes = keypair.public_key.as_bytes().to_vec();
+        malformed_public_key_bytes[0] ^= 0x80;
+        let malformed_public_key = FalconPublicKey(malformed_public_key_bytes);
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &malformed_public_key,
+            message,
+            &signature,
+        )
+        .unwrap());
+
+        let empty_signature = FalconSignature(Vec::new());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            message,
+            &empty_signature,
+        )
+        .unwrap());
+
+        let empty_public_key = FalconPublicKey(Vec::new());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &empty_public_key,
+            message,
+            &signature,
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn falcon_length_validation_rejects_wrong_sizes() {
         let err = validate_key_lengths(&[], &[]).unwrap_err();
         assert_eq!(err, CryptoError::InvalidKeyLength);
@@ -413,6 +532,140 @@ mod tests {
         assert!(public_key_len_ok(FALCON_512_PUBLIC_KEY_BYTES));
         assert!(!public_key_len_ok(896));
         assert!(!public_key_len_ok(FALCON_512_PUBLIC_KEY_BYTES + 1));
+    }
+
+    #[test]
+    fn falcon_deterministic_keygen_is_stable_and_empty_seed_is_rejected() {
+        let a = generate_from_seed(b"atho-falcon-deterministic-seed").unwrap();
+        let b = generate_from_seed(b"atho-falcon-deterministic-seed").unwrap();
+        let c = generate_from_seed(b"atho-falcon-different-seed").unwrap();
+
+        assert_eq!(a.public_key, b.public_key);
+        assert_eq!(a.secret_key.as_bytes(), b.secret_key.as_bytes());
+        assert_ne!(a.public_key, c.public_key);
+        assert_ne!(a.secret_key.as_bytes(), c.secret_key.as_bytes());
+        assert_eq!(
+            generate_from_seed(b"").unwrap_err(),
+            CryptoError::InvalidKeyLength
+        );
+    }
+
+    #[test]
+    fn falcon_constructor_validation_rejects_wrong_lengths_and_malformed_keys() {
+        let keypair = generate_from_seed(b"atho-falcon-ctor-validation").unwrap();
+
+        assert!(FalconPublicKey::from_bytes(keypair.public_key.as_bytes()).is_ok());
+        assert!(FalconSecretKey::from_bytes(keypair.secret_key.as_bytes()).is_ok());
+        assert!(FalconSignature::from_bytes(&vec![7; FALCON_512_SIGNATURE_BYTES]).is_ok());
+
+        assert_eq!(
+            FalconPublicKey::from_bytes(&[]).unwrap_err(),
+            CryptoError::InvalidKeyLength
+        );
+        assert_eq!(
+            FalconSecretKey::from_bytes(&[]).unwrap_err(),
+            CryptoError::InvalidKeyLength
+        );
+        assert_eq!(
+            FalconSignature::from_bytes(&[]).unwrap_err(),
+            CryptoError::InvalidKeyLength
+        );
+
+        let mut malformed_public_key = keypair.public_key.as_bytes().to_vec();
+        malformed_public_key[0] ^= 0x80;
+        assert_eq!(
+            FalconPublicKey::from_bytes(&malformed_public_key).unwrap_err(),
+            CryptoError::OperationFailed
+        );
+
+        let mut malformed_secret_key = keypair.secret_key.as_bytes().to_vec();
+        malformed_secret_key[0] ^= 0x80;
+        assert_eq!(
+            FalconSecretKey::from_bytes(&malformed_secret_key).unwrap_err(),
+            CryptoError::OperationFailed
+        );
+    }
+
+    #[test]
+    fn falcon_debug_output_redacts_secret_material() {
+        let keypair = generate_from_seed(b"atho-falcon-debug-redaction").unwrap();
+        let rendered_secret = format!("{:?}", keypair.secret_key);
+        let rendered_keypair = format!("{:?}", keypair);
+
+        assert!(rendered_secret.contains("<redacted>"));
+        assert!(!rendered_secret.contains("SecretBytes(["));
+        assert!(rendered_keypair.contains("<redacted>"));
+        assert!(!rendered_keypair.contains("SecretBytes(["));
+    }
+
+    #[test]
+    fn falcon_signatures_are_bound_to_network_and_covered_input_set() {
+        let keypair = generate_from_seed(b"atho-falcon-network-binding").unwrap();
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxInput {
+                    previous_txid: [1; 48],
+                    output_index: 0,
+                    unlocking_script: vec![1, 2, 3],
+                },
+                TxInput {
+                    previous_txid: [2; 48],
+                    output_index: 1,
+                    unlocking_script: vec![4, 5, 6],
+                },
+            ],
+            outputs: vec![TxOutput {
+                value_atoms: 500,
+                locking_script: vec![7, 8],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let mainnet_digest = transaction_signing_digest(Network::Mainnet, &tx);
+        let testnet_digest = transaction_signing_digest(Network::Testnet, &tx);
+        let first_input_digest =
+            transaction_signing_digest_for_input_indexes(Network::Mainnet, &tx, &[0]);
+        let second_input_digest =
+            transaction_signing_digest_for_input_indexes(Network::Mainnet, &tx, &[1]);
+
+        let signature = sign(
+            AthoSignatureDomain::Transaction,
+            &keypair.secret_key,
+            &first_input_digest,
+        )
+        .unwrap();
+
+        assert!(verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            &first_input_digest,
+            &signature,
+        )
+        .unwrap());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            &second_input_digest,
+            &signature,
+        )
+        .unwrap());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            &mainnet_digest,
+            &signature,
+        )
+        .unwrap());
+        assert!(!verify(
+            AthoSignatureDomain::Transaction,
+            &keypair.public_key,
+            &testnet_digest,
+            &signature,
+        )
+        .unwrap());
     }
 
     #[test]

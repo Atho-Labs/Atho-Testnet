@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Wallet address-book records and label tracking.
 use crate::hd::{AddressKind, DerivationPath};
 use atho_core::network::Network;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 // Auto-generated from wordlistm.py
 pub static WORDLIST: [&str; 2048] = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",

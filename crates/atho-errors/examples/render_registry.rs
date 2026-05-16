@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 fn main() {
     let mode = std::env::args()
         .nth(1)

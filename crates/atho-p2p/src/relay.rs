@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Inventory, block, and transaction relay helpers.
 use crate::config::{network_params, NetworkParams};
 use crate::peer::PeerBook;
@@ -250,6 +253,30 @@ impl RelayLoop {
                 self.sync.clear_requested_header_locators();
                 self.sync.best_tip = local_tip;
             }
+        }
+    }
+
+    pub fn reset_sync_target_at(
+        &mut self,
+        local_best_height: u64,
+        local_tip: Option<Hash48>,
+        peer_best_height: Option<u64>,
+    ) {
+        let target_height = peer_best_height
+            .unwrap_or(local_best_height)
+            .max(local_best_height);
+        self.sync.best_height = target_height;
+        if local_best_height >= target_height {
+            self.sync.headers_synced = true;
+            self.sync.clear_requested_header_locators();
+            self.sync.best_tip = local_tip;
+            if let Some(local_tip) = local_tip {
+                self.sync.locator_hashes.retain(|hash| *hash != local_tip);
+                self.sync.locator_hashes.insert(0, local_tip);
+                self.sync.locator_hashes.truncate(32);
+            }
+        } else {
+            self.sync.headers_synced = false;
         }
     }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Wallet activity extraction from on-chain and mempool data.
 use atho_core::block::Block;
 use atho_rpc::request::WalletHistoryAddress;

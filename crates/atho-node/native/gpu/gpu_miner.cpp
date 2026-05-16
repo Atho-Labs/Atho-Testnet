@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 #define CL_TARGET_OPENCL_VERSION 120
 #if defined(__APPLE__)
 #include <OpenCL/opencl.h>

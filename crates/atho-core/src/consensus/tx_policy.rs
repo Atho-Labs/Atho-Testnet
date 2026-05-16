@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) Atho contributors
+
 //! Transaction anti-spam policy helpers shared across wallets, nodes, and tests.
 //!
 //! These helpers define the active relay/consensus transaction policy: fee

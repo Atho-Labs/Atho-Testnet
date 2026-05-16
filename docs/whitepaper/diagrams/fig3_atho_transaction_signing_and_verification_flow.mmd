@@ -1,8 +1,0 @@
-flowchart LR
-    UTXO[Wallet selects UTXOs] --> Body[Canonical transaction body]
-    Body --> Digest[SHA3-384 signing digest]
-    Digest --> Sign[Falcon-512 signs]
-    Sign --> Broadcast[Broadcast transaction]
-    Broadcast --> Rebuild[Node rebuilds digest]
-    Rebuild --> Verify[Falcon verifies]
-    Verify --> Admit[Admit or reject]
