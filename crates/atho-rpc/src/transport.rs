@@ -61,18 +61,38 @@ impl AthoErrorMeta for RpcTransportError {
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     address: String,
+    auth: Option<(String, String)>,
 }
 
 impl RpcClient {
     pub fn new(address: impl Into<String>) -> Self {
         Self {
             address: address.into(),
+            auth: None,
+        }
+    }
+
+    pub fn with_auth(
+        address: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            auth: Some((username.into(), password.into())),
         }
     }
 
     pub fn call(&self, request: &RpcRequest) -> Result<RpcResponse, RpcTransportError> {
         let mut stream = connect_stream(&self.address)?;
-        write_message(&mut stream, request)?;
+        match &self.auth {
+            Some((username, password)) => {
+                let authenticated =
+                    RpcRequest::authenticated(username.clone(), password.clone(), request.clone());
+                write_message(&mut stream, &authenticated)?;
+            }
+            None => write_message(&mut stream, request)?,
+        }
         let mut reader = BufReader::new(stream);
         let response: RpcResponse = read_message(&mut reader)?;
         Ok(response)

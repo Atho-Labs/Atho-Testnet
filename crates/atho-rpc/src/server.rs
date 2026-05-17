@@ -54,6 +54,7 @@ impl RpcServer {
 
     pub fn handle(&self, request: RpcRequest) -> RpcResponse {
         match request {
+            RpcRequest::Authenticated { request, .. } => self.handle(*request),
             RpcRequest::GetBlockCount => RpcResponse::BlockCount(self.block_count),
             RpcRequest::GetNetwork => RpcResponse::Network(self.network.id().to_string()),
             RpcRequest::GetNodeStatus => RpcResponse::NodeStatus(self.node_status()),

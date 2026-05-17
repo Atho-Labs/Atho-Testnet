@@ -350,7 +350,7 @@ impl ReadOnlyNodeConnection {
         } else {
             match start_local_node_if_needed(network, &rpc_address) {
                 Ok(startup) => ConnectionBackend::Rpc {
-                    client: RpcClient::new(rpc_address.clone()),
+                    client: rpc_client_for_network(network, rpc_address.clone()),
                     node: startup.node,
                     local_node: startup.local_node,
                 },
@@ -389,13 +389,7 @@ impl ReadOnlyNodeConnection {
         match &self.backend {
             ConnectionBackend::Local(system) => {
                 let mut system = system.lock().expect("local node mutex poisoned");
-                let requires_mutable = match &request {
-                    RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => true,
-                    RpcRequest::ExecuteCommand(invocation) => {
-                        command_requires_mutable_access(&invocation.name)
-                    }
-                    _ => false,
-                };
+                let requires_mutable = rpc_request_requires_mutable_access(&request);
                 if requires_mutable {
                     system.handle_mut(request)
                 } else {
@@ -531,7 +525,7 @@ impl ReadOnlyNodeConnection {
                 let node = node.clone();
                 let local_node = *local_node;
                 thread::spawn(move || {
-                    let client = RpcClient::new(rpc_address.clone());
+                    let client = rpc_client_for_network(network, rpc_address.clone());
                     let mut last_status: Option<ConnectionStatus> = None;
                     loop {
                         let status = collect_rpc_status(
@@ -603,6 +597,15 @@ impl ReadOnlyNodeConnection {
             }
             _ => None,
         }
+    }
+}
+
+fn rpc_request_requires_mutable_access(request: &RpcRequest) -> bool {
+    match request {
+        RpcRequest::Authenticated { request, .. } => rpc_request_requires_mutable_access(request),
+        RpcRequest::SubmitBlock(_) | RpcRequest::SubmitTransaction { .. } => true,
+        RpcRequest::ExecuteCommand(invocation) => command_requires_mutable_access(&invocation.name),
+        _ => false,
     }
 }
 
@@ -1094,7 +1097,7 @@ fn managed_parent_pid_env_value() -> String {
 }
 
 fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> ExistingRpcEndpoint {
-    let client = RpcClient::new(rpc_address.to_string());
+    let client = rpc_client_for_network(network, rpc_address.to_string());
     if let Ok(RpcResponse::NodeStatus(status)) = client.call(&RpcRequest::GetNodeStatus) {
         if status.network != network {
             return ExistingRpcEndpoint::WrongNetwork(status.network.id().to_string());
@@ -1122,6 +1125,19 @@ fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> Existin
         ExistingRpcEndpoint::None
     } else {
         ExistingRpcEndpoint::OccupiedByNonAtho
+    }
+}
+
+fn rpc_client_for_network(network: Network, rpc_address: String) -> RpcClient {
+    let config = atho_node::config::NodeConfig::from_env(network);
+    if config.rpc_auth.enabled {
+        RpcClient::with_auth(
+            rpc_address,
+            config.rpc_auth.username,
+            config.rpc_auth.password,
+        )
+    } else {
+        RpcClient::new(rpc_address)
     }
 }
 
@@ -1201,7 +1217,7 @@ fn spawn_bootstrap_watcher(
     managed_node: Arc<ManagedNodeState>,
 ) {
     thread::spawn(move || {
-        let client = RpcClient::new(rpc_address.clone());
+        let client = rpc_client_for_network(network, rpc_address.clone());
         for attempt in 0..90 {
             if let Some(error) = managed_node.observe_exit(network) {
                 let _ = atho_node::dev::append_log("atho-qt", &error);
@@ -1274,7 +1290,7 @@ fn stop_existing_local_node(rpc_address: &str, network: Network) -> Result<(), S
     let mut invocation = CommandInvocation::new("stop", Vec::new());
     invocation.confirmed = true;
     let stop_request = RpcRequest::ExecuteCommand(invocation);
-    let client = RpcClient::new(rpc_address.to_string());
+    let client = rpc_client_for_network(network, rpc_address.to_string());
 
     let current_stop_result = client.call(&stop_request);
     let current_stop = match &current_stop_result {

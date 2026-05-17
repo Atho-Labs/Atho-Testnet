@@ -458,6 +458,118 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
     ui.add_space(14.0);
     widgets::panel_frame().show(ui, |ui| {
+        widgets::section_header(ui, "Node Settings");
+        ui.add_space(12.0);
+        widgets::muted_label(
+            ui,
+            "These settings are written to atho.conf and are also editable by hand. Restart a managed local node after saving runtime settings.",
+        );
+        ui.add_space(12.0);
+        render_copyable_path_row(
+            ui,
+            "Config file",
+            &atho_node::config::NodeConfig::config_file_path()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        ui.add_space(10.0);
+        ui.checkbox(&mut app.node_settings_form.rpc_auth_enabled, "Enable RPC auth");
+        ui.horizontal(|ui| {
+            ui.label("RPC user");
+            ui.add_sized(
+                [180.0, 26.0],
+                egui::TextEdit::singleline(&mut app.node_settings_form.rpc_user),
+            );
+            ui.label("RPC password");
+            ui.add_sized(
+                [220.0, 26.0],
+                egui::TextEdit::singleline(&mut app.node_settings_form.rpc_password)
+                    .password(true),
+            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut app.node_settings_form.wallet_enabled, "Wallet enabled");
+            let require_passphrase_response = ui.checkbox(
+                &mut app.node_settings_form.wallet_require_encryption,
+                "Require wallet passphrase",
+            );
+            if require_passphrase_response.changed()
+                && app.node_settings_form.wallet_require_encryption
+            {
+                app.show_wallet_encryption_notice_dialog = true;
+            }
+        });
+        if app.node_settings_form.wallet_enabled && app.node_settings_form.wallet_require_encryption
+        {
+            widgets::muted_label(
+                ui,
+                "Wallet mode requires encrypted wallet files. If the active wallet is plaintext, set a passphrase in Backup & Passphrase before saving.",
+            );
+        }
+        ui.add_space(10.0);
+        egui::Grid::new("node_settings_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Max mempool MiB");
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.node_settings_form.max_mempool_mib),
+                );
+                ui.end_row();
+
+                ui.label("Max mempool transactions");
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(
+                        &mut app.node_settings_form.max_mempool_transactions,
+                    ),
+                );
+                ui.end_row();
+
+                ui.label("Prune target MiB");
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.node_settings_form.prune_mib),
+                );
+                ui.end_row();
+
+                ui.label("Database cache MiB");
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.node_settings_form.db_cache_mib),
+                );
+                ui.end_row();
+
+                ui.label("Max peer connections");
+                ui.add_sized(
+                    [120.0, 26.0],
+                    egui::TextEdit::singleline(&mut app.node_settings_form.max_peer_connections),
+                );
+                ui.end_row();
+            });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save Node Settings").clicked() {
+                match app.save_node_settings() {
+                    Ok(message) => {
+                        app.last_error = None;
+                        app.send_status = message;
+                    }
+                    Err(err) => app.last_error = Some(err),
+                }
+            }
+            if ui.button("Reload").clicked() {
+                app.node_settings_form =
+                    crate::app::NodeSettingsForm::load(app.connection.network());
+                app.send_status = String::from("Node settings reloaded");
+            }
+        });
+    });
+
+    ui.add_space(14.0);
+    widgets::panel_frame().show(ui, |ui| {
         widgets::section_header(ui, "Mining");
         ui.add_space(12.0);
         widgets::muted_label(

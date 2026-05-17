@@ -5,7 +5,7 @@
 use crate::config::NodeConfig;
 use crate::dev;
 use crate::error::NodeError;
-use crate::mempool::{Mempool, MempoolEntry};
+use crate::mempool::{Mempool, MempoolEntry, MempoolLimits};
 use crate::miner::Miner;
 #[cfg(test)]
 use crate::test_support::acquire_global_test_lock;
@@ -49,14 +49,23 @@ pub struct Node {
 }
 
 impl Node {
+    fn mempool_for_config(config: &NodeConfig) -> Mempool {
+        Mempool::with_limits(MempoolLimits {
+            max_transactions: config.mempool.max_transactions,
+            max_vbytes: config.mempool.max_vbytes,
+        })
+    }
+
     pub fn new(config: NodeConfig) -> Self {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        config.apply_process_overrides();
+        let mempool = Self::mempool_for_config(&config);
         Self {
             config,
             chainstate: StorageChainstate::new(network),
-            mempool: Mempool::new(),
+            mempool,
             #[cfg(test)]
             _test_lock: test_lock,
         }
@@ -427,10 +436,12 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        config.apply_process_overrides();
+        let mempool = Self::mempool_for_config(&config);
         Self {
             config,
             chainstate: StorageChainstate::load_or_new(network),
-            mempool: Mempool::new(),
+            mempool,
             #[cfg(test)]
             _test_lock: test_lock,
         }
@@ -440,10 +451,12 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        config.apply_process_overrides();
+        let mempool = Self::mempool_for_config(&config);
         Ok(Self {
             config,
             chainstate: StorageChainstate::try_load_or_new(network)?,
-            mempool: Mempool::new(),
+            mempool,
             #[cfg(test)]
             _test_lock: test_lock,
         })
@@ -453,10 +466,12 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        config.apply_process_overrides();
+        let mempool = Self::mempool_for_config(&config);
         Ok(Self {
             config,
             chainstate: StorageChainstate::try_load_or_recover(network)?,
-            mempool: Mempool::new(),
+            mempool,
             #[cfg(test)]
             _test_lock: test_lock,
         })

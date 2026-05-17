@@ -3,6 +3,7 @@
 
 use super::{default_wallet_name, default_wallet_path, suggested_wallet_path};
 use atho_core::network::Network;
+use atho_node::config::NodeConfig;
 use atho_rpc::command::{CommandGroup, CommandPermission};
 use atho_wallet::mnemonic::DEFAULT_MNEMONIC_WORD_COUNT;
 use atho_wallet::wallet::WalletAddress;
@@ -197,7 +198,7 @@ impl CreateWalletForm {
                 .to_string_lossy()
                 .into_owned(),
             mnemonic_word_count: DEFAULT_MNEMONIC_WORD_COUNT,
-            encrypt_wallet: false,
+            encrypt_wallet: true,
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
             mnemonic_passphrase: String::new(),
@@ -229,6 +230,45 @@ pub(crate) struct WalletManagementForm {
     pub(crate) backup_password_confirm: String,
     pub(crate) restore_gap_limit_input: String,
     pub(crate) show_passwords: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeSettingsForm {
+    pub(crate) rpc_auth_enabled: bool,
+    pub(crate) rpc_user: String,
+    pub(crate) rpc_password: String,
+    pub(crate) wallet_enabled: bool,
+    pub(crate) wallet_require_encryption: bool,
+    pub(crate) max_mempool_mib: String,
+    pub(crate) max_mempool_transactions: String,
+    pub(crate) prune_mib: String,
+    pub(crate) db_cache_mib: String,
+    pub(crate) max_peer_connections: String,
+}
+
+impl NodeSettingsForm {
+    pub(crate) fn load(network: Network) -> Self {
+        Self::from_config(&NodeConfig::from_env(network))
+    }
+
+    pub(crate) fn from_config(config: &NodeConfig) -> Self {
+        Self {
+            rpc_auth_enabled: config.rpc_auth.enabled,
+            rpc_user: config.rpc_auth.username.clone(),
+            rpc_password: config.rpc_auth.password.clone(),
+            wallet_enabled: config.wallet.enabled,
+            wallet_require_encryption: config.wallet.require_encryption,
+            max_mempool_mib: bytes_to_mib_ceil(config.mempool.max_vbytes as u64).to_string(),
+            max_mempool_transactions: config.mempool.max_transactions.to_string(),
+            prune_mib: bytes_to_mib_ceil(config.storage.prune_target_bytes).to_string(),
+            db_cache_mib: bytes_to_mib_ceil(config.storage.db_cache_bytes).to_string(),
+            max_peer_connections: config.peers.max_connections.to_string(),
+        }
+    }
+}
+
+fn bytes_to_mib_ceil(bytes: u64) -> u64 {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
 }
 
 impl WalletManagementForm {
@@ -266,7 +306,7 @@ impl ImportWalletForm {
             wallet_path: suggested_wallet_path(network)
                 .to_string_lossy()
                 .into_owned(),
-            encrypt_wallet: false,
+            encrypt_wallet: true,
             wallet_password: String::new(),
             wallet_password_confirm: String::new(),
             mnemonic_words: vec![String::new(); DEFAULT_MNEMONIC_WORD_COUNT],

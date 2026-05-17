@@ -345,7 +345,7 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
     runtime.apply_env();
     let network = runtime
         .network
-        .ok_or_else(|| "wipe requires --network <testnet|regnet|prunetest>".to_string())?;
+        .ok_or_else(|| "wipe requires --network <mainnet|testnet|regnet|prunetest>".to_string())?;
     network.operator_launch_allowed().map_err(str::to_string)?;
     if !runtime.all {
         return Err("wipe requires --all".to_string());
@@ -626,10 +626,10 @@ fn parse_network(value: &str) -> Option<Network> {
 
 fn print_usage() {
     eprintln!("usage:");
-    eprintln!("  athod [--network <testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");
-    eprintln!("  athod wipe --network <testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets]");
-    eprintln!("  athod status [--network <testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
-    eprintln!("  athod verify [--network <testnet|regnet|prunetest>] [--data-dir PATH]");
+    eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");
+    eprintln!("  athod wipe --network <mainnet|testnet|regnet|prunetest> --data-dir PATH --all [--include-wallets]");
+    eprintln!("  athod status [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--data-dir PATH]");
+    eprintln!("  athod verify [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH]");
     eprintln!("  athod dev <genesis|wipe|reset|watch|export|mine> [options]");
     eprintln!();
     eprintln!("legacy compatibility:");

@@ -303,6 +303,7 @@ impl NodeService {
     /// Handles read-only RPC requests.
     pub fn handle(&self, request: RpcRequest) -> RpcResponse {
         match request {
+            RpcRequest::Authenticated { request, .. } => self.handle(*request),
             RpcRequest::GetNetwork => RpcResponse::Network(self.network().id().to_string()),
             RpcRequest::GetBlockCount => {
                 RpcResponse::BlockCount(self.orchestrator.runtime.node.height())
@@ -355,6 +356,7 @@ impl NodeService {
     /// Handles mutable RPC requests that may update node state.
     pub fn handle_mut(&mut self, request: RpcRequest) -> RpcResponse {
         match request {
+            RpcRequest::Authenticated { request, .. } => self.handle_mut(*request),
             RpcRequest::ExecuteCommand(invocation) => self.execute_command_mut(invocation),
             RpcRequest::SubmitTransaction {
                 transaction,

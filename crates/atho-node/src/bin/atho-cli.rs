@@ -29,6 +29,8 @@ impl OutputFormat {
 struct CliConfig {
     network: Network,
     rpc_address: Option<String>,
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
     format: OutputFormat,
     command_line: Option<String>,
     confirmed: bool,
@@ -39,6 +41,8 @@ impl Default for CliConfig {
         Self {
             network: Network::Mainnet,
             rpc_address: None,
+            rpc_user: None,
+            rpc_password: None,
             format: OutputFormat::Pretty,
             command_line: None,
             confirmed: false,
@@ -79,11 +83,17 @@ fn run() -> Result<(), String> {
     let mut invocation = parse_command_line(command_line)?;
     invocation.confirmed = config.confirmed;
 
-    let client = RpcClient::new(
-        config
-            .rpc_address
-            .unwrap_or_else(|| atho_node::runtime::default_rpc_bind_address(config.network)),
-    );
+    let node_config = atho_node::config::NodeConfig::from_env(config.network);
+    let rpc_address = config
+        .rpc_address
+        .unwrap_or_else(|| node_config.rpc_bind_address());
+    let rpc_user = config.rpc_user.unwrap_or(node_config.rpc_auth.username);
+    let rpc_password = config.rpc_password.unwrap_or(node_config.rpc_auth.password);
+    let client = if node_config.rpc_auth.enabled {
+        RpcClient::with_auth(rpc_address, rpc_user, rpc_password)
+    } else {
+        RpcClient::new(rpc_address)
+    };
     match client.call(&RpcRequest::ExecuteCommand(invocation)) {
         Ok(RpcResponse::Command(response)) => {
             print_value(&response.data, config.format);
@@ -133,6 +143,20 @@ fn parse_cli(args: &[String]) -> Result<CliConfig, String> {
                     .ok_or_else(|| String::from("--rpc-url requires a value"))?;
                 config.rpc_address = Some(normalize_rpc_address(value)?);
             }
+            "--rpcuser" | "--rpc-user" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| String::from("--rpcuser requires a value"))?;
+                config.rpc_user = Some(value.clone());
+            }
+            "--rpcpassword" | "--rpc-password" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| String::from("--rpcpassword requires a value"))?;
+                config.rpc_password = Some(value.clone());
+            }
             "--format" => {
                 index += 1;
                 let value = args
@@ -144,7 +168,7 @@ fn parse_cli(args: &[String]) -> Result<CliConfig, String> {
             "--confirm" => {
                 config.confirmed = true;
             }
-            "--cookie-auth" | "--rpc-user" | "--rpc-password" | "--timeout" => {
+            "--cookie-auth" | "--timeout" => {
                 return Err(format!(
                     "{} is not supported by the current Atho local RPC transport yet",
                     args[index]
@@ -291,12 +315,14 @@ fn print_usage() {
     println!("Atho CLI");
     println!();
     println!("Usage:");
-    println!("  atho-cli [--network <mainnet|testnet|regnet|prunetest>] [--rpc-url <host:port>] [--format <json|pretty|table>] <command> [args]");
+    println!("  atho-cli [--network <mainnet|testnet|regnet|prunetest>] [--rpc-url <host:port>] [--rpcuser USER] [--rpcpassword PASSWORD] [--format <json|pretty|table>] <command> [args]");
     println!("  atho-cli help [command|group]");
     println!();
     println!("Flags:");
     println!("  --network      Select the network and default local RPC port");
     println!("  --rpc-url      Override the local RPC address");
+    println!("  --rpcuser      RPC username when rpcauth=1");
+    println!("  --rpcpassword  RPC password when rpcauth=1");
     println!("  --format       Output format: json, pretty, or table");
     println!("  --confirm      Confirm dangerous commands when supported");
     println!("  --help         Show this usage text");
@@ -340,7 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_rejects_unsupported_auth_flags() {
+    fn parse_cli_accepts_rpc_auth_flags() {
+        let config = parse_cli(&[
+            String::from("--rpcuser"),
+            String::from("operator"),
+            String::from("--rpcpassword"),
+            String::from("secret"),
+            String::from("getstatus"),
+        ])
+        .expect("parse cli");
+        assert_eq!(config.rpc_user.as_deref(), Some("operator"));
+        assert_eq!(config.rpc_password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn parse_cli_rejects_unsupported_cookie_auth_flag() {
         let err = parse_cli(&[String::from("--cookie-auth"), String::from("getstatus")])
             .expect_err("unsupported");
         assert!(err.contains("not supported"));

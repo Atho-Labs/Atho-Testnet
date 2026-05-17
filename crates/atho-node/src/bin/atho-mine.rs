@@ -249,7 +249,8 @@ fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
-            "testnet" | "regnet" | "regtest" | "prunetest" | "prune-test" | "prune_test" => {
+            "mainnet" | "testnet" | "regnet" | "regtest" | "prunetest" | "prune-test"
+            | "prune_test" => {
                 cli.network = parse_network(&args[i]);
                 i += 1;
             }
@@ -348,7 +349,7 @@ fn default_network() -> Network {
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(
-        "  atho-mine [--network <testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH] [--backend <cpu|gpu|auto>] [--probe-gpu] [--loop] [--retry-delay SECS]  (default backend: auto)"
+        "  atho-mine [--network <mainnet|testnet|regnet|prunetest>] [--rpc-addr HOST:PORT] [--cores N] [--data-dir PATH] [--backend <cpu|gpu|auto>] [--probe-gpu] [--loop] [--retry-delay SECS]  (default backend: auto)"
     );
 }
 

@@ -280,7 +280,7 @@ impl Database {
             return Err(StorageError::LegacyStorageLayout);
         }
         let block_store = BlockFileStore::open(network)?;
-        let state = Self::open_state(&root, INITIAL_MAP_SIZE)?;
+        let state = Self::open_state(&root, configured_db_cache_bytes())?;
         let database = Self {
             network,
             path: root,
@@ -339,7 +339,7 @@ impl Database {
         builder
             .set_max_readers(32)
             .set_max_dbs(MAX_DBS)
-            .set_map_size(INITIAL_MAP_SIZE);
+            .set_map_size(configured_db_cache_bytes());
         let env = builder.open(&root)?;
         let meta = env.create_db(Some(META_DB), DatabaseFlags::empty())?;
         let txn = env.begin_ro_txn()?;
@@ -557,8 +557,8 @@ impl Database {
             files.entry(record.file_number).or_default().push(record);
         }
 
-        let mut prune_files: Vec<(u64, Vec<BlockArchiveRecord>)> = Vec::new();
-        for (file_number, file_records) in files {
+        let mut prune_files: BTreeMap<u64, Vec<BlockArchiveRecord>> = BTreeMap::new();
+        for (file_number, file_records) in &files {
             let file_max_height = file_records
                 .iter()
                 .map(|record| record.height)
@@ -577,12 +577,55 @@ impl Database {
                 continue;
             }
 
+            prune_files.insert(*file_number, pending_prune);
+        }
+
+        if let Some(max_archive_bytes) = configured_prune_target_bytes() {
+            let mut unpruned_bytes = files
+                .values()
+                .flat_map(|records| records.iter())
+                .filter(|record| !record.pruned)
+                .map(|record| record.file_location().record_length())
+                .sum::<u64>();
+
+            for (file_number, file_records) in &files {
+                if unpruned_bytes <= max_archive_bytes {
+                    break;
+                }
+                if prune_files.contains_key(file_number) {
+                    continue;
+                }
+                let file_max_height = file_records
+                    .iter()
+                    .map(|record| record.height)
+                    .max()
+                    .unwrap_or(0);
+                if file_max_height >= tip_height {
+                    continue;
+                }
+                let pending_prune = file_records
+                    .iter()
+                    .filter(|record| !record.pruned)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if pending_prune.is_empty() {
+                    continue;
+                }
+                let file_bytes = pending_prune
+                    .iter()
+                    .map(|record| record.file_location().record_length())
+                    .sum::<u64>();
+                unpruned_bytes = unpruned_bytes.saturating_sub(file_bytes);
+                prune_files.insert(*file_number, pending_prune);
+            }
+        }
+
+        for pending_prune in prune_files.values() {
             report.pruned_blocks += pending_prune.len();
             report.reclaimed_bytes += pending_prune
                 .iter()
                 .map(|record| record.file_location().record_length())
                 .sum::<u64>();
-            prune_files.push((file_number, pending_prune));
         }
 
         if prune_files.is_empty() {
@@ -591,7 +634,7 @@ impl Database {
 
         self.write_with_retry(|state| {
             let mut txn = state.env.begin_rw_txn()?;
-            for (_, file_records) in &prune_files {
+            for file_records in prune_files.values() {
                 for record in file_records {
                     let mut updated = record.clone();
                     if updated.pruned {
@@ -612,7 +655,7 @@ impl Database {
             Ok(())
         })?;
 
-        for (file_number, _) in &prune_files {
+        for file_number in prune_files.keys() {
             self.block_store.delete_file(*file_number)?;
             report.pruned_files.push(*file_number);
         }
@@ -1287,6 +1330,21 @@ where
     T: for<'de> Deserialize<'de>,
 {
     bincode::deserialize(bytes).map_err(|_| StorageError::CorruptData)
+}
+
+fn configured_prune_target_bytes() -> Option<u64> {
+    std::env::var("ATHO_PRUNE_TARGET_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn configured_db_cache_bytes() -> usize {
+    std::env::var("ATHO_DB_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(64 * 1024 * 1024, MAX_MAP_SIZE))
+        .unwrap_or(INITIAL_MAP_SIZE)
 }
 
 fn clear_db(txn: &mut RwTransaction<'_>, db: LmdbDatabase) -> Result<(), StorageError> {

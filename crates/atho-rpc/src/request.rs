@@ -16,6 +16,11 @@ pub struct WalletHistoryAddress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RpcRequest {
+    Authenticated {
+        username: String,
+        password: String,
+        request: Box<RpcRequest>,
+    },
     GetBlockCount,
     GetNetwork,
     GetNodeStatus,
@@ -32,6 +37,20 @@ pub enum RpcRequest {
     GetMempoolInfo,
     GetMempoolSpentInputs,
     ExecuteCommand(CommandInvocation),
+}
+
+impl RpcRequest {
+    pub fn authenticated(
+        username: impl Into<String>,
+        password: impl Into<String>,
+        request: RpcRequest,
+    ) -> Self {
+        Self::Authenticated {
+            username: username.into(),
+            password: password.into(),
+            request: Box::new(request),
+        }
+    }
 }
 
 #[cfg(test)]

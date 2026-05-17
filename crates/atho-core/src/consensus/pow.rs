@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn expected_timespan_is_derived_from_target_block_time() {
-        assert_eq!(expected_timespan_seconds(), 1_200);
+        assert_eq!(expected_timespan_seconds(), 1_600);
     }
 
     #[test]

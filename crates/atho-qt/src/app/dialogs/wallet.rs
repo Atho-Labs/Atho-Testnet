@@ -36,10 +36,20 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
             "Each wallet is stored in its own folder and uses a local .datafile inside it.",
         );
         ui.add_space(10.0);
-        ui.checkbox(
-            &mut app.create_form.encrypt_wallet,
-            "Encrypt wallet with passphrase",
+        let wallet_encryption_required = app.node_settings_form.wallet_require_encryption;
+        if wallet_encryption_required {
+            app.create_form.encrypt_wallet = true;
+        }
+        ui.add_enabled(
+            !wallet_encryption_required,
+            egui::Checkbox::new(
+                &mut app.create_form.encrypt_wallet,
+                "Encrypt wallet with passphrase",
+            ),
         );
+        if wallet_encryption_required {
+            widgets::muted_label(ui, "Required by Node Settings.");
+        }
         if app.create_form.encrypt_wallet {
             ui.add_space(8.0);
             form_label(ui, "Wallet passphrase");
@@ -108,12 +118,12 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
         ui.add_space(18.0);
         ui.horizontal_wrapped(|ui| {
+            let wallet_password_ready = !app.create_form.encrypt_wallet
+                || (!app.create_form.wallet_password.is_empty()
+                    && app.create_form.wallet_password == app.create_form.wallet_password_confirm);
             let ready = create_mnemonic_sentence.is_some()
                 && app.create_form.acknowledged_backup
-                && (!app.create_form.encrypt_wallet
-                    || (!app.create_form.wallet_password.is_empty()
-                        && app.create_form.wallet_password
-                            == app.create_form.wallet_password_confirm));
+                && wallet_password_ready;
             if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
                 create_clicked = true;
             }
@@ -137,6 +147,13 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
         if app.create_form.wallet_name.trim().is_empty() {
             app.last_error = Some(String::from("Enter a wallet name"));
+            return;
+        }
+
+        if app.node_settings_form.wallet_require_encryption && !app.create_form.encrypt_wallet {
+            app.last_error = Some(String::from(
+                "Wallet passphrase is required by Node Settings",
+            ));
             return;
         }
 
@@ -232,10 +249,20 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         form_label(ui, "Seed passphrase (optional)");
         widgets::text_input(ui, &mut app.import_form.mnemonic_passphrase, "");
         ui.add_space(8.0);
-        ui.checkbox(
-            &mut app.import_form.encrypt_wallet,
-            "Encrypt wallet with passphrase",
+        let wallet_encryption_required = app.node_settings_form.wallet_require_encryption;
+        if wallet_encryption_required {
+            app.import_form.encrypt_wallet = true;
+        }
+        ui.add_enabled(
+            !wallet_encryption_required,
+            egui::Checkbox::new(
+                &mut app.import_form.encrypt_wallet,
+                "Encrypt wallet with passphrase",
+            ),
         );
+        if wallet_encryption_required {
+            widgets::muted_label(ui, "Required by Node Settings.");
+        }
         if app.import_form.encrypt_wallet {
             ui.add_space(8.0);
             form_label(ui, "Wallet passphrase");
@@ -260,10 +287,10 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             let import_mnemonic_ready =
                 mnemonic_ui::mnemonic_sentence_from_words(&app.import_form.mnemonic_words).is_ok();
-            let ready = (!app.import_form.encrypt_wallet
+            let wallet_password_ready = !app.import_form.encrypt_wallet
                 || (!app.import_form.wallet_password.is_empty()
-                    && app.import_form.wallet_password == app.import_form.wallet_password_confirm))
-                && import_mnemonic_ready;
+                    && app.import_form.wallet_password == app.import_form.wallet_password_confirm);
+            let ready = wallet_password_ready && import_mnemonic_ready;
             if ui.add_enabled(ready, egui::Button::new("Import")).clicked() {
                 import_clicked = true;
             }
@@ -287,6 +314,13 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
         if app.import_form.wallet_name.trim().is_empty() {
             app.last_error = Some(String::from("Enter a wallet name"));
+            return;
+        }
+
+        if app.node_settings_form.wallet_require_encryption && !app.import_form.encrypt_wallet {
+            app.last_error = Some(String::from(
+                "Wallet passphrase is required by Node Settings",
+            ));
             return;
         }
 

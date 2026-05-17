@@ -8,7 +8,7 @@
 //!
 //! SECURITY: RPC remains loopback-only by default. Public binding requires an
 //! explicit override because wallet and admin commands assume local trust.
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, RpcAuthConfig};
 use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
@@ -20,6 +20,7 @@ use atho_errors::{
     LAUNCH_RPC_BIND_FAILED, NET_INVALID_NETWORK_SELECTION,
 };
 use atho_p2p::config::{configured_bootstrap_peers, network_params};
+use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
@@ -151,20 +152,21 @@ impl NodeRuntime {
 
 /// Loads the node configuration from environment variables.
 pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
-    let network = match std::env::var("ATHO_NETWORK") {
-        Ok(raw) => Network::parse(&raw).ok_or(RuntimeError::InvalidNetwork)?,
-        Err(_) => Network::operator_default(),
-    };
+    let network = NodeConfig::network_from_sources(Network::operator_default())
+        .map_err(|_| RuntimeError::InvalidNetwork)?;
 
     Ok(NodeConfig::from_env(network))
 }
 
 /// Runs the full Atho node with live RPC and P2P listeners.
 pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
+    config.apply_process_overrides();
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));
     let network = config.network;
+    let rpc_address = config.rpc_bind_address();
     let api_config = config.api.clone();
+    let rpc_auth = config.rpc_auth.clone();
     let system = Arc::new(Mutex::new(AthoSystem::try_new(config)?));
     {
         let mut guard = system.lock().expect("node runtime mutex poisoned");
@@ -185,8 +187,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     for peer in initial_outbound_peers(network, bootstrap_peers) {
         p2p_runtime.maintain_outbound(peer);
     }
-    let rpc_address = rpc_bind_address(network);
-    validate_rpc_bind_address(&rpc_address)?;
+    validate_rpc_bind_address(&rpc_address, &rpc_auth)?;
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
@@ -256,6 +257,13 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                         continue;
                     }
                 };
+                let request = match authenticate_rpc_request(request, &rpc_auth) {
+                    Ok(request) => request,
+                    Err(response) => {
+                        let _ = write_message(&mut stream, &response);
+                        continue;
+                    }
+                };
                 // RPC requests are always executed through the validated node
                 // service path; there is no direct mutation of chainstate here.
                 let response: RpcResponse = {
@@ -302,18 +310,32 @@ pub fn rpc_bind_address(network: Network) -> String {
     if let Ok(address) = std::env::var("ATHO_RPC_ADDR") {
         return address;
     }
-    default_rpc_bind_address(network)
+    NodeConfig::from_env(network).rpc_bind_address()
 }
 
 pub fn default_rpc_bind_address(network: Network) -> String {
     format!("127.0.0.1:{}", network.rpc_port())
 }
 
-fn validate_rpc_bind_address(address: &str) -> Result<(), NodeError> {
+fn validate_rpc_bind_address(address: &str, auth: &RpcAuthConfig) -> Result<(), NodeError> {
     if std::env::var("ATHO_RPC_ALLOW_PUBLIC").ok().as_deref() == Some("1") {
+        if !rpc_address_is_loopback(address)? && !auth.securely_configured_for_public_rpc() {
+            return Err(NodeError::Runtime(RuntimeError::PublicRpcDenied(format!(
+                "{address} requires non-default rpcauth credentials in atho.conf or ATHO_RPC_USER/ATHO_RPC_PASSWORD"
+            ))));
+        }
         return Ok(());
     }
 
+    if !rpc_address_is_loopback(address)? {
+        return Err(NodeError::Runtime(RuntimeError::PublicRpcDenied(
+            address.to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn rpc_address_is_loopback(address: &str) -> Result<bool, NodeError> {
     let resolved = address.to_socket_addrs().map_err(|err| {
         NodeError::Runtime(RuntimeError::RpcBindFailed(format!(
             "invalid rpc bind address {address}: {err}"
@@ -321,18 +343,42 @@ fn validate_rpc_bind_address(address: &str) -> Result<(), NodeError> {
     })?;
     for socket_addr in resolved {
         if !is_loopback_addr(socket_addr) {
-            return Err(NodeError::Runtime(RuntimeError::PublicRpcDenied(
-                address.to_string(),
-            )));
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn is_loopback_addr(address: SocketAddr) -> bool {
     match address.ip() {
         IpAddr::V4(ip) => ip.is_loopback(),
         IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
+fn authenticate_rpc_request(
+    request: RpcRequest,
+    auth: &RpcAuthConfig,
+) -> Result<RpcRequest, RpcResponse> {
+    if !auth.enabled {
+        return match request {
+            RpcRequest::Authenticated { request, .. } => Ok(*request),
+            other => Ok(other),
+        };
+    }
+
+    match request {
+        RpcRequest::Authenticated {
+            username,
+            password,
+            request,
+        } if username == auth.username && password == auth.password => Ok(*request),
+        RpcRequest::Authenticated { .. } => Err(RpcResponse::Error(RpcError::invalid_request(
+            "rpc authentication failed",
+        ))),
+        _ => Err(RpcResponse::Error(RpcError::invalid_request(
+            "rpc authentication required",
+        ))),
     }
 }
 
@@ -381,7 +427,7 @@ mod tests {
 
     #[test]
     fn rpc_bind_validation_rejects_public_addresses_by_default() {
-        let err = validate_rpc_bind_address("0.0.0.0:9010").unwrap_err();
+        let err = validate_rpc_bind_address("0.0.0.0:9010", &RpcAuthConfig::default()).unwrap_err();
         assert!(matches!(
             err,
             NodeError::Runtime(RuntimeError::PublicRpcDenied(_))
@@ -389,16 +435,23 @@ mod tests {
     }
 
     #[test]
-    fn rpc_bind_validation_accepts_public_addresses_when_explicitly_allowed() {
+    fn rpc_bind_validation_accepts_public_addresses_when_auth_is_configured() {
         std::env::set_var("ATHO_RPC_ALLOW_PUBLIC", "1");
-        let result = validate_rpc_bind_address("0.0.0.0:9010");
+        let auth = RpcAuthConfig {
+            enabled: true,
+            bind: String::from("127.0.0.1"),
+            port: 9010,
+            username: String::from("operator"),
+            password: String::from("not-the-default-password"),
+        };
+        let result = validate_rpc_bind_address("0.0.0.0:9010", &auth);
         std::env::remove_var("ATHO_RPC_ALLOW_PUBLIC");
         assert!(result.is_ok());
     }
 
     #[test]
     fn rpc_bind_validation_accepts_loopback_addresses() {
-        assert!(validate_rpc_bind_address("127.0.0.1:9010").is_ok());
+        assert!(validate_rpc_bind_address("127.0.0.1:9010", &RpcAuthConfig::default()).is_ok());
     }
 
     #[test]

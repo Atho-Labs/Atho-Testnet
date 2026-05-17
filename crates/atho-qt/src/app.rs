@@ -72,8 +72,8 @@ mod widgets;
 pub(crate) use models::{
     AddressPoolFilter, CreateWalletForm, DebugConsoleEntry, DebugConsoleOutputMode, DebugWindowTab,
     ImportWalletForm, LaunchPage, MiningJob, MiningJobResult, MiningOutcome, MiningStaleTemplate,
-    NavTab, NetworkTrafficSample, OpenWalletForm, ReceiveAddressRow, ReceivePageTab,
-    ReceiveRequestRecord, SendJob, SendJobEvent, SendOutcome, SendProgressStage,
+    NavTab, NetworkTrafficSample, NodeSettingsForm, OpenWalletForm, ReceiveAddressRow,
+    ReceivePageTab, ReceiveRequestRecord, SendJob, SendJobEvent, SendOutcome, SendProgressStage,
     SyncProgressSample, WalletActivityKind, WalletActivityRow, WalletBalanceSummary,
     WalletManagementForm,
 };
@@ -122,6 +122,7 @@ pub struct DesktopApp {
     import_form: ImportWalletForm,
     open_form: OpenWalletForm,
     wallet_management_form: WalletManagementForm,
+    node_settings_form: NodeSettingsForm,
     last_error: Option<String>,
     active_tab: NavTab,
     send_to: String,
@@ -197,6 +198,7 @@ pub struct DesktopApp {
     sync_status_hidden_until_synced: bool,
     storage_recovery_notice: Option<String>,
     show_storage_recovery_notice_dialog: bool,
+    show_wallet_encryption_notice_dialog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +407,7 @@ impl DesktopApp {
             import_form: ImportWalletForm::new(network),
             open_form: OpenWalletForm::new(network),
             wallet_management_form: WalletManagementForm::new(network),
+            node_settings_form: NodeSettingsForm::load(network),
             last_error: None,
             active_tab: NavTab::Overview,
             send_to: String::new(),
@@ -482,6 +485,7 @@ impl DesktopApp {
             sync_status_hidden_until_synced: false,
             storage_recovery_notice: None,
             show_storage_recovery_notice_dialog: false,
+            show_wallet_encryption_notice_dialog: false,
         };
 
         app.view_model.network_label = app.connection.network().id().to_string();
@@ -2886,6 +2890,57 @@ impl DesktopApp {
         fs::write(preferences_path, bytes).map_err(|err| err.to_string())
     }
 
+    pub(crate) fn save_node_settings(&mut self) -> Result<String, String> {
+        let network = self.connection.network();
+        let mut config = atho_node::config::NodeConfig::from_env(network);
+        config.network = network;
+        config.rpc_auth.enabled = self.node_settings_form.rpc_auth_enabled;
+        config.rpc_auth.username = self.node_settings_form.rpc_user.trim().to_string();
+        config.rpc_auth.password = self.node_settings_form.rpc_password.trim().to_string();
+        config.wallet.enabled = self.node_settings_form.wallet_enabled;
+        config.wallet.require_encryption = self.node_settings_form.wallet_require_encryption;
+        config.mempool.max_vbytes =
+            parse_mib_setting(&self.node_settings_form.max_mempool_mib, "max mempool")? as usize;
+        config.mempool.max_transactions = parse_usize_setting(
+            &self.node_settings_form.max_mempool_transactions,
+            "max mempool transactions",
+        )?;
+        config.storage.prune_target_bytes =
+            parse_mib_setting(&self.node_settings_form.prune_mib, "prune target")?;
+        config.storage.db_cache_bytes =
+            parse_mib_setting(&self.node_settings_form.db_cache_mib, "database cache")?;
+        config.peers.max_connections =
+            parse_usize_setting(&self.node_settings_form.max_peer_connections, "max peers")?;
+
+        if config.rpc_auth.enabled
+            && (config.rpc_auth.username.is_empty() || config.rpc_auth.password.is_empty())
+        {
+            return Err(String::from("RPC auth requires both username and password"));
+        }
+        if config.wallet.enabled
+            && config.wallet.require_encryption
+            && self.wallet.is_some()
+            && self
+                .wallet_session_password
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        {
+            return Err(String::from(
+                "Wallet protection is enabled. Set a wallet passphrase in Backup & Passphrase before saving this mode.",
+            ));
+        }
+
+        config
+            .write_operator_config_file()
+            .map_err(|err| err.to_string())?;
+        self.node_settings_form = NodeSettingsForm::from_config(&config);
+        Ok(format!(
+            "Node settings saved to {}. Restart the local node for runtime-only changes.",
+            atho_node::config::NodeConfig::config_file_path().display()
+        ))
+    }
+
     fn persist_recipient_address_book(&self) -> Result<(), String> {
         let address_book_path = recipient_address_book_path(self.connection.network());
         if let Some(parent) = address_book_path.parent() {
@@ -3266,6 +3321,11 @@ impl DesktopApp {
     }
 
     fn wallet_send_block_reason(&self) -> Option<String> {
+        if !self.node_settings_form.wallet_enabled {
+            return Some(String::from(
+                "Wallet sending is disabled in Node Settings. The node can still receive and relay transactions.",
+            ));
+        }
         if self.wallet.is_none() {
             return Some(String::from("Load or create a wallet first"));
         }
@@ -4513,6 +4573,46 @@ impl DesktopApp {
         available_mining_cores()
     }
 
+    fn render_wallet_encryption_notice(&mut self, ctx: &egui::Context) {
+        if !self.show_wallet_encryption_notice_dialog {
+            return;
+        }
+
+        let mut keep_open = true;
+        egui::Window::new("Wallet Passphrase")
+            .id(egui::Id::new("wallet_encryption_notice_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(430.0, 190.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut keep_open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Wallet passphrases will be required")
+                        .size(18.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                widgets::muted_label(
+                    ui,
+                    "New and imported wallets must be encrypted before they can be used. If a plaintext wallet is already open, set a passphrase in Backup & Passphrase before saving Node Settings.",
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        self.show_wallet_encryption_notice_dialog = false;
+                    }
+                    if ui.button("Turn Off").clicked() {
+                        self.node_settings_form.wallet_require_encryption = false;
+                        self.show_wallet_encryption_notice_dialog = false;
+                    }
+                });
+            });
+        if !keep_open {
+            self.show_wallet_encryption_notice_dialog = false;
+        }
+    }
+
     fn render_wallet_preparation_overlay(&mut self, ctx: &egui::Context) {
         if self.wallet_preparation_job.is_none() || self.wallet.is_none() {
             return;
@@ -4742,6 +4842,7 @@ impl eframe::App for DesktopApp {
         } else {
             startup::render_startup_screen(self, ctx);
         }
+        self.render_wallet_encryption_notice(ctx);
         self.render_wallet_preparation_overlay(ctx);
     }
 }
@@ -5002,6 +5103,21 @@ fn current_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn parse_usize_setting(value: &str, label: &str) -> Result<usize, String> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{label} must be a whole number"))
+}
+
+fn parse_mib_setting(value: &str, label: &str) -> Result<u64, String> {
+    let mib = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{label} must be a whole number of MiB"))?;
+    Ok(mib.saturating_mul(1024).saturating_mul(1024))
 }
 
 fn backup_wallet_path(wallet_path: &str) -> String {

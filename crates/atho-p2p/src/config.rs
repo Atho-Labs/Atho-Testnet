@@ -8,12 +8,13 @@ use atho_core::network::Network;
 
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
-pub const MAINNET_DNS_SEEDS: &[&str] = &[];
+pub const MAINNET_DNS_SEEDS: &[&str] = &["mainnet-node1.atho.io", "mainnet-node2.atho.io"];
 pub const TESTNET_DNS_SEEDS: &[&str] = &["testnet-node1.atho.io", "testnet-node2.atho.io"];
 pub const REGNET_DNS_SEEDS: &[&str] = &[];
 pub const PRUNETEST_DNS_SEEDS: &[&str] = &[];
 
-pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[];
+pub const MAINNET_BOOTSTRAP_PEERS: &[&str] =
+    &["mainnet-node1.atho.io:56000", "mainnet-node2.atho.io:56000"];
 pub const TESTNET_BOOTSTRAP_PEERS: &[&str] = &["162.222.206.163:9100", "74.208.219.116:9100"];
 pub const REGNET_BOOTSTRAP_PEERS: &[&str] = &[];
 pub const PRUNETEST_BOOTSTRAP_PEERS: &[&str] = &[];
@@ -115,6 +116,7 @@ const DEFAULT_LIMITS: P2pLimits = P2pLimits {
 };
 
 pub fn network_params(network: Network) -> NetworkParams {
+    let limits = runtime_limits(DEFAULT_LIMITS);
     match network {
         Network::Mainnet => NetworkParams {
             network,
@@ -123,7 +125,7 @@ pub fn network_params(network: Network) -> NetworkParams {
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
             dns_seeds: MAINNET_DNS_SEEDS,
-            limits: DEFAULT_LIMITS,
+            limits,
         },
         Network::Testnet => NetworkParams {
             network,
@@ -132,7 +134,7 @@ pub fn network_params(network: Network) -> NetworkParams {
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
             dns_seeds: TESTNET_DNS_SEEDS,
-            limits: DEFAULT_LIMITS,
+            limits,
         },
         Network::Regnet => NetworkParams {
             network,
@@ -141,7 +143,7 @@ pub fn network_params(network: Network) -> NetworkParams {
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
             dns_seeds: REGNET_DNS_SEEDS,
-            limits: DEFAULT_LIMITS,
+            limits,
         },
         Network::Prunetest => NetworkParams {
             network,
@@ -150,9 +152,20 @@ pub fn network_params(network: Network) -> NetworkParams {
             protocol_version: PROTOCOL_VERSION,
             min_supported_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
             dns_seeds: PRUNETEST_DNS_SEEDS,
-            limits: DEFAULT_LIMITS,
+            limits,
         },
     }
+}
+
+fn runtime_limits(mut limits: P2pLimits) -> P2pLimits {
+    if let Ok(raw) = std::env::var("ATHO_MAX_PEER_CONNECTIONS") {
+        if let Ok(total) = raw.trim().parse::<usize>() {
+            let total = total.clamp(8, 512);
+            limits.max_outbound_peers = (total / 5).clamp(2, 128);
+            limits.max_inbound_peers = total.saturating_sub(limits.max_outbound_peers).max(4);
+        }
+    }
+    limits
 }
 
 pub fn network_from_magic(magic: [u8; 4]) -> Option<Network> {
@@ -258,8 +271,15 @@ mod tests {
         let _lock = env_lock();
         std::env::remove_var("ATHO_P2P_PEERS");
 
-        let peers = configured_bootstrap_peers(Network::Mainnet);
-        assert!(peers.is_empty());
+        assert_eq!(
+            configured_bootstrap_peers(Network::Mainnet),
+            vec![
+                String::from("mainnet-node1.atho.io:56000"),
+                String::from("mainnet-node2.atho.io:56000"),
+                String::from(MAINNET_BOOTSTRAP_PEERS[0]),
+                String::from(MAINNET_BOOTSTRAP_PEERS[1]),
+            ]
+        );
         assert_eq!(
             configured_bootstrap_peers(Network::Testnet),
             vec![
@@ -284,6 +304,17 @@ mod tests {
         );
 
         std::env::remove_var("ATHO_P2P_PEERS");
+    }
+
+    #[test]
+    fn max_peer_connection_env_updates_inbound_and_outbound_limits() {
+        let _lock = env_lock();
+        std::env::set_var("ATHO_MAX_PEER_CONNECTIONS", "60");
+        let params = network_params(Network::Mainnet);
+        std::env::remove_var("ATHO_MAX_PEER_CONNECTIONS");
+
+        assert_eq!(params.limits.max_outbound_peers, 12);
+        assert_eq!(params.limits.max_inbound_peers, 48);
     }
 
     #[test]

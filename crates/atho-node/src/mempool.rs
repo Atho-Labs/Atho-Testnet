@@ -8,6 +8,7 @@
 //!
 //! POLICY: Relay policy is intentionally stricter than bare consensus. Dust and
 //! fee-floor checks happen here before transactions are mined into templates.
+use crate::config::{DEFAULT_MAX_MEMPOOL_TRANSACTIONS, DEFAULT_MAX_MEMPOOL_VBYTES};
 use crate::dev;
 use crate::validation::{validate_transaction_with_context_for_mempool, ValidationError};
 #[cfg(test)]
@@ -109,12 +110,49 @@ pub struct Mempool {
     entries: BTreeMap<[u8; 48], MempoolEntry>,
     spent_inputs: BTreeSet<([u8; 48], u32)>,
     total_fee_atoms: u64,
+    total_vbytes: usize,
+    limits: MempoolLimits,
     fingerprint_cache: RefCell<Option<MempoolFingerprintCache>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MempoolLimits {
+    pub max_transactions: usize,
+    pub max_vbytes: usize,
+}
+
+impl Default for MempoolLimits {
+    fn default() -> Self {
+        Self {
+            max_transactions: DEFAULT_MAX_MEMPOOL_TRANSACTIONS,
+            max_vbytes: DEFAULT_MAX_MEMPOOL_VBYTES,
+        }
+    }
 }
 
 impl Mempool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_limits(limits: MempoolLimits) -> Self {
+        Self {
+            limits: limits.normalized(),
+            ..Self::default()
+        }
+    }
+
+    pub fn limits(&self) -> MempoolLimits {
+        self.limits
+    }
+
+    pub fn total_vbytes(&self) -> usize {
+        self.total_vbytes
+    }
+
+    fn would_exceed_limits(&self, entry: &MempoolEntry) -> bool {
+        self.entries.len() >= self.limits.max_transactions
+            || self.total_vbytes.saturating_add(entry.vsize_bytes()) > self.limits.max_vbytes
     }
 
     fn input_keys(tx: &Transaction) -> impl Iterator<Item = ([u8; 48], u32)> + '_ {
@@ -186,9 +224,13 @@ impl Mempool {
         if self.entries.contains_key(&txid) {
             return Err(ValidationError::MempoolConflict);
         }
+        if self.would_exceed_limits(&entry) {
+            return Err(ValidationError::MempoolConflict);
+        }
         self.validate_entry(&entry, network, spend_height, lookup)?;
         self.reserve_inputs(&entry.transaction)?;
         self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+        self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
         self.entries.insert(txid, entry);
         self.invalidate_fingerprint();
         let entry = self
@@ -229,6 +271,7 @@ impl Mempool {
         let current = std::mem::take(&mut self.entries);
         self.spent_inputs.clear();
         self.total_fee_atoms = 0;
+        self.total_vbytes = 0;
         let before = current.len();
         for (txid, entry) in current {
             if self
@@ -237,6 +280,7 @@ impl Mempool {
                 && self.reserve_inputs(&entry.transaction).is_ok()
             {
                 self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+                self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
                 self.entries.insert(txid, entry);
             }
         }
@@ -438,6 +482,7 @@ impl Mempool {
             if let Some(entry) = self.entries.remove(&txid) {
                 self.release_inputs(&entry.transaction);
                 self.total_fee_atoms = self.total_fee_atoms.saturating_sub(entry.fee_atoms);
+                self.total_vbytes = self.total_vbytes.saturating_sub(entry.vsize_bytes());
                 removed_any = true;
             }
         }
@@ -451,9 +496,20 @@ impl Mempool {
         let txid = entry.txid();
         if let Some(previous) = self.entries.insert(txid, entry.clone()) {
             self.total_fee_atoms = self.total_fee_atoms.saturating_sub(previous.fee_atoms);
+            self.total_vbytes = self.total_vbytes.saturating_sub(previous.vsize_bytes());
         }
         self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+        self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
         self.invalidate_fingerprint();
+    }
+}
+
+impl MempoolLimits {
+    fn normalized(self) -> Self {
+        Self {
+            max_transactions: self.max_transactions.max(1),
+            max_vbytes: self.max_vbytes.max(1),
+        }
     }
 }
 
@@ -590,6 +646,38 @@ mod tests {
                 .expect_err("conflict should fail"),
             ValidationError::MempoolConflict
         );
+    }
+
+    #[test]
+    fn mempool_rejects_new_entries_when_transaction_cap_is_reached() {
+        let mut mempool = Mempool::with_limits(MempoolLimits {
+            max_transactions: 1,
+            max_vbytes: usize::MAX,
+        });
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [2; 48],
+                output_index: 0,
+                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: DUST_RELAY_VALUE_ATOMS,
+                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        mempool.insert_unchecked(MempoolEntry::new(tx.clone(), 1_000));
+
+        let err = mempool
+            .admit(MempoolEntry::new(tx, 1_000), Network::Mainnet, 0, |_, _| {
+                None
+            })
+            .expect_err("full mempool should reject before expensive validation");
+        assert_eq!(err, ValidationError::MempoolConflict);
     }
 
     #[test]
