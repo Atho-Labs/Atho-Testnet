@@ -429,6 +429,17 @@
     "consensus_critical": true
   },
   {
+    "code": "ATHO-TX-015",
+    "category": "transaction",
+    "severity": "critical",
+    "title": "Legacy Lock Format Rejected",
+    "explanation": "The transaction uses a non-canonical locking script or unlocking script format.",
+    "common_cause": "A legacy/test-form output, alternate lock length, or malformed locking digest was submitted.",
+    "suggested_fix": "Rebuild the transaction so every spendable output uses the current 32-byte Atho payment digest format.",
+    "user_facing": true,
+    "consensus_critical": true
+  },
+  {
     "code": "ATHO-UTXO-001",
     "category": "utxo",
     "severity": "critical",
