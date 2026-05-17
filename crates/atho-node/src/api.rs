@@ -867,8 +867,20 @@ fn mempool_tx_value(
             status: 404,
             code: "not_found",
         })?;
-    let depends = mempool_dependencies(txid, &entries);
-    let descendants = mempool_descendants(txid, &entries);
+    let depends = service
+        .node_ref()
+        .mempool_dependency_txids(&txid)
+        .unwrap_or_default()
+        .into_iter()
+        .map(hex::encode)
+        .collect::<Vec<_>>();
+    let descendants = service
+        .node_ref()
+        .mempool_descendant_txids(&txid)
+        .unwrap_or_default()
+        .into_iter()
+        .map(hex::encode)
+        .collect::<Vec<_>>();
     let transaction = command_value(service, "getrawtransaction", vec![txid_hex.to_string()])?
         .get("transaction")
         .cloned()
@@ -1592,51 +1604,6 @@ fn render_mempool_entry_value(
         "descendants": descendants,
         "network": network.domain_tag(),
     })
-}
-
-fn mempool_dependencies(target: [u8; 48], entries: &[MempoolEntry]) -> Vec<String> {
-    let index = entries
-        .iter()
-        .map(|entry| (entry.txid(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut visited = std::collections::BTreeSet::new();
-    let mut stack = vec![target];
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = index.get(&txid) else {
-            continue;
-        };
-        for input in &entry.transaction.inputs {
-            if index.contains_key(&input.previous_txid) && visited.insert(input.previous_txid) {
-                stack.push(input.previous_txid);
-            }
-        }
-    }
-    visited.into_iter().map(hex::encode).collect()
-}
-
-fn mempool_descendants(target: [u8; 48], entries: &[MempoolEntry]) -> Vec<String> {
-    let reverse = entries.iter().fold(
-        BTreeMap::<[u8; 48], Vec<[u8; 48]>>::new(),
-        |mut acc, entry| {
-            for input in &entry.transaction.inputs {
-                acc.entry(input.previous_txid)
-                    .or_default()
-                    .push(entry.txid());
-            }
-            acc
-        },
-    );
-    let mut visited = std::collections::BTreeSet::new();
-    let mut stack = reverse.get(&target).cloned().unwrap_or_default();
-    while let Some(txid) = stack.pop() {
-        if !visited.insert(txid) {
-            continue;
-        }
-        if let Some(children) = reverse.get(&txid) {
-            stack.extend(children.iter().copied());
-        }
-    }
-    visited.into_iter().map(hex::encode).collect()
 }
 
 fn format_atoms_decimal(atoms: u64) -> String {

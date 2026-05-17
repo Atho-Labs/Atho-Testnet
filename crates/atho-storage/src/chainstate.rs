@@ -185,12 +185,6 @@ impl Chainstate {
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
-        let working_utxos = if block.transactions.len() == 1 && block.transactions[0].is_coinbase()
-        {
-            UtxoSet::new(self.network)
-        } else {
-            self.utxos.clone()
-        };
         validation::validate_block_with_context(
             block,
             self.height.saturating_add(1),
@@ -198,7 +192,7 @@ impl Chainstate {
             self.tip_hash,
             self.next_difficulty_target_for_timestamp(block.header.timestamp),
             &self.blocks,
-            working_utxos,
+            &self.utxos,
         )?;
 
         let undo = self.utxos.apply_block(block)?;

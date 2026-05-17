@@ -410,6 +410,14 @@ impl Node {
         self.mempool.entries()
     }
 
+    pub fn mempool_dependency_txids(&self, txid: &[u8; 48]) -> Option<Vec<[u8; 48]>> {
+        self.mempool.dependency_txids(txid)
+    }
+
+    pub fn mempool_descendant_txids(&self, txid: &[u8; 48]) -> Option<Vec<[u8; 48]>> {
+        self.mempool.descendant_txids(txid)
+    }
+
     pub fn mempool_transactions(&self) -> Vec<Transaction> {
         self.mempool.transactions()
     }
@@ -517,12 +525,12 @@ impl Node {
     }
 
     pub fn admit_transaction(&mut self, entry: MempoolEntry) -> Result<[u8; 48], NodeError> {
-        let utxos = self.chainstate.utxo_snapshot();
+        let chainstate = &self.chainstate;
         let txid = self.mempool.admit(
             entry,
             self.network(),
             self.chainstate.height,
-            |txid, output_index| utxos.get(*txid, output_index).cloned(),
+            |txid, output_index| chainstate.utxo_entry(*txid, output_index),
         )?;
         Ok(txid)
     }
@@ -534,9 +542,11 @@ impl Node {
         if transaction.is_coinbase() {
             return Err(NodeError::Validation(ValidationError::InvalidCoinbase));
         }
-        let utxos = self.chainstate.utxo_snapshot();
-        let fee_atoms = transaction_fee_from_utxos(&transaction, &utxos)
-            .ok_or(NodeError::Validation(ValidationError::MissingUtxo))?;
+        let chainstate = &self.chainstate;
+        let fee_atoms = transaction_fee_from_lookup(&transaction, |txid, output_index| {
+            chainstate.utxo_entry(*txid, output_index)
+        })
+        .ok_or(NodeError::Validation(ValidationError::MissingUtxo))?;
         self.submit_transaction(MempoolEntry::new(transaction, fee_atoms))
     }
 
@@ -594,20 +604,22 @@ impl Node {
         }
 
         if selection.outcome == ChainSelectionOutcome::Reorged {
-            let utxos = self.chainstate.utxo_snapshot();
+            let chainstate = &self.chainstate;
             for tx in selection
                 .disconnected
                 .iter()
                 .flat_map(|block| block.transactions.iter().skip(1))
             {
-                let Some(fee_atoms) = transaction_fee_from_utxos(tx, &utxos) else {
+                let Some(fee_atoms) = transaction_fee_from_lookup(tx, |txid, output_index| {
+                    chainstate.utxo_entry(*txid, output_index)
+                }) else {
                     continue;
                 };
                 let _ = self.mempool.admit(
                     MempoolEntry::new(tx.clone(), fee_atoms),
                     self.network(),
                     self.chainstate.height,
-                    |txid, output_index| utxos.get(*txid, output_index).cloned(),
+                    |txid, output_index| chainstate.utxo_entry(*txid, output_index),
                 );
             }
         }
@@ -648,25 +660,28 @@ impl Node {
         if self.mempool.is_empty() {
             return;
         }
-        let updated_utxos = self.chainstate.utxo_snapshot();
+        let chainstate = &self.chainstate;
         self.mempool.revalidate(
             self.network(),
             self.chainstate.height,
-            |txid, output_index| updated_utxos.get(*txid, output_index).cloned(),
+            |txid, output_index| chainstate.utxo_entry(*txid, output_index),
         );
     }
 }
 
-fn transaction_fee_from_utxos(
+fn transaction_fee_from_lookup<F>(
     tx: &atho_core::transaction::Transaction,
-    utxos: &atho_storage::utxo::UtxoSet,
-) -> Option<u64> {
+    mut lookup: F,
+) -> Option<u64>
+where
+    F: FnMut(&[u8; 48], u32) -> Option<atho_storage::utxo::UtxoEntry>,
+{
     if tx.is_coinbase() {
         return None;
     }
     let mut input_total = 0u64;
     for input in &tx.inputs {
-        let utxo = utxos.get(input.previous_txid, input.output_index)?;
+        let utxo = lookup(&input.previous_txid, input.output_index)?;
         input_total = input_total.checked_add(utxo.value_atoms)?;
     }
     input_total.checked_sub(tx.checked_output_value_atoms()?)
@@ -1162,8 +1177,10 @@ mod tests {
                 tx_pow_bits: 0,
             };
             tx.witness = witness_bytes_for_tx(Network::Mainnet, &tx);
-            let fee_atoms = transaction_fee_from_utxos(&tx, &node.chainstate.utxo_snapshot())
-                .expect("fee atoms");
+            let fee_atoms = transaction_fee_from_lookup(&tx, |txid, output_index| {
+                node.chainstate.utxo_entry(*txid, output_index)
+            })
+            .expect("fee atoms");
             solve_transaction_pow(Network::Mainnet, &mut tx, fee_atoms);
             node.admit_transaction(MempoolEntry::new(tx, fee_atoms))
                 .unwrap();

@@ -50,6 +50,6 @@ fuzz_target!(|data: &[u8]| {
         fixture.tip_hash,
         atho_core::consensus::pow::initial_target_for_network(fixture.network),
         &[],
-        utxos,
+        &utxos,
     );
 });

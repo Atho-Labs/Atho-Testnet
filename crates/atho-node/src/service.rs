@@ -2683,18 +2683,30 @@ impl NodeService {
                     .collect(),
             ));
         }
-        let relation_entries = entries.clone();
         let map = entries
             .into_iter()
             .map(|entry| {
+                let depends = self
+                    .orchestrator
+                    .runtime
+                    .node
+                    .mempool_dependency_txids(&entry.txid())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>();
+                let descendants = self
+                    .orchestrator
+                    .runtime
+                    .node
+                    .mempool_descendant_txids(&entry.txid())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>();
                 (
                     hex::encode(entry.txid()),
-                    render_mempool_entry_value(
-                        self.network(),
-                        &entry,
-                        &mempool_dependencies(entry.txid(), &relation_entries),
-                        &mempool_descendants(entry.txid(), &relation_entries),
-                    ),
+                    render_mempool_entry_value(self.network(), &entry, &depends, &descendants),
                 )
             })
             .collect::<serde_json::Map<String, Value>>();
@@ -2711,8 +2723,24 @@ impl NodeService {
             .ok_or_else(|| {
                 atho_rpc::error::RpcError::invalid_request("transaction is not in the mempool")
             })?;
-        let depends = mempool_dependencies(txid, &entries);
-        let descendants = mempool_descendants(txid, &entries);
+        let depends = self
+            .orchestrator
+            .runtime
+            .node
+            .mempool_dependency_txids(&txid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
+        let descendants = self
+            .orchestrator
+            .runtime
+            .node
+            .mempool_descendant_txids(&txid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
         Ok(render_mempool_entry_value(
             self.network(),
             &entry,
@@ -2738,9 +2766,18 @@ impl NodeService {
                 "transaction is not in the mempool",
             ));
         }
-        let ancestors = mempool_dependencies(txid, &entries);
+        let ancestors = self
+            .orchestrator
+            .runtime
+            .node
+            .mempool_dependency_txids(&txid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
         Ok(render_mempool_relation_value(
             self.network(),
+            &self.orchestrator.runtime.node,
             &entries,
             &ancestors,
             verbose,
@@ -2764,9 +2801,18 @@ impl NodeService {
                 "transaction is not in the mempool",
             ));
         }
-        let descendants = mempool_descendants(txid, &entries);
+        let descendants = self
+            .orchestrator
+            .runtime
+            .node
+            .mempool_descendant_txids(&txid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>();
         Ok(render_mempool_relation_value(
             self.network(),
+            &self.orchestrator.runtime.node,
             &entries,
             &descendants,
             verbose,
@@ -3581,6 +3627,7 @@ fn mempool_status_label(transaction_count: usize, mempool_vsize_bytes: u64) -> &
 
 fn render_mempool_relation_value(
     network: Network,
+    node: &crate::node::Node,
     entries: &[MempoolEntry],
     txids: &[String],
     verbose: bool,
@@ -3596,8 +3643,18 @@ fn render_mempool_relation_value(
         .iter()
         .filter_map(|txid| {
             index.get(txid).map(|entry| {
-                let depends = mempool_dependencies(entry.txid(), entries);
-                let descendants = mempool_descendants(entry.txid(), entries);
+                let depends = node
+                    .mempool_dependency_txids(&entry.txid())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>();
+                let descendants = node
+                    .mempool_descendant_txids(&entry.txid())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(hex::encode)
+                    .collect::<Vec<_>>();
                 (
                     txid.clone(),
                     render_mempool_entry_value(network, entry, &depends, &descendants),
@@ -3606,51 +3663,6 @@ fn render_mempool_relation_value(
         })
         .collect::<serde_json::Map<String, Value>>();
     Value::Object(map)
-}
-
-fn mempool_dependencies(target: [u8; 48], entries: &[MempoolEntry]) -> Vec<String> {
-    let index = entries
-        .iter()
-        .map(|entry| (entry.txid(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut visited = BTreeSet::new();
-    let mut stack = vec![target];
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = index.get(&txid) else {
-            continue;
-        };
-        for input in &entry.transaction.inputs {
-            if index.contains_key(&input.previous_txid) && visited.insert(input.previous_txid) {
-                stack.push(input.previous_txid);
-            }
-        }
-    }
-    visited.into_iter().map(hex::encode).collect()
-}
-
-fn mempool_descendants(target: [u8; 48], entries: &[MempoolEntry]) -> Vec<String> {
-    let reverse = entries.iter().fold(
-        BTreeMap::<[u8; 48], Vec<[u8; 48]>>::new(),
-        |mut acc, entry| {
-            for input in &entry.transaction.inputs {
-                acc.entry(input.previous_txid)
-                    .or_default()
-                    .push(entry.txid());
-            }
-            acc
-        },
-    );
-    let mut visited = BTreeSet::new();
-    let mut stack = reverse.get(&target).cloned().unwrap_or_default();
-    while let Some(txid) = stack.pop() {
-        if !visited.insert(txid) {
-            continue;
-        }
-        if let Some(children) = reverse.get(&txid) {
-            stack.extend(children.iter().copied());
-        }
-    }
-    visited.into_iter().map(hex::encode).collect()
 }
 
 fn verify_canonical_chain(network: Network, blocks: &[Block]) -> Result<usize, NodeError> {
@@ -3680,7 +3692,7 @@ fn verify_canonical_chain(network: Network, blocks: &[Block]) -> Result<usize, N
             expected_previous_hash,
             expected_target,
             &previous_blocks,
-            utxos.clone(),
+            &utxos,
         )
         .map_err(NodeError::Validation)?;
         utxos.apply_block(block).map_err(NodeError::Storage)?;

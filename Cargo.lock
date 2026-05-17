@@ -726,6 +726,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde-big-array",
+ "sha3",
  "thiserror 1.0.69",
 ]
 

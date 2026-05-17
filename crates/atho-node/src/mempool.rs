@@ -18,6 +18,7 @@ use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,9 +106,29 @@ struct MempoolFingerprintCache {
     fingerprint: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MiningOrderKey {
+    feerate_atoms_per_vbyte: Reverse<u64>,
+    fee_atoms: Reverse<u64>,
+    txid: [u8; 48],
+}
+
+impl From<&MempoolEntry> for MiningOrderKey {
+    fn from(entry: &MempoolEntry) -> Self {
+        Self {
+            feerate_atoms_per_vbyte: Reverse(entry.feerate_atoms_per_vbyte()),
+            fee_atoms: Reverse(entry.fee_atoms),
+            txid: entry.txid(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Mempool {
     entries: BTreeMap<[u8; 48], MempoolEntry>,
+    mining_order: BTreeSet<MiningOrderKey>,
+    parents_by_txid: BTreeMap<[u8; 48], BTreeSet<[u8; 48]>>,
+    children_by_txid: BTreeMap<[u8; 48], BTreeSet<[u8; 48]>>,
     spent_inputs: BTreeSet<([u8; 48], u32)>,
     total_fee_atoms: u64,
     total_vbytes: usize,
@@ -186,6 +207,120 @@ impl Mempool {
         self.fingerprint_cache.replace(None);
     }
 
+    fn reset_derived_state(&mut self) {
+        self.mining_order.clear();
+        self.parents_by_txid.clear();
+        self.children_by_txid.clear();
+        self.spent_inputs.clear();
+        self.total_fee_atoms = 0;
+        self.total_vbytes = 0;
+    }
+
+    fn rebuild_derived_state_from_entries(&mut self) {
+        self.reset_derived_state();
+        let txids = self.entries.keys().copied().collect::<Vec<_>>();
+        for txid in txids {
+            let Some(entry) = self.entries.get(&txid) else {
+                continue;
+            };
+            self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+            self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
+            self.mining_order.insert(MiningOrderKey::from(entry));
+            for key in Self::input_keys(&entry.transaction) {
+                self.spent_inputs.insert(key);
+            }
+        }
+
+        for txid in self.entries.keys().copied().collect::<Vec<_>>() {
+            let Some(entry) = self.entries.get(&txid) else {
+                continue;
+            };
+            let mut parents = BTreeSet::new();
+            for input in &entry.transaction.inputs {
+                if self.entries.contains_key(&input.previous_txid) {
+                    parents.insert(input.previous_txid);
+                    self.children_by_txid
+                        .entry(input.previous_txid)
+                        .or_default()
+                        .insert(txid);
+                }
+            }
+            if !parents.is_empty() {
+                self.parents_by_txid.insert(txid, parents);
+            }
+        }
+    }
+
+    fn link_relations(&mut self, txid: [u8; 48], tx: &Transaction) {
+        let mut parents = BTreeSet::new();
+        for input in &tx.inputs {
+            if self.entries.contains_key(&input.previous_txid) {
+                parents.insert(input.previous_txid);
+                self.children_by_txid
+                    .entry(input.previous_txid)
+                    .or_default()
+                    .insert(txid);
+            }
+        }
+        if !parents.is_empty() {
+            self.parents_by_txid.insert(txid, parents);
+        }
+    }
+
+    fn unlink_relations(&mut self, txid: [u8; 48]) {
+        if let Some(parents) = self.parents_by_txid.remove(&txid) {
+            let parent_ids = parents.into_iter().collect::<Vec<_>>();
+            for parent in parent_ids {
+                let should_remove = if let Some(children) = self.children_by_txid.get_mut(&parent) {
+                    children.remove(&txid);
+                    children.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    self.children_by_txid.remove(&parent);
+                }
+            }
+        }
+
+        if let Some(children) = self.children_by_txid.remove(&txid) {
+            for child in children {
+                let should_remove = if let Some(parents) = self.parents_by_txid.get_mut(&child) {
+                    parents.remove(&txid);
+                    parents.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    self.parents_by_txid.remove(&child);
+                }
+            }
+        }
+    }
+
+    fn insert_entry(&mut self, txid: [u8; 48], entry: MempoolEntry) {
+        self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+        self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
+        self.mining_order.insert(MiningOrderKey::from(&entry));
+        self.link_relations(txid, &entry.transaction);
+        self.entries.insert(txid, entry);
+    }
+
+    fn remove_entry(&mut self, txid: &[u8; 48]) -> Option<MempoolEntry> {
+        let entry = self.entries.remove(txid)?;
+        self.unlink_relations(entry.txid());
+        self.mining_order.remove(&MiningOrderKey::from(&entry));
+        self.total_fee_atoms = self.total_fee_atoms.saturating_sub(entry.fee_atoms);
+        self.total_vbytes = self.total_vbytes.saturating_sub(entry.vsize_bytes());
+        Some(entry)
+    }
+
+    fn ordered_entries_iter(&self) -> impl Iterator<Item = &MempoolEntry> + '_ {
+        self.mining_order
+            .iter()
+            .filter_map(|key| self.entries.get(&key.txid))
+    }
+
     fn validate_entry<F>(
         &self,
         entry: &MempoolEntry,
@@ -229,9 +364,7 @@ impl Mempool {
         }
         self.validate_entry(&entry, network, spend_height, lookup)?;
         self.reserve_inputs(&entry.transaction)?;
-        self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
-        self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
-        self.entries.insert(txid, entry);
+        self.insert_entry(txid, entry);
         self.invalidate_fingerprint();
         let entry = self
             .entries
@@ -269,9 +402,7 @@ impl Mempool {
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
         let current = std::mem::take(&mut self.entries);
-        self.spent_inputs.clear();
-        self.total_fee_atoms = 0;
-        self.total_vbytes = 0;
+        self.reset_derived_state();
         let before = current.len();
         for (txid, entry) in current {
             if self
@@ -279,11 +410,10 @@ impl Mempool {
                 .is_ok()
                 && self.reserve_inputs(&entry.transaction).is_ok()
             {
-                self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
-                self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
                 self.entries.insert(txid, entry);
             }
         }
+        self.rebuild_derived_state_from_entries();
         self.invalidate_fingerprint();
         let kept = self.entries.len();
         let _ = dev::append_log(
@@ -361,22 +491,9 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let mut ordered: Vec<([u8; 48], &MempoolEntry)> = self
-            .entries
-            .iter()
-            .map(|(txid, entry)| (*txid, entry))
-            .collect();
-        ordered.sort_by(|(left_txid, left), (right_txid, right)| {
-            right
-                .feerate_atoms_per_vbyte()
-                .cmp(&left.feerate_atoms_per_vbyte())
-                .then_with(|| right.fee_atoms.cmp(&left.fee_atoms))
-                .then_with(|| left_txid.cmp(right_txid))
-        });
-
-        let mut entries = Vec::with_capacity(ordered.len());
+        let mut entries = Vec::with_capacity(self.mining_order.len());
         let mut fees = 0u64;
-        for (_, entry) in ordered {
+        for entry in self.ordered_entries_iter() {
             let fee = validate_transaction_with_context_for_mempool(
                 &entry.transaction,
                 entry.fee_atoms,
@@ -399,23 +516,10 @@ impl Mempool {
     where
         F: FnMut(&[u8; 48], u32) -> Option<UtxoEntry>,
     {
-        let mut ordered: Vec<([u8; 48], &MempoolEntry)> = self
-            .entries
-            .iter()
-            .map(|(txid, entry)| (*txid, entry))
-            .collect();
-        ordered.sort_by(|(left_txid, left), (right_txid, right)| {
-            right
-                .feerate_atoms_per_vbyte()
-                .cmp(&left.feerate_atoms_per_vbyte())
-                .then_with(|| right.fee_atoms.cmp(&left.fee_atoms))
-                .then_with(|| left_txid.cmp(right_txid))
-        });
-
-        let mut entries = Vec::with_capacity(ordered.len());
+        let mut entries = Vec::with_capacity(self.mining_order.len());
         let mut fees = 0u64;
         let mut skipped = 0usize;
-        for (_, entry) in ordered {
+        for entry in self.ordered_entries_iter() {
             match validate_transaction_with_context_for_mempool(
                 &entry.transaction,
                 entry.fee_atoms,
@@ -437,6 +541,48 @@ impl Mempool {
 
     pub fn total_fee_atoms(&self) -> u64 {
         self.total_fee_atoms
+    }
+
+    pub fn dependency_txids(&self, target: &[u8; 48]) -> Option<Vec<[u8; 48]>> {
+        if !self.entries.contains_key(target) {
+            return None;
+        }
+        let mut visited = BTreeSet::new();
+        let mut stack = self
+            .parents_by_txid
+            .get(target)
+            .map(|parents| parents.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        while let Some(txid) = stack.pop() {
+            if !visited.insert(txid) {
+                continue;
+            }
+            if let Some(parents) = self.parents_by_txid.get(&txid) {
+                stack.extend(parents.iter().copied());
+            }
+        }
+        Some(visited.into_iter().collect())
+    }
+
+    pub fn descendant_txids(&self, target: &[u8; 48]) -> Option<Vec<[u8; 48]>> {
+        if !self.entries.contains_key(target) {
+            return None;
+        }
+        let mut visited = BTreeSet::new();
+        let mut stack = self
+            .children_by_txid
+            .get(target)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        while let Some(txid) = stack.pop() {
+            if !visited.insert(txid) {
+                continue;
+            }
+            if let Some(children) = self.children_by_txid.get(&txid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        Some(visited.into_iter().collect())
     }
 
     pub fn spent_inputs_snapshot(&self) -> Vec<([u8; 48], u32)> {
@@ -479,10 +625,8 @@ impl Mempool {
         let mut removed_any = false;
         for tx in &block.transactions {
             let txid = tx.txid();
-            if let Some(entry) = self.entries.remove(&txid) {
+            if let Some(entry) = self.remove_entry(&txid) {
                 self.release_inputs(&entry.transaction);
-                self.total_fee_atoms = self.total_fee_atoms.saturating_sub(entry.fee_atoms);
-                self.total_vbytes = self.total_vbytes.saturating_sub(entry.vsize_bytes());
                 removed_any = true;
             }
         }
@@ -494,12 +638,10 @@ impl Mempool {
     #[cfg(test)]
     pub(crate) fn insert_unchecked(&mut self, entry: MempoolEntry) {
         let txid = entry.txid();
-        if let Some(previous) = self.entries.insert(txid, entry.clone()) {
-            self.total_fee_atoms = self.total_fee_atoms.saturating_sub(previous.fee_atoms);
-            self.total_vbytes = self.total_vbytes.saturating_sub(previous.vsize_bytes());
+        if let Some(previous) = self.entries.insert(txid, entry) {
+            self.release_inputs(&previous.transaction);
         }
-        self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
-        self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
+        self.rebuild_derived_state_from_entries();
         self.invalidate_fingerprint();
     }
 }
@@ -1039,5 +1181,86 @@ mod tests {
         assert_eq!(entries[0].txid(), valid.txid());
         assert_eq!(fees, 3_000);
         assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn unchecked_rebuild_tracks_dependency_and_descendant_indexes() {
+        let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
+        let output_lock = alternate_lock(Network::Mainnet);
+
+        let parent = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [0x11; 48],
+                output_index: 0,
+                unlocking_script: spend_lock.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 8_000,
+                locking_script: output_lock.clone(),
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let child = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: parent.txid(),
+                output_index: 0,
+                unlocking_script: output_lock.clone(),
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 7_000,
+                locking_script: spend_lock.clone(),
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let grandchild = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: child.txid(),
+                output_index: 0,
+                unlocking_script: spend_lock,
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 6_000,
+                locking_script: output_lock,
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+
+        // Insert in reverse topological order to ensure the unchecked rebuild
+        // path reconstructs the relation indexes from the full entry set.
+        mempool.insert_unchecked(MempoolEntry::new(grandchild.clone(), 1_000));
+        mempool.insert_unchecked(MempoolEntry::new(child.clone(), 1_000));
+        mempool.insert_unchecked(MempoolEntry::new(parent.clone(), 1_000));
+
+        assert_eq!(
+            mempool.dependency_txids(&parent.txid()),
+            Some(Vec::new()),
+            "parent has no in-mempool ancestors"
+        );
+        let dependencies = mempool
+            .dependency_txids(&grandchild.txid())
+            .expect("grandchild should be indexed");
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.contains(&parent.txid()));
+        assert!(dependencies.contains(&child.txid()));
+
+        let descendants = mempool
+            .descendant_txids(&parent.txid())
+            .expect("parent should be indexed");
+        assert_eq!(descendants.len(), 2);
+        assert!(descendants.contains(&child.txid()));
+        assert!(descendants.contains(&grandchild.txid()));
     }
 }

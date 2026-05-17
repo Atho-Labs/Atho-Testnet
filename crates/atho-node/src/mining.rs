@@ -25,12 +25,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Builds a candidate block from the current tip and mempool contents.
 pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
-    let utxos = node.utxo_snapshot();
     let height = node.height().saturating_add(1);
     let (validated_entries, _, skipped_entries) =
         node.mempool
             .validated_entries_for_mining(node.network(), height, |txid, output_index| {
-                utxos.get(*txid, output_index).cloned()
+                node.utxo_entry(*txid, output_index)
             });
     if skipped_entries > 0 {
         let _ = dev::append_log(

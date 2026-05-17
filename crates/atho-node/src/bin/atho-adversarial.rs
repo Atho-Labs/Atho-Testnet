@@ -1118,7 +1118,7 @@ fn block_template_attack(cases: usize, seed: u64) -> Result<CategoryReport, Stri
                     [0; 48],
                     pow::target_for_height(Network::Mainnet, 1),
                     &[],
-                    UtxoSet::new(Network::Mainnet),
+                    &UtxoSet::new(Network::Mainnet),
                 )
                 .is_err());
             }
@@ -1138,7 +1138,7 @@ fn block_template_attack(cases: usize, seed: u64) -> Result<CategoryReport, Stri
                     [0; 48],
                     pow::target_for_height(Network::Mainnet, 1),
                     &[],
-                    UtxoSet::new(Network::Mainnet),
+                    &UtxoSet::new(Network::Mainnet),
                 )
                 .is_err());
             }
@@ -1152,7 +1152,7 @@ fn block_template_attack(cases: usize, seed: u64) -> Result<CategoryReport, Stri
                     [0; 48],
                     pow::target_for_height(Network::Mainnet, 1),
                     &[],
-                    UtxoSet::new(Network::Mainnet),
+                    &UtxoSet::new(Network::Mainnet),
                 )
                 .is_err());
             }

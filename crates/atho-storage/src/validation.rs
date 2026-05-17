@@ -10,7 +10,7 @@
 //! SECURITY: Duplicate inputs, missing UTXOs, immature coinbase spends, wrong
 //! witness references, and wrong-network blocks are rejected here before the
 //! chainstate mutates.
-use crate::utxo::{UtxoEntry, UtxoSet};
+use crate::utxo::{UtxoEntry, UtxoKey, UtxoSet};
 use atho_core::address::{payment_digest_from_locking_script, public_key_digest};
 use atho_core::block::Block;
 use atho_core::consensus::rules;
@@ -27,7 +27,6 @@ use atho_core::constants::{
     FALCON_512_SIGNATURE_BYTES, MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT,
     MAX_STANDARD_INPUTS, MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES,
 };
-use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxWitness, WitnessInputRef};
 use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
@@ -43,7 +42,8 @@ use atho_errors::{
     TX_NO_OUTPUTS, TX_TOO_LARGE, TX_TOO_MANY_OUTPUTS, TX_WRONG_POW_BITS, TX_ZERO_VALUE_OUTPUT,
 };
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use sha3::{Digest, Sha3_256};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Validation failures raised while checking transactions or blocks.
@@ -189,14 +189,12 @@ impl AthoErrorMeta for ValidationError {
 /// CONSENSUS: Both signers and validators must derive the same two-byte tag for
 /// the same txid, signature, and input index.
 pub fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
-    let mut preimage = Vec::with_capacity(
-        b"ATHO_SIG_REF_SHORT_V1".len() + txid.len() + signature.len() + core::mem::size_of::<u32>(),
-    );
-    preimage.extend_from_slice(b"ATHO_SIG_REF_SHORT_V1");
-    preimage.extend_from_slice(txid);
-    preimage.extend_from_slice(signature);
-    preimage.extend_from_slice(&input_index.to_be_bytes());
-    let digest = sha3_256(&preimage);
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"ATHO_SIG_REF_SHORT_V1");
+    hasher.update(txid);
+    hasher.update(signature);
+    hasher.update(input_index.to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
     [digest[0], digest[1]]
 }
 
@@ -206,17 +204,12 @@ pub fn derive_witness_commit_ref(
     block_witness_root: &[u8; 48],
     input_index: u32,
 ) -> [u8; 16] {
-    let mut preimage = Vec::with_capacity(
-        b"ATHO_WITNESS_COMMIT_REF_V1".len()
-            + txid.len()
-            + core::mem::size_of::<u32>()
-            + block_witness_root.len(),
-    );
-    preimage.extend_from_slice(b"ATHO_WITNESS_COMMIT_REF_V1");
-    preimage.extend_from_slice(txid);
-    preimage.extend_from_slice(&input_index.to_be_bytes());
-    preimage.extend_from_slice(block_witness_root);
-    let digest = sha3_256(&preimage);
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"ATHO_WITNESS_COMMIT_REF_V1");
+    hasher.update(txid);
+    hasher.update(input_index.to_be_bytes());
+    hasher.update(block_witness_root);
+    let digest: [u8; 32] = hasher.finalize().into();
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest[..16]);
     out
@@ -1026,6 +1019,65 @@ pub fn validate_block_without_pow(
     validate_block_impl(block, height, network, true)
 }
 
+struct UtxoOverlay<'a> {
+    base: &'a UtxoSet,
+    added: BTreeMap<UtxoKey, UtxoEntry>,
+    removed: BTreeSet<UtxoKey>,
+}
+
+impl<'a> UtxoOverlay<'a> {
+    fn new(base: &'a UtxoSet) -> Self {
+        Self {
+            base,
+            added: BTreeMap::new(),
+            removed: BTreeSet::new(),
+        }
+    }
+
+    fn get(&self, txid: [u8; 48], output_index: u32) -> Option<UtxoEntry> {
+        let key = UtxoKey { txid, output_index };
+        if let Some(entry) = self.added.get(&key) {
+            return Some(entry.clone());
+        }
+        if self.removed.contains(&key) {
+            return None;
+        }
+        self.base.get(txid, output_index).cloned()
+    }
+
+    fn remove(&mut self, txid: [u8; 48], output_index: u32) -> Result<UtxoEntry, ValidationError> {
+        let key = UtxoKey { txid, output_index };
+        if let Some(entry) = self.added.remove(&key) {
+            return Ok(entry);
+        }
+        if self.removed.contains(&key) {
+            return Err(ValidationError::MissingUtxo);
+        }
+        let entry = self
+            .base
+            .get(txid, output_index)
+            .cloned()
+            .ok_or(ValidationError::MissingUtxo)?;
+        self.removed.insert(key);
+        Ok(entry)
+    }
+
+    fn insert(&mut self, entry: UtxoEntry) -> Result<(), ValidationError> {
+        let key = UtxoKey {
+            txid: entry.txid,
+            output_index: entry.output_index,
+        };
+        if self.added.contains_key(&key)
+            || (!self.removed.contains(&key)
+                && self.base.get(entry.txid, entry.output_index).is_some())
+        {
+            return Err(ValidationError::MempoolConflict);
+        }
+        self.added.insert(key, entry);
+        Ok(())
+    }
+}
+
 /// Validates a block against the expected parent, target, and live UTXO set.
 pub fn validate_block_with_context(
     block: &Block,
@@ -1034,7 +1086,7 @@ pub fn validate_block_with_context(
     expected_previous_hash: [u8; 48],
     expected_target: [u8; 48],
     previous_blocks: &[Block],
-    utxos: UtxoSet,
+    utxos: &UtxoSet,
 ) -> Result<(), ValidationError> {
     validate_block_with_context_and_schedule(
         block,
@@ -1057,7 +1109,7 @@ pub struct BlockValidationContext<'a> {
     pub expected_previous_hash: [u8; 48],
     pub expected_target: [u8; 48],
     pub previous_blocks: &'a [Block],
-    pub utxos: UtxoSet,
+    pub utxos: &'a UtxoSet,
 }
 
 /// Validates a block against chain context and an explicit activation schedule.
@@ -1072,7 +1124,7 @@ pub fn validate_block_with_context_and_schedule(
         expected_previous_hash,
         expected_target,
         previous_blocks,
-        mut utxos,
+        utxos,
     } = context;
 
     validate_block_static_header_precheck_with_schedule(block, height, network, schedule)?;
@@ -1087,6 +1139,7 @@ pub fn validate_block_with_context_and_schedule(
         collect_prepared_block_transactions_with_schedule(block, height, network, schedule)?;
 
     let block_witness_root = block.header.witness_root;
+    let mut overlay = UtxoOverlay::new(utxos);
     // INVARIANT: No input may be spent twice within one block.
     let mut seen_inputs = BTreeSet::new();
     let mut sum_fees = 0u64;
@@ -1103,7 +1156,7 @@ pub fn validate_block_with_context_and_schedule(
             fee_rate,
             network,
             height,
-            |txid, output_index| utxos.get(*txid, output_index).cloned(),
+            |txid, output_index| overlay.get(*txid, output_index),
             schedule,
         )?;
 
@@ -1111,9 +1164,7 @@ pub fn validate_block_with_context_and_schedule(
             if !seen_inputs.insert((input.previous_txid, input.output_index)) {
                 return Err(ValidationError::MempoolConflict);
             }
-            utxos
-                .remove(input.previous_txid, input.output_index)
-                .map_err(|_| ValidationError::MissingUtxo)?;
+            overlay.remove(input.previous_txid, input.output_index)?;
         }
 
         for signer_group in &prepared.signer_groups {
@@ -1130,17 +1181,15 @@ pub fn validate_block_with_context_and_schedule(
             .checked_add(fee)
             .ok_or(ValidationError::FeeMismatch)?;
         for (output_index, output) in tx.outputs.iter().enumerate() {
-            utxos
-                .insert(UtxoEntry::new(
-                    network,
-                    txid,
-                    output_index as u32,
-                    output.value_atoms,
-                    output.locking_script.clone(),
-                    height,
-                    false,
-                ))
-                .map_err(|_| ValidationError::MempoolConflict)?;
+            overlay.insert(UtxoEntry::new(
+                network,
+                txid,
+                output_index as u32,
+                output.value_atoms,
+                output.locking_script.clone(),
+                height,
+                false,
+            ))?;
         }
     }
 
@@ -1453,7 +1502,7 @@ mod tests {
                 [0; 48],
                 wrong_target,
                 &[],
-                UtxoSet::new(Network::Mainnet),
+                &UtxoSet::new(Network::Mainnet),
             ),
             Err(ValidationError::BlockTargetOutOfBounds)
         );
@@ -1500,7 +1549,7 @@ mod tests {
                 [0; 48],
                 target,
                 &[],
-                UtxoSet::new(Network::Mainnet),
+                &UtxoSet::new(Network::Mainnet),
             ),
             Err(ValidationError::BlockParentHashMismatch)
         );
@@ -2293,7 +2342,7 @@ mod tests {
             .expect("seed legacy utxo for block validation");
 
         assert_eq!(
-            validate_block_with_context(&block, 2, Network::Regnet, [0; 48], target, &[], utxos,),
+            validate_block_with_context(&block, 2, Network::Regnet, [0; 48], target, &[], &utxos,),
             Err(ValidationError::LegacyLockFormatRejected)
         );
     }
@@ -2376,7 +2425,7 @@ mod tests {
                 [0; 48],
                 pow::initial_target_for_network(Network::Mainnet),
                 &[],
-                UtxoSet::new(Network::Mainnet),
+                &UtxoSet::new(Network::Mainnet),
             ),
             Err(ValidationError::BlockTooLarge)
         );
@@ -2496,7 +2545,7 @@ mod tests {
                 [0; 48],
                 pow::initial_target_for_network(Network::Mainnet),
                 &[],
-                utxos,
+                &utxos,
             ),
             Ok(())
         );

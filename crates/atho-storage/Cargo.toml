@@ -15,4 +15,5 @@ num-bigint = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
+sha3 = "0.10"
 thiserror = "1"

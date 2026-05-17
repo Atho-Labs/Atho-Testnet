@@ -515,7 +515,7 @@ fn bench_block_validation(
             fixture.tip_hash,
             node.difficulty_target_for_next_block(),
             node.blocks(),
-            utxos,
+            &utxos,
         )
         .map_err(|err| format!("block validation precheck failed: {err}"))?;
         let start = Instant::now();
@@ -627,7 +627,7 @@ fn verify_block_fixture(fixture: &BenchmarkFixture) -> Result<(), String> {
         fixture.tip_hash,
         node.difficulty_target_for_next_block(),
         node.blocks(),
-        utxos,
+        &utxos,
     ) {
         Ok(()) => Ok(()),
         Err(err) => {

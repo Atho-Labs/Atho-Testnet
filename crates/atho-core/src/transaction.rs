@@ -12,7 +12,6 @@ use crate::constants::{
     FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES, MAX_WITNESS_INPUT_REFS,
     TX_POW_BITS_BYTES, TX_POW_NONCE_BYTES,
 };
-use crate::crypto::hash::sha3_384;
 use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_384};
@@ -49,6 +48,34 @@ pub struct TxWitness {
 }
 
 impl TxWitness {
+    fn write_commitment_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&(self.additional_signers.len() as u32).to_le_bytes());
+        for group in &self.additional_signers {
+            out.extend_from_slice(&(group.signature.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.signature);
+            out.extend_from_slice(&(group.pubkey.len() as u32).to_le_bytes());
+            out.extend_from_slice(&group.pubkey);
+        }
+    }
+
+    pub fn update_commitment_hasher<D: Digest>(&self, hasher: &mut D) {
+        hasher.update((self.signature.len() as u32).to_le_bytes());
+        hasher.update(&self.signature);
+        hasher.update((self.pubkey.len() as u32).to_le_bytes());
+        hasher.update(&self.pubkey);
+        hasher.update((self.additional_signers.len() as u32).to_le_bytes());
+        for group in &self.additional_signers {
+            hasher.update((group.signature.len() as u32).to_le_bytes());
+            hasher.update(&group.signature);
+            hasher.update((group.pubkey.len() as u32).to_le_bytes());
+            hasher.update(&group.pubkey);
+        }
+    }
+
     /// Returns `true` when no witness fields are populated.
     pub fn is_empty(&self) -> bool {
         self.signature.is_empty()
@@ -181,17 +208,7 @@ impl TxWitness {
     /// Returns the subset of witness bytes committed by the witness tree.
     pub fn commitment_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.signature);
-        out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&(self.additional_signers.len() as u32).to_le_bytes());
-        for group in &self.additional_signers {
-            out.extend_from_slice(&(group.signature.len() as u32).to_le_bytes());
-            out.extend_from_slice(&group.signature);
-            out.extend_from_slice(&(group.pubkey.len() as u32).to_le_bytes());
-            out.extend_from_slice(&group.pubkey);
-        }
+        self.write_commitment_bytes(&mut out);
         out
     }
 
@@ -435,6 +452,51 @@ impl Transaction {
             + TX_POW_BITS_BYTES
     }
 
+    pub fn write_full_bytes_without_pow_fields(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.push(0x00);
+        out.push(0x01);
+        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
+        for input in &self.inputs {
+            out.extend_from_slice(&input.previous_txid);
+            out.extend_from_slice(&input.output_index.to_le_bytes());
+            out.extend_from_slice(&(input.unlocking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&input.unlocking_script);
+        }
+        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
+        for output in &self.outputs {
+            out.extend_from_slice(&output.value_atoms.to_le_bytes());
+            out.extend_from_slice(&(output.locking_script.len() as u32).to_le_bytes());
+            out.extend_from_slice(&output.locking_script);
+        }
+        out.extend_from_slice(&(self.witness.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.witness);
+        out.extend_from_slice(&self.lock_time.to_le_bytes());
+    }
+
+    pub fn update_full_hasher<D: Digest>(&self, hasher: &mut D) {
+        hasher.update(self.version.to_le_bytes());
+        hasher.update([0x00, 0x01]);
+        hasher.update((self.inputs.len() as u32).to_le_bytes());
+        for input in &self.inputs {
+            hasher.update(input.previous_txid);
+            hasher.update(input.output_index.to_le_bytes());
+            hasher.update((input.unlocking_script.len() as u32).to_le_bytes());
+            hasher.update(&input.unlocking_script);
+        }
+        hasher.update((self.outputs.len() as u32).to_le_bytes());
+        for output in &self.outputs {
+            hasher.update(output.value_atoms.to_le_bytes());
+            hasher.update((output.locking_script.len() as u32).to_le_bytes());
+            hasher.update(&output.locking_script);
+        }
+        hasher.update((self.witness.len() as u32).to_le_bytes());
+        hasher.update(&self.witness);
+        hasher.update(self.lock_time.to_le_bytes());
+        hasher.update(self.tx_pow_nonce.to_le_bytes());
+        hasher.update([self.tx_pow_bits]);
+    }
+
     pub fn compact_size_bytes(&self) -> usize {
         2 + compact_size_len(self.inputs.len())
             + self
@@ -478,25 +540,7 @@ impl Transaction {
                 .saturating_sub(TX_POW_NONCE_BYTES)
                 .saturating_sub(TX_POW_BITS_BYTES),
         );
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.push(0x00);
-        out.push(0x01);
-        out.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
-        for input in &self.inputs {
-            out.extend_from_slice(&input.previous_txid);
-            out.extend_from_slice(&input.output_index.to_le_bytes());
-            out.extend_from_slice(&(input.unlocking_script.len() as u32).to_le_bytes());
-            out.extend_from_slice(&input.unlocking_script);
-        }
-        out.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
-        for output in &self.outputs {
-            out.extend_from_slice(&output.value_atoms.to_le_bytes());
-            out.extend_from_slice(&(output.locking_script.len() as u32).to_le_bytes());
-            out.extend_from_slice(&output.locking_script);
-        }
-        out.extend_from_slice(&(self.witness.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.witness);
-        out.extend_from_slice(&self.lock_time.to_le_bytes());
+        self.write_full_bytes_without_pow_fields(&mut out);
         out
     }
 
@@ -564,15 +608,18 @@ impl Transaction {
     }
 
     pub fn wtxid(&self) -> [u8; 48] {
-        sha3_384(&self.full_bytes())
+        let mut hasher = Sha3_384::new();
+        self.update_full_hasher(&mut hasher);
+        hasher.finalize().into()
     }
 
     pub fn witness_commitment_hash(&self) -> [u8; 48] {
-        let mut out = self.base_bytes();
+        let mut hasher = Sha3_384::new();
+        self.update_base_hasher(&mut hasher);
         if let Some(witness) = self.witness_payload() {
-            out.extend_from_slice(&witness.commitment_bytes());
+            witness.update_commitment_hasher(&mut hasher);
         }
-        sha3_384(&out)
+        hasher.finalize().into()
     }
 
     fn update_signing_hasher_for_input_indexes<D: Digest>(

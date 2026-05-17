@@ -1,8 +1,10 @@
 name: Atho Production Readiness
 
-# Hosted GitHub Actions are temporarily manual-only for this repo until
-# account billing/spending limits are restored.
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -37,6 +39,39 @@ jobs:
         run: |
           set -euo pipefail
           cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  benchmark-smoke:
+    name: Benchmark Smoke
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run end-to-end benchmark smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo run -p atho-node --bin atho-benchmark --release -- --network regnet --tx-count 64 --samples 1 --output artifacts/atho-benchmark.md
+
+      - name: Run wallet persistence benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench -p atho-wallet --bench datafile_hot_paths -- --noplot
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: atho-benchmark-artifacts
+          path: artifacts/
 
   nightly-hardening:
     name: Nightly Hardening
