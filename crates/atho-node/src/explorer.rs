@@ -12,20 +12,23 @@
 use crate::error::NodeError;
 use crate::node::Node;
 use atho_core::address::encode_base56_address;
+use atho_core::block::Block;
 use atho_core::constants::ATOMS_PER_ATHO;
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplorerIndex {
     network: Option<Network>,
     tip_height: u64,
     #[serde(with = "serde_big_array::BigArray")]
     tip_hash: [u8; 48],
+    canonical_hashes: Vec<CanonicalHash>,
+    known_outputs: BTreeMap<OutputRef, KnownOutput>,
     addresses: BTreeMap<String, IndexedAddressRecord>,
 }
 
@@ -35,23 +38,23 @@ impl Default for ExplorerIndex {
             network: None,
             tip_height: 0,
             tip_hash: [0; 48],
+            canonical_hashes: Vec::new(),
+            known_outputs: BTreeMap::new(),
             addresses: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct IndexedAddressRecord {
     #[serde(with = "serde_big_array::BigArray")]
     payment_digest: [u8; 32],
     transactions: Vec<AddressTransactionEntry>,
     utxos: Vec<UtxoEntry>,
     balance_atoms: u64,
-    spendable_atoms: u64,
-    immature_atoms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AddressTransactionEntry {
     txid: String,
     source: String,
@@ -69,10 +72,32 @@ struct AddressTransactionEntry {
     confirmed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CanonicalHash {
+    #[serde(with = "serde_big_array::BigArray")]
+    hash: [u8; 48],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct OutputRef {
+    #[serde(with = "serde_big_array::BigArray")]
+    txid: [u8; 48],
+    output_index: u32,
+}
+
+impl OutputRef {
+    fn new(txid: [u8; 48], output_index: u32) -> Self {
+        Self { txid, output_index }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct KnownOutput {
     address: Option<String>,
     value_atoms: u64,
+    locking_script: Vec<u8>,
+    created_height: u64,
+    is_coinbase: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,12 +123,15 @@ impl ExplorerIndex {
         let tip_height = node.height();
         let tip_hash = node.tip_hash();
         let blocks = node.canonical_blocks()?;
-        let utxos: Vec<UtxoEntry> = node.utxo_snapshot().entries().cloned().collect();
 
         let mut addresses = BTreeMap::<String, IndexedAddressRecord>::new();
-        let mut known_outputs = BTreeMap::<([u8; 48], u32), KnownOutput>::new();
+        let mut known_outputs = BTreeMap::<OutputRef, KnownOutput>::new();
+        let mut canonical_hashes = Vec::with_capacity(blocks.len());
 
         for block in &blocks {
+            canonical_hashes.push(CanonicalHash {
+                hash: block.header.block_hash(),
+            });
             for tx in &block.transactions {
                 index_transaction(
                     &mut addresses,
@@ -121,52 +149,87 @@ impl ExplorerIndex {
             }
         }
 
-        for utxo in utxos {
+        for utxo in node.utxo_entries() {
             let Some(address) = script_address_hint(network, &utxo.locking_script) else {
                 continue;
             };
             let record = addresses
                 .entry(address)
-                .or_insert_with(|| IndexedAddressRecord {
-                    payment_digest: [0; 32],
-                    ..IndexedAddressRecord::default()
-                });
+                .or_insert_with(|| indexed_address_record_from_script(&utxo.locking_script));
             record.utxos.push(utxo.clone());
             record.balance_atoms = record.balance_atoms.saturating_add(utxo.value_atoms);
-            if utxo.is_spendable_at(tip_height) {
-                record.spendable_atoms = record.spendable_atoms.saturating_add(utxo.value_atoms);
-            } else {
-                record.immature_atoms = record.immature_atoms.saturating_add(utxo.value_atoms);
-            }
         }
 
-        for (address, record) in &mut addresses {
-            if let Ok((payment_digest, _)) = atho_core::address::decode_base56_address(address) {
-                record.payment_digest = payment_digest;
-            }
-            record.transactions.sort_by(|left, right| {
-                right
-                    .confirmed
-                    .cmp(&left.confirmed)
-                    .then(right.timestamp.cmp(&left.timestamp))
-                    .then(right.height.cmp(&left.height))
-                    .then(right.txid.cmp(&left.txid))
-            });
-            record.utxos.sort_by(|left, right| {
-                right
-                    .created_height
-                    .cmp(&left.created_height)
-                    .then(left.txid.cmp(&right.txid))
-                    .then(left.output_index.cmp(&right.output_index))
-            });
+        for record in addresses.values_mut() {
+            sort_address_record(record);
         }
 
         Ok(Self {
             network: Some(network),
             tip_height,
             tip_hash,
+            canonical_hashes,
+            known_outputs,
             addresses,
         })
+    }
+
+    pub fn try_refresh_incremental(&mut self, node: &Node) -> Result<bool, NodeError> {
+        let network = node.network();
+        let tip_height = node.height();
+        let tip_hash = node.tip_hash();
+        if !self.needs_refresh(network, tip_height, tip_hash) {
+            return Ok(true);
+        }
+        if self.network != Some(network)
+            || self.canonical_hashes.is_empty()
+            || self.canonical_hashes.len() != self.tip_height.saturating_add(1) as usize
+        {
+            return Ok(false);
+        }
+
+        let Some(common_ancestor_height) = self.common_ancestor_height(node) else {
+            return Ok(false);
+        };
+        let mut disconnected = Vec::new();
+        for height in common_ancestor_height.saturating_add(1)..=self.tip_height {
+            let Some(hash) = self
+                .canonical_hashes
+                .get(height as usize)
+                .map(|entry| entry.hash)
+            else {
+                return Ok(false);
+            };
+            let Some(block) = node.block_by_hash(hash) else {
+                return Ok(false);
+            };
+            disconnected.push(block);
+        }
+
+        let mut connected = Vec::new();
+        for height in common_ancestor_height.saturating_add(1)..=tip_height {
+            let Some(block) = node.block_by_height(height) else {
+                return Ok(false);
+            };
+            connected.push(block);
+        }
+
+        for block in disconnected.iter().rev() {
+            self.disconnect_block(network, block);
+        }
+        self.canonical_hashes
+            .truncate(common_ancestor_height.saturating_add(1) as usize);
+
+        for block in &connected {
+            self.connect_block(network, block);
+            self.canonical_hashes.push(CanonicalHash {
+                hash: block.header.block_hash(),
+            });
+        }
+
+        self.tip_height = tip_height;
+        self.tip_hash = tip_hash;
+        Ok(true)
     }
 
     pub fn network(&self) -> Option<Network> {
@@ -190,6 +253,17 @@ impl ExplorerIndex {
     ) -> Option<Value> {
         let record = self.addresses.get(address)?;
         let slice = paginate(&record.transactions, limit, offset);
+        let (spendable_atoms, immature_atoms) =
+            record
+                .utxos
+                .iter()
+                .fold((0u64, 0u64), |(spendable, immature), utxo| {
+                    if utxo.is_spendable_at(self.tip_height) {
+                        (spendable.saturating_add(utxo.value_atoms), immature)
+                    } else {
+                        (spendable, immature.saturating_add(utxo.value_atoms))
+                    }
+                });
         Some(json!({
             "address": address,
             "network": network.domain_tag(),
@@ -198,10 +272,10 @@ impl ExplorerIndex {
             "utxo_count": record.utxos.len(),
             "balance_atoms": record.balance_atoms,
             "balance_atho": format_atoms_decimal(record.balance_atoms),
-            "spendable_atoms": record.spendable_atoms,
-            "spendable_atho": format_atoms_decimal(record.spendable_atoms),
-            "immature_atoms": record.immature_atoms,
-            "immature_atho": format_atoms_decimal(record.immature_atoms),
+            "spendable_atoms": spendable_atoms,
+            "spendable_atho": format_atoms_decimal(spendable_atoms),
+            "immature_atoms": immature_atoms,
+            "immature_atho": format_atoms_decimal(immature_atoms),
             "pending_delta_atoms": "0",
             "pending_delta_atho": "0.000000000000",
             "transactions": slice,
@@ -240,6 +314,63 @@ impl ExplorerIndex {
             }
         }))
     }
+
+    fn common_ancestor_height(&self, node: &Node) -> Option<u64> {
+        let mut height = self.tip_height.min(node.height());
+        loop {
+            let indexed_hash = self.canonical_hashes.get(height as usize)?.hash;
+            let chain_hash = node.block_by_height(height)?.header.block_hash();
+            if indexed_hash == chain_hash {
+                return Some(height);
+            }
+            if height == 0 {
+                return None;
+            }
+            height = height.saturating_sub(1);
+        }
+    }
+
+    fn connect_block(&mut self, network: Network, block: &Block) {
+        let mut touched = BTreeSet::new();
+        for tx in &block.transactions {
+            connect_transaction(
+                &mut self.addresses,
+                &mut self.known_outputs,
+                &mut touched,
+                network,
+                tx,
+                TransactionIndexContext {
+                    height: Some(block.header.height),
+                    block_hash: Some(block.header.block_hash()),
+                    timestamp: Some(block.header.timestamp),
+                    fee_atoms: if tx.is_coinbase() { Some(0) } else { None },
+                    source: "chain",
+                },
+            );
+        }
+        finalize_touched_addresses(&mut self.addresses, touched);
+    }
+
+    fn disconnect_block(&mut self, network: Network, block: &Block) {
+        let mut touched = BTreeSet::new();
+        for tx in block.transactions.iter().rev() {
+            disconnect_transaction(
+                &mut self.addresses,
+                &mut self.known_outputs,
+                &mut touched,
+                network,
+                tx,
+                TransactionIndexContext {
+                    height: Some(block.header.height),
+                    block_hash: Some(block.header.block_hash()),
+                    timestamp: Some(block.header.timestamp),
+                    fee_atoms: if tx.is_coinbase() { Some(0) } else { None },
+                    source: "chain",
+                },
+            );
+        }
+        finalize_touched_addresses(&mut self.addresses, touched);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,7 +384,7 @@ struct TransactionIndexContext {
 
 fn index_transaction(
     addresses: &mut BTreeMap<String, IndexedAddressRecord>,
-    known_outputs: &mut BTreeMap<([u8; 48], u32), KnownOutput>,
+    known_outputs: &mut BTreeMap<OutputRef, KnownOutput>,
     network: Network,
     tx: &Transaction,
     context: TransactionIndexContext,
@@ -269,7 +400,9 @@ fn index_transaction(
     let mut per_address = BTreeMap::<String, AddressTxAccumulator>::new();
 
     for input in &tx.inputs {
-        if let Some(previous) = known_outputs.get(&(input.previous_txid, input.output_index)) {
+        if let Some(previous) =
+            known_outputs.get(&OutputRef::new(input.previous_txid, input.output_index))
+        {
             if let Some(address) = &previous.address {
                 let accumulator = per_address.entry(address.clone()).or_default();
                 accumulator.sent_atoms =
@@ -281,10 +414,13 @@ fn index_transaction(
     for (output_index, output) in tx.outputs.iter().enumerate() {
         let address = script_address_hint(network, &output.locking_script);
         known_outputs.insert(
-            (txid, output_index as u32),
+            OutputRef::new(txid, output_index as u32),
             KnownOutput {
                 address: address.clone(),
                 value_atoms: output.value_atoms,
+                locking_script: output.locking_script.clone(),
+                created_height: height.unwrap_or_default(),
+                is_coinbase: tx.is_coinbase(),
             },
         );
         if let Some(address) = address {
@@ -323,12 +459,252 @@ fn index_transaction(
             confirmed: source == "chain",
         };
         let record = addresses
-            .entry(address)
-            .or_insert_with(|| IndexedAddressRecord {
-                payment_digest: [0; 32],
-                ..IndexedAddressRecord::default()
-            });
+            .entry(address.clone())
+            .or_insert_with(|| indexed_address_record_from_address(&address));
         record.transactions.push(entry);
+    }
+}
+
+fn connect_transaction(
+    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
+    known_outputs: &mut BTreeMap<OutputRef, KnownOutput>,
+    touched: &mut BTreeSet<String>,
+    network: Network,
+    tx: &Transaction,
+    context: TransactionIndexContext,
+) {
+    let TransactionIndexContext {
+        height,
+        block_hash: _,
+        timestamp: _,
+        fee_atoms: _,
+        source: _,
+    } = context;
+    let txid = tx.txid();
+    let mut per_address = BTreeMap::<String, AddressTxAccumulator>::new();
+
+    for input in &tx.inputs {
+        if let Some(previous) =
+            known_outputs.get(&OutputRef::new(input.previous_txid, input.output_index))
+        {
+            if let Some(address) = previous.address.as_ref() {
+                touched.insert(address.clone());
+                let record = addresses
+                    .entry(address.clone())
+                    .or_insert_with(|| indexed_address_record_from_address(address));
+                if let Some(index) = record.utxos.iter().position(|utxo| {
+                    utxo.txid == input.previous_txid && utxo.output_index == input.output_index
+                }) {
+                    let spent = record.utxos.remove(index);
+                    record.balance_atoms = record.balance_atoms.saturating_sub(spent.value_atoms);
+                }
+                let accumulator = per_address.entry(address.clone()).or_default();
+                accumulator.sent_atoms =
+                    accumulator.sent_atoms.saturating_add(previous.value_atoms);
+            }
+        }
+    }
+
+    for (output_index, output) in tx.outputs.iter().enumerate() {
+        let output_ref = OutputRef::new(txid, output_index as u32);
+        let address = script_address_hint(network, &output.locking_script);
+        known_outputs.insert(
+            output_ref,
+            KnownOutput {
+                address: address.clone(),
+                value_atoms: output.value_atoms,
+                locking_script: output.locking_script.clone(),
+                created_height: height.unwrap_or_default(),
+                is_coinbase: tx.is_coinbase(),
+            },
+        );
+        if let Some(address) = address {
+            touched.insert(address.clone());
+            let record = addresses
+                .entry(address.clone())
+                .or_insert_with(|| indexed_address_record_from_script(&output.locking_script));
+            record.utxos.push(UtxoEntry::new(
+                network,
+                txid,
+                output_index as u32,
+                output.value_atoms,
+                output.locking_script.clone(),
+                height.unwrap_or_default(),
+                tx.is_coinbase(),
+            ));
+            record.balance_atoms = record.balance_atoms.saturating_add(output.value_atoms);
+            let accumulator = per_address.entry(address).or_default();
+            accumulator.received_atoms = accumulator
+                .received_atoms
+                .saturating_add(output.value_atoms);
+        }
+    }
+
+    push_transaction_entries(addresses, tx, context, per_address);
+}
+
+fn disconnect_transaction(
+    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
+    known_outputs: &mut BTreeMap<OutputRef, KnownOutput>,
+    touched: &mut BTreeSet<String>,
+    network: Network,
+    tx: &Transaction,
+    context: TransactionIndexContext,
+) {
+    let txid = tx.txid();
+    let txid_hex = hex::encode(txid);
+
+    for (output_index, _) in tx.outputs.iter().enumerate() {
+        let output_ref = OutputRef::new(txid, output_index as u32);
+        let Some(known_output) = known_outputs.remove(&output_ref) else {
+            continue;
+        };
+        if let Some(address) = known_output.address {
+            touched.insert(address.clone());
+            if let Some(record) = addresses.get_mut(&address) {
+                if let Some(index) = record
+                    .utxos
+                    .iter()
+                    .position(|utxo| utxo.txid == txid && utxo.output_index == output_index as u32)
+                {
+                    let removed = record.utxos.remove(index);
+                    record.balance_atoms = record.balance_atoms.saturating_sub(removed.value_atoms);
+                }
+            }
+        }
+    }
+
+    for input in &tx.inputs {
+        if let Some(previous) =
+            known_outputs.get(&OutputRef::new(input.previous_txid, input.output_index))
+        {
+            if let Some(address) = previous.address.as_ref() {
+                touched.insert(address.clone());
+                let record = addresses
+                    .entry(address.clone())
+                    .or_insert_with(|| indexed_address_record_from_address(address));
+                record.utxos.push(UtxoEntry::new(
+                    network,
+                    input.previous_txid,
+                    input.output_index,
+                    previous.value_atoms,
+                    previous.locking_script.clone(),
+                    previous.created_height,
+                    previous.is_coinbase,
+                ));
+                record.balance_atoms = record.balance_atoms.saturating_add(previous.value_atoms);
+            }
+        }
+    }
+
+    for address in touched.iter() {
+        if let Some(record) = addresses.get_mut(address) {
+            record
+                .transactions
+                .retain(|entry| !(entry.txid == txid_hex && entry.source == context.source));
+        }
+    }
+}
+
+fn push_transaction_entries(
+    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
+    tx: &Transaction,
+    context: TransactionIndexContext,
+    per_address: BTreeMap<String, AddressTxAccumulator>,
+) {
+    let TransactionIndexContext {
+        height,
+        block_hash,
+        timestamp,
+        fee_atoms,
+        source,
+    } = context;
+    let txid = tx.txid();
+
+    for (address, accumulator) in per_address {
+        let net_atoms = accumulator.received_atoms as i128 - accumulator.sent_atoms as i128;
+        let kind = if tx.is_coinbase() && accumulator.received_atoms > 0 {
+            "mined"
+        } else if accumulator.sent_atoms > 0 && accumulator.received_atoms > 0 {
+            "self_transfer"
+        } else if accumulator.sent_atoms > 0 {
+            "sent"
+        } else {
+            "received"
+        };
+        let entry = AddressTransactionEntry {
+            txid: hex::encode(txid),
+            source: source.to_string(),
+            block_hash: block_hash.map(hex::encode),
+            height,
+            timestamp,
+            kind: kind.to_string(),
+            received_atoms: accumulator.received_atoms,
+            sent_atoms: accumulator.sent_atoms,
+            net_atoms: net_atoms.to_string(),
+            received_atho: format_atoms_decimal(accumulator.received_atoms),
+            sent_atho: format_atoms_decimal(accumulator.sent_atoms),
+            net_atho: format_signed_atoms_decimal(net_atoms),
+            fee_atoms,
+            confirmed: source == "chain",
+        };
+        let record = addresses
+            .entry(address.clone())
+            .or_insert_with(|| indexed_address_record_from_address(&address));
+        record.transactions.push(entry);
+    }
+}
+
+fn finalize_touched_addresses(
+    addresses: &mut BTreeMap<String, IndexedAddressRecord>,
+    touched: BTreeSet<String>,
+) {
+    for address in touched {
+        let should_remove = if let Some(record) = addresses.get_mut(&address) {
+            sort_address_record(record);
+            record.transactions.is_empty() && record.utxos.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            addresses.remove(&address);
+        }
+    }
+}
+
+fn sort_address_record(record: &mut IndexedAddressRecord) {
+    record.transactions.sort_by(|left, right| {
+        right
+            .confirmed
+            .cmp(&left.confirmed)
+            .then(right.timestamp.cmp(&left.timestamp))
+            .then(right.height.cmp(&left.height))
+            .then(right.txid.cmp(&left.txid))
+    });
+    record.utxos.sort_by(|left, right| {
+        right
+            .created_height
+            .cmp(&left.created_height)
+            .then(left.txid.cmp(&right.txid))
+            .then(left.output_index.cmp(&right.output_index))
+    });
+}
+
+fn indexed_address_record_from_address(address: &str) -> IndexedAddressRecord {
+    let payment_digest = atho_core::address::decode_base56_address(address)
+        .map(|(payment_digest, _)| payment_digest)
+        .unwrap_or([0; 32]);
+    IndexedAddressRecord {
+        payment_digest,
+        ..IndexedAddressRecord::default()
+    }
+}
+
+fn indexed_address_record_from_script(locking_script: &[u8]) -> IndexedAddressRecord {
+    let payment_digest = locking_script.try_into().unwrap_or([0; 32]);
+    IndexedAddressRecord {
+        payment_digest,
+        ..IndexedAddressRecord::default()
     }
 }
 

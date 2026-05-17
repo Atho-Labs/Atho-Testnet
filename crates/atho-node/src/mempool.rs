@@ -131,6 +131,7 @@ pub struct Mempool {
     children_by_txid: BTreeMap<[u8; 48], BTreeSet<[u8; 48]>>,
     spent_inputs: BTreeSet<([u8; 48], u32)>,
     total_fee_atoms: u64,
+    total_raw_bytes: usize,
     total_vbytes: usize,
     limits: MempoolLimits,
     fingerprint_cache: RefCell<Option<MempoolFingerprintCache>>,
@@ -213,6 +214,7 @@ impl Mempool {
         self.children_by_txid.clear();
         self.spent_inputs.clear();
         self.total_fee_atoms = 0;
+        self.total_raw_bytes = 0;
         self.total_vbytes = 0;
     }
 
@@ -224,6 +226,7 @@ impl Mempool {
                 continue;
             };
             self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+            self.total_raw_bytes = self.total_raw_bytes.saturating_add(entry.raw_size_bytes());
             self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
             self.mining_order.insert(MiningOrderKey::from(entry));
             for key in Self::input_keys(&entry.transaction) {
@@ -300,6 +303,7 @@ impl Mempool {
 
     fn insert_entry(&mut self, txid: [u8; 48], entry: MempoolEntry) {
         self.total_fee_atoms = self.total_fee_atoms.saturating_add(entry.fee_atoms);
+        self.total_raw_bytes = self.total_raw_bytes.saturating_add(entry.raw_size_bytes());
         self.total_vbytes = self.total_vbytes.saturating_add(entry.vsize_bytes());
         self.mining_order.insert(MiningOrderKey::from(&entry));
         self.link_relations(txid, &entry.transaction);
@@ -311,6 +315,7 @@ impl Mempool {
         self.unlink_relations(entry.txid());
         self.mining_order.remove(&MiningOrderKey::from(&entry));
         self.total_fee_atoms = self.total_fee_atoms.saturating_sub(entry.fee_atoms);
+        self.total_raw_bytes = self.total_raw_bytes.saturating_sub(entry.raw_size_bytes());
         self.total_vbytes = self.total_vbytes.saturating_sub(entry.vsize_bytes());
         Some(entry)
     }
@@ -541,6 +546,18 @@ impl Mempool {
 
     pub fn total_fee_atoms(&self) -> u64 {
         self.total_fee_atoms
+    }
+
+    pub fn total_raw_bytes(&self) -> usize {
+        self.total_raw_bytes
+    }
+
+    pub fn entries_iter(&self) -> impl Iterator<Item = &MempoolEntry> + '_ {
+        self.entries.values()
+    }
+
+    pub fn entry_ref(&self, txid: &[u8; 48]) -> Option<&MempoolEntry> {
+        self.entries.get(txid)
     }
 
     pub fn dependency_txids(&self, target: &[u8; 48]) -> Option<Vec<[u8; 48]>> {

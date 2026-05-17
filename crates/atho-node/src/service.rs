@@ -46,7 +46,7 @@ use atho_storage::utxo::{UtxoEntry, UtxoSet};
 use atho_wallet::snapshot::WalletSnapshot;
 
 const DIFFICULTY_DISPLAY_SCALE: u64 = 100_000_000;
-const EXPLORER_API_SNAPSHOT_VERSION: u32 = 2;
+const EXPLORER_API_SNAPSHOT_VERSION: u32 = 3;
 const EXPLORER_API_SNAPSHOT_FILENAME: &str = "explorer-api-snapshot.bin";
 const HASHRATE_WINDOW_BLOCKS: usize = 120;
 const BLOCKTIME_WINDOW_BLOCKS: usize = 120;
@@ -484,8 +484,7 @@ impl NodeService {
         self.orchestrator
             .runtime
             .node
-            .utxo_snapshot()
-            .entries()
+            .utxo_entries()
             .cloned()
             .collect()
     }
@@ -1445,6 +1444,24 @@ impl NodeService {
         {
             return;
         }
+        match self.explorer_index.try_refresh_incremental(node) {
+            Ok(true) => {
+                self.explorer_index_ready = true;
+                self.explorer_index_source = "incremental";
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                let _ = dev::append_log(
+                    "api",
+                    &format!(
+                        "explorer index incremental refresh failed network={} height={} error={err}",
+                        self.network().id(),
+                        tip_height
+                    ),
+                );
+            }
+        }
         self.rebuild_explorer_index();
     }
 
@@ -1459,8 +1476,7 @@ impl NodeService {
         }
 
         let mut recent_transactions = node
-            .mempool_entries()
-            .into_iter()
+            .mempool_entries_iter()
             .map(|entry| CachedPendingTransaction {
                 txid: entry.txid(),
                 fee_atoms: entry.fee_atoms,
@@ -1479,18 +1495,9 @@ impl NodeService {
         });
 
         let transaction_count = recent_transactions.len();
-        let mempool_size_bytes = recent_transactions
-            .iter()
-            .map(|entry| entry.size_bytes)
-            .sum::<u64>();
-        let mempool_vsize_bytes = recent_transactions
-            .iter()
-            .map(|entry| entry.size_vbytes)
-            .sum::<u64>();
-        let total_fee_atoms = recent_transactions
-            .iter()
-            .map(|entry| entry.fee_atoms)
-            .sum::<u64>();
+        let mempool_size_bytes = node.mempool_total_raw_bytes() as u64;
+        let mempool_vsize_bytes = node.mempool_total_vbytes() as u64;
+        let total_fee_atoms = node.mempool_total_fee_atoms();
         let average_fee_atoms = if transaction_count == 0 {
             0
         } else {
@@ -2111,15 +2118,11 @@ impl NodeService {
             .node
             .canonical_blocks()
             .map_err(rpc_error_from_node)?;
-        let mempool_entries = self.orchestrator.runtime.node.mempool_entries();
-        let mempool_bytes: usize = mempool_entries
-            .iter()
-            .map(MempoolEntry::full_size_bytes)
-            .sum();
+        let mempool_bytes = self.orchestrator.runtime.node.mempool_total_raw_bytes();
         let chain_bytes: usize = blocks.iter().map(Block::full_size_bytes).sum();
         Ok(json!({
             "network": self.network().id(),
-            "mempool_transactions": mempool_entries.len(),
+            "mempool_transactions": self.orchestrator.runtime.node.mempool_len(),
             "mempool_estimated_bytes": mempool_bytes,
             "canonical_blocks": blocks.len(),
             "canonical_chain_estimated_bytes": chain_bytes,
@@ -2394,17 +2397,15 @@ impl NodeService {
 
     fn command_gettxoutsetinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("gettxoutsetinfo", args)?;
-        let snapshot = self.orchestrator.runtime.node.utxo_snapshot();
-        let entries: Vec<UtxoEntry> = snapshot.entries().cloned().collect();
-        let total_amount_atoms: u64 = entries.iter().map(|entry| entry.value_atoms).sum();
+        let stats = utxo_set_stats(self.orchestrator.runtime.node.utxo_entries());
         Ok(json!({
             "height": self.orchestrator.runtime.node.height(),
             "best_block_hash": hex::encode(self.orchestrator.runtime.node.tip_hash()),
-            "txouts": entries.len(),
-            "bogosize": entries.iter().map(|entry| 48usize + 4 + 8 + entry.locking_script.len()).sum::<usize>(),
-            "total_amount_atoms": total_amount_atoms,
-            "total_amount_atho": format_atoms_decimal(self.network(), total_amount_atoms),
-            "utxo_set_hash": hex::encode(utxo_set_hash(&entries)),
+            "txouts": stats.txouts,
+            "bogosize": stats.bogosize,
+            "total_amount_atoms": stats.total_amount_atoms,
+            "total_amount_atho": format_atoms_decimal(self.network(), stats.total_amount_atoms),
+            "utxo_set_hash": hex::encode(stats.hash),
         }))
     }
 
@@ -2674,31 +2675,25 @@ impl NodeService {
             ));
         }
         let verbose = self.parse_optional_bool_arg(args.first(), false)?;
-        let entries = self.orchestrator.runtime.node.mempool_entries();
+        let node = &self.orchestrator.runtime.node;
         if !verbose {
             return Ok(Value::Array(
-                entries
+                node.mempool_txids()
                     .into_iter()
-                    .map(|entry| Value::String(hex::encode(entry.txid())))
+                    .map(|txid| Value::String(hex::encode(txid)))
                     .collect(),
             ));
         }
-        let map = entries
-            .into_iter()
+        let map = node
+            .mempool_entries_iter()
             .map(|entry| {
-                let depends = self
-                    .orchestrator
-                    .runtime
-                    .node
+                let depends = node
                     .mempool_dependency_txids(&entry.txid())
                     .unwrap_or_default()
                     .into_iter()
                     .map(hex::encode)
                     .collect::<Vec<_>>();
-                let descendants = self
-                    .orchestrator
-                    .runtime
-                    .node
+                let descendants = node
                     .mempool_descendant_txids(&entry.txid())
                     .unwrap_or_default()
                     .into_iter()
@@ -2715,11 +2710,11 @@ impl NodeService {
 
     fn command_getmempoolentry(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         let txid = parse_hash48(&self.parse_single_string_arg("getmempoolentry", args, "txid")?)?;
-        let entries = self.orchestrator.runtime.node.mempool_entries();
-        let entry = entries
-            .iter()
-            .find(|entry| entry.txid() == txid)
-            .cloned()
+        let entry = self
+            .orchestrator
+            .runtime
+            .node
+            .mempool_entry(&txid)
             .ok_or_else(|| {
                 atho_rpc::error::RpcError::invalid_request("transaction is not in the mempool")
             })?;
@@ -2760,8 +2755,7 @@ impl NodeService {
         }
         let txid = parse_hash48(&args[0])?;
         let verbose = self.parse_optional_bool_arg(args.get(1), false)?;
-        let entries = self.orchestrator.runtime.node.mempool_entries();
-        if !entries.iter().any(|entry| entry.txid() == txid) {
+        if !self.orchestrator.runtime.node.mempool_contains(&txid) {
             return Err(atho_rpc::error::RpcError::invalid_request(
                 "transaction is not in the mempool",
             ));
@@ -2771,14 +2765,10 @@ impl NodeService {
             .runtime
             .node
             .mempool_dependency_txids(&txid)
-            .unwrap_or_default()
-            .into_iter()
-            .map(hex::encode)
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
         Ok(render_mempool_relation_value(
             self.network(),
             &self.orchestrator.runtime.node,
-            &entries,
             &ancestors,
             verbose,
         ))
@@ -2795,8 +2785,7 @@ impl NodeService {
         }
         let txid = parse_hash48(&args[0])?;
         let verbose = self.parse_optional_bool_arg(args.get(1), false)?;
-        let entries = self.orchestrator.runtime.node.mempool_entries();
-        if !entries.iter().any(|entry| entry.txid() == txid) {
+        if !self.orchestrator.runtime.node.mempool_contains(&txid) {
             return Err(atho_rpc::error::RpcError::invalid_request(
                 "transaction is not in the mempool",
             ));
@@ -2806,14 +2795,10 @@ impl NodeService {
             .runtime
             .node
             .mempool_descendant_txids(&txid)
-            .unwrap_or_default()
-            .into_iter()
-            .map(hex::encode)
-            .collect::<Vec<_>>();
+            .unwrap_or_default();
         Ok(render_mempool_relation_value(
             self.network(),
             &self.orchestrator.runtime.node,
-            &entries,
             &descendants,
             verbose,
         ))
@@ -3577,9 +3562,26 @@ fn render_utxo_value(spend_height: u64, entry: &UtxoEntry) -> Value {
     })
 }
 
-fn utxo_set_hash(entries: &[UtxoEntry]) -> [u8; 48] {
+#[derive(Debug, Clone, Copy)]
+struct UtxoSetStats {
+    txouts: usize,
+    bogosize: usize,
+    total_amount_atoms: u64,
+    hash: [u8; 48],
+}
+
+fn utxo_set_stats<'a, I>(entries: I) -> UtxoSetStats
+where
+    I: IntoIterator<Item = &'a UtxoEntry>,
+{
+    let mut txouts = 0usize;
+    let mut bogosize = 0usize;
+    let mut total_amount_atoms = 0u64;
     let mut bytes = Vec::new();
     for entry in entries {
+        txouts = txouts.saturating_add(1);
+        bogosize = bogosize.saturating_add(48usize + 4 + 8 + entry.locking_script.len());
+        total_amount_atoms = total_amount_atoms.saturating_add(entry.value_atoms);
         bytes.extend_from_slice(&entry.txid);
         bytes.extend_from_slice(&entry.output_index.to_le_bytes());
         bytes.extend_from_slice(&entry.value_atoms.to_le_bytes());
@@ -3589,7 +3591,12 @@ fn utxo_set_hash(entries: &[UtxoEntry]) -> [u8; 48] {
         bytes.push(u8::from(entry.is_coinbase));
         bytes.push(entry.network.consensus_id());
     }
-    sha3_384(&bytes)
+    UtxoSetStats {
+        txouts,
+        bogosize,
+        total_amount_atoms,
+        hash: sha3_384(&bytes),
+    }
 }
 
 fn render_mempool_entry_value(
@@ -3628,21 +3635,21 @@ fn mempool_status_label(transaction_count: usize, mempool_vsize_bytes: u64) -> &
 fn render_mempool_relation_value(
     network: Network,
     node: &crate::node::Node,
-    entries: &[MempoolEntry],
-    txids: &[String],
+    txids: &[[u8; 48]],
     verbose: bool,
 ) -> Value {
     if !verbose {
-        return Value::Array(txids.iter().cloned().map(Value::String).collect());
+        return Value::Array(
+            txids
+                .iter()
+                .map(|txid| Value::String(hex::encode(txid)))
+                .collect(),
+        );
     }
-    let index = entries
-        .iter()
-        .map(|entry| (hex::encode(entry.txid()), entry))
-        .collect::<BTreeMap<_, _>>();
     let map = txids
         .iter()
         .filter_map(|txid| {
-            index.get(txid).map(|entry| {
+            node.mempool_entry(txid).map(|entry| {
                 let depends = node
                     .mempool_dependency_txids(&entry.txid())
                     .unwrap_or_default()
@@ -3656,8 +3663,8 @@ fn render_mempool_relation_value(
                     .map(hex::encode)
                     .collect::<Vec<_>>();
                 (
-                    txid.clone(),
-                    render_mempool_entry_value(network, entry, &depends, &descendants),
+                    hex::encode(txid),
+                    render_mempool_entry_value(network, &entry, &depends, &descendants),
                 )
             })
         })
@@ -3997,6 +4004,58 @@ mod tests {
 
         service.refresh_api_views();
         assert_eq!(service.explorer_index().tip_hash(), new_tip);
+        assert_eq!(service.explorer_index_source(), "incremental");
+    }
+
+    #[test]
+    fn explorer_index_incremental_refresh_matches_full_rebuild() {
+        let root = temp_data_dir("explorer-incremental-refresh");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.refresh_api_views();
+        assert!(service.explorer_index_ready());
+        assert_eq!(service.explorer_index_source(), "rebuilt");
+
+        service
+            .orchestrator
+            .runtime
+            .node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine block");
+
+        service.refresh_api_views();
+        assert_eq!(service.explorer_index_source(), "incremental");
+
+        let rebuilt = ExplorerIndex::rebuild(service.node_ref()).expect("rebuild");
+        assert_eq!(service.explorer_index(), &rebuilt);
+    }
+
+    #[test]
+    fn gettxoutsetinfo_matches_listed_utxo_stats() {
+        let root = temp_data_dir("gettxoutsetinfo-stats");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service
+            .orchestrator
+            .runtime
+            .node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine block");
+
+        let listed = service.list_utxos();
+        let stats = utxo_set_stats(listed.iter());
+        let value = service
+            .command_gettxoutsetinfo(&[])
+            .expect("gettxoutsetinfo");
+
+        assert_eq!(value["txouts"], stats.txouts);
+        assert_eq!(value["bogosize"], stats.bogosize);
+        assert_eq!(value["total_amount_atoms"], stats.total_amount_atoms);
+        assert_eq!(value["utxo_set_hash"], hex::encode(stats.hash));
     }
 
     #[test]

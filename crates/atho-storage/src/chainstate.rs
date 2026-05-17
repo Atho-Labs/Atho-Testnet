@@ -368,6 +368,10 @@ impl Chainstate {
         self.utxos.clone()
     }
 
+    pub fn utxo_entries(&self) -> impl Iterator<Item = &UtxoEntry> + '_ {
+        self.utxos.entries()
+    }
+
     pub fn utxo_entry(&self, txid: [u8; 48], output_index: u32) -> Option<UtxoEntry> {
         self.utxos.get(txid, output_index).cloned()
     }

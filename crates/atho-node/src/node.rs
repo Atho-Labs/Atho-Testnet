@@ -88,6 +88,10 @@ impl Node {
         self.chainstate.utxo_snapshot()
     }
 
+    pub fn utxo_entries(&self) -> impl Iterator<Item = &atho_storage::utxo::UtxoEntry> + '_ {
+        self.chainstate.utxo_entries()
+    }
+
     pub fn utxo_count(&self) -> usize {
         self.chainstate.utxo_count()
     }
@@ -406,8 +410,16 @@ impl Node {
         self.mempool.entry(txid)
     }
 
+    pub fn mempool_entry_ref(&self, txid: &[u8; 48]) -> Option<&MempoolEntry> {
+        self.mempool.entry_ref(txid)
+    }
+
     pub fn mempool_entries(&self) -> Vec<MempoolEntry> {
         self.mempool.entries()
+    }
+
+    pub fn mempool_entries_iter(&self) -> impl Iterator<Item = &MempoolEntry> + '_ {
+        self.mempool.entries_iter()
     }
 
     pub fn mempool_dependency_txids(&self, txid: &[u8; 48]) -> Option<Vec<[u8; 48]>> {
@@ -424,6 +436,14 @@ impl Node {
 
     pub fn mempool_txids(&self) -> Vec<[u8; 48]> {
         self.mempool.txids()
+    }
+
+    pub fn mempool_total_raw_bytes(&self) -> usize {
+        self.mempool.total_raw_bytes()
+    }
+
+    pub fn mempool_total_vbytes(&self) -> usize {
+        self.mempool.total_vbytes()
     }
 
     #[doc(hidden)]

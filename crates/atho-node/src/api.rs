@@ -783,7 +783,10 @@ fn mempool_value(
 ) -> Result<Value, ApiError> {
     let limit = parse_limit(query, 25, 100)?;
     let offset = parse_offset(query)?;
-    let mut entries = service.node_ref().mempool_entries();
+    let mut entries = service
+        .node_ref()
+        .mempool_entries_iter()
+        .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
         right
             .received_at_unix()
@@ -858,15 +861,10 @@ fn mempool_tx_value(
     txid_hex: &str,
 ) -> Result<Value, ApiError> {
     let txid = parse_hash48_value(txid_hex)?;
-    let entries = service.node_ref().mempool_entries();
-    let entry = entries
-        .iter()
-        .find(|entry| entry.txid() == txid)
-        .cloned()
-        .ok_or(ApiError {
-            status: 404,
-            code: "not_found",
-        })?;
+    let entry = service.node_ref().mempool_entry(&txid).ok_or(ApiError {
+        status: 404,
+        code: "not_found",
+    })?;
     let depends = service
         .node_ref()
         .mempool_dependency_txids(&txid)
@@ -902,8 +900,7 @@ fn mempool_tx_value(
 fn fees_value(service: &NodeService, network: Network) -> Result<Value, ApiError> {
     let mut feerates = service
         .node_ref()
-        .mempool_entries()
-        .into_iter()
+        .mempool_entries_iter()
         .map(|entry| entry.feerate_atoms_per_vbyte())
         .collect::<Vec<_>>();
     feerates.sort_unstable();
