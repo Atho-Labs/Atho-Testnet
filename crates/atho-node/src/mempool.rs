@@ -516,12 +516,23 @@ impl MempoolLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atho_core::address::public_key_digest;
     use atho_core::consensus::rules::TRANSACTION_VERSION_V2_PLACEHOLDER;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::solve_transaction_pow;
     use atho_core::constants::DUST_RELAY_VALUE_ATOMS;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign};
+
+    fn test_lock(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
+    }
+
+    fn alternate_lock(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-mempool-output").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
+    }
 
     fn witness_bytes_for_tx(network: Network, tx: &Transaction) -> Vec<u8> {
         let keypair = generate_from_seed(b"atho-mempool-test").expect("falcon keypair");
@@ -583,16 +594,17 @@ mod tests {
     #[test]
     fn mempool_admits_valid_transactions() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [2; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Mainnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -607,7 +619,12 @@ mod tests {
         };
 
         let txid = mempool
-            .admit(MempoolEntry::new(tx, 500), Network::Mainnet, 0, |_, _| None)
+            .admit(
+                MempoolEntry::new(tx, 10_000),
+                Network::Mainnet,
+                0,
+                |_, _| None,
+            )
             .expect_err("missing utxo should fail");
 
         assert_eq!(txid, ValidationError::MissingUtxo);
@@ -616,16 +633,17 @@ mod tests {
     #[test]
     fn mempool_rejects_conflicts() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [2; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Mainnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -654,16 +672,17 @@ mod tests {
             max_transactions: 1,
             max_vbytes: usize::MAX,
         });
+        let spend_lock = test_lock(Network::Mainnet);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [2; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Mainnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -739,16 +758,17 @@ mod tests {
     #[test]
     fn mempool_rejects_sub_dust_outputs() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Regnet);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [6; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Regnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -775,16 +795,17 @@ mod tests {
     #[test]
     fn mining_view_skips_unchecked_dust_entries() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Regnet);
         let tx = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [16; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Regnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -811,16 +832,18 @@ mod tests {
     #[test]
     fn valid_transactions_are_sorted_by_feerate() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
+        let output_lock = alternate_lock(Network::Mainnet);
         let low = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [4; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock.clone(),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_500,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock.clone(),
             }],
             lock_time: 0,
             witness: vec![],
@@ -838,11 +861,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [5; 48],
                 output_index: 0,
-                unlocking_script: vec![3; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock.clone(),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![4; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock.clone(),
             }],
             lock_time: 0,
             witness: vec![],
@@ -871,7 +894,7 @@ mod tests {
                 [4; 48],
                 0,
                 10_000,
-                vec![1],
+                spend_lock.clone(),
                 0,
                 false,
             ),
@@ -883,7 +906,7 @@ mod tests {
                 [5; 48],
                 0,
                 10_000,
-                vec![3],
+                spend_lock.clone(),
                 0,
                 false,
             ),
@@ -903,16 +926,17 @@ mod tests {
     #[test]
     fn mempool_rejects_future_transaction_version_before_activation() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
         let tx = Transaction {
             version: TRANSACTION_VERSION_V2_PLACEHOLDER,
             inputs: vec![TxInput {
                 previous_txid: [7; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_500,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Mainnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -939,16 +963,18 @@ mod tests {
     #[test]
     fn mining_view_skips_invalid_entries_instead_of_failing_whole_selection() {
         let mut mempool = Mempool::new();
+        let spend_lock = test_lock(Network::Mainnet);
+        let output_lock = alternate_lock(Network::Mainnet);
         let valid = Transaction {
             version: 1,
             inputs: vec![TxInput {
                 previous_txid: [11; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock.clone(),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock.clone(),
             }],
             lock_time: 0,
             witness: vec![],
@@ -966,11 +992,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [12; 48],
                 output_index: 0,
-                unlocking_script: vec![3; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock.clone(),
             }],
             outputs: vec![TxOutput {
                 value_atoms: 7_000,
-                locking_script: vec![4; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock,
             }],
             lock_time: 0,
             witness: vec![],
@@ -998,7 +1024,7 @@ mod tests {
                 [11; 48],
                 0,
                 10_000,
-                vec![1],
+                spend_lock,
                 0,
                 false,
             ),

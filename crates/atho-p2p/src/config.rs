@@ -319,7 +319,13 @@ mod tests {
 
     #[test]
     fn dns_seed_targets_use_network_default_ports() {
-        assert!(dns_seed_targets(Network::Mainnet).is_empty());
+        assert_eq!(
+            dns_seed_targets(Network::Mainnet),
+            vec![
+                String::from("mainnet-node1.atho.io:56000"),
+                String::from("mainnet-node2.atho.io:56000"),
+            ]
+        );
         assert_eq!(
             dns_seed_targets(Network::Testnet),
             vec![

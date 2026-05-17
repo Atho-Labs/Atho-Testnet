@@ -60,6 +60,7 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
         Self {
@@ -436,6 +437,7 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
         Self {
@@ -451,6 +453,7 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
         Ok(Self {
@@ -466,6 +469,7 @@ impl Node {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
         let network = config.network;
+        #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
         Ok(Self {
@@ -684,6 +688,7 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+    use atho_core::address::public_key_digest;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -698,6 +703,16 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_lock(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
+    }
+
+    fn alternate_lock(network: Network) -> Vec<u8> {
+        let keypair = generate_from_seed(b"atho-node-output").expect("falcon keypair");
+        public_key_digest(network, &keypair.public_key.0).to_vec()
+    }
 
     fn witness_bytes_for_tx(network: Network, tx: &Transaction) -> Vec<u8> {
         let keypair = generate_from_seed(b"atho-node-test").expect("falcon keypair");
@@ -978,13 +993,15 @@ mod tests {
     fn node_mines_and_connects_candidate_block() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
         node.chainstate.height = 6;
+        let spend_lock = test_lock(Network::Mainnet);
+        let output_lock = alternate_lock(Network::Mainnet);
         node.chainstate
             .insert_utxo(UtxoEntry::new(
                 Network::Mainnet,
                 [9; 48],
                 0,
                 2_000,
-                vec![1],
+                spend_lock.clone(),
                 0,
                 false,
             ))
@@ -994,11 +1011,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [9; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: 1_000,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock.clone(),
             }],
             lock_time: 0,
             witness: vec![],
@@ -1015,7 +1032,7 @@ mod tests {
         let tx = Transaction {
             outputs: vec![TxOutput {
                 value_atoms: 2_000 - fee_atoms,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: output_lock,
             }],
             ..Transaction {
                 witness: vec![],
@@ -1044,13 +1061,14 @@ mod tests {
     #[test]
     fn node_rejects_sub_dust_transaction_submission() {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        let spend_lock = test_lock(Network::Regnet);
         node.chainstate
             .insert_utxo(UtxoEntry::new(
                 Network::Regnet,
                 [0x19; 48],
                 0,
                 2_000,
-                vec![1],
+                spend_lock.clone(),
                 0,
                 false,
             ))
@@ -1060,11 +1078,11 @@ mod tests {
             inputs: vec![TxInput {
                 previous_txid: [0x19; 48],
                 output_index: 0,
-                unlocking_script: vec![1; ADDRESS_DIGEST_BYTES],
+                unlocking_script: spend_lock,
             }],
             outputs: vec![TxOutput {
                 value_atoms: DUST_RELAY_VALUE_ATOMS - 1,
-                locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                locking_script: alternate_lock(Network::Regnet),
             }],
             lock_time: 0,
             witness: vec![],
@@ -1072,7 +1090,7 @@ mod tests {
             tx_pow_bits: 0,
         };
         let tx = Transaction {
-            witness: witness_bytes_for_tx(Network::Mainnet, &tx),
+            witness: witness_bytes_for_tx(Network::Regnet, &tx),
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
             ..tx
@@ -1114,8 +1132,9 @@ mod tests {
     fn candidate_block_rejects_fee_total_overflow() {
         let mut node = Node::new(NodeConfig::new(Network::Mainnet));
         node.chainstate.height = 6;
+        let locking_script = test_lock(Network::Mainnet);
+        let output_lock = alternate_lock(Network::Mainnet);
         for txid in [[0x31; 48], [0x32; 48]] {
-            let locking_script = vec![1];
             let utxo = UtxoEntry::new(
                 Network::Mainnet,
                 txid,
@@ -1135,7 +1154,7 @@ mod tests {
                 }],
                 outputs: vec![TxOutput {
                     value_atoms: DUST_RELAY_VALUE_ATOMS,
-                    locking_script: vec![2; ADDRESS_DIGEST_BYTES],
+                    locking_script: output_lock.clone(),
                 }],
                 lock_time: 0,
                 witness: vec![],

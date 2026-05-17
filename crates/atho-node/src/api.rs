@@ -1739,7 +1739,9 @@ fn paginate<T>(items: &[T], limit: usize, offset: usize) -> &[T] {
 mod tests {
     use super::*;
     use crate::config::NodeConfig;
-    use crate::dev::{seed_utxo, signed_spend_transaction};
+    use crate::dev::{
+        seed_utxo, signed_spend_transaction, signed_spend_transaction_with_signer_seed,
+    };
     use crate::mempool::MempoolEntry;
     use crate::miner::Miner;
     use crate::node::Node;
@@ -2055,18 +2057,23 @@ mod tests {
             )
             .expect("signed first spend");
             let tx1id = tx1.txid();
-            let tx1_fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx1);
             let tx1_output_value = tx1.outputs[0].value_atoms;
+            let tx1_fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx1);
             node.admit_transaction(MempoolEntry::new(tx1, tx1_fee_atoms))
                 .expect("admit first tx");
             node.mine_and_connect_candidate_block(&miner)
                 .expect("mine first block");
+            for _ in 0..5 {
+                node.mine_and_connect_candidate_block(&miner)
+                    .expect("mine confirmation block");
+            }
 
-            let tx2 = signed_spend_transaction(
+            let tx2 = signed_spend_transaction_with_signer_seed(
                 Network::Testnet,
                 tx1id,
                 tx1_output_value,
                 seed_script.clone(),
+                seed_txid,
             )
             .expect("signed second spend");
             let fee_atoms = minimum_required_fee_atoms(Network::Testnet, &tx2);

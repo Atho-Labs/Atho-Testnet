@@ -396,7 +396,23 @@ pub(crate) fn signed_spend_transaction(
     seed_value: u64,
     seed_script: Vec<u8>,
 ) -> std::io::Result<Transaction> {
-    let keypair = signing_keypair(network, seed_txid)?;
+    signed_spend_transaction_with_signer_seed(
+        network,
+        seed_txid,
+        seed_value,
+        seed_script,
+        seed_txid,
+    )
+}
+
+pub(crate) fn signed_spend_transaction_with_signer_seed(
+    network: Network,
+    seed_txid: [u8; 48],
+    seed_value: u64,
+    seed_script: Vec<u8>,
+    signer_seed_txid: [u8; 48],
+) -> std::io::Result<Transaction> {
+    let keypair = signing_keypair(network, signer_seed_txid)?;
     let mut output_atoms = seed_value.saturating_sub(1);
     let mut last_fee = 0u64;
     for _ in 0..4 {
@@ -478,10 +494,10 @@ fn signing_keypair(network: Network, seed_txid: [u8; 48]) -> std::io::Result<Fal
 
 pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, Vec<u8>) {
     let (txid, value_atoms) = match network {
-        Network::Mainnet => ([0x11; 48], 2_000),
-        Network::Testnet => ([0x22; 48], 1_500),
-        Network::Regnet => ([0x33; 48], 2_000),
-        Network::Prunetest => ([0x44; 48], 2_000),
+        Network::Mainnet => ([0x11; 48], 25_000),
+        Network::Testnet => ([0x22; 48], 25_000),
+        Network::Regnet => ([0x33; 48], 25_000),
+        Network::Prunetest => ([0x44; 48], 25_000),
     };
     let locking_script = locking_script_for_seed(network, txid);
     (txid, value_atoms, locking_script)

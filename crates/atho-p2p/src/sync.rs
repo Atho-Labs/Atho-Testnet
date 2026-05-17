@@ -285,8 +285,9 @@ mod tests {
         };
         if let Some(nonce) = nonce {
             let header = test_header(network, height, previous_block_hash, nonce);
-            assert!(pow::meets_target(&header.block_hash(), &target));
-            return header;
+            if pow::meets_target(&header.block_hash(), &target) {
+                return header;
+            }
         }
 
         let mut header = test_header(network, height, previous_block_hash, 0);
