@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Desktop GUI launcher for the Atho wallet and optional local node.
+
 use std::path::Path;
 
 use atho_core::network::Network;
 
+/// Parsed CLI options for the desktop launcher.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct QtCli {
     network: Option<Network>,
@@ -17,6 +20,7 @@ struct QtCli {
 }
 
 impl QtCli {
+    /// Applies CLI overrides into the environment before app startup.
     fn apply_env(&self) {
         if let Some(data_dir) = &self.data_dir {
             std::env::set_var(atho_storage::path::ATHO_DATA_DIR_ENV, data_dir);
@@ -30,6 +34,7 @@ impl QtCli {
     }
 }
 
+/// Rendering backend preference for the desktop window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RendererChoice {
     Glow,
@@ -55,6 +60,7 @@ impl From<RendererChoice> for eframe::Renderer {
     }
 }
 
+/// Entrypoint for the desktop application.
 fn main() {
     let _ = atho_node::dev::append_log("atho-qt", "starting atho-qt");
     if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
@@ -117,6 +123,7 @@ fn main() {
     let _ = atho_node::dev::append_log("atho-qt", "stopped atho-qt");
 }
 
+/// Returns whether the GUI should auto-launch a managed local node.
 fn should_auto_launch_local_node(cli: &QtCli) -> bool {
     if cli.local_node || cli.rpc_address.is_some() {
         return false;

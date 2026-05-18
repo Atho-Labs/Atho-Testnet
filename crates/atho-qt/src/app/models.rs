@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! View-model types and small UI enums shared across the desktop client.
+
 use super::{default_wallet_name, default_wallet_path, suggested_wallet_path};
 use atho_core::network::Network;
 use atho_node::config::NodeConfig;
@@ -12,6 +14,7 @@ use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
+/// Primary navigation tabs in the main application shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NavTab {
     Overview,
@@ -22,6 +25,7 @@ pub(crate) enum NavTab {
     Settings,
 }
 
+/// Sub-tabs within the receive page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceivePageTab {
     RequestPayment,
@@ -29,6 +33,7 @@ pub(crate) enum ReceivePageTab {
 }
 
 impl ReceivePageTab {
+    /// Returns the button label used for the sub-tab.
     pub(crate) fn label(self) -> &'static str {
         match self {
             ReceivePageTab::RequestPayment => "Request payment",
@@ -37,6 +42,7 @@ impl ReceivePageTab {
     }
 }
 
+/// Filters for the receive-address pool table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddressPoolFilter {
     Unused,
@@ -45,6 +51,7 @@ pub(crate) enum AddressPoolFilter {
 }
 
 impl AddressPoolFilter {
+    /// Returns the UI label for the filter option.
     pub(crate) fn label(self) -> &'static str {
         match self {
             AddressPoolFilter::Unused => "Unused",
@@ -53,6 +60,7 @@ impl AddressPoolFilter {
         }
     }
 
+    /// Returns whether the filter should include an address with the given usage flag.
     pub(crate) fn matches(self, used: bool) -> bool {
         match self {
             AddressPoolFilter::Unused => !used,
@@ -61,6 +69,7 @@ impl AddressPoolFilter {
         }
     }
 
+    /// Returns every selectable address-pool filter.
     pub(crate) fn variants() -> [AddressPoolFilter; 3] {
         [
             AddressPoolFilter::Unused,
@@ -71,6 +80,7 @@ impl AddressPoolFilter {
 }
 
 impl NavTab {
+    /// Returns the tabs shown in the primary toolbar.
     pub(crate) fn toolbar_tabs() -> [NavTab; 4] {
         [
             NavTab::Overview,
@@ -80,6 +90,7 @@ impl NavTab {
         ]
     }
 
+    /// Returns the visible tab label.
     pub(crate) fn label(self) -> &'static str {
         match self {
             NavTab::Overview => "Overview",
@@ -92,6 +103,7 @@ impl NavTab {
     }
 }
 
+/// Output formatting modes for the embedded debug console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DebugConsoleOutputMode {
     Pretty,
@@ -100,6 +112,7 @@ pub(crate) enum DebugConsoleOutputMode {
 }
 
 impl DebugConsoleOutputMode {
+    /// Returns the short label used in the console UI.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Pretty => "Pretty",
@@ -109,6 +122,7 @@ impl DebugConsoleOutputMode {
     }
 }
 
+/// Tabs within the separate node/debug window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DebugWindowTab {
     Information,

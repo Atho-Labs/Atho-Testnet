@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Wallet summary page showing balances, sync hints, and recent activity.
+
 use crate::app::amounts::DisplayUnit;
 use crate::app::{widgets, DesktopApp};
 use crate::resources;
 use eframe::egui;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Renders the overview page for the active wallet.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let summary = app.wallet_balance_summary().clone();
     let rows = app.wallet_activity_rows().to_vec();

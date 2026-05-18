@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Amount-formatting and input-unit helpers for the desktop client.
+
 use atho_core::constants::ATOMS_PER_ATHO;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +10,7 @@ pub(crate) const ATOMS_PER_MILLIATHO: u64 = 1_000_000_000;
 pub(crate) const ATOMS_PER_MICROATHO: u64 = 1_000_000;
 pub(crate) const ATOMS_PER_NANOATHO: u64 = 1_000;
 
+/// Display unit preferences used when showing balances and history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum DisplayUnit {
     #[default]
@@ -20,6 +23,7 @@ pub(crate) enum DisplayUnit {
 }
 
 impl DisplayUnit {
+    /// Returns the short label shown in combo boxes and value rows.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
@@ -31,6 +35,7 @@ impl DisplayUnit {
         }
     }
 
+    /// Returns the full set of supported display units.
     pub(crate) fn variants() -> [DisplayUnit; 6] {
         [
             Self::Auto,
@@ -42,6 +47,7 @@ impl DisplayUnit {
         ]
     }
 
+    /// Chooses a human-friendly unit when the preference is `Auto`.
     pub(crate) fn effective_for_amount(self, amount_atoms: u64) -> DisplayUnit {
         match self {
             Self::Auto => {
@@ -62,6 +68,7 @@ impl DisplayUnit {
     }
 }
 
+/// Input unit preferences used when parsing typed send amounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum InputUnit {
     #[default]
@@ -73,6 +80,7 @@ pub(crate) enum InputUnit {
 }
 
 impl InputUnit {
+    /// Returns the short label shown beside input widgets.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Atho => "ATHO",
@@ -83,6 +91,7 @@ impl InputUnit {
         }
     }
 
+    /// Returns the full set of supported amount-entry units.
     pub(crate) fn variants() -> [InputUnit; 5] {
         [
             Self::Atho,
@@ -93,6 +102,7 @@ impl InputUnit {
         ]
     }
 
+    /// Returns the atoms-per-unit factor used for parsing.
     pub(crate) fn factor(self) -> u64 {
         match self {
             Self::Atho => ATOMS_PER_ATHO,
@@ -103,6 +113,7 @@ impl InputUnit {
         }
     }
 
+    /// Returns the maximum decimal precision allowed for this unit.
     pub(crate) fn max_decimals(self) -> usize {
         match self {
             Self::Atho => 12,
@@ -114,6 +125,7 @@ impl InputUnit {
     }
 }
 
+/// Persisted client-side display preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) struct ClientDisplayPreferences {
     pub(crate) display_unit: DisplayUnit,

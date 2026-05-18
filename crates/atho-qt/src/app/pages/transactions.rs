@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Transaction history page with filters for wallet activity.
+
 use crate::app::{widgets, DesktopApp, WalletActivityKind, WalletActivityRow};
 use eframe::egui;
 
 const DATE_FILTERS: &[&str] = &["All", "Confirmed"];
 const TYPE_FILTERS: &[&str] = &["All", "Mined", "Received", "Sent"];
 
+/// Renders the wallet transaction history page.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(480.0);
@@ -99,6 +102,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Applies the current filter/search state to wallet activity rows.
 fn filtered_rows(app: &DesktopApp) -> Vec<WalletActivityRow> {
     let search = app.transaction_search.trim().to_ascii_lowercase();
     let min_amount = app.transaction_min_amount.trim().parse::<u64>().ok();

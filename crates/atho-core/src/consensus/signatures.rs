@@ -1,20 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Canonical signature-domain labels and prehash builders.
+//!
+//! Keeping these rules frozen in one place prevents drift between wallet
+//! signing code, block assembly, and future protocol upgrades.
+
 use crate::block::Block;
 use crate::crypto::hash::sha3_384;
 use crate::genesis::genesis_hash;
 use crate::network::Network;
 use crate::transaction::Transaction;
 
+/// Version tag for Atho's signature-domain prehash rules.
 pub const ATHO_SIGNATURE_RULES_VERSION: u32 = 1;
 
+/// Domain separator for transaction signatures.
 pub const ATHO_TX_SIGN_V1: &str = "ATHO_TX_SIGN_V1";
+/// Reserved domain separator for future block-signature use.
 pub const ATHO_BLOCK_SIG_V1: &str = "ATHO_BLOCK_SIG_V1";
+/// Domain separator for local wallet-only signatures.
 pub const ATHO_WALLET_LOCAL_SIG_V1: &str = "ATHO_WALLET_LOCAL_SIG_V1";
+/// Domain separator for package or bundle signing.
 pub const ATHO_PACKAGE_SIG_V1: &str = "ATHO_PACKAGE_SIG_V1";
+/// Domain separator for development-only test signatures.
 pub const ATHO_TEST_DEV_SIG_V1: &str = "ATHO_TEST_DEV_SIG_V1";
 
+/// Enumerates the supported signature domains Atho recognizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AthoSignatureDomain {
     Transaction,
@@ -25,6 +37,7 @@ pub enum AthoSignatureDomain {
 }
 
 impl AthoSignatureDomain {
+    /// Returns the stable domain-separator label for this signature kind.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Transaction => ATHO_TX_SIGN_V1,

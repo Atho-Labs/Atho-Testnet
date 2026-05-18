@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Canonical Atho error descriptors and conversion helpers.
+//!
+//! This crate gives the rest of the workspace one place to describe user-facing
+//! and operator-facing failures with stable codes and structured metadata.
+
 mod registry;
 
 use serde::{Deserialize, Serialize};
@@ -47,15 +52,18 @@ pub use registry::{
     WALLET_UNSUPPORTED_VERSION,
 };
 
+/// Stable registry-backed Atho error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AthoErrorCode(&'static str);
 
 impl AthoErrorCode {
+    /// Creates a new static error code wrapper.
     pub const fn new(value: &'static str) -> Self {
         Self(value)
     }
 
+    /// Returns the raw string form used in logs and APIs.
     pub const fn as_str(self) -> &'static str {
         self.0
     }
@@ -67,6 +75,7 @@ impl fmt::Display for AthoErrorCode {
     }
 }
 
+/// High-level bucket used to group related errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AthoErrorCategory {
@@ -92,6 +101,7 @@ pub enum AthoErrorCategory {
 }
 
 impl AthoErrorCategory {
+    /// Returns the short category token embedded in Atho error codes.
     pub const fn short_code(self) -> &'static str {
         match self {
             Self::Config => "CFG",
@@ -117,6 +127,7 @@ impl AthoErrorCategory {
     }
 }
 
+/// Severity level attached to a registry descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AthoSeverity {
@@ -128,6 +139,7 @@ pub enum AthoSeverity {
 }
 
 impl AthoSeverity {
+    /// Returns the lowercase string form used in logs and JSON payloads.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
@@ -145,37 +157,58 @@ impl fmt::Display for AthoSeverity {
     }
 }
 
+/// Immutable metadata entry for a single canonical Atho error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AthoErrorDescriptor {
+    /// Stable registry code such as `ATHO-TX-001`.
     pub code: AthoErrorCode,
+    /// Broad area of the system the error belongs to.
     pub category: AthoErrorCategory,
+    /// Relative urgency of the failure.
     pub severity: AthoSeverity,
+    /// Short title suitable for logs or UI headings.
     pub title: &'static str,
+    /// Human-readable explanation of what went wrong.
     pub explanation: &'static str,
+    /// Typical root cause to help operators triage the issue.
     pub common_cause: &'static str,
+    /// Recommended next step for a user or operator.
     pub suggested_fix: &'static str,
+    /// Whether the descriptor is suitable to show directly to end users.
     pub user_facing: bool,
+    /// Whether the failure can indicate a consensus-invalid state transition.
     pub consensus_critical: bool,
 }
 
+/// Sanitized runtime details attached to a concrete error instance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AthoErrorContext {
+    /// Logical module reporting the failure.
     pub source_module: &'static str,
+    /// Optional subject such as a txid, path, or peer label.
     pub subject: Option<String>,
+    /// Optional network context for multi-network tools.
     pub network: Option<String>,
+    /// Optional chain height related to the failure.
     pub height: Option<u64>,
+    /// Safe diagnostic details that may be shown in logs or UI.
     pub safe_details: Option<String>,
 }
 
+/// Structured runtime error instance paired with a registry descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AthoError {
     descriptor: &'static AthoErrorDescriptor,
+    /// User-focused summary message for the specific occurrence.
     pub message: String,
+    /// Optional lower-level details intended for logs and diagnostics.
     pub technical: Option<String>,
+    /// Sanitized context fields attached to this error instance.
     pub context: AthoErrorContext,
 }
 
 impl AthoError {
+    /// Creates a new runtime error from a descriptor and source module.
     pub fn new(
         descriptor: &'static AthoErrorDescriptor,
         source_module: &'static str,
@@ -192,51 +225,62 @@ impl AthoError {
         }
     }
 
+    /// Attaches implementation-specific diagnostics that should stay out of UX copy.
     pub fn with_technical(mut self, technical: impl Into<String>) -> Self {
         self.technical = Some(technical.into());
         self
     }
 
+    /// Attaches extra safe details suitable for logs and UI surfaces.
     pub fn with_safe_details(mut self, details: impl Into<String>) -> Self {
         self.context.safe_details = Some(details.into());
         self
     }
 
+    /// Attaches the primary subject of the failure, such as a txid or file path.
     pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
         self.context.subject = Some(subject.into());
         self
     }
 
+    /// Attaches network context for multi-network callers.
     pub fn with_network(mut self, network: impl Into<String>) -> Self {
         self.context.network = Some(network.into());
         self
     }
 
+    /// Attaches a relevant chain height to the error.
     pub fn with_height(mut self, height: u64) -> Self {
         self.context.height = Some(height);
         self
     }
 
+    /// Returns the static descriptor describing this error family.
     pub fn descriptor(&self) -> &'static AthoErrorDescriptor {
         self.descriptor
     }
 
+    /// Returns the stable Atho error code.
     pub fn code(&self) -> AthoErrorCode {
         self.descriptor.code
     }
 
+    /// Returns the short descriptor title.
     pub fn title(&self) -> &'static str {
         self.descriptor.title
     }
 
+    /// Returns the descriptor severity.
     pub fn severity(&self) -> AthoSeverity {
         self.descriptor.severity
     }
 
+    /// Returns the module that reported the error.
     pub fn source_module(&self) -> &'static str {
         self.context.source_module
     }
 
+    /// Formats the error as a structured one-line log entry.
     pub fn log_line(&self) -> String {
         let mut line = format!(
             "[{}] [{}] [{}] {}",
@@ -274,22 +318,29 @@ impl fmt::Display for AthoError {
     }
 }
 
+/// Trait for typed errors that can map themselves into the Atho registry model.
 pub trait AthoErrorMeta: fmt::Display {
+    /// Returns the canonical descriptor for the error variant.
     fn descriptor(&self) -> &'static AthoErrorDescriptor;
+    /// Returns the logical module originating this error.
     fn source_module(&self) -> &'static str;
 
+    /// Returns a user-oriented message for the specific error instance.
     fn user_message(&self) -> String {
         self.descriptor().explanation.to_string()
     }
 
+    /// Returns technical diagnostics appropriate for logs.
     fn technical_details(&self) -> Option<String> {
         Some(self.to_string())
     }
 
+    /// Returns additional sanitized details suitable for user-visible surfaces.
     fn safe_details(&self) -> Option<String> {
         None
     }
 
+    /// Converts the typed error into the shared runtime error shape.
     fn to_atho_error(&self) -> AthoError {
         let mut error =
             AthoError::new(self.descriptor(), self.source_module(), self.user_message());

@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Welcome dialog shown before a wallet has been loaded.
+
 use crate::app::{widgets, DesktopApp, ImportWalletForm, LaunchPage};
 use crate::resources;
 use eframe::egui;
 
+/// Renders the welcome screen that funnels users into create/import flows.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::dialog_frame().show(ui, |ui| {
         ui.set_width(600.0);

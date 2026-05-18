@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Command-line mining client for requesting work from a running Atho node.
+
 use atho_core::network::Network;
 use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
 use atho_rpc::request::RpcRequest;
@@ -10,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Parsed mining CLI options.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MinerCli {
     network: Option<Network>,
@@ -23,6 +26,7 @@ struct MinerCli {
 }
 
 impl MinerCli {
+    /// Applies CLI overrides into the process environment before connecting.
     fn apply_env(&self) {
         if let Some(network) = self.network {
             std::env::set_var("ATHO_NETWORK", network.cli_arg());
@@ -36,6 +40,7 @@ impl MinerCli {
     }
 }
 
+/// Entrypoint for `atho-mine`.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -43,6 +48,7 @@ fn main() {
     }
 }
 
+/// Connects to the target node, configures the backend, and mines one or more rounds.
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -127,6 +133,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Requests a template, mines it locally, and submits the solved block.
 fn mine_once(
     client: &RpcClient,
     controller: &MiningController,
@@ -200,6 +207,7 @@ fn mine_once(
     Ok(())
 }
 
+/// Prints human-readable GPU probe details for the selected backend.
 fn print_gpu_probe(info: &MiningAcceleratorInfo) {
     println!("gpu_backend={}", info.backend);
     println!("gpu_usable={}", info.usable);
@@ -244,6 +252,7 @@ fn print_gpu_probe(info: &MiningAcceleratorInfo) {
     }
 }
 
+/// Parses CLI flags into a miner configuration.
 fn parse_cli(args: &[String]) -> Result<MinerCli, String> {
     let mut cli = MinerCli::default();
     let mut i = 0usize;
@@ -346,6 +355,7 @@ fn default_network() -> Network {
         .unwrap_or_else(Network::operator_default)
 }
 
+/// Prints command-line usage for `atho-mine`.
 fn print_usage() {
     eprintln!("usage:");
     eprintln!(

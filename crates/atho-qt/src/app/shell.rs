@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Desktop shell layout and high-level chrome for the Qt/egui client.
+
 use super::{
     pages, widgets, CreateWalletForm, DebugWindowTab, DesktopApp, ImportWalletForm, LaunchPage,
     NavTab,
@@ -8,6 +10,7 @@ use super::{
 use crate::resources;
 use eframe::egui;
 
+/// Renders the main application shell once a wallet is loaded.
 pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
     render_menu_bar(app, ctx);
     render_toolbar(app, ctx);
@@ -28,6 +31,7 @@ pub(crate) fn render_main_shell(app: &mut DesktopApp, ctx: &egui::Context) {
         });
 }
 
+/// Renders the top menu bar that exposes wallet, settings, and window actions.
 fn render_menu_bar(app: &mut DesktopApp, ctx: &egui::Context) {
     egui::TopBottomPanel::top("menu_bar")
         .exact_height(24.0)

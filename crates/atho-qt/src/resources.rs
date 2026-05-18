@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Shared image and icon helpers for the desktop client.
+
 use eframe::egui::{self, IconData, Image};
 
+/// Builds a fixed-size icon image from an embedded asset.
 fn sized_icon(source: egui::ImageSource<'static>, size: f32) -> Image<'static> {
     Image::new(source).fit_to_exact_size(egui::vec2(size, size))
 }
 
+/// Builds a fixed-size icon image with a UI tint applied.
 fn sized_tinted_icon(
     source: egui::ImageSource<'static>,
     size: f32,
@@ -17,15 +21,18 @@ fn sized_tinted_icon(
         .tint(tint)
 }
 
+/// Builds a fixed-size logo image while preserving the requested footprint.
 fn sized_logo(source: egui::ImageSource<'static>, width: f32, height: f32) -> Image<'static> {
     Image::new(source).fit_to_exact_size(egui::vec2(width, height))
 }
 
+/// Returns the operating-system window icon for the Atho desktop client.
 pub fn app_icon() -> IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/branding/atho-icon.png"))
         .expect("atho-icon.png must be a valid application icon")
 }
 
+/// Returns the square brand badge used in small UI surfaces.
 pub fn logo_badge(size: f32) -> Image<'static> {
     sized_icon(
         egui::include_image!("../assets/branding/atho-icon.png"),
@@ -33,6 +40,7 @@ pub fn logo_badge(size: f32) -> Image<'static> {
     )
 }
 
+/// Returns the vertical logo mark used on splash and welcome surfaces.
 pub fn logo_mark(width: f32) -> Image<'static> {
     sized_logo(
         egui::include_image!("../assets/branding/atho-mark.png"),

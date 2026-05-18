@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Command-line RPC client for talking to a running Atho node.
+
 use atho_core::network::Network;
 use atho_rpc::command::{help_payload, parse_command_line};
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
 
+/// Output rendering modes for command responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Json,
@@ -25,6 +28,7 @@ impl OutputFormat {
     }
 }
 
+/// Parsed CLI settings for one `atho-cli` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliConfig {
     network: Network,
@@ -50,6 +54,7 @@ impl Default for CliConfig {
     }
 }
 
+/// Entrypoint that converts process failures into a one-line stderr message.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -57,6 +62,7 @@ fn main() {
     }
 }
 
+/// Parses arguments, executes the requested RPC command, and prints the result.
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = parse_cli(&args)?;
@@ -118,6 +124,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Parses raw CLI arguments into a typed configuration.
 fn parse_cli(args: &[String]) -> Result<CliConfig, String> {
     let mut config = CliConfig::default();
     let mut index = 0usize;
@@ -196,6 +203,7 @@ fn parse_cli(args: &[String]) -> Result<CliConfig, String> {
     Ok(config)
 }
 
+/// Normalizes a user-supplied RPC endpoint into a socket-address string.
 fn normalize_rpc_address(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     let trimmed = trimmed
@@ -208,6 +216,7 @@ fn normalize_rpc_address(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Renders a JSON value according to the requested output format.
 fn print_value(value: &serde_json::Value, format: OutputFormat) {
     match format {
         OutputFormat::Json => println!("{value}"),
@@ -230,6 +239,7 @@ fn print_value(value: &serde_json::Value, format: OutputFormat) {
     }
 }
 
+/// Converts a JSON value into a compact table cell when possible.
 fn format_table_value(value: &serde_json::Value) -> Option<String> {
     let rows = value.as_array()?;
     if rows.is_empty() {
@@ -285,6 +295,7 @@ fn format_table_value(value: &serde_json::Value) -> Option<String> {
     Some(output)
 }
 
+/// Renders a padded table row using precomputed column widths.
 fn render_table_row(row: &[String], widths: &[usize]) -> String {
     row.iter()
         .zip(widths.iter())
@@ -293,6 +304,7 @@ fn render_table_row(row: &[String], widths: &[usize]) -> String {
         .join(" | ")
 }
 
+/// Renders the ASCII separator line for a table.
 fn render_table_separator(widths: &[usize]) -> String {
     widths
         .iter()
@@ -301,6 +313,7 @@ fn render_table_separator(widths: &[usize]) -> String {
         .join("-+-")
 }
 
+/// Converts nested JSON into a compact single-cell string.
 fn render_table_cell(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::from("-"),
@@ -311,6 +324,7 @@ fn render_table_cell(value: &serde_json::Value) -> String {
     }
 }
 
+/// Prints command-line usage and the supported flags.
 fn print_usage() {
     println!("Atho CLI");
     println!();

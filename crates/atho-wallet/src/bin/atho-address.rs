@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Wallet utility for generating and inspecting Atho addresses offline.
+
 use atho_core::address::{address_checksum, decode_base56_address, hashed_public_key_from_digest};
 use atho_core::constants::ADDRESS_CHECKSUM_BASE56_CHARS;
 use atho_core::network::Network;
@@ -8,6 +10,7 @@ use atho_wallet::hd::WalletSeed;
 use atho_wallet::mnemonic::MnemonicPhrase;
 use atho_wallet::wallet::{Wallet, WalletAddress};
 
+/// Entrypoint for the address utility binary.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -15,6 +18,7 @@ fn main() {
     }
 }
 
+/// Dispatches to the selected address utility subcommand.
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -28,6 +32,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Generates receive or change addresses from a seed or mnemonic.
 fn generate_addresses(args: &[String]) -> Result<(), String> {
     if matches!(
         args.first().map(String::as_str),
@@ -59,6 +64,7 @@ fn generate_addresses(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Decodes an address and prints the derived fields for inspection.
 fn inspect_address(args: &[String]) -> Result<(), String> {
     let address = args
         .first()
@@ -83,6 +89,7 @@ fn inspect_address(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Prints a generated address after verifying its derived fields round-trip.
 fn print_address(index: usize, address: &WalletAddress) -> Result<(), String> {
     let (decoded_digest, decoded_network) =
         decode_base56_address(&address.address).map_err(|err| err.to_string())?;
@@ -105,6 +112,7 @@ fn print_address(index: usize, address: &WalletAddress) -> Result<(), String> {
     Ok(())
 }
 
+/// Parses generation flags into a typed option bundle.
 fn parse_generate_options(args: &[String]) -> Result<GenerateOptions, String> {
     let mut opts = GenerateOptions {
         network: default_network(),

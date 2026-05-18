@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Node/debug window entrypoint and tabbed diagnostics surfaces.
+
 use crate::app::{widgets, DebugWindowTab, DesktopApp};
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
 
+/// Renders the placeholder page shown when the debug console lives in a separate window.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     app.open_debug_window(DebugWindowTab::Console);
     widgets::panel_frame().show(ui, |ui| {
@@ -17,6 +20,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Renders the detached node/debug window when it is open.
 pub(crate) fn render_window(app: &mut DesktopApp, ctx: &egui::Context) {
     if !app.show_debug_window {
         return;
@@ -57,6 +61,7 @@ pub(crate) fn render_window(app: &mut DesktopApp, ctx: &egui::Context) {
     });
 }
 
+/// Renders the body of the detached node/debug window.
 fn render_window_contents(app: &mut DesktopApp, ui: &mut egui::Ui) {
     render_tab_bar(app, ui);
     ui.add_space(10.0);

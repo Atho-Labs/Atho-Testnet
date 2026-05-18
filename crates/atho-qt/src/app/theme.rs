@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Font and theme installation for the desktop client.
+
 use super::widgets;
 use eframe::egui;
 
+/// Installs the custom font overrides used by the Atho UI.
 pub(crate) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -16,6 +19,7 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Applies Atho's desktop color palette and spacing defaults.
 pub(crate) fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::light();
     visuals.panel_fill = widgets::SHELL_BG;

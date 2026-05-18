@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Canonical error registry definitions.
+//!
+//! The descriptor list here is treated as the source of truth for generated
+//! markdown/JSON artifacts and for stable error-code lookup at runtime.
+
 use crate::{AthoErrorCategory, AthoErrorCode, AthoErrorDescriptor, AthoSeverity};
 
+/// Declares the static descriptor constants and the shared registry slice.
 macro_rules! descriptors {
     ($(
         $name:ident => (
@@ -184,6 +190,7 @@ descriptors! {
     WALLET_INVALID_PASSWORD => ("ATHO-WALLET-011", Wallet, Error, true, false, "Wallet Password Rejected", "The wallet password is wrong or the encrypted wallet file is corrupted.", "The password is incorrect or authenticated decryption failed.", "Retry with the correct password or restore the wallet from backup.")
 }
 
+/// Looks up a descriptor by its stable error code string.
 pub fn registry_descriptor(code: &str) -> Option<&'static AthoErrorDescriptor> {
     REGISTRY
         .iter()
@@ -191,6 +198,7 @@ pub fn registry_descriptor(code: &str) -> Option<&'static AthoErrorDescriptor> {
         .find(|descriptor| descriptor.code.as_str() == code)
 }
 
+/// Renders the registry as human-readable markdown documentation.
 pub fn render_markdown_registry() -> String {
     let mut out = String::from("# Atho Error Codes\n\n");
     out.push_str("This registry is generated from `crates/atho-errors` and is the canonical source for Atho error metadata.\n\n");
@@ -220,6 +228,7 @@ pub fn render_markdown_registry() -> String {
     out
 }
 
+/// Renders the registry as a machine-readable pretty-printed JSON document.
 pub fn render_json_registry() -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(REGISTRY)
 }

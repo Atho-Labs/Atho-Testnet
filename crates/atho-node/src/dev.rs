@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Development-only helpers for sandbox data, logs, fixtures, and demos.
+//!
+//! These helpers intentionally centralize the ad hoc filesystem layout used by
+//! Atho's local tooling so tests, binaries, and the Qt client all agree on
+//! where to place temporary state and how to append diagnostic output.
+
 use crate::config::NodeConfig;
 use crate::mempool::MempoolEntry;
 use crate::miner::Miner;
@@ -27,6 +33,7 @@ use std::time::Duration;
 
 const ACTIVITY_LOG: &str = "activity.log";
 
+/// Parsed entry from the shared development activity log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityLine {
     pub timestamp: String,
@@ -34,31 +41,38 @@ pub struct ActivityLine {
     pub line: String,
 }
 
+/// Returns the process-wide mutex used to serialize dev-root mutations.
 fn dev_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Returns the top-level sandbox root used by Atho's development helpers.
 pub fn dev_root() -> PathBuf {
     atho_storage::path::sandbox_root()
 }
 
+/// Returns the directory containing per-component log files.
 pub fn logs_dir() -> PathBuf {
     dev_root().join("logs")
 }
 
+/// Returns the directory containing flat exported chain views.
 pub fn chain_dir() -> PathBuf {
     dev_root().join("chain")
 }
 
+/// Returns the wallet sandbox directory used by local tooling.
 pub fn wallet_dir() -> PathBuf {
     atho_storage::path::wallet_root()
 }
 
+/// Returns the database sandbox directory.
 pub fn db_dir() -> PathBuf {
     dev_root().join("db")
 }
 
+/// Returns the audit-log directory.
 pub fn audit_dir() -> PathBuf {
     dev_root().join("audit")
 }
@@ -79,6 +93,7 @@ fn chain_outputs_file() -> PathBuf {
     chain_dir().join("transaction_outputs.tsv")
 }
 
+/// Ensures the expected sandbox layout exists before dev helpers write into it.
 pub fn ensure_layout() -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     ensure_layout_locked()
@@ -98,11 +113,13 @@ fn ensure_layout_for(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Appends one line to the component log and mirrored activity log.
 pub fn append_log(component: &str, line: &str) -> std::io::Result<()> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     append_log_locked(component, line)
 }
 
+/// Appends a structured Atho error to the development log stream.
 pub fn append_atho_error(component: &str, error: &AthoError) -> std::io::Result<()> {
     append_log(component, &error.log_line())
 }

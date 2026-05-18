@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Compact integer encoding helpers shared by Atho's wire and storage formats.
+//!
+//! The implementation mirrors Bitcoin-style compact size prefixes so callers can
+//! produce canonical byte layouts for hashes, P2P payloads, and persisted data.
+
+/// Returns the number of bytes needed to encode `value` as a compact size.
 pub fn compact_size_len(value: usize) -> usize {
     match value as u64 {
         0..=0xfc => 1,
@@ -10,6 +16,7 @@ pub fn compact_size_len(value: usize) -> usize {
     }
 }
 
+/// Appends the canonical compact-size encoding for `value` to `out`.
 pub fn write_compact_size(out: &mut Vec<u8>, value: usize) {
     let value = value as u64;
     match value {

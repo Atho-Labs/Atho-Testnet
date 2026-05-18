@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Native GPU mining bridge types and error mapping helpers.
+
 use atho_errors::{
     MINE_GPU_BATCH_TOO_LARGE, MINE_GPU_BUFFER_ALLOC_FAILED, MINE_GPU_BUFFER_IO_FAILED,
     MINE_GPU_CONTEXT_CREATE_FAILED, MINE_GPU_FEATURE_DISABLED, MINE_GPU_INVALID_ARGUMENT,
@@ -13,10 +15,14 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "gpu-native")]
 use std::ffi::{CStr, CString};
 
+/// Canonical serialized header length expected by the native mining bridge.
 pub const HEADER_BYTES: usize = 211;
+/// Target byte width used by Atho proof-of-work comparisons.
 pub const TARGET_BYTES: usize = 48;
+/// Hash byte width returned by the native GPU backend.
 pub const HASH_BYTES: usize = 48;
 
+/// Normalized GPU backend error codes exposed to Rust callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuErrorCode {
     FeatureDisabled,
@@ -131,6 +137,7 @@ impl GpuErrorCode {
         }
     }
 
+    /// Returns the stable Atho error-code string for this GPU failure.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::FeatureDisabled => MINE_GPU_FEATURE_DISABLED.code.as_str(),
@@ -153,6 +160,7 @@ impl GpuErrorCode {
     }
 }
 
+/// Successful GPU mining result returned by the native bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuSolution {
     pub nonce: u64,

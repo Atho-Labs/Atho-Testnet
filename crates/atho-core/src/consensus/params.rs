@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Frozen consensus constants exposed as a structured parameter set.
+
 use crate::constants::{
     ATOMS_PER_ATHO, BLOCK_TIME_SECONDS, COINBASE_MATURITY_BLOCKS, DECIMALS,
     HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, MIN_TX_FEE_ATOMS,
@@ -8,19 +10,30 @@ use crate::constants::{
 };
 use crate::network::Network;
 
+/// User-facing and validation-facing constants for a network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusParams {
+    /// Number of decimal places supported by Atho amounts.
     pub decimals: usize,
+    /// Smallest indivisible units in one ATHO.
     pub atoms_per_atho: u64,
+    /// Finite max supply expressed in ATHO, if the network has one.
     pub max_supply_atho: Option<u64>,
+    /// Initial block reward before halvings.
     pub initial_block_reward_atoms: u64,
+    /// Number of blocks between halving events.
     pub halving_interval_blocks: u64,
+    /// Required confirmations before coinbase outputs are spendable.
     pub coinbase_maturity_blocks: u64,
+    /// Default wallet-facing confirmation threshold for standard payments.
     pub standard_tx_confirmations: u64,
+    /// Minimum relay/mining fee floor in atoms.
     pub min_tx_fee_atoms: u64,
+    /// Target inter-block time used by scheduling and UX.
     pub block_time_seconds: u64,
 }
 
+/// Shared consensus parameters for all current Atho networks.
 pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
     decimals: DECIMALS,
     atoms_per_atho: ATOMS_PER_ATHO,
@@ -33,6 +46,10 @@ pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
     block_time_seconds: BLOCK_TIME_SECONDS,
 };
 
+/// Returns the active parameter set for `network`.
+///
+/// All networks currently share the same values, but this API keeps callers
+/// network-aware and leaves room for future divergence.
 pub const fn consensus_params_for_network(network: Network) -> ConsensusParams {
     match network {
         Network::Mainnet => CONSENSUS_PARAMS,

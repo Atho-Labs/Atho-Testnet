@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Broad adversarial campaign for validation, storage, and protocol edge cases.
+
 use atho_core::address::{address_parts_from_public_key, decode_base56_address};
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::transaction_signing_digest;
@@ -52,6 +54,7 @@ const BASE_UNLOCKING_SCRIPT: [u8; 4] = [1, 2, 3, 4];
 const BASE_LOCKING_SCRIPT: [u8; 4] = [4, 3, 2, 1];
 const BASE_REWARD_SCRIPT: [u8; 4] = [9, 9, 9, 9];
 
+/// Entrypoint for the adversarial campaign runner.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -59,6 +62,7 @@ fn main() {
     }
 }
 
+/// Runs the adversarial campaign and prints summarized results per scenario.
 fn run() -> Result<(), String> {
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().collect();

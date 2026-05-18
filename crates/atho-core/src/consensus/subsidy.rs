@@ -1,19 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Block reward and long-horizon issuance helpers.
+//!
+//! This module centralizes Atho's emission schedule so mining, validation, and
+//! wallet display code all reason about the same subsidy curve.
+
 use crate::constants::{
     BLOCKS_PER_YEAR, HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, TAIL_REWARD_ATOMS,
 };
 use crate::network::Network;
 
+/// Frozen description of the chain-wide emission schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmissionSchedule {
+    /// Reward at height zero before any halving has occurred.
     pub initial_block_reward_atoms: u64,
+    /// Minimum perpetual reward once halving reaches the tail-emission era.
     pub tail_reward_atoms: u64,
+    /// Number of blocks between halvings.
     pub halving_interval_blocks: u64,
+    /// Expected block production for a nominal year at the target block time.
     pub blocks_per_year: u64,
 }
 
+/// Canonical emission parameters shared by all currently supported networks.
 pub const EMISSION_SCHEDULE: EmissionSchedule = EmissionSchedule {
     initial_block_reward_atoms: INITIAL_BLOCK_REWARD_ATOMS,
     tail_reward_atoms: TAIL_REWARD_ATOMS,
@@ -24,6 +35,7 @@ pub const EMISSION_SCHEDULE: EmissionSchedule = EmissionSchedule {
 pub const TAIL_EMISSION_START_HEIGHT: u64 = EMISSION_SCHEDULE.halving_interval_blocks * 3;
 pub const YEAR_20_HEIGHT: u64 = EMISSION_SCHEDULE.blocks_per_year * 20;
 
+/// Returns the mined reward at `height`, including the permanent tail emission.
 pub fn get_block_reward_atoms(height: u64) -> u64 {
     let halvings = height / HALVING_INTERVAL_BLOCKS;
     let reward = if halvings >= 64 {
@@ -39,18 +51,25 @@ pub fn get_block_reward_atoms(height: u64) -> u64 {
     }
 }
 
+/// Alias retained for consensus-call-site clarity.
 pub fn block_subsidy_atoms(height: u64) -> u64 {
     get_block_reward_atoms(height)
 }
 
+/// Network-specific reward accessor.
+///
+/// Atho currently shares one subsidy schedule across all networks, but this
+/// wrapper preserves a stable call shape if a future network diverges.
 pub fn block_subsidy_atoms_for_network(_network: Network, height: u64) -> u64 {
     get_block_reward_atoms(height)
 }
 
+/// Returns the genesis coinbase amount for the selected network.
 pub fn genesis_coinbase_atoms_for_network(_network: Network) -> u64 {
     get_block_reward_atoms(0)
 }
 
+/// Computes total issuance strictly before `height`.
 pub fn cumulative_issued_before_height(height: u64) -> u128 {
     if height == 0 {
         return 0;
@@ -76,18 +95,24 @@ pub fn cumulative_issued_before_height(height: u64) -> u128 {
     issued
 }
 
+/// Computes total issuance including the block at `height`.
 pub fn cumulative_issued_through_height(height: u64) -> u128 {
     cumulative_issued_before_height(height.saturating_add(1))
 }
 
+/// Network-scoped issuance accessor.
 pub fn cumulative_issued_before_height_for_network(_network: Network, height: u64) -> u128 {
     cumulative_issued_before_height(height)
 }
 
+/// Network-scoped issuance accessor including `height`.
 pub fn cumulative_issued_through_height_for_network(_network: Network, height: u64) -> u128 {
     cumulative_issued_through_height(height)
 }
 
+/// Returns the configured maximum supply, if the network has a hard cap.
+///
+/// Atho currently uses indefinite tail emission, so there is no finite cap.
 pub fn max_supply_atoms_for_network(_network: Network) -> Option<u128> {
     None
 }

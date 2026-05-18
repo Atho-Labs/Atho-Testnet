@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! End-to-end benchmark harness for Atho hot paths.
+
 use atho_core::block::Block;
 use atho_core::consensus::rules;
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
@@ -40,6 +42,7 @@ const DEFAULT_SPEND_HEIGHT: u64 = 6;
 const DEFAULT_INPUT_VALUE: u64 = 100_000;
 const DEFAULT_TIP_HASH: [u8; 48] = [0x5a; 48];
 
+/// CLI settings that shape the generated benchmark workload.
 #[derive(Debug, Clone)]
 struct Cli {
     network: Network,
@@ -51,6 +54,7 @@ struct Cli {
     wipe_first: bool,
 }
 
+/// Reusable fixture shared across benchmark scenarios.
 #[derive(Debug, Clone)]
 struct BenchmarkFixture {
     network: Network,
@@ -64,6 +68,7 @@ struct BenchmarkFixture {
     compact_block_frame: Vec<u8>,
 }
 
+/// Summary of a single benchmark scenario.
 #[derive(Debug, Clone)]
 struct BenchResult {
     name: &'static str,
@@ -74,6 +79,7 @@ struct BenchResult {
     notes: String,
 }
 
+/// Entrypoint for the benchmark harness.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -81,6 +87,7 @@ fn main() {
     }
 }
 
+/// Builds the benchmark fixture, runs the scenarios, and writes the report.
 fn run() -> Result<(), String> {
     let cli = parse_cli(&env::args().skip(1).collect::<Vec<_>>())?;
     if cli.network == Network::Mainnet {
@@ -149,6 +156,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Parses CLI flags into a benchmark configuration.
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         network: Network::Regnet,
@@ -239,11 +247,13 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     Ok(cli)
 }
 
+/// Prints command-line usage for the benchmark harness.
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  atho-benchmark [--network <testnet|regnet>] [--tx-count N] [--inputs-per-tx N] [--samples N] [--data-dir PATH] [--wipe-first] [--no-wipe-first] [--output benchmark.md]");
 }
 
+/// Creates the workspace root used for temporary benchmark data.
 fn prepare_benchmark_root(cli: &Cli) -> Result<PathBuf, String> {
     if let Some(root) = &cli.data_dir {
         return Ok(root.clone());
@@ -261,6 +271,7 @@ fn prepare_benchmark_root(cli: &Cli) -> Result<PathBuf, String> {
 }
 
 impl BenchmarkFixture {
+    /// Builds a deterministic fixture so benchmark runs are comparable across samples.
     fn build(
         network: Network,
         tx_count: usize,

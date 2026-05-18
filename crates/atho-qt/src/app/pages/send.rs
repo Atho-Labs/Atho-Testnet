@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Send page for building, validating, and submitting wallet transactions.
+
 use crate::app::{widgets, DesktopApp};
 use crate::resources;
 use atho_core::constants::MIN_TX_FEE_PER_VBYTE_ATOMS;
 use eframe::egui;
 
+/// Renders the send page and its validation/mempool feedback panels.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let available_balance = app.wallet_balance_atoms();
     let send_block_reason = app.wallet_send_block_reason();
@@ -49,6 +52,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Renders the main send form and its field-level affordances.
 fn render_send_form(
     app: &mut DesktopApp,
     ui: &mut egui::Ui,

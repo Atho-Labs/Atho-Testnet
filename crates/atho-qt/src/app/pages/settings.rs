@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Settings page for wallet metadata, node controls, and diagnostics.
+
 use crate::app::{
     mnemonic_ui, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage,
 };
@@ -10,6 +12,7 @@ use eframe::egui;
 use rfd::FileDialog;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Renders the settings page for the active wallet and node session.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         widgets::section_header(ui, "Wallet");

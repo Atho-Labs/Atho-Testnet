@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Adversarial validation harness for transaction and block edge cases.
+
 use atho_core::address::public_key_digest;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
@@ -22,6 +24,8 @@ use atho_storage::chainstate::Chainstate as StorageChainstate;
 use atho_storage::utxo::UtxoEntry;
 
 const ATTACK_TXID: [u8; 48] = [7; 48];
+
+/// Entrypoint for the adversarial validation campaign.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -29,6 +33,7 @@ fn main() {
     }
 }
 
+/// Executes the full set of negative and positive validation scenarios.
 fn run() -> Result<(), String> {
     let network = parse_network();
     let miner = Miner::new(mining_cores());
@@ -368,6 +373,7 @@ fn direct_storage_injection(network: Network) -> Result<bool, String> {
 }
 
 #[derive(Debug)]
+/// Transaction fixture paired with the expected validation result.
 struct BuiltTransaction {
     transaction: Transaction,
     fee_atoms: u64,

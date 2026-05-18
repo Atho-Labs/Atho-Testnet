@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Main Atho node launcher and local management CLI.
+
 use atho_core::genesis;
 use atho_core::network::Network;
 use atho_node::config::NodeConfig;
@@ -8,6 +10,7 @@ use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::RpcClient;
 
+/// Runtime options used when launching or verifying a node process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RuntimeCli {
     network: Option<Network>,
@@ -22,6 +25,7 @@ struct RuntimeCli {
 }
 
 impl RuntimeCli {
+    /// Applies CLI overrides into the process environment before node startup.
     fn apply_env(&self) {
         if let Some(network) = self.network {
             std::env::set_var("ATHO_NETWORK", network.cli_arg());
@@ -44,6 +48,7 @@ impl RuntimeCli {
     }
 }
 
+/// Options used by read-only status queries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatusCli {
     network: Option<Network>,
@@ -52,6 +57,7 @@ struct StatusCli {
 }
 
 impl StatusCli {
+    /// Applies status-query overrides into the process environment.
     fn apply_env(&self) {
         if let Some(network) = self.network {
             std::env::set_var("ATHO_NETWORK", network.cli_arg());
@@ -65,6 +71,7 @@ impl StatusCli {
     }
 }
 
+/// Entrypoint for the `athod` binary.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -72,6 +79,7 @@ fn main() {
     }
 }
 
+/// Dispatches the selected subcommand.
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -88,6 +96,7 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Launches the node runtime after resolving CLI and environment overrides.
 fn run_node(args: &[String]) -> Result<(), String> {
     let runtime = parse_runtime_cli(args)?;
     runtime.apply_env();
@@ -101,6 +110,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
     atho_node::runtime::run_with_config(config).map_err(|err| err.to_string())
 }
 
+/// Builds the runtime node config using explicit CLI network selection when present.
 fn runtime_node_config(runtime: &RuntimeCli) -> Result<NodeConfig, String> {
     let network = match runtime.network {
         Some(network) => network,
@@ -113,6 +123,7 @@ fn runtime_node_config(runtime: &RuntimeCli) -> Result<NodeConfig, String> {
     Ok(NodeConfig::from_env(network))
 }
 
+/// Runs the non-destructive validation flow against the configured node path.
 fn verify_node(args: &[String]) -> Result<(), String> {
     let runtime = parse_runtime_cli(args)?;
     runtime.apply_env();
@@ -162,6 +173,7 @@ fn verify_node(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Queries a running node and prints a summarized status report.
 fn show_status(args: &[String]) -> Result<(), String> {
     let status_cli = parse_status_cli(args)?;
     status_cli.apply_env();
@@ -252,6 +264,7 @@ fn show_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Dispatches development helpers exposed through `athod dev ...`.
 fn run_dev(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("genesis") => {
@@ -340,6 +353,7 @@ fn run_dev(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Removes local data for the selected environment after explicit confirmation.
 fn run_wipe(args: &[String]) -> Result<(), String> {
     let runtime = parse_runtime_cli(args)?;
     runtime.apply_env();
@@ -373,6 +387,7 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns whether a local RPC endpoint matches the requested network namespace.
 fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Result<bool, String> {
     let client = RpcClient::new(rpc_address.to_string());
     match client.call(&RpcRequest::GetNodeStatus) {
@@ -416,6 +431,7 @@ fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Re
     }
 }
 
+/// Applies the explicit network override requested by the operator, if any.
 fn apply_network_override_if_requested(
     runtime: &RuntimeCli,
     network: Network,
@@ -437,6 +453,7 @@ fn apply_network_override_if_requested(
     Ok(())
 }
 
+/// Returns whether the caller explicitly asked to override network-local safety checks.
 fn network_override_requested(runtime: &RuntimeCli) -> bool {
     runtime.network_overrides_local
         || std::env::var("ATHO_NETWORK_OVERRIDES_LOCAL")
@@ -444,6 +461,7 @@ fn network_override_requested(runtime: &RuntimeCli) -> bool {
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+/// Starts a lightweight monitor that exits child-managed nodes when the parent dies.
 fn start_managed_parent_monitor() {
     let Some(parent_pid) = std::env::var("ATHO_MANAGED_PARENT_PID")
         .ok()
@@ -472,6 +490,7 @@ fn start_managed_parent_monitor() {
         .ok();
 }
 
+/// Checks whether the given parent process ID is still alive.
 fn managed_parent_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -502,6 +521,7 @@ fn managed_parent_is_alive(pid: u32) -> bool {
     }
 }
 
+/// Parses runtime subcommand flags.
 fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
     let mut runtime = RuntimeCli::default();
     let mut i = 0usize;
@@ -579,6 +599,7 @@ fn parse_runtime_cli(args: &[String]) -> Result<RuntimeCli, String> {
     Ok(runtime)
 }
 
+/// Parses read-only status subcommand flags.
 fn parse_status_cli(args: &[String]) -> Result<StatusCli, String> {
     let mut status = StatusCli::default();
     let mut i = 0usize;
@@ -620,10 +641,12 @@ fn parse_status_cli(args: &[String]) -> Result<StatusCli, String> {
     Ok(status)
 }
 
+/// Parses a network selector accepted by `athod`.
 fn parse_network(value: &str) -> Option<Network> {
     Network::parse(value)
 }
 
+/// Prints top-level usage for `athod`.
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  athod [--network <mainnet|testnet|regnet|prunetest>] [--data-dir PATH] [--rpc-addr HOST:PORT] [--p2p-addr HOST:PORT] [--peer HOST:PORT] [--public-rpc] [--network-overrides-local]");

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Canonical BIP39-compatible English wordlist used by Atho mnemonics.
+
 // Auto-generated from wordlistm.py
+/// The full 2048-word mnemonic dictionary used for wallet phrase encoding.
 pub static WORDLIST: [&str; 2048] = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire",

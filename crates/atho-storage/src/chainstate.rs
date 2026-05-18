@@ -29,6 +29,52 @@ struct ChainUndo {
     block_undo: BlockUndo,
 }
 
+/// Tracks exactly how far an incremental branch switch progressed.
+///
+/// The old implementation protected reorg rollback by cloning the full block
+/// list, full UTXO set, and undo stack before switching branches. That was
+/// correct, but it scaled poorly because the failure path copied the whole
+/// chainstate image even when we only needed to undo a small suffix.
+///
+/// This journal records only the canonical blocks we successfully disconnected
+/// and the candidate blocks we successfully connected. On failure we can walk
+/// those counts backward and restore the original chain without cloning the
+/// entire in-memory state.
+#[derive(Debug, Clone, Copy)]
+struct IncrementalBranchSwitchJournal<'a> {
+    fork_height: u64,
+    canonical_suffix: &'a [Block],
+    disconnected_count: usize,
+    connected_count: usize,
+}
+
+impl<'a> IncrementalBranchSwitchJournal<'a> {
+    fn new(fork_height: u64, canonical_suffix: &'a [Block]) -> Self {
+        Self {
+            fork_height,
+            canonical_suffix,
+            disconnected_count: 0,
+            connected_count: 0,
+        }
+    }
+
+    fn note_disconnect(&mut self) {
+        self.disconnected_count = self.disconnected_count.saturating_add(1);
+    }
+
+    fn note_connect(&mut self) {
+        self.connected_count = self.connected_count.saturating_add(1);
+    }
+
+    fn disconnected_suffix_to_restore(self) -> &'a [Block] {
+        let start = self
+            .canonical_suffix
+            .len()
+            .saturating_sub(self.disconnected_count);
+        &self.canonical_suffix[start..]
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PersistedChainstate {
     height: u64,
@@ -185,6 +231,10 @@ impl Chainstate {
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), StorageError> {
+        // Validation always runs against the live tip and live UTXO image.
+        // That keeps the persisted database as a consequence of a successful
+        // state transition, never the source of truth for whether the block is
+        // acceptable.
         validation::validate_block_with_context(
             block,
             self.height.saturating_add(1),
@@ -205,6 +255,9 @@ impl Chainstate {
                 tip_hash: next_tip_hash,
                 tip_header: Some(block.header.clone()),
             };
+            // Normal block extension only persists the block delta. Full UTXO
+            // rewrites are reserved for explicit snapshot commits and heavier
+            // chain replacement paths.
             if let Err(err) =
                 storage.commit_chainstate(&snapshot, &[], Some((block.header.height, block)))
             {
@@ -281,6 +334,9 @@ impl Chainstate {
             });
         }
         if !can_switch_incrementally {
+            // If the competing branch reaches back past the in-memory suffix we
+            // still have, we stop pretending an incremental reorg is cheap and
+            // rebuild the exact canonical chain image from validated blocks.
             self.replace_with_validated_branch(fork_height, branch)?;
             return Ok(ChainSelectionResult {
                 outcome: if disconnected.is_empty() {
@@ -292,53 +348,7 @@ impl Chainstate {
             });
         }
 
-        let original_tip = self.tip.clone();
-        let original_tip_hash = self.tip_hash;
-        let original_height = self.height;
-        let original_blocks = self.blocks.clone();
-        let original_utxos = self.utxos.clone();
-        let original_undo_stack = self.undo_stack.clone();
-        let original_bundle = if self.storage.is_some() {
-            Some(self.export_snapshot_bundle()?)
-        } else {
-            None
-        };
-
-        for _ in 0..disconnected.len() {
-            if let Err(err) = self.disconnect_last_block() {
-                if let Some(bundle) = original_bundle.clone() {
-                    self.import_snapshot_bundle(bundle)?;
-                } else {
-                    self.restore_chainstate_state(
-                        original_tip.clone(),
-                        original_tip_hash,
-                        original_height,
-                        original_blocks.clone(),
-                        original_utxos.clone(),
-                        original_undo_stack.clone(),
-                    )?;
-                }
-                return Err(err);
-            }
-        }
-
-        for block in branch {
-            if let Err(err) = self.connect_block(block) {
-                if let Some(bundle) = original_bundle.clone() {
-                    self.import_snapshot_bundle(bundle)?;
-                } else {
-                    self.restore_chainstate_state(
-                        original_tip.clone(),
-                        original_tip_hash,
-                        original_height,
-                        original_blocks.clone(),
-                        original_utxos.clone(),
-                        original_undo_stack.clone(),
-                    )?;
-                }
-                return Err(err);
-            }
-        }
+        self.switch_branch_incrementally(fork_height, &disconnected, branch)?;
 
         Ok(ChainSelectionResult {
             outcome: if disconnected.is_empty() {
@@ -348,6 +358,40 @@ impl Chainstate {
             },
             disconnected,
         })
+    }
+
+    /// Switches to a preferred branch by mutating only the affected suffix and
+    /// recording a tiny rollback journal.
+    ///
+    /// The journal lets us restore the original branch without whole-state
+    /// clones if a disconnect or candidate connect fails halfway through. If
+    /// even the journaled rollback path hits an unexpected storage failure, we
+    /// fall back to a full validated rewrite of the original canonical branch.
+    fn switch_branch_incrementally(
+        &mut self,
+        fork_height: u64,
+        disconnected: &[Block],
+        branch: &[Block],
+    ) -> Result<(), StorageError> {
+        let mut journal = IncrementalBranchSwitchJournal::new(fork_height, disconnected);
+
+        for _ in 0..disconnected.len() {
+            if let Err(err) = self.disconnect_last_block() {
+                self.restore_original_branch_from_journal(journal)?;
+                return Err(err);
+            }
+            journal.note_disconnect();
+        }
+
+        for block in branch {
+            if let Err(err) = self.connect_block(block) {
+                self.restore_original_branch_from_journal(journal)?;
+                return Err(err);
+            }
+            journal.note_connect();
+        }
+
+        Ok(())
     }
 
     fn extend_with_validated_branch(&mut self, branch: &[Block]) -> Result<(), StorageError> {
@@ -790,6 +834,10 @@ impl Chainstate {
             .cloned()
             .ok_or(StorageError::NoBlockToDisconnect)?;
 
+        // Apply the inverse UTXO delta first so the persisted snapshot we write
+        // below matches the post-disconnect in-memory view. If persistence
+        // fails, we immediately replay the removed block and leave the caller
+        // with the exact pre-disconnect state still intact.
         self.utxos.disconnect_block(undo.block_undo.clone());
         let previous_height = undo
             .previous_tip
@@ -859,6 +907,8 @@ impl Chainstate {
         if prune_count == 0 {
             return;
         }
+        // Genesis always stays resident so a reloaded in-memory suffix still
+        // has a fixed local anchor even after aggressive pruning.
         self.blocks.drain(1..1 + prune_count);
         let undo_prune_count = prune_count.min(self.undo_stack.len());
         self.undo_stack.drain(0..undo_prune_count);
@@ -887,23 +937,38 @@ impl Chainstate {
         Ok(())
     }
 
-    fn restore_chainstate_state(
+    /// Attempts the cheap rollback path first, then escalates to a full chain
+    /// rewrite only if the journaled recovery itself fails.
+    fn restore_original_branch_from_journal(
         &mut self,
-        tip: Option<BlockHeader>,
-        tip_hash: [u8; 48],
-        height: u64,
-        blocks: Vec<Block>,
-        utxos: UtxoSet,
-        undo_stack: Vec<ChainUndo>,
+        journal: IncrementalBranchSwitchJournal<'_>,
     ) -> Result<(), StorageError> {
-        self.tip = tip;
-        self.tip_hash = tip_hash;
-        self.height = height;
-        self.blocks = blocks;
-        self.block_index_by_hash = build_block_index_by_hash(&self.blocks);
-        self.utxos = utxos;
-        self.undo_stack = undo_stack;
-        self.persist_snapshot_for(self.height, self.tip_hash, self.tip.clone())
+        match self.rollback_incremental_branch_switch(journal) {
+            Ok(()) => Ok(()),
+            Err(_) => self.replace_with_validated_branch(
+                journal.fork_height,
+                journal.disconnected_suffix_to_restore(),
+            ),
+        }
+    }
+
+    /// Undoes the candidate suffix and reconnects the canonical suffix that we
+    /// previously removed from the active chain.
+    ///
+    /// This keeps the normal connect/disconnect validation and persistence
+    /// rules in one place. The rollback work stays proportional to the number
+    /// of blocks touched by the reorg attempt instead of the total chain size.
+    fn rollback_incremental_branch_switch(
+        &mut self,
+        journal: IncrementalBranchSwitchJournal<'_>,
+    ) -> Result<(), StorageError> {
+        for _ in 0..journal.connected_count {
+            self.disconnect_last_block()?;
+        }
+        for block in journal.disconnected_suffix_to_restore() {
+            self.connect_block(block)?;
+        }
+        Ok(())
     }
 
     pub fn known_block_height(&self, block_hash: [u8; 48]) -> Option<u64> {
@@ -964,6 +1029,11 @@ impl Chainstate {
         fork_height: u64,
         branch: &[Block],
     ) -> Result<(), StorageError> {
+        // This path is intentionally heavier than the incremental switch. It is
+        // our escape hatch when the live in-memory suffix is incomplete or when
+        // a journaled rollback could not finish cleanly. We rebuild the exact
+        // canonical block list, fully validate it, and then atomically replace
+        // the persisted chainstate image.
         let mut replacement_blocks = self.canonical_prefix_through(fork_height)?;
         replacement_blocks.extend_from_slice(branch);
         let validated = validate_replacement_chain(self.network, &replacement_blocks)?;
@@ -3457,5 +3527,107 @@ mod tests {
             .expect("present snapshot");
         assert_eq!(snapshot.height, before.0);
         assert_eq!(snapshot.tip_hash, before.1);
+    }
+
+    #[test]
+    fn select_branch_restores_exact_state_after_candidate_validation_failure() {
+        let root = temp_workspace("select-branch-validate-rollback");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+        let genesis_timestamp = genesis::genesis_state(Network::Mainnet)
+            .block
+            .header
+            .timestamp;
+        let main_1 = build_coinbase_successor(&state);
+        state.connect_block(&main_1).expect("connect main one");
+        let main_2 = build_coinbase_successor_with_script(
+            &state,
+            canonical_test_lock(2),
+            genesis_timestamp.saturating_add(2),
+        );
+        state.connect_block(&main_2).expect("connect main two");
+        let main_3 = build_coinbase_successor_with_script(
+            &state,
+            canonical_test_lock(3),
+            genesis_timestamp.saturating_add(20_000),
+        );
+        state.connect_block(&main_3).expect("connect main three");
+        let main_4 = build_coinbase_successor_with_script(
+            &state,
+            canonical_test_lock(4),
+            genesis_timestamp.saturating_add(20_001),
+        );
+        state.connect_block(&main_4).expect("connect main four");
+
+        let before_height = state.height;
+        let before_tip_hash = state.tip_hash;
+        let before_blocks: Vec<_> = state
+            .blocks()
+            .iter()
+            .map(|block| block.header.block_hash())
+            .collect();
+        let before_utxos: Vec<_> = state.utxo_entries().cloned().collect();
+
+        let mut fork_state = Chainstate::new(Network::Mainnet);
+        fork_state
+            .connect_block(&main_1)
+            .expect("connect fork anchor");
+        let fork_2 = build_coinbase_successor_with_script(
+            &fork_state,
+            canonical_test_lock(22),
+            genesis_timestamp.saturating_add(10),
+        );
+        fork_state.connect_block(&fork_2).expect("connect fork two");
+        let fork_3 = build_coinbase_successor_with_script(
+            &fork_state,
+            canonical_test_lock(33),
+            genesis_timestamp.saturating_add(11),
+        );
+        fork_state
+            .connect_block(&fork_3)
+            .expect("connect fork three");
+        let mut fork_4 = build_coinbase_successor_with_script(
+            &fork_state,
+            canonical_test_lock(44),
+            genesis_timestamp.saturating_add(12),
+        );
+        // Break only the final candidate block after the competing branch is
+        // otherwise well-formed. That forces the branch switch to disconnect
+        // the old tip, connect part of the candidate, and then exercise the
+        // journaled rollback path when the invalid tip is encountered.
+        fork_4.header.nonce = fork_4.header.nonce.saturating_add(1);
+
+        assert!(atho_core::consensus::pow::branch_is_preferred(
+            &[fork_2.clone(), fork_3.clone(), fork_4.clone()],
+            &[main_2.clone(), main_3.clone(), main_4.clone()]
+        ));
+
+        let result = state.select_branch(&[fork_2, fork_3, fork_4]);
+        assert!(result.is_err(), "unexpected result: {result:?}");
+
+        assert_eq!(state.height, before_height);
+        assert_eq!(state.tip_hash, before_tip_hash);
+        assert_eq!(
+            state
+                .blocks()
+                .iter()
+                .map(|block| block.header.block_hash())
+                .collect::<Vec<_>>(),
+            before_blocks
+        );
+        assert_eq!(
+            state.utxo_entries().cloned().collect::<Vec<_>>(),
+            before_utxos
+        );
+
+        let db = Database::open(Network::Mainnet).expect("database");
+        let snapshot = db
+            .load_chainstate_snapshot()
+            .expect("snapshot")
+            .expect("present snapshot");
+        assert_eq!(snapshot.height, before_height);
+        assert_eq!(snapshot.tip_hash, before_tip_hash);
     }
 }

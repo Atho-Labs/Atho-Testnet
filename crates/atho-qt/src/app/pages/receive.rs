@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) Atho contributors
 
+//! Receive page for payment requests and receive-address management.
+
 use crate::app::{widgets, AddressPoolFilter, DesktopApp, ReceivePageTab};
 use crate::resources;
 use eframe::egui;
 use qrcodegen::{QrCode, QrCodeEcc};
 use rfd::FileDialog;
 
+/// Renders the receive page and whichever sub-tab is currently active.
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     widgets::panel_frame().show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -40,6 +43,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Renders the request-payment tab with request history and QR details.
 fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let selected_request = app.selected_receive_request().cloned();
     let current_address = app.current_receive_address_text();

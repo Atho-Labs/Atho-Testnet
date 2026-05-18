@@ -147,6 +147,10 @@ impl UtxoSet {
     }
 
     pub fn apply_block(&mut self, block: &Block) -> Result<BlockUndo, StorageError> {
+        // The undo journal is built as we go so a partially applied block can
+        // always be unwound back to the exact pre-apply state. Chainstate uses
+        // the returned journal both for normal disconnection and for reorg
+        // rollback when a competing branch fails midway through connection.
         let mut undo = BlockUndo {
             spent: Vec::new(),
             created: Vec::new(),
@@ -176,6 +180,8 @@ impl UtxoSet {
     }
 
     pub fn disconnect_block(&mut self, undo: BlockUndo) {
+        // Reverse output creation before re-inserting spent entries so we
+        // restore the precise pre-block UTXO image without duplicate keys.
         for output in undo.created {
             let _ = self.remove(output.txid, output.output_index);
         }
