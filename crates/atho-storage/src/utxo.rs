@@ -246,9 +246,11 @@ fn create_outputs(tx: &Transaction, network: Network, created_height: u64) -> Ve
 mod tests {
     use super::*;
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
+    use atho_core::constants::ADDRESS_DIGEST_BYTES;
     use atho_core::crypto::hash::sha3_256;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
+    use proptest::prelude::*;
 
     fn derive_sig_ref_short(txid: &[u8; 48], signature: &[u8], input_index: u32) -> [u8; 2] {
         let mut preimage = Vec::with_capacity(
@@ -510,5 +512,85 @@ mod tests {
         assert!(matches!(err, StorageError::MissingUtxo));
         assert_eq!(set.len(), 1);
         assert!(set.get(funding.txid, funding.output_index).is_some());
+    }
+
+    proptest! {
+        #[test]
+        fn apply_then_disconnect_restores_exact_utxo_image(
+            funding_value in 2u64..1_000_000,
+            spend_value in 1u64..1_000_000,
+        ) {
+            prop_assume!(spend_value < funding_value);
+
+            let mut set = UtxoSet::new(Network::Regnet);
+            let funding = UtxoEntry::new(
+                Network::Regnet,
+                [0x31; 48],
+                0,
+                funding_value,
+                vec![0x11; ADDRESS_DIGEST_BYTES],
+                0,
+                false,
+            );
+            set.insert(funding.clone()).unwrap();
+            let before = set.entries().cloned().collect::<Vec<_>>();
+
+            let spend = Transaction {
+                version: 1,
+                inputs: vec![TxInput {
+                    previous_txid: funding.txid,
+                    output_index: funding.output_index,
+                    unlocking_script: funding.locking_script.clone(),
+                }],
+                outputs: vec![TxOutput {
+                    value_atoms: spend_value,
+                    locking_script: vec![0x22; ADDRESS_DIGEST_BYTES],
+                }],
+                lock_time: 0,
+                witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            };
+            let spend = Transaction {
+                witness: witness_bytes_for_tx(&spend),
+                ..spend
+            };
+            let coinbase = Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: 50,
+                    locking_script: vec![0x33; ADDRESS_DIGEST_BYTES],
+                }],
+                lock_time: 1,
+                witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            };
+            let transactions = vec![coinbase, spend];
+            let block = Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Regnet,
+                    height: 1,
+                    previous_block_hash: [0; 48],
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
+                    timestamp: 1,
+                    difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
+                        Network::Regnet,
+                    ),
+                    nonce: 0,
+                },
+                transactions,
+            );
+
+            let undo = set.apply_block(&block).unwrap();
+            set.disconnect_block(undo);
+
+            prop_assert_eq!(set.entries().cloned().collect::<Vec<_>>(), before);
+        }
     }
 }

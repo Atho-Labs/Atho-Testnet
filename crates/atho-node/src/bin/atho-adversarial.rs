@@ -3,7 +3,7 @@
 
 //! Broad adversarial campaign for validation, storage, and protocol edge cases.
 
-use atho_core::address::{address_parts_from_public_key, decode_base56_address};
+use atho_core::address::{address_parts_from_public_key, decode_base56_address, public_key_digest};
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::signatures::transaction_signing_digest;
 use atho_core::consensus::subsidy;
@@ -50,9 +50,9 @@ const BASE_TX_VALUE: u64 = 100_000;
 const BASE_TX_OUTPUT: u64 = 90_000;
 const BASE_TX_FEE: u64 = BASE_TX_VALUE - BASE_TX_OUTPUT;
 const BASE_TXID: [u8; 48] = [7; 48];
-const BASE_UNLOCKING_SCRIPT: [u8; 4] = [1, 2, 3, 4];
-const BASE_LOCKING_SCRIPT: [u8; 4] = [4, 3, 2, 1];
-const BASE_REWARD_SCRIPT: [u8; 4] = [9, 9, 9, 9];
+const BASE_SPEND_SEED: &[u8] = b"atho-adversarial-spend";
+const BASE_OUTPUT_SEED: &[u8] = b"atho-adversarial-output";
+const BASE_REWARD_SEED: &[u8] = b"atho-adversarial-reward";
 
 /// Entrypoint for the adversarial campaign runner.
 fn main() {
@@ -295,16 +295,18 @@ impl Drop for EnvVarGuard {
 }
 
 fn signed_base_tx(keypair: &FalconKeypair, input_txid: [u8; 48], output_value: u64) -> Transaction {
+    let input_locking_script = canonical_lock_for_pubkey(Network::Mainnet, &keypair.public_key.0);
+    let output_locking_script = canonical_lock_from_seed(Network::Mainnet, BASE_OUTPUT_SEED);
     let mut tx = Transaction {
         version: 1,
         inputs: vec![TxInput {
             previous_txid: input_txid,
             output_index: 0,
-            unlocking_script: BASE_UNLOCKING_SCRIPT.to_vec(),
+            unlocking_script: input_locking_script,
         }],
         outputs: vec![TxOutput {
             value_atoms: output_value,
-            locking_script: BASE_LOCKING_SCRIPT.to_vec(),
+            locking_script: output_locking_script,
         }],
         lock_time: 0,
         witness: Vec::new(),
@@ -336,25 +338,39 @@ fn finalize_tx_for_block(tx: &Transaction, witness_root: [u8; 48]) -> Transactio
     finalize_witness_commit_refs(tx, witness_root)
 }
 
-fn valid_utxo(network: Network, created_height: u64, value_atoms: u64) -> UtxoEntry {
+fn canonical_lock_for_pubkey(network: Network, pubkey: &[u8]) -> Vec<u8> {
+    public_key_digest(network, pubkey).to_vec()
+}
+
+fn canonical_lock_from_seed(network: Network, seed: &[u8]) -> Vec<u8> {
+    let keypair = generate_from_seed(seed).expect("canonical lock keypair");
+    canonical_lock_for_pubkey(network, &keypair.public_key.0)
+}
+
+fn valid_utxo(
+    network: Network,
+    keypair: &FalconKeypair,
+    created_height: u64,
+    value_atoms: u64,
+) -> UtxoEntry {
     UtxoEntry::new(
         network,
         BASE_TXID,
         0,
         value_atoms,
-        BASE_UNLOCKING_SCRIPT.to_vec(),
+        canonical_lock_for_pubkey(network, &keypair.public_key.0),
         created_height,
         false,
     )
 }
 
-fn valid_coinbase(_network: Network, height: u64, fee_atoms: u64) -> Transaction {
+fn valid_coinbase(network: Network, height: u64, fee_atoms: u64) -> Transaction {
     Transaction {
         version: 1,
         inputs: vec![],
         outputs: vec![TxOutput {
             value_atoms: subsidy::block_subsidy_atoms(height).saturating_add(fee_atoms),
-            locking_script: BASE_REWARD_SCRIPT.to_vec(),
+            locking_script: canonical_lock_from_seed(network, BASE_REWARD_SEED),
         }],
         lock_time: height as u32,
         witness: vec![],
@@ -386,8 +402,8 @@ fn valid_block(network: Network, height: u64, txs: Vec<Transaction>) -> Block {
 }
 
 fn valid_spend_fixture() -> (FalconKeypair, UtxoEntry, Transaction, u64) {
-    let keypair = generate_from_seed(b"atho-adversarial-spend").expect("keypair");
-    let utxo = valid_utxo(Network::Mainnet, 0, BASE_TX_VALUE);
+    let keypair = generate_from_seed(BASE_SPEND_SEED).expect("keypair");
+    let utxo = valid_utxo(Network::Mainnet, &keypair, 0, BASE_TX_VALUE);
     let mut tx = signed_base_tx(&keypair, utxo.txid, BASE_TX_OUTPUT);
     solve_transaction_pow(Network::Mainnet, &mut tx, BASE_TX_FEE);
     (keypair, utxo, tx, BASE_TX_FEE)
@@ -395,12 +411,14 @@ fn valid_spend_fixture() -> (FalconKeypair, UtxoEntry, Transaction, u64) {
 
 fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Transaction, u64) {
     let keypair = generate_from_seed(b"atho-adversarial-spend-two").expect("keypair");
+    let locking_script = canonical_lock_for_pubkey(Network::Mainnet, &keypair.public_key.0);
+    let output_locking_script = canonical_lock_from_seed(Network::Mainnet, BASE_OUTPUT_SEED);
     let utxo_a = UtxoEntry::new(
         Network::Mainnet,
         [8; 48],
         0,
         u64::MAX / 2,
-        BASE_UNLOCKING_SCRIPT.to_vec(),
+        locking_script.clone(),
         0,
         false,
     );
@@ -409,7 +427,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         [9; 48],
         1,
         u64::MAX / 2,
-        BASE_UNLOCKING_SCRIPT.to_vec(),
+        locking_script.clone(),
         0,
         false,
     );
@@ -429,7 +447,7 @@ fn valid_spend_fixture_two_inputs() -> (FalconKeypair, UtxoEntry, UtxoEntry, Tra
         ],
         outputs: vec![TxOutput {
             value_atoms: u64::MAX / 2 - 10,
-            locking_script: BASE_LOCKING_SCRIPT.to_vec(),
+            locking_script: output_locking_script,
         }],
         lock_time: 0,
         witness: vec![],

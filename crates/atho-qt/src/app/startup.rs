@@ -73,8 +73,9 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
             widgets::shell_frame()
                 .inner_margin(egui::Margin::symmetric(24.0, 22.0))
                 .show(ui, |ui| {
-                    let card_width = ui.available_width().min(560.0);
-                    let top_padding = ((ui.available_height() - 260.0) * 0.38).max(18.0);
+                    let card_width = widgets::finite_available_width(ui, 560.0).min(560.0);
+                    let top_padding =
+                        ((widgets::finite_available_height(ui, 320.0) - 260.0) * 0.38).max(18.0);
                     ui.add_space(top_padding);
                     ui.vertical_centered(|ui| {
                         egui::Frame::none()
@@ -123,7 +124,9 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
                                     if show_progress {
                                         ui.add(
                                             egui::ProgressBar::new(progress)
-                                                .desired_width((card_width - 56.0).max(240.0))
+                                                .desired_width(widgets::reserved_width(
+                                                    card_width, 56.0, 240.0, 320.0,
+                                                ))
                                                 .animate(true),
                                         );
                                     } else {
@@ -137,7 +140,7 @@ pub(crate) fn render_wallet_preparation_screen(app: &mut DesktopApp, ctx: &egui:
 }
 
 fn render_welcome_actions(app: &mut DesktopApp, ui: &mut egui::Ui) {
-    let content_width = ui.available_width().min(1080.0);
+    let content_width = widgets::finite_available_width(ui, 960.0).min(1080.0);
     let compact = content_width < 860.0;
     let card_width = (content_width * if compact { 0.98 } else { 0.94 }).min(1000.0);
     let action_width = if compact {

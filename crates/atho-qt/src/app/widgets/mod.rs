@@ -25,6 +25,30 @@ pub(crate) fn shell_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(6.0))
 }
 
+pub(crate) fn finite_layout_space(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        fallback.max(0.0)
+    }
+}
+
+pub(crate) fn finite_available_width(ui: &egui::Ui, fallback: f32) -> f32 {
+    finite_layout_space(ui.available_width(), fallback)
+}
+
+pub(crate) fn finite_available_height(ui: &egui::Ui, fallback: f32) -> f32 {
+    finite_layout_space(ui.available_height(), fallback)
+}
+
+pub(crate) fn clamped_available_width(ui: &egui::Ui, min: f32, max: f32, fallback: f32) -> f32 {
+    finite_available_width(ui, fallback).clamp(min, max)
+}
+
+pub(crate) fn reserved_width(available: f32, reserve: f32, minimum: f32, fallback: f32) -> f32 {
+    (finite_layout_space(available, fallback) - reserve).max(minimum)
+}
+
 pub(crate) fn panel_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(PANEL_BG)
@@ -205,4 +229,25 @@ pub(crate) fn elide_text(text: &str, max_chars: usize) -> String {
         out.push(*ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finite_layout_space_replaces_non_finite_values() {
+        assert_eq!(finite_layout_space(f32::NAN, 320.0), 320.0);
+        assert_eq!(finite_layout_space(f32::INFINITY, 320.0), 320.0);
+        assert_eq!(finite_layout_space(f32::NEG_INFINITY, 320.0), 320.0);
+        assert_eq!(finite_layout_space(-12.0, 320.0), 0.0);
+        assert_eq!(finite_layout_space(48.0, 320.0), 48.0);
+    }
+
+    #[test]
+    fn reserved_width_clamps_to_minimum_when_available_is_invalid() {
+        assert_eq!(reserved_width(f32::NAN, 112.0, 160.0, 420.0), 308.0);
+        assert_eq!(reserved_width(200.0, 112.0, 160.0, 420.0), 160.0);
+        assert_eq!(reserved_width(600.0, 112.0, 160.0, 420.0), 488.0);
+    }
 }

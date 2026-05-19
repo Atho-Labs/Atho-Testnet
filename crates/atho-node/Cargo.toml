@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [features]
 default = []
+devtools = []
 gpu-native = ["dep:atho-gpu-native", "atho-gpu-native/gpu-native"]
 
 [dependencies]
@@ -27,6 +28,9 @@ bincode = "1"
 thiserror = "1"
 get_if_addrs = "0.5"
 tiny_http = "0.12"
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
 
 [[bin]]
 name = "athod"
@@ -39,10 +43,17 @@ path = "src/bin/atho-mine.rs"
 [[bin]]
 name = "atho-attack"
 path = "src/bin/atho-attack.rs"
+required-features = ["devtools"]
 
 [[bin]]
 name = "atho-adversarial"
 path = "src/bin/atho-adversarial.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "atho-benchmark"
+path = "src/bin/atho-benchmark.rs"
+required-features = ["devtools"]
 
 [[bin]]
 name = "atho-cli"

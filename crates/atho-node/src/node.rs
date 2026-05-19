@@ -15,6 +15,7 @@ use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
 #[cfg(test)]
 use atho_core::constants::ADDRESS_DIGEST_BYTES;
+use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
 use atho_core::transaction::Transaction;
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
@@ -27,6 +28,7 @@ use atho_storage::db::{
     BlockArchiveRecord, BlockPruneReport, PeerHealthRecord, PeerRecord, TransactionArchiveRecord,
 };
 use atho_storage::error::StorageError;
+use std::fs;
 
 fn chain_trace_enabled() -> bool {
     matches!(
@@ -74,6 +76,16 @@ impl Node {
 
     pub fn network(&self) -> atho_core::network::Network {
         self.config.network
+    }
+
+    pub fn mark_runtime_started(&self) -> Result<(), NodeError> {
+        self.chainstate.mark_runtime_started()?;
+        Ok(())
+    }
+
+    pub fn mark_clean_shutdown(&self) -> Result<(), NodeError> {
+        self.chainstate.mark_clean_shutdown()?;
+        Ok(())
     }
 
     pub fn height(&self) -> u64 {
@@ -446,6 +458,7 @@ impl Node {
         self.mempool.total_vbytes()
     }
 
+    #[cfg(any(test, feature = "devtools"))]
     #[doc(hidden)]
     pub fn dev_seed_chainstate(
         &mut self,
@@ -468,13 +481,16 @@ impl Node {
         #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
-        Self {
+        let mut node = Self {
             config,
             chainstate: StorageChainstate::load_or_new(network),
             mempool,
             #[cfg(test)]
             _test_lock: test_lock,
-        }
+        };
+        node.maybe_bootstrap_from_snapshot()
+            .unwrap_or_else(|err| panic!("failed to load node snapshot bootstrap: {err}"));
+        node
     }
 
     pub fn try_load_or_new(config: NodeConfig) -> Result<Self, NodeError> {
@@ -484,13 +500,15 @@ impl Node {
         #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
-        Ok(Self {
+        let mut node = Self {
             config,
             chainstate: StorageChainstate::try_load_or_new(network)?,
             mempool,
             #[cfg(test)]
             _test_lock: test_lock,
-        })
+        };
+        node.maybe_bootstrap_from_snapshot()?;
+        Ok(node)
     }
 
     pub fn try_load_or_recover(config: NodeConfig) -> Result<Self, NodeError> {
@@ -500,13 +518,35 @@ impl Node {
         #[cfg(not(test))]
         config.apply_process_overrides();
         let mempool = Self::mempool_for_config(&config);
-        Ok(Self {
+        let mut node = Self {
             config,
             chainstate: StorageChainstate::try_load_or_recover(network)?,
             mempool,
             #[cfg(test)]
             _test_lock: test_lock,
-        })
+        };
+        node.maybe_bootstrap_from_snapshot()?;
+        Ok(node)
+    }
+
+    fn maybe_bootstrap_from_snapshot(&mut self) -> Result<(), NodeError> {
+        let snapshot_path = self.config.sync.bootstrap_snapshot_path.trim();
+        if snapshot_path.is_empty() || self.height() > 0 || self.blocks_len() > 1 {
+            return Ok(());
+        }
+
+        let bundle_bytes = fs::read(snapshot_path).map_err(StorageError::Io)?;
+        let expected_hash = self.config.sync.bootstrap_snapshot_hash.trim();
+        if !expected_hash.is_empty() {
+            let actual_hash = hex::encode(sha3_384(&bundle_bytes));
+            if actual_hash != expected_hash.to_ascii_lowercase() {
+                return Err(NodeError::Storage(StorageError::CorruptData));
+            }
+        }
+        let bundle: ChainSnapshotBundle =
+            bincode::deserialize(&bundle_bytes).map_err(|_| StorageError::CorruptData)?;
+        self.import_snapshot_bundle(bundle)?;
+        Ok(())
     }
 
     pub fn connect_block(&mut self, block: &Block) -> Result<(), NodeError> {
@@ -723,7 +763,7 @@ mod tests {
     use crate::miner::Miner;
     use crate::test_support::acquire_global_test_lock;
     use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
-    use atho_core::address::public_key_digest;
+    use atho_core::address::{encode_base56_address, public_key_digest};
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
     use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
@@ -797,6 +837,14 @@ mod tests {
             additional_signers: vec![],
         }
         .canonical_bytes()
+    }
+
+    fn configured_node_config(network: Network) -> NodeConfig {
+        let mut config = NodeConfig::new(network);
+        let keypair = generate_from_seed(b"atho-node-mining-reward").expect("reward keypair");
+        let digest = public_key_digest(network, &keypair.public_key.0);
+        config.mining_reward_address = encode_base56_address(network, &digest);
+        config
     }
 
     fn temp_data_dir(label: &str) -> std::path::PathBuf {
@@ -1026,7 +1074,7 @@ mod tests {
 
     #[test]
     fn node_mines_and_connects_candidate_block() {
-        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let mut node = Node::new(configured_node_config(Network::Mainnet));
         node.chainstate.height = 6;
         let spend_lock = test_lock(Network::Mainnet);
         let output_lock = alternate_lock(Network::Mainnet);
@@ -1143,7 +1191,7 @@ mod tests {
 
     #[test]
     fn node_mines_two_blocks_in_sequence() {
-        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let mut node = Node::new(configured_node_config(Network::Mainnet));
         node.chainstate
             .insert_utxo(UtxoEntry::new(
                 Network::Mainnet,
@@ -1164,8 +1212,24 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_candidate_block_requires_explicit_reward_address() {
+        let node = Node::new(NodeConfig::new(Network::Mainnet));
+        let err = node.build_candidate_block().unwrap_err();
+        assert!(matches!(err, NodeError::MiningRewardAddressRequired(_)));
+    }
+
+    #[test]
+    fn candidate_block_rejects_wrong_network_reward_address() {
+        let mut config = NodeConfig::new(Network::Mainnet);
+        config.mining_reward_address = encode_base56_address(Network::Testnet, &[9; 32]);
+        let node = Node::new(config);
+        let err = node.build_candidate_block().unwrap_err();
+        assert!(matches!(err, NodeError::MiningRewardAddressRequired(_)));
+    }
+
+    #[test]
     fn candidate_block_rejects_fee_total_overflow() {
-        let mut node = Node::new(NodeConfig::new(Network::Mainnet));
+        let mut node = Node::new(configured_node_config(Network::Mainnet));
         node.chainstate.height = 6;
         let locking_script = test_lock(Network::Mainnet);
         let output_lock = alternate_lock(Network::Mainnet);
@@ -1270,7 +1334,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
 
-        let mut node = Node::load_or_new(NodeConfig::new(Network::Mainnet));
+        let mut node = Node::load_or_new(configured_node_config(Network::Mainnet));
         let block = node
             .mine_and_connect_candidate_block(&Miner::new(1))
             .expect("mine");
@@ -1428,5 +1492,39 @@ mod tests {
         let reloaded = Node::load_or_new(NodeConfig::new(Network::Regnet));
         assert_eq!(reloaded.height(), 4);
         assert_eq!(reloaded.canonical_blocks().expect("canonical").len(), 5);
+    }
+
+    #[test]
+    fn node_bootstraps_from_trusted_snapshot_bundle_when_configured() {
+        let donor_root = temp_data_dir("trusted-snapshot-donor");
+        fs::create_dir_all(&donor_root).expect("donor root");
+        let donor_bundle = {
+            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &donor_root);
+            let mut donor = Node::load_or_new(NodeConfig::new(Network::Regnet));
+            donor
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine donor 1");
+            donor
+                .mine_and_connect_candidate_block(&Miner::new(1))
+                .expect("mine donor 2");
+            donor
+                .export_snapshot_bundle()
+                .expect("export trusted snapshot bundle")
+        };
+
+        let receiver_root = temp_data_dir("trusted-snapshot-receiver");
+        fs::create_dir_all(&receiver_root).expect("receiver root");
+        let snapshot_path = receiver_root.join("trusted-snapshot.bin");
+        let snapshot_bytes = bincode::serialize(&donor_bundle).expect("serialize snapshot");
+        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot bundle");
+
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
+        let mut config = NodeConfig::new(Network::Regnet);
+        config.sync.bootstrap_snapshot_path = snapshot_path.to_string_lossy().into_owned();
+        config.sync.bootstrap_snapshot_hash = hex::encode(sha3_384(&snapshot_bytes));
+
+        let bootstrapped = Node::load_or_new(config);
+        assert_eq!(bootstrapped.height(), donor_bundle.snapshot.height);
+        assert_eq!(bootstrapped.tip_hash(), donor_bundle.snapshot.tip_hash);
     }
 }

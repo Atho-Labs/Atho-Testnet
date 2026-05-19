@@ -27,7 +27,6 @@ pub const SPEND_HEIGHT: u64 = 6;
 pub const FIXTURE_TX_COUNT: usize = 2;
 pub const FIXTURE_INPUT_COUNT: usize = 1;
 pub const FIXTURE_INPUT_VALUE: u64 = 100_000;
-pub const FIXTURE_OUTPUT_LOCKING_SCRIPT: [u8; 4] = [0x42, 0x43, 0x44, 0x45];
 pub const FIXTURE_TIP_HASH: [u8; 48] = [0x5a; 48];
 
 #[derive(Debug, Clone)]
@@ -268,6 +267,8 @@ pub fn build_finalized_block_from_transactions(transactions: &[Transaction]) -> 
         previous_block_hash: FIXTURE_TIP_HASH,
         merkle_root: merkle_root(&transactions),
         witness_root,
+        founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+        founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
         timestamp: atho_core::genesis::genesis_state(NETWORK)
             .block
             .header

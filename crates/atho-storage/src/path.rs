@@ -35,6 +35,14 @@ pub fn database_dir(network: Network) -> PathBuf {
     data_root().join(data_dir(network))
 }
 
+pub fn rpc_cookie_path(network: Network) -> PathBuf {
+    database_dir(network).join(".cookie")
+}
+
+pub fn storage_commit_journal_path(network: Network) -> PathBuf {
+    database_dir(network).join("chainstate.commit-journal")
+}
+
 pub fn block_storage_dir(network: Network) -> PathBuf {
     database_dir(network).join("blocks")
 }

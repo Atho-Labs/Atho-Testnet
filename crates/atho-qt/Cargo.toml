@@ -36,5 +36,6 @@ name = "atho-qt"
 path = "src/bin/atho-qt.rs"
 
 [dev-dependencies]
+atho-node = { path = "../atho-node", features = ["devtools"] }
 bincode = "1"
 lmdb = "0.8"

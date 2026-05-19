@@ -73,7 +73,8 @@ fn render_send_form(
                             "Enter a base56 Atho address for the active network. Example: R... on regnet.",
                         );
                     ui.horizontal(|ui| {
-                        let address_width = (ui.available_width() - 102.0).max(220.0);
+                        let address_width =
+                            widgets::reserved_width(ui.available_width(), 102.0, 220.0, 420.0);
                         let address_response = ui.add_sized(
                             [address_width, 28.0],
                             egui::TextEdit::singleline(&mut app.send_to)

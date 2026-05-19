@@ -89,7 +89,7 @@ const DEFAULT_LIMITS: P2pLimits = P2pLimits {
     max_untrusted_block_cache_bytes: 256 * 1024 * 1024,
     max_pending_validation_blocks: 4_096,
     enable_fast_body_download: true,
-    enable_background_validation: false,
+    enable_background_validation: true,
     enable_checkpoint_anchored_sync: true,
     require_full_validation_before_mining: true,
     sync_maintenance_interval_ms: 50,
@@ -165,7 +165,30 @@ fn runtime_limits(mut limits: P2pLimits) -> P2pLimits {
             limits.max_inbound_peers = total.saturating_sub(limits.max_outbound_peers).max(4);
         }
     }
+    if let Ok(raw) = std::env::var("ATHO_SYNC_FAST_BODY_DOWNLOAD") {
+        if let Some(value) = parse_bool(&raw) {
+            limits.enable_fast_body_download = value;
+        }
+    }
+    if let Ok(raw) = std::env::var("ATHO_SYNC_BACKGROUND_VALIDATION") {
+        if let Some(value) = parse_bool(&raw) {
+            limits.enable_background_validation = value;
+        }
+    }
+    if let Ok(raw) = std::env::var("ATHO_SYNC_CHECKPOINT_ANCHORED") {
+        if let Some(value) = parse_bool(&raw) {
+            limits.enable_checkpoint_anchored_sync = value;
+        }
+    }
     limits
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn network_from_magic(magic: [u8; 4]) -> Option<Network> {

@@ -1714,6 +1714,7 @@ mod tests {
     use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
     use atho_core::genesis;
     use atho_core::transaction::Transaction;
+    use atho_crypto::falcon::generate_from_seed;
     use atho_storage::chainstate::ChainSelectionOutcome;
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
@@ -1765,7 +1766,14 @@ mod tests {
         let root = temp_data_dir("service");
         fs::create_dir_all(&root).expect("root");
         let guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-        let mut service = NodeService::new(NodeConfig::new(network));
+        let mut config = NodeConfig::new(network);
+        if matches!(network, Network::Mainnet | Network::Testnet) {
+            let keypair = generate_from_seed(b"atho-api-test-mining-reward")
+                .expect("api test mining reward keypair");
+            let digest = atho_core::address::public_key_digest(network, &keypair.public_key.0);
+            config.mining_reward_address = encode_base56_address(network, &digest);
+        }
+        let mut service = NodeService::new(config);
         service.start();
         (service, guard)
     }
@@ -2486,8 +2494,8 @@ mod tests {
         });
 
         let mut fork = Node::new(NodeConfig::new(Network::Regnet));
-        mine_with_timestamp_offset(&mut fork, &miner, 10_000);
-        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 10_001);
+        mine_with_timestamp_offset(&mut fork, &miner, 100);
+        let fork_block_2 = mine_with_timestamp_offset(&mut fork, &miner, 101);
         let fork_tip_hash = fork_block_2.header.block_hash();
         let reward_digest: [u8; 32] = fork_block_2.transactions[0].outputs[0]
             .locking_script
@@ -2495,8 +2503,22 @@ mod tests {
             .try_into()
             .expect("reward digest");
         let reward_address = encode_base56_address(Network::Regnet, &reward_digest);
-        let reward_atoms = fork_block_2.transactions[0].outputs[0].value_atoms;
         let fork_blocks = fork.canonical_blocks().expect("fork blocks");
+        let expected_utxo_count = fork_blocks
+            .iter()
+            .filter(|block| {
+                block.transactions[0].outputs[0].locking_script.as_slice()
+                    == reward_digest.as_slice()
+            })
+            .count() as u64;
+        let expected_balance_atoms = fork_blocks
+            .iter()
+            .filter_map(|block| {
+                let output = &block.transactions[0].outputs[0];
+                (output.locking_script.as_slice() == reward_digest.as_slice())
+                    .then_some(output.value_atoms)
+            })
+            .sum::<u64>();
 
         service.sandbox_with_node_mut(|node| {
             let selection = node.consider_branch(&fork_blocks[1..]).expect("reorg");
@@ -2536,8 +2558,8 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("reorg reward address");
-        assert_eq!(address["utxo_count"], 1);
-        assert_eq!(address["balance_atoms"], reward_atoms);
+        assert_eq!(address["utxo_count"], expected_utxo_count);
+        assert_eq!(address["balance_atoms"], expected_balance_atoms);
     }
 
     #[test]

@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.runtime_launcher import main
+from scripts.runtime_launcher import main # type: ignore
 
 
 if __name__ == "__main__":

@@ -26,7 +26,9 @@ use thiserror::Error;
 pub const NODE_NETWORK: u64 = 1 << 0;
 pub const NODE_WITNESS: u64 = 1 << 3;
 pub const LOCAL_NODE_SERVICES: u64 = NODE_NETWORK | NODE_WITNESS;
-const MIN_SERIALIZED_TRANSACTION_BYTES: usize = 14;
+// version + marker + input_count + output_count + witness_len + lock_time +
+// tx_pow_nonce + tx_pow_bits for the strict full-transaction format.
+const MIN_SERIALIZED_TRANSACTION_BYTES: usize = 29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Hash48(#[serde(with = "serde_big_array::BigArray")] pub [u8; 48]);
@@ -474,10 +476,11 @@ pub enum CompactBlockReconstruction {
     },
 }
 
-pub fn compact_short_id(txid: [u8; 48]) -> u64 {
-    let mut preimage = Vec::with_capacity(b"ATHO_COMPACT_SHORTID_V1".len() + txid.len());
+pub fn compact_short_id(transaction_identity: [u8; 48]) -> u64 {
+    let mut preimage =
+        Vec::with_capacity(b"ATHO_COMPACT_SHORTID_V1".len() + transaction_identity.len());
     preimage.extend_from_slice(b"ATHO_COMPACT_SHORTID_V1");
-    preimage.extend_from_slice(&txid);
+    preimage.extend_from_slice(&transaction_identity);
     let digest = sha3_256(&preimage);
     u64::from_le_bytes(digest[..8].try_into().expect("compact short id"))
 }
@@ -491,7 +494,7 @@ pub fn compact_block_from_block(block: &Block) -> CompactBlockMessage {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != 0)
-            .map(|(_, tx)| compact_short_id(tx.txid()))
+            .map(|(_, tx)| compact_short_id(tx.witness_commitment_hash()))
             .collect(),
         prefilled_transactions: block
             .transactions
@@ -830,13 +833,46 @@ mod tests {
         let compact = compact_block_from_block(&block);
         let reconstructed = reconstruct_compact_block(
             &compact,
-            |short_id| (short_id == compact_short_id(tx.txid())).then_some(tx.clone()),
+            |short_id| {
+                (short_id == compact_short_id(tx.witness_commitment_hash())).then_some(tx.clone())
+            },
             &BTreeMap::new(),
         )
         .expect("reconstruct");
         assert_eq!(
             reconstructed,
             CompactBlockReconstruction::Complete(Box::new(block))
+        );
+    }
+
+    #[test]
+    fn compact_short_ids_differentiate_tx_pow_variants_with_same_txid() {
+        let base = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![atho_core::transaction::TxOutput {
+                value_atoms: 1,
+                locking_script: vec![1],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let variant = Transaction {
+            tx_pow_nonce: 77,
+            tx_pow_bits: 4,
+            ..base.clone()
+        };
+
+        assert_eq!(base.txid(), variant.txid());
+        assert_ne!(
+            base.witness_commitment_hash(),
+            variant.witness_commitment_hash()
+        );
+        assert_ne!(
+            compact_short_id(base.witness_commitment_hash()),
+            compact_short_id(variant.witness_commitment_hash())
         );
     }
 

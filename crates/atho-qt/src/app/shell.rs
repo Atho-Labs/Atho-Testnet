@@ -241,7 +241,7 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
             let sync_tooltip = sync_tooltip_text(app, blocks_left, progress);
 
             ui.horizontal(|ui| {
-                let available = ui.available_width();
+                let available = widgets::finite_available_width(ui, 760.0);
                 let right_width = (available * 0.34).clamp(220.0, 320.0);
                 let left_width = (available - right_width - 6.0).max(140.0);
 

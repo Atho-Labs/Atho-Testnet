@@ -10,15 +10,12 @@ use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
 use crate::validation::finalize_witness_commit_refs;
-use atho_core::address::address_parts_from_public_key;
+use atho_core::address::decode_base56_address;
 use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
 use atho_core::consensus::rules;
 use atho_core::consensus::{pow, subsidy};
 use atho_core::constants::{MAX_BLOCK_RAW_BYTES, MAX_BLOCK_VBYTES, MAX_BLOCK_WEIGHT};
-use atho_core::crypto::hash::sha3_384;
-use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxOutput};
-use atho_crypto::falcon;
 use atho_storage::validation::ValidationError;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,7 +42,7 @@ pub(crate) fn build_candidate_block(node: &Node) -> Result<Block, NodeError> {
     let active_rules = rules::rules_at_height(height);
     let subsidy_atoms =
         subsidy::block_subsidy_atoms_for_network(node.network(), node.height().saturating_add(1));
-    let (reward_address, reward_script) = reward_target_for_height(node.network(), height);
+    let (reward_address, reward_script) = configured_reward_target(node)?;
     let previous_block_hash = node.tip_hash();
     let timestamp = candidate_block_timestamp(node.blocks());
     let difficulty_target_or_bits = node.difficulty_target_for_next_block_at(timestamp);
@@ -196,16 +193,26 @@ fn current_unix_timestamp_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Selects the deterministic reward target for the next mined height.
-///
-/// Mining rewards are sent to a synthetic per-height key derived from the
-/// network tag and height so tests and solo mining runs stay reproducible.
-fn reward_target_for_height(network: Network, height: u64) -> (String, Vec<u8>) {
-    let mut seed = Vec::with_capacity(network.id().len() + 8);
-    seed.extend_from_slice(network.domain_tag().as_bytes());
-    seed.extend_from_slice(&height.to_le_bytes());
-    let keypair = falcon::generate_from_seed(&sha3_384(&seed)).expect("falcon reward keypair");
-    let public_key = keypair.public_key.as_bytes().to_vec();
-    let parts = address_parts_from_public_key(network, &public_key);
-    (parts.base56_address, parts.payment_digest.to_vec())
+fn configured_reward_target(node: &Node) -> Result<(String, Vec<u8>), NodeError> {
+    let configured = node.config.mining_reward_address.trim();
+    if configured.is_empty() {
+        return Err(NodeError::MiningRewardAddressRequired(format!(
+            "configure ATHO_MINING_REWARD_ADDRESS or atho.conf miningrewardaddress for {}",
+            node.network().id()
+        )));
+    }
+    let (payment_digest, decoded_network) = decode_base56_address(configured).map_err(|_| {
+        NodeError::MiningRewardAddressRequired(format!(
+            "configured miningrewardaddress is not a valid Atho address for {}",
+            node.network().id()
+        ))
+    })?;
+    if decoded_network != node.network() {
+        return Err(NodeError::MiningRewardAddressRequired(format!(
+            "configured miningrewardaddress targets {} but node is on {}",
+            decoded_network.id(),
+            node.network().id()
+        )));
+    }
+    Ok((configured.to_string(), payment_digest.to_vec()))
 }

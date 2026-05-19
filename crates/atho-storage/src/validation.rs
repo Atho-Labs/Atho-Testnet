@@ -44,7 +44,10 @@ use atho_errors::{
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+const MAX_FUTURE_BLOCK_TIMESTAMP_DRIFT_SECS: u64 = 2 * 60 * 60;
 
 /// Validation failures raised while checking transactions or blocks.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -800,6 +803,21 @@ pub fn validate_coinbase_transaction_with_schedule(
     height: u64,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<(), ValidationError> {
+    validate_coinbase_transaction_shape_with_schedule(tx, height, schedule)?;
+    let output_total = tx
+        .checked_output_value_atoms()
+        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
+    if output_total != expected_reward_atoms {
+        return Err(ValidationError::CoinbaseRewardMismatch);
+    }
+    Ok(())
+}
+
+fn validate_coinbase_transaction_shape_with_schedule(
+    tx: &Transaction,
+    height: u64,
+    schedule: &[rules::ScheduledActivation],
+) -> Result<(), ValidationError> {
     if !tx.is_coinbase() {
         return Err(ValidationError::InvalidCoinbase);
     }
@@ -810,11 +828,8 @@ pub fn validate_coinbase_transaction_with_schedule(
         return Err(ValidationError::InvalidCoinbase);
     }
     canonical_payment_lock(tx.outputs[0].locking_script.as_slice())?;
-    let output_total = tx
-        .checked_output_value_atoms()
-        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
-    if output_total != expected_reward_atoms {
-        return Err(ValidationError::CoinbaseRewardMismatch);
+    if !tx.witness.is_empty() || tx.tx_pow_nonce != 0 || tx.tx_pow_bits != 0 {
+        return Err(ValidationError::InvalidCoinbase);
     }
     Ok(())
 }
@@ -897,16 +912,7 @@ fn collect_prepared_block_transactions_with_schedule(
     network: Network,
     schedule: &[rules::ScheduledActivation],
 ) -> Result<Vec<PreparedTransactionValidation>, ValidationError> {
-    let subsidy = subsidy::block_subsidy_atoms_for_network(network, height);
-    let expected_coinbase_reward = subsidy
-        .checked_add(block.fees_miner_atoms)
-        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
-    validate_coinbase_transaction_with_schedule(
-        &block.transactions[0],
-        expected_coinbase_reward,
-        height,
-        schedule,
-    )?;
+    validate_coinbase_transaction_shape_with_schedule(&block.transactions[0], height, schedule)?;
     if !txids_are_unique(&block.transactions) {
         return Err(ValidationError::DuplicateTransactionId);
     }
@@ -1193,12 +1199,15 @@ pub fn validate_block_with_context_and_schedule(
         }
     }
 
-    if sum_fees != block.fees_total_atoms {
-        return Err(ValidationError::FeeMismatch);
-    }
-    if block.fees_total_atoms != block.fees_miner_atoms {
-        return Err(ValidationError::FeeMismatch);
-    }
+    let expected_coinbase_reward = subsidy::block_subsidy_atoms_for_network(network, height)
+        .checked_add(sum_fees)
+        .ok_or(ValidationError::CoinbaseRewardMismatch)?;
+    validate_coinbase_transaction_with_schedule(
+        &block.transactions[0],
+        expected_coinbase_reward,
+        height,
+        schedule,
+    )?;
     verify_transaction_signatures_parallel_prepared(
         network,
         &block.transactions[1..],
@@ -1222,6 +1231,11 @@ fn validate_contextual_header_precheck(
             return Err(ValidationError::InvalidBlockTimestamp);
         }
     }
+    let maximum_timestamp =
+        current_unix_timestamp_seconds().saturating_add(MAX_FUTURE_BLOCK_TIMESTAMP_DRIFT_SECS);
+    if block.header.timestamp > maximum_timestamp {
+        return Err(ValidationError::InvalidBlockTimestamp);
+    }
     if block.header.difficulty_target_or_bits != expected_target {
         return Err(ValidationError::BlockTargetOutOfBounds);
     }
@@ -1229,6 +1243,13 @@ fn validate_contextual_header_precheck(
         return Err(ValidationError::ProofOfWorkInvalid);
     }
     Ok(())
+}
+
+fn current_unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -2293,6 +2314,32 @@ mod tests {
     }
 
     #[test]
+    fn coinbase_witness_and_pow_fields_are_rejected() {
+        let tx = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 1),
+                locking_script: vec![0x66; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![0x01],
+            tx_pow_nonce: 7,
+            tx_pow_bits: 1,
+        };
+
+        assert_eq!(
+            validate_coinbase_transaction_with_schedule(
+                &tx,
+                subsidy::block_subsidy_atoms_for_network(Network::Regnet, 1),
+                1,
+                &rules::SCHEDULED_ACTIVATIONS,
+            ),
+            Err(ValidationError::InvalidCoinbase)
+        );
+    }
+
+    #[test]
     fn block_spending_legacy_locking_script_utxo_is_rejected() {
         let utxo = UtxoEntry::new(Network::Regnet, [0x52; 48], 0, 20_000, vec![0x88], 1, false);
         let (spend_tx, fee_atoms) = sign_single_input_transaction(
@@ -2306,7 +2353,7 @@ mod tests {
             version: TRANSACTION_VERSION_V1,
             inputs: vec![],
             outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 2)
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 10)
                     .checked_add(fee_atoms)
                     .expect("coinbase reward"),
                 locking_script: vec![0x99; ADDRESS_DIGEST_BYTES],
@@ -2316,19 +2363,22 @@ mod tests {
             tx_pow_nonce: 0,
             tx_pow_bits: 0,
         };
+        let staged_transactions = vec![coinbase.clone(), spend_tx.clone()];
+        let block_witness_root = witness_root(&staged_transactions);
+        let spend_tx = finalize_witness_commit_refs(&spend_tx, block_witness_root);
         let transactions = vec![coinbase, spend_tx];
         let target = pow::initial_target_for_network(Network::Regnet);
         let mut block = solve_block(Block::new(
             BlockHeader {
                 version: BLOCK_VERSION_V1,
                 network_id: Network::Regnet,
-                height: 2,
+                height: 10,
                 previous_block_hash: [0; 48],
                 merkle_root: merkle_root(&transactions),
                 witness_root: witness_root(&transactions),
                 founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
                 founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
-                timestamp: 2,
+                timestamp: 10,
                 difficulty_target_or_bits: target,
                 nonce: 0,
             },
@@ -2342,7 +2392,7 @@ mod tests {
             .expect("seed legacy utxo for block validation");
 
         assert_eq!(
-            validate_block_with_context(&block, 2, Network::Regnet, [0; 48], target, &[], &utxos,),
+            validate_block_with_context(&block, 10, Network::Regnet, [0; 48], target, &[], &utxos,),
             Err(ValidationError::LegacyLockFormatRejected)
         );
     }
@@ -2432,6 +2482,56 @@ mod tests {
     }
 
     #[test]
+    fn future_timestamp_beyond_drift_window_is_rejected() {
+        let coinbase = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms(1),
+                locking_script: vec![1; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 1,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let transactions = vec![coinbase];
+        let target = pow::initial_target_for_network(Network::Mainnet);
+        let future_timestamp = current_unix_timestamp_seconds()
+            .saturating_add(MAX_FUTURE_BLOCK_TIMESTAMP_DRIFT_SECS)
+            .saturating_add(60);
+        let block = solve_block(Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Mainnet,
+                height: 1,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
+                timestamp: future_timestamp,
+                difficulty_target_or_bits: target,
+                nonce: 0,
+            },
+            transactions,
+        ));
+
+        assert_eq!(
+            validate_block_with_context(
+                &block,
+                1,
+                Network::Mainnet,
+                [0; 48],
+                target,
+                &[],
+                &UtxoSet::new(Network::Mainnet),
+            ),
+            Err(ValidationError::InvalidBlockTimestamp)
+        );
+    }
+
+    #[test]
     fn higher_fee_transactions_are_accepted_in_blocks() {
         let funding_keypair =
             generate_from_seed(b"atho-validation-high-fee").expect("funding keypair");
@@ -2492,13 +2592,9 @@ mod tests {
             }],
             additional_signers: vec![],
         };
-        let staged_tx = Transaction {
-            witness: staged_witness.canonical_bytes(),
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-            ..tx.clone()
-        };
-        let staged_transactions = vec![coinbase.clone(), staged_tx.clone()];
+        tx.witness = staged_witness.canonical_bytes();
+        solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);
+        let staged_transactions = vec![coinbase.clone(), tx.clone()];
         let block_witness_root = witness_root(&staged_transactions);
         tx.witness = TxWitness {
             signature: signature_bytes.clone(),
@@ -2511,7 +2607,6 @@ mod tests {
             additional_signers: vec![],
         }
         .canonical_bytes();
-        solve_transaction_pow(Network::Mainnet, &mut tx, 1_000);
 
         let transactions = vec![coinbase, tx.clone()];
         let block = Block::new(
@@ -2547,6 +2642,77 @@ mod tests {
                 &[],
                 &utxos,
             ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn contextual_block_validation_ignores_uncommitted_fee_metadata() {
+        let utxo = UtxoEntry::new(
+            Network::Regnet,
+            [0x53; 48],
+            0,
+            20_000,
+            public_key_digest(
+                Network::Regnet,
+                &generate_from_seed(b"atho-validation-fee-metadata")
+                    .expect("fee metadata keypair")
+                    .public_key
+                    .0,
+            )
+            .to_vec(),
+            1,
+            false,
+        );
+        let (spend_tx, fee_atoms) = sign_single_input_transaction(
+            Network::Regnet,
+            &utxo,
+            vec![0x55; ADDRESS_DIGEST_BYTES],
+            19_000,
+            b"atho-validation-fee-metadata",
+        );
+        let coinbase = Transaction {
+            version: TRANSACTION_VERSION_V1,
+            inputs: vec![],
+            outputs: vec![TxOutput {
+                value_atoms: subsidy::block_subsidy_atoms_for_network(Network::Regnet, 10)
+                    .checked_add(fee_atoms)
+                    .expect("coinbase reward"),
+                locking_script: vec![0x99; ADDRESS_DIGEST_BYTES],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let staged_transactions = vec![coinbase.clone(), spend_tx.clone()];
+        let block_witness_root = witness_root(&staged_transactions);
+        let spend_tx = finalize_witness_commit_refs(&spend_tx, block_witness_root);
+        let transactions = vec![coinbase, spend_tx];
+        let target = pow::initial_target_for_network(Network::Regnet);
+        let mut block = solve_block(Block::new(
+            BlockHeader {
+                version: BLOCK_VERSION_V1,
+                network_id: Network::Regnet,
+                height: 10,
+                previous_block_hash: [0; 48],
+                merkle_root: merkle_root(&transactions),
+                witness_root: witness_root(&transactions),
+                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
+                timestamp: 10,
+                difficulty_target_or_bits: target,
+                nonce: 0,
+            },
+            transactions,
+        ));
+        block.fees_total_atoms = fee_atoms.saturating_add(1);
+        block.fees_miner_atoms = 0;
+        let mut utxos = UtxoSet::new(Network::Regnet);
+        utxos.insert(utxo).expect("seed utxo");
+
+        assert_eq!(
+            validate_block_with_context(&block, 10, Network::Regnet, [0; 48], target, &[], &utxos,),
             Ok(())
         );
     }

@@ -477,6 +477,10 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(10.0);
         ui.checkbox(&mut app.node_settings_form.rpc_auth_enabled, "Enable RPC auth");
+        ui.checkbox(
+            &mut app.node_settings_form.rpc_cookie_auth,
+            "Enable local .cookie auth",
+        );
         ui.horizontal(|ui| {
             ui.label("RPC user");
             ui.add_sized(
@@ -490,6 +494,10 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                     .password(true),
             );
         });
+        widgets::muted_label(
+            ui,
+            "Atho now keeps plaintext RPC passwords out of atho.conf. Leave the password blank to preserve the current hashed rpcauth entry, or enter a new password to rotate it. Local tools prefer the .cookie token when enabled.",
+        );
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut app.node_settings_form.wallet_enabled, "Wallet enabled");
@@ -552,6 +560,40 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 );
                 ui.end_row();
             });
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut app.node_settings_form.fast_sync_enabled,
+                "Fast body download",
+            );
+            ui.checkbox(
+                &mut app.node_settings_form.background_validation_enabled,
+                "Background validation",
+            );
+            ui.checkbox(
+                &mut app.node_settings_form.checkpoint_sync_enabled,
+                "Checkpoint-anchored sync",
+            );
+        });
+        widgets::muted_label(
+            ui,
+            "These sync controls only tune download and validation scheduling. Consensus rules stay unchanged, and the node still rejects invalid blocks and transactions.",
+        );
+        ui.add_space(10.0);
+        ui.label("Trusted snapshot bundle");
+        ui.add_sized(
+            [f32::INFINITY, 26.0],
+            egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_path),
+        );
+        ui.label("Trusted snapshot SHA3-384");
+        ui.add_sized(
+            [f32::INFINITY, 26.0],
+            egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_hash),
+        );
+        widgets::muted_label(
+            ui,
+            "Optional. When set on a fresh node, Atho can import this snapshot bundle before regular sync. The hash pin protects the startup path from accidental or tampered files.",
+        );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("Save Node Settings").clicked() {
@@ -918,10 +960,8 @@ fn render_browse_save_row(
     filter: Option<(&str, &[&str])>,
 ) {
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width((ui.available_width() - 112.0).max(160.0)),
-        );
+        let input_width = widgets::reserved_width(ui.available_width(), 112.0, 160.0, 420.0);
+        ui.add(egui::TextEdit::singleline(value).desired_width(input_width));
         if ui
             .add_sized([96.0, 28.0], egui::Button::new(button_label))
             .clicked()

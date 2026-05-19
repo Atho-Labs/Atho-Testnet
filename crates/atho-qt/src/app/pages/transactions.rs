@@ -16,6 +16,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         let chain_synced = app.view_model.chain_synced();
 
         ui.horizontal(|ui| {
+            let search_width = widgets::reserved_width(ui.available_width(), 170.0, 220.0, 420.0);
             egui::ComboBox::from_id_source("tx_date_filter")
                 .selected_text(
                     DATE_FILTERS[app.transaction_date_filter.min(DATE_FILTERS.len() - 1)],
@@ -39,7 +40,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 });
 
             ui.add_sized(
-                [ui.available_width() - 170.0, 28.0],
+                [search_width, 28.0],
                 egui::TextEdit::singleline(&mut app.transaction_search)
                     .hint_text("Enter address, transaction id, or label to search"),
             );

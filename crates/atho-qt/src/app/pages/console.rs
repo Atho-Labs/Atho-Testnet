@@ -229,9 +229,10 @@ fn render_console_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
         }
 
         ui.add_space(8.0);
-        let output_height = (ui.available_height() - 92.0).max(220.0);
+        let output_height = (widgets::finite_available_height(ui, 320.0) - 92.0).max(220.0);
+        let output_width = widgets::finite_available_width(ui, 640.0);
         ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), output_height),
+            egui::vec2(output_width, output_height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 widgets::panel_frame()
@@ -262,7 +263,8 @@ fn render_console_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             );
             prompt.on_hover_text("Enter a local Atho RPC command.");
             let run_width = 68.0;
-            let input_width = (ui.available_width() - run_width - 8.0).max(220.0);
+            let input_width =
+                widgets::reserved_width(ui.available_width(), run_width + 8.0, 220.0, 420.0);
             let response = ui.add_sized(
                 [input_width, 28.0],
                 egui::TextEdit::singleline(&mut app.debug_console_input)
@@ -433,7 +435,10 @@ fn render_network_traffic_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::panel_frame().show(ui, |ui| {
             widgets::section_header(ui, "Network Traffic");
             ui.add_space(10.0);
-            let desired = egui::vec2((ui.available_width() - 8.0).max(320.0), 280.0);
+            let desired = egui::vec2(
+                widgets::reserved_width(ui.available_width(), 8.0, 320.0, 420.0),
+                280.0,
+            );
             let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
             paint_traffic_graph(&app.network_traffic_samples, response.rect, &painter);
             ui.add_space(8.0);

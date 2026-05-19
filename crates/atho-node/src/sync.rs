@@ -429,8 +429,9 @@ impl NodeSync {
         let pending_validation_blocks = self.pending_untrusted_validation_blocks();
         let validation_lag_blocks =
             best_downloaded_body_height.saturating_sub(best_connected_height);
-        let fast_download_enabled =
-            limits.enable_fast_body_download && limits.enable_checkpoint_anchored_sync;
+        let fast_download_enabled = limits.enable_fast_body_download
+            && limits.enable_checkpoint_anchored_sync
+            && limits.enable_background_validation;
         let background_validation_enabled = limits.enable_background_validation;
         let safe_to_serve = self.chain_synced(node) && pending_validation_blocks == 0;
         let safe_to_mine = if limits.require_full_validation_before_mining {
@@ -2730,7 +2731,7 @@ impl NodeSync {
         let mempool_by_short_id = node
             .mempool_transactions()
             .into_iter()
-            .map(|tx| (compact_short_id(tx.txid()), tx))
+            .map(|tx| (compact_short_id(tx.witness_commitment_hash()), tx))
             .collect::<BTreeMap<_, _>>();
         match reconstruct_compact_block(
             &message,
@@ -2834,7 +2835,7 @@ impl NodeSync {
         let mempool_by_short_id = node
             .mempool_transactions()
             .into_iter()
-            .map(|tx| (compact_short_id(tx.txid()), tx))
+            .map(|tx| (compact_short_id(tx.witness_commitment_hash()), tx))
             .collect::<BTreeMap<_, _>>();
         match reconstruct_compact_block(
             &pending.message,
@@ -2959,7 +2960,10 @@ impl NodeSync {
 
     fn block_download_stage_lookahead(&self, node: &Node) -> u64 {
         let limits = network_params(self.network).limits;
-        if limits.enable_fast_body_download && self.checkpoint_anchor_allows_fast_download(node) {
+        if limits.enable_fast_body_download
+            && limits.enable_background_validation
+            && self.checkpoint_anchor_allows_fast_download(node)
+        {
             limits.max_fast_download_ahead
         } else {
             self.block_download_lookahead()
@@ -5968,7 +5972,7 @@ mod tests {
 
         let mut reference = Node::new(NodeConfig::new(Network::Regnet));
         let remote_blocks = (0..4)
-            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 10_000 + index))
+            .map(|index| mine_with_timestamp_offset(&mut reference, &miner, 100 + index))
             .collect::<Vec<_>>();
         assert_ne!(peer.node.tip_hash(), remote_blocks[1].header.block_hash());
 

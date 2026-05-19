@@ -189,7 +189,7 @@ fn show_status(args: &[String]) -> Result<(), String> {
     let rpc_address = status_cli
         .rpc_addr
         .unwrap_or_else(|| atho_node::runtime::rpc_bind_address(network));
-    let client = RpcClient::new(rpc_address.clone());
+    let client = rpc_client_for_network(network, rpc_address.clone());
     let status = match client.call(&RpcRequest::GetNodeStatus) {
         Ok(RpcResponse::NodeStatus(status)) => status,
         Ok(RpcResponse::Error(err)) => return Err(err.to_string()),
@@ -389,7 +389,7 @@ fn run_wipe(args: &[String]) -> Result<(), String> {
 
 /// Returns whether a local RPC endpoint matches the requested network namespace.
 fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Result<bool, String> {
-    let client = RpcClient::new(rpc_address.to_string());
+    let client = rpc_client_for_network(network, rpc_address.to_string());
     match client.call(&RpcRequest::GetNodeStatus) {
         Ok(RpcResponse::NodeStatus(status)) => {
             if status.network == network {
@@ -429,6 +429,23 @@ fn local_rpc_endpoint_matches_network(network: Network, rpc_address: &str) -> Re
         Ok(_) => Ok(false),
         Err(_) => Ok(false),
     }
+}
+
+fn rpc_client_for_network(network: Network, rpc_address: String) -> RpcClient {
+    let config = NodeConfig::from_env(network);
+    if config.rpc_auth.enabled {
+        if config.rpc_auth.cookie_auth {
+            if let Ok(Some(secret)) = config.load_rpc_cookie_secret() {
+                return RpcClient::with_cookie(rpc_address, secret);
+            }
+        }
+        return RpcClient::with_auth(
+            rpc_address,
+            config.rpc_auth.username,
+            config.rpc_auth.password,
+        );
+    }
+    RpcClient::new(rpc_address)
 }
 
 /// Applies the explicit network override requested by the operator, if any.

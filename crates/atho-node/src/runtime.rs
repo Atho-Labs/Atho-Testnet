@@ -8,7 +8,7 @@
 //!
 //! SECURITY: RPC remains loopback-only by default. Public binding requires an
 //! explicit override because wallet and admin commands assume local trust.
-use crate::config::{NodeConfig, RpcAuthConfig};
+use crate::config::{NodeConfig, RpcAuthConfig, ATHO_RPC_COOKIE_USER};
 use crate::dev;
 use crate::error::NodeError;
 use crate::node::Node;
@@ -24,9 +24,13 @@ use atho_rpc::error::RpcError;
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
 use atho_rpc::transport::{read_message, write_message};
+use getrandom::getrandom;
 use std::collections::BTreeSet;
-use std::io::BufReader;
+use std::fs::{self, File};
+use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -119,6 +123,24 @@ impl NodeRuntime {
 
     /// Starts the runtime and records the process start time.
     pub fn start(&mut self) {
+        if let Err(err) = self.node.mark_runtime_started() {
+            let _ = dev::append_log(
+                "athod",
+                &format!(
+                    "runtime startup marker failed network={} error={err}",
+                    self.node.network().id()
+                ),
+            );
+        }
+        if let Err(err) = refresh_rpc_cookie(&mut self.node.config) {
+            let _ = dev::append_log(
+                "athod",
+                &format!(
+                    "rpc cookie refresh failed network={} error={err}",
+                    self.node.network().id()
+                ),
+            );
+        }
         self.running = true;
         self.started_at_unix = Some(
             SystemTime::now()
@@ -136,8 +158,18 @@ impl NodeRuntime {
         );
     }
 
-    /// Stops the runtime without mutating persisted state.
+    /// Stops the runtime and records a clean shutdown marker for the next start.
     pub fn stop(&mut self) {
+        if let Err(err) = self.node.mark_clean_shutdown() {
+            let _ = dev::append_log(
+                "athod",
+                &format!(
+                    "runtime clean shutdown marker failed network={} error={err}",
+                    self.node.network().id()
+                ),
+            );
+        }
+        let _ = remove_rpc_cookie(&mut self.node.config);
         self.running = false;
         let _ = dev::append_log(
             "athod",
@@ -166,12 +198,15 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let network = config.network;
     let rpc_address = config.rpc_bind_address();
     let api_config = config.api.clone();
-    let rpc_auth = config.rpc_auth.clone();
     let system = Arc::new(Mutex::new(AthoSystem::try_new(config)?));
     {
         let mut guard = system.lock().expect("node runtime mutex poisoned");
         guard.start();
     }
+    let rpc_auth = {
+        let guard = system.lock().expect("node runtime mutex poisoned");
+        guard.node_ref().config.rpc_auth.clone()
+    };
     let p2p_address = p2p_bind_address(network);
     let p2p_runtime = TcpP2pRuntime::bind_shared(network, Arc::clone(&system), &p2p_address)
         .map_err(|err| NodeError::Runtime(RuntimeError::P2pBindFailed(err.to_string())))?;
@@ -187,8 +222,14 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     for peer in initial_outbound_peers(network, bootstrap_peers) {
         p2p_runtime.maintain_outbound(peer);
     }
-    validate_rpc_bind_address(&rpc_address, &rpc_auth)?;
+    validate_rpc_bind_address(&rpc_address, &rpc_auth).map_err(|err| {
+        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        guard.stop();
+        err
+    })?;
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
+        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        guard.stop();
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
     println!("athod running on {} rpc={rpc_address}", network.id());
@@ -212,8 +253,11 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     if api_config.enabled {
         let shared = Arc::clone(&system);
         let bind = api_config.bind_address();
-        let server = crate::api::bind_http_server(&api_config)
-            .map_err(|err| NodeError::Runtime(RuntimeError::ApiBindFailed(err)))?;
+        let server = crate::api::bind_http_server(&api_config).map_err(|err| {
+            let mut guard = system.lock().expect("node runtime mutex poisoned");
+            guard.stop();
+            NodeError::Runtime(RuntimeError::ApiBindFailed(err))
+        })?;
         std::thread::Builder::new()
             .name(format!("atho-api-{}", network.domain_tag()))
             .spawn(move || {
@@ -224,7 +268,11 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                     );
                 }
             })
-            .map_err(|err| NodeError::Runtime(RuntimeError::ApiBindFailed(err.to_string())))?;
+            .map_err(|err| {
+                let mut guard = system.lock().expect("node runtime mutex poisoned");
+                guard.stop();
+                NodeError::Runtime(RuntimeError::ApiBindFailed(err.to_string()))
+            })?;
     }
     for incoming in listener.incoming() {
         match incoming {
@@ -289,6 +337,10 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                 let _ = dev::append_log("athod", &format!("rpc accept error: {err}"));
             }
         }
+    }
+    {
+        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        guard.stop();
     }
     let _ = dev::append_log("athod", "runtime stopped");
     Ok(())
@@ -372,7 +424,7 @@ fn authenticate_rpc_request(
             username,
             password,
             request,
-        } if username == auth.username && password == auth.password => Ok(*request),
+        } if auth.verify_username_password(&username, &password) => Ok(*request),
         RpcRequest::Authenticated { .. } => Err(RpcResponse::Error(RpcError::invalid_request(
             "rpc authentication failed",
         ))),
@@ -380,6 +432,72 @@ fn authenticate_rpc_request(
             "rpc authentication required",
         ))),
     }
+}
+
+fn refresh_rpc_cookie(config: &mut NodeConfig) -> io::Result<()> {
+    if !config.rpc_auth.enabled || !config.rpc_auth.cookie_auth {
+        config.rpc_auth.cookie_secret = None;
+        let _ = remove_rpc_cookie(config);
+        return Ok(());
+    }
+
+    let mut secret = [0u8; 32];
+    getrandom(&mut secret)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to gather rpc cookie entropy"))?;
+    let cookie_secret = hex::encode(secret);
+    let cookie_path = config.rpc_cookie_path();
+    atomic_write_owner_only(&cookie_path, cookie_secret.as_bytes())?;
+    config.rpc_auth.cookie_secret = Some(cookie_secret);
+    config.rpc_auth.username = config
+        .rpc_auth
+        .username
+        .trim()
+        .is_empty()
+        .then(|| String::from(ATHO_RPC_COOKIE_USER))
+        .unwrap_or_else(|| config.rpc_auth.username.clone());
+    Ok(())
+}
+
+fn remove_rpc_cookie(config: &mut NodeConfig) -> io::Result<()> {
+    config.rpc_auth.cookie_secret = None;
+    match fs::remove_file(config.rpc_cookie_path()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".cookie");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    {
+        let mut file = File::create(&tmp_path)?;
+        restrict_owner_only_permissions(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    restrict_owner_only_permissions(path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn restrict_owner_only_permissions(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn p2p_bind_address(network: Network) -> String {
@@ -443,10 +561,30 @@ mod tests {
             port: 9010,
             username: String::from("operator"),
             password: String::from("not-the-default-password"),
+            ..RpcAuthConfig::default()
         };
         let result = validate_rpc_bind_address("0.0.0.0:9010", &auth);
         std::env::remove_var("ATHO_RPC_ALLOW_PUBLIC");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rpc_authentication_accepts_cookie_secret_when_enabled() {
+        let mut auth = RpcAuthConfig::default();
+        auth.enabled = true;
+        auth.cookie_auth = true;
+        auth.cookie_secret = Some(String::from("cookie-secret"));
+
+        let request = RpcRequest::authenticated(
+            ATHO_RPC_COOKIE_USER,
+            "cookie-secret",
+            RpcRequest::GetNetwork,
+        );
+
+        assert_eq!(
+            authenticate_rpc_request(request, &auth).expect("cookie auth"),
+            RpcRequest::GetNetwork
+        );
     }
 
     #[test]

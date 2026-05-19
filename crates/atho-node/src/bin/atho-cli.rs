@@ -35,6 +35,7 @@ struct CliConfig {
     rpc_address: Option<String>,
     rpc_user: Option<String>,
     rpc_password: Option<String>,
+    cookie_auth: bool,
     format: OutputFormat,
     command_line: Option<String>,
     confirmed: bool,
@@ -47,6 +48,7 @@ impl Default for CliConfig {
             rpc_address: None,
             rpc_user: None,
             rpc_password: None,
+            cookie_auth: false,
             format: OutputFormat::Pretty,
             command_line: None,
             confirmed: false,
@@ -93,10 +95,33 @@ fn run() -> Result<(), String> {
     let rpc_address = config
         .rpc_address
         .unwrap_or_else(|| node_config.rpc_bind_address());
-    let rpc_user = config.rpc_user.unwrap_or(node_config.rpc_auth.username);
-    let rpc_password = config.rpc_password.unwrap_or(node_config.rpc_auth.password);
     let client = if node_config.rpc_auth.enabled {
-        RpcClient::with_auth(rpc_address, rpc_user, rpc_password)
+        let prefer_cookie = config.cookie_auth
+            || (node_config.rpc_auth.cookie_auth
+                && config.rpc_user.is_none()
+                && config.rpc_password.is_none());
+        if prefer_cookie {
+            match node_config
+                .load_rpc_cookie_secret()
+                .map_err(|err| err.to_string())?
+            {
+                Some(secret) => RpcClient::with_cookie(rpc_address, secret),
+                None if config.cookie_auth => {
+                    return Err(String::from(
+                        "rpc cookie auth was requested, but the local .cookie file was not found",
+                    ))
+                }
+                None => {
+                    let rpc_user = config.rpc_user.unwrap_or(node_config.rpc_auth.username);
+                    let rpc_password = config.rpc_password.unwrap_or(node_config.rpc_auth.password);
+                    RpcClient::with_auth(rpc_address, rpc_user, rpc_password)
+                }
+            }
+        } else {
+            let rpc_user = config.rpc_user.unwrap_or(node_config.rpc_auth.username);
+            let rpc_password = config.rpc_password.unwrap_or(node_config.rpc_auth.password);
+            RpcClient::with_auth(rpc_address, rpc_user, rpc_password)
+        }
     } else {
         RpcClient::new(rpc_address)
     };
@@ -175,11 +200,11 @@ fn parse_cli(args: &[String]) -> Result<CliConfig, String> {
             "--confirm" => {
                 config.confirmed = true;
             }
-            "--cookie-auth" | "--timeout" => {
-                return Err(format!(
-                    "{} is not supported by the current Atho local RPC transport yet",
-                    args[index]
-                ));
+            "--cookie-auth" => {
+                config.cookie_auth = true;
+            }
+            "--timeout" => {
+                return Err(format!("{} is not supported yet", args[index]));
             }
             "--verbose" | "--debug" => {}
             "--" => {
@@ -329,12 +354,13 @@ fn print_usage() {
     println!("Atho CLI");
     println!();
     println!("Usage:");
-    println!("  atho-cli [--network <mainnet|testnet|regnet|prunetest>] [--rpc-url <host:port>] [--rpcuser USER] [--rpcpassword PASSWORD] [--format <json|pretty|table>] <command> [args]");
+    println!("  atho-cli [--network <mainnet|testnet|regnet|prunetest>] [--rpc-url <host:port>] [--cookie-auth] [--rpcuser USER] [--rpcpassword PASSWORD] [--format <json|pretty|table>] <command> [args]");
     println!("  atho-cli help [command|group]");
     println!();
     println!("Flags:");
     println!("  --network      Select the network and default local RPC port");
     println!("  --rpc-url      Override the local RPC address");
+    println!("  --cookie-auth  Use the local node .cookie token when available");
     println!("  --rpcuser      RPC username when rpcauth=1");
     println!("  --rpcpassword  RPC password when rpcauth=1");
     println!("  --format       Output format: json, pretty, or table");
@@ -345,11 +371,6 @@ fn print_usage() {
     println!("  atho-cli --network testnet getblockchaininfo");
     println!("  atho-cli getpeerinfo --format table");
     println!("  atho-cli help getblocktemplate");
-    println!();
-    println!("Current local RPC note:");
-    println!(
-        "  Authentication flags are not implemented in the current Atho local RPC transport yet."
-    );
 }
 
 #[cfg(test)]
@@ -394,9 +415,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_cli_rejects_unsupported_cookie_auth_flag() {
-        let err = parse_cli(&[String::from("--cookie-auth"), String::from("getstatus")])
-            .expect_err("unsupported");
-        assert!(err.contains("not supported"));
+    fn parse_cli_accepts_cookie_auth_flag() {
+        let config = parse_cli(&[String::from("--cookie-auth"), String::from("getstatus")])
+            .expect("cookie auth");
+        assert!(config.cookie_auth);
     }
 }

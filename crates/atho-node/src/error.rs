@@ -4,7 +4,7 @@
 //! Node-layer errors that wrap runtime, storage, validation, and RPC failures.
 use crate::runtime::RuntimeError;
 use crate::validation::ValidationError;
-use atho_errors::{AthoErrorDescriptor, AthoErrorMeta};
+use atho_errors::{AthoErrorDescriptor, AthoErrorMeta, MINE_REWARD_ADDRESS_REQUIRED};
 use atho_p2p::connection::ConnectionError;
 use atho_p2p::protocol::ProtocolError;
 use atho_rpc::error::RpcError;
@@ -23,6 +23,8 @@ pub enum NodeError {
     P2pConnection(#[from] ConnectionError),
     #[error(transparent)]
     P2pProtocol(#[from] ProtocolError),
+    #[error("mining reward address required: {0}")]
+    MiningRewardAddressRequired(String),
 }
 
 impl AthoErrorMeta for NodeError {
@@ -33,6 +35,7 @@ impl AthoErrorMeta for NodeError {
             Self::Storage(error) => error.descriptor(),
             Self::P2pConnection(error) => error.descriptor(),
             Self::P2pProtocol(error) => error.descriptor(),
+            Self::MiningRewardAddressRequired(_) => &MINE_REWARD_ADDRESS_REQUIRED,
         }
     }
 
@@ -43,6 +46,7 @@ impl AthoErrorMeta for NodeError {
             Self::Storage(error) => error.source_module(),
             Self::P2pConnection(error) => error.source_module(),
             Self::P2pProtocol(error) => error.source_module(),
+            Self::MiningRewardAddressRequired(_) => "atho-node::mining",
         }
     }
 
@@ -53,6 +57,7 @@ impl AthoErrorMeta for NodeError {
             Self::Storage(error) => error.safe_details(),
             Self::P2pConnection(error) => error.safe_details(),
             Self::P2pProtocol(error) => error.safe_details(),
+            Self::MiningRewardAddressRequired(message) => Some(message.clone()),
         }
     }
 }

@@ -417,6 +417,9 @@ impl Block {
         let header = BlockHeader::from_canonical_bytes(bytes.get(..header_len)?)?;
         let mut offset = header_len;
         let tx_count = read_u32(bytes, &mut offset)? as usize;
+        if tx_count > bytes.len().saturating_sub(offset) / 4 {
+            return None;
+        }
         let mut transactions = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
             let tx_len = read_u32(bytes, &mut offset)? as usize;

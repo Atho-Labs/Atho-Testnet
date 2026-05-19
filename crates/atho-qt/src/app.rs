@@ -2895,8 +2895,8 @@ impl DesktopApp {
         let mut config = atho_node::config::NodeConfig::from_env(network);
         config.network = network;
         config.rpc_auth.enabled = self.node_settings_form.rpc_auth_enabled;
+        config.rpc_auth.cookie_auth = self.node_settings_form.rpc_cookie_auth;
         config.rpc_auth.username = self.node_settings_form.rpc_user.trim().to_string();
-        config.rpc_auth.password = self.node_settings_form.rpc_password.trim().to_string();
         config.wallet.enabled = self.node_settings_form.wallet_enabled;
         config.wallet.require_encryption = self.node_settings_form.wallet_require_encryption;
         config.mempool.max_vbytes =
@@ -2911,11 +2911,32 @@ impl DesktopApp {
             parse_mib_setting(&self.node_settings_form.db_cache_mib, "database cache")?;
         config.peers.max_connections =
             parse_usize_setting(&self.node_settings_form.max_peer_connections, "max peers")?;
+        config.sync.fast_body_download = self.node_settings_form.fast_sync_enabled;
+        config.sync.background_validation = self.node_settings_form.background_validation_enabled;
+        config.sync.checkpoint_anchored_sync = self.node_settings_form.checkpoint_sync_enabled;
+        config.sync.bootstrap_snapshot_path = self
+            .node_settings_form
+            .bootstrap_snapshot_path
+            .trim()
+            .to_string();
+        config.sync.bootstrap_snapshot_hash = self
+            .node_settings_form
+            .bootstrap_snapshot_hash
+            .trim()
+            .to_string();
 
-        if config.rpc_auth.enabled
-            && (config.rpc_auth.username.is_empty() || config.rpc_auth.password.is_empty())
-        {
-            return Err(String::from("RPC auth requires both username and password"));
+        if config.rpc_auth.enabled && config.rpc_auth.username.is_empty() {
+            return Err(String::from("RPC auth requires an operator username"));
+        }
+        if config.rpc_auth.enabled && !config.rpc_auth.cookie_auth {
+            let updating_hash = !self.node_settings_form.rpc_password.trim().is_empty();
+            let preserving_hash = config.rpc_auth.password_hmac.is_some()
+                || !config.rpc_auth.password.trim().is_empty();
+            if !updating_hash && !preserving_hash {
+                return Err(String::from(
+                    "RPC auth without local cookie auth needs a password so Atho can write a hashed rpcauth entry.",
+                ));
+            }
         }
         if config.wallet.enabled
             && config.wallet.require_encryption
@@ -2930,6 +2951,42 @@ impl DesktopApp {
                 "Wallet protection is enabled. Set a wallet passphrase in Backup & Passphrase before saving this mode.",
             ));
         }
+
+        if config.rpc_auth.enabled && !self.node_settings_form.rpc_password.trim().is_empty() {
+            config.rpc_auth.password_hmac = Some(
+                atho_node::config::RpcHashedCredential::from_password(
+                    &config.rpc_auth.username,
+                    self.node_settings_form.rpc_password.trim(),
+                )
+                .map_err(|err| err.to_string())?,
+            );
+        } else if config.rpc_auth.enabled
+            && config.rpc_auth.password_hmac.is_none()
+            && !config.rpc_auth.password.trim().is_empty()
+        {
+            config.rpc_auth.password_hmac = Some(
+                atho_node::config::RpcHashedCredential::from_password(
+                    &config.rpc_auth.username,
+                    config.rpc_auth.password.trim(),
+                )
+                .map_err(|err| err.to_string())?,
+            );
+        } else if config.rpc_auth.enabled
+            && config.rpc_auth.password_hmac.is_some()
+            && config.rpc_auth.username
+                != config
+                    .rpc_auth
+                    .password_hmac
+                    .as_ref()
+                    .map(|credential| credential.username.as_str())
+                    .unwrap_or_default()
+        {
+            return Err(String::from(
+                "Changing the RPC username requires entering a new password so Atho can regenerate the hashed rpcauth entry.",
+            ));
+        }
+        config.rpc_auth.password.clear();
+        config.rpc_auth.cookie_secret = None;
 
         config
             .write_operator_config_file()

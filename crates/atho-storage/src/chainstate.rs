@@ -14,6 +14,7 @@ use atho_core::consensus::{pow, rules};
 use atho_core::constants::{MAX_REORG_DEPTH_BLOCKS, PRUNE_DEPTH_BLOCKS};
 use atho_core::genesis;
 use atho_core::network::Network;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -83,7 +84,7 @@ struct PersistedChainstate {
     utxos: Vec<UtxoEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainSnapshotBundle {
     pub snapshot: ChainstateSnapshot,
     pub utxos: Vec<UtxoEntry>,
@@ -178,6 +179,20 @@ impl Chainstate {
     pub fn load_or_new(network: Network) -> Self {
         Self::try_load_or_recover(network)
             .unwrap_or_else(|err| panic!("failed to load chainstate for {}: {}", network.id(), err))
+    }
+
+    pub fn mark_runtime_started(&self) -> Result<(), StorageError> {
+        if let Some(storage) = self.storage.as_ref() {
+            storage.mark_runtime_started()?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_clean_shutdown(&self) -> Result<(), StorageError> {
+        if let Some(storage) = self.storage.as_ref() {
+            storage.mark_clean_shutdown()?;
+        }
+        Ok(())
     }
 
     pub fn try_load_or_recover(network: Network) -> Result<Self, StorageError> {
@@ -1495,7 +1510,8 @@ mod tests {
     use atho_core::genesis;
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxOutput};
-    use lmdb::{Environment, Transaction as LmdbTransaction, WriteFlags};
+    use lmdb::{Cursor, Environment, Transaction as LmdbTransaction, WriteFlags};
+    use proptest::prelude::*;
     use std::ffi::OsString;
     use std::fs;
     use std::sync::MutexGuard;
@@ -1764,6 +1780,32 @@ mod tests {
         txn.commit().expect("commit metadata");
     }
 
+    fn mutate_first_persisted_utxo(network: Network, mutate: impl FnOnce(&mut UtxoEntry)) {
+        let db_path = crate::path::database_dir(network);
+        let mut builder = Environment::new();
+        builder
+            .set_max_readers(128)
+            .set_max_dbs(10)
+            .set_map_size(1 << 30);
+        let env = builder.open(&db_path).expect("open env");
+        let utxo_db = env.open_db(Some("utxos")).expect("utxos db");
+        let read_txn = env.begin_ro_txn().expect("ro txn");
+        let mut cursor = read_txn.open_ro_cursor(utxo_db).expect("utxo cursor");
+        let (_, raw_value) = cursor.iter().next().expect("persisted utxo");
+        let mut target: UtxoEntry = bincode::deserialize(raw_value).expect("deserialize utxo");
+        drop(cursor);
+        drop(read_txn);
+
+        mutate(&mut target);
+
+        let mut txn = env.begin_rw_txn().expect("rw txn");
+        let key = fixture_utxo_key(target.txid, target.output_index);
+        let value = bincode::serialize(&target).expect("serialize utxo");
+        txn.put(utxo_db, &key.as_slice(), &value, WriteFlags::empty())
+            .expect("put utxo");
+        txn.commit().expect("commit utxo mutation");
+    }
+
     #[test]
     fn chainstate_tracks_tip_and_height() {
         let mut state = Chainstate::new(Network::Mainnet);
@@ -1901,56 +1943,69 @@ mod tests {
         let root = temp_workspace("fault-injection");
         fs::create_dir_all(&root).expect("root");
         let _guard = CurrentDirGuard::switch_to(&root);
-        let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
-        let before_height = state.height;
-        let before_tip_hash = state.tip_hash;
-        let before_utxo_count = state.utxo_count();
+        for point in [
+            CommitFaultPoint::AfterArchiveWrite,
+            CommitFaultPoint::AfterSnapshotWrite,
+            CommitFaultPoint::AfterStateWrite,
+            CommitFaultPoint::BeforeCommit,
+        ] {
+            let mut state = Chainstate::try_load_or_new(Network::Mainnet).expect("state");
+            let before_height = state.height;
+            let before_tip_hash = state.tip_hash;
+            let before_utxo_count = state.utxo_count();
 
-        let coinbase = Transaction {
-            version: 1,
-            inputs: vec![],
-            outputs: vec![TxOutput {
-                value_atoms: subsidy::block_subsidy_atoms(1),
-                locking_script: vec![9; ADDRESS_DIGEST_BYTES],
-            }],
-            lock_time: 0,
-            witness: vec![],
-            tx_pow_nonce: 0,
-            tx_pow_bits: 0,
-        };
-        let transactions = vec![coinbase];
-        let block = solve_block(Block::new(
-            BlockHeader {
+            let coinbase = Transaction {
                 version: 1,
-                network_id: Network::Mainnet,
-                height: 1,
-                previous_block_hash: state.tip_hash,
-                merkle_root: merkle_root(&transactions),
-                witness_root: witness_root(&transactions),
-                founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
-                founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
-                timestamp: genesis::genesis_state(Network::Mainnet)
-                    .block
-                    .header
-                    .timestamp
-                    .saturating_add(1),
-                difficulty_target_or_bits: atho_core::consensus::pow::initial_target_for_network(
-                    Network::Mainnet,
-                ),
-                nonce: 0,
-            },
-            transactions,
-        ));
+                inputs: vec![],
+                outputs: vec![TxOutput {
+                    value_atoms: subsidy::block_subsidy_atoms(1),
+                    locking_script: vec![9; ADDRESS_DIGEST_BYTES],
+                }],
+                lock_time: 0,
+                witness: vec![],
+                tx_pow_nonce: 0,
+                tx_pow_bits: 0,
+            };
+            let transactions = vec![coinbase];
+            let block = solve_block(Block::new(
+                BlockHeader {
+                    version: 1,
+                    network_id: Network::Mainnet,
+                    height: 1,
+                    previous_block_hash: state.tip_hash,
+                    merkle_root: merkle_root(&transactions),
+                    witness_root: witness_root(&transactions),
+                    founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+                    founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
+                    timestamp: genesis::genesis_state(Network::Mainnet)
+                        .block
+                        .header
+                        .timestamp
+                        .saturating_add(1),
+                    difficulty_target_or_bits:
+                        atho_core::consensus::pow::initial_target_for_network(Network::Mainnet),
+                    nonce: 0,
+                },
+                transactions,
+            ));
 
-        Database::inject_commit_fault_for_test(CommitFaultPoint::BeforeCommit, 1);
-        let result = state.connect_block(&block);
-        Database::clear_commit_fault_for_test();
+            Database::inject_commit_fault_for_test(point, 1);
+            let result = state.connect_block(&block);
+            Database::clear_commit_fault_for_test();
 
-        assert!(matches!(result, Err(StorageError::Io(_))));
-        assert_eq!(state.height, before_height);
-        assert_eq!(state.tip_hash, before_tip_hash);
-        assert_eq!(state.utxo_count(), before_utxo_count);
-        assert_eq!(state.blocks().len(), 1);
+            assert!(
+                matches!(result, Err(StorageError::Io(_))),
+                "fault point {point:?}"
+            );
+            assert_eq!(state.height, before_height, "fault point {point:?}");
+            assert_eq!(state.tip_hash, before_tip_hash, "fault point {point:?}");
+            assert_eq!(
+                state.utxo_count(),
+                before_utxo_count,
+                "fault point {point:?}"
+            );
+            assert_eq!(state.blocks().len(), 1, "fault point {point:?}");
+        }
     }
 
     #[test]
@@ -2125,6 +2180,36 @@ mod tests {
         assert_eq!(recovered.tip_hash, tip_hash);
         assert_eq!(recovered.blocks().len(), 2);
         assert!(!crate::path::storage_recovery_root(Network::Testnet).exists());
+    }
+
+    #[test]
+    fn dirty_restart_detects_persisted_utxo_corruption_and_quarantines_state() {
+        let root = temp_workspace("dirty-utxo-corruption");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+
+        let mut state = Chainstate::try_load_or_new(Network::Testnet).expect("state");
+        let block = build_coinbase_successor(&state);
+        state.connect_block(&block).expect("connect block");
+        state.mark_runtime_started().expect("mark runtime started");
+        drop(state);
+
+        mutate_first_persisted_utxo(Network::Testnet, |entry| {
+            entry.value_atoms = entry.value_atoms.saturating_add(1);
+        });
+
+        let recovered = Chainstate::try_load_or_recover(Network::Testnet).expect("recovered");
+        assert_eq!(recovered.height, 0);
+        assert_eq!(recovered.tip_hash, genesis::genesis_hash(Network::Testnet));
+
+        let mut backups = fs::read_dir(crate::path::storage_recovery_root(Network::Testnet))
+            .expect("backup root")
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let report = backups.pop().expect("backup").path().join("RECOVERY.txt");
+        let report_text = fs::read_to_string(report).expect("report");
+        assert!(report_text.contains("error=corrupt storage data"));
     }
 
     #[test]
@@ -3629,5 +3714,65 @@ mod tests {
             .expect("present snapshot");
         assert_eq!(snapshot.height, before_height);
         assert_eq!(snapshot.tip_hash, before_tip_hash);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+
+        #[test]
+        fn replay_from_genesis_matches_live_chainstate(
+            timestamp_steps in prop::collection::vec(1u64..300u64, 0..4),
+        ) {
+            let mut live = Chainstate::new(Network::Regnet);
+            let mut next_timestamp = genesis::genesis_state(Network::Regnet)
+                .block
+                .header
+                .timestamp;
+
+            for (index, step) in timestamp_steps.iter().enumerate() {
+                next_timestamp = next_timestamp.saturating_add(*step);
+                let block = build_coinbase_successor_with_script(
+                    &live,
+                    canonical_test_lock((index as u8).wrapping_add(1)),
+                    next_timestamp,
+                );
+                live.connect_block(&block).expect("connect generated block");
+            }
+
+            let mut replayed = Chainstate::new(Network::Regnet);
+            for block in &live.blocks()[1..] {
+                replayed.connect_block(block).expect("replay generated block");
+            }
+
+            prop_assert_eq!(replayed.height, live.height);
+            prop_assert_eq!(replayed.tip_hash, live.tip_hash);
+            prop_assert_eq!(
+                replayed.utxo_entries().cloned().collect::<Vec<_>>(),
+                live.utxo_entries().cloned().collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn reward_schedule_stays_additive_and_monotonic(height in 0u64..2_000_000u64) {
+            for network in [
+                Network::Mainnet,
+                Network::Testnet,
+                Network::Regnet,
+                Network::Prunetest,
+            ] {
+                let before = subsidy::cumulative_issued_before_height_for_network(network, height);
+                let through = subsidy::cumulative_issued_through_height_for_network(network, height);
+                let reward = subsidy::block_subsidy_atoms_for_network(network, height) as u128;
+
+                prop_assert_eq!(through, before + reward);
+                prop_assert_eq!(
+                    subsidy::cumulative_issued_before_height_for_network(network, height.saturating_add(1)),
+                    through
+                );
+                prop_assert!(
+                    subsidy::cumulative_issued_before_height_for_network(network, height.saturating_add(1)) >= before
+                );
+            }
+        }
     }
 }

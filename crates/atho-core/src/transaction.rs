@@ -16,6 +16,12 @@ use crate::encoding::{compact_size_len, write_compact_size};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_384};
 
+const WITNESS_INPUT_REF_BYTES: usize = 4 + 2 + 16;
+const MIN_TRANSACTION_INPUT_BYTES: usize = 48 + 4 + 4;
+const MIN_TRANSACTION_OUTPUT_BYTES: usize = 8 + 4;
+const MIN_ADDITIONAL_SIGNER_BYTES: usize =
+    4 + FALCON_512_SIGNATURE_BYTES + 4 + FALCON_512_PUBLIC_KEY_BYTES + 4;
+
 /// Compact witness reference that binds an input to the shared witness payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessInputRef {
@@ -53,12 +59,22 @@ impl TxWitness {
         out.extend_from_slice(&self.signature);
         out.extend_from_slice(&(self.pubkey.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&(self.input_refs.len() as u32).to_le_bytes());
+        for input_ref in &self.input_refs {
+            out.extend_from_slice(&input_ref.input_index.to_le_bytes());
+            out.extend_from_slice(&input_ref.sig_ref_short);
+        }
         out.extend_from_slice(&(self.additional_signers.len() as u32).to_le_bytes());
         for group in &self.additional_signers {
             out.extend_from_slice(&(group.signature.len() as u32).to_le_bytes());
             out.extend_from_slice(&group.signature);
             out.extend_from_slice(&(group.pubkey.len() as u32).to_le_bytes());
             out.extend_from_slice(&group.pubkey);
+            out.extend_from_slice(&(group.input_refs.len() as u32).to_le_bytes());
+            for input_ref in &group.input_refs {
+                out.extend_from_slice(&input_ref.input_index.to_le_bytes());
+                out.extend_from_slice(&input_ref.sig_ref_short);
+            }
         }
     }
 
@@ -67,12 +83,22 @@ impl TxWitness {
         hasher.update(&self.signature);
         hasher.update((self.pubkey.len() as u32).to_le_bytes());
         hasher.update(&self.pubkey);
+        hasher.update((self.input_refs.len() as u32).to_le_bytes());
+        for input_ref in &self.input_refs {
+            hasher.update(input_ref.input_index.to_le_bytes());
+            hasher.update(input_ref.sig_ref_short);
+        }
         hasher.update((self.additional_signers.len() as u32).to_le_bytes());
         for group in &self.additional_signers {
             hasher.update((group.signature.len() as u32).to_le_bytes());
             hasher.update(&group.signature);
             hasher.update((group.pubkey.len() as u32).to_le_bytes());
             hasher.update(&group.pubkey);
+            hasher.update((group.input_refs.len() as u32).to_le_bytes());
+            for input_ref in &group.input_refs {
+                hasher.update(input_ref.input_index.to_le_bytes());
+                hasher.update(input_ref.sig_ref_short);
+            }
         }
     }
 
@@ -247,6 +273,9 @@ impl TxWitness {
         if ref_count > MAX_WITNESS_INPUT_REFS {
             return None;
         }
+        if ref_count > bytes.len().saturating_sub(offset) / WITNESS_INPUT_REF_BYTES {
+            return None;
+        }
         let mut input_refs = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
             let input_index = read_u32(bytes, &mut offset)?;
@@ -271,6 +300,11 @@ impl TxWitness {
             });
         }
         let additional_group_count = read_u32(bytes, &mut offset)? as usize;
+        if additional_group_count
+            > bytes.len().saturating_sub(offset) / MIN_ADDITIONAL_SIGNER_BYTES.max(1)
+        {
+            return None;
+        }
         let mut additional_signers = Vec::with_capacity(additional_group_count);
         let mut total_ref_count = ref_count;
         for _ in 0..additional_group_count {
@@ -287,6 +321,9 @@ impl TxWitness {
             let group_ref_count = read_u32(bytes, &mut offset)? as usize;
             total_ref_count = total_ref_count.checked_add(group_ref_count)?;
             if total_ref_count > MAX_WITNESS_INPUT_REFS {
+                return None;
+            }
+            if group_ref_count > bytes.len().saturating_sub(offset) / WITNESS_INPUT_REF_BYTES {
                 return None;
             }
             let mut group_input_refs = Vec::with_capacity(group_ref_count);
@@ -616,8 +653,23 @@ impl Transaction {
     pub fn witness_commitment_hash(&self) -> [u8; 48] {
         let mut hasher = Sha3_384::new();
         self.update_base_hasher(&mut hasher);
-        if let Some(witness) = self.witness_payload() {
+        if self.witness.is_empty() && self.tx_pow_nonce == 0 && self.tx_pow_bits == 0 {
+            // Preserve the historical empty-coinbase commitment so genesis and
+            // zero-witness block templates remain stable. Non-empty witness
+            // payloads and any non-zero tx-PoW still extend the commitment.
+        } else if self.witness.is_empty() {
+            hasher.update([0u8]);
+        } else if let Some(witness) = self.witness_payload() {
+            hasher.update([1u8]);
             witness.update_commitment_hasher(&mut hasher);
+        } else {
+            hasher.update([2u8]);
+            hasher.update((self.witness.len() as u32).to_le_bytes());
+            hasher.update(&self.witness);
+        }
+        if !(self.witness.is_empty() && self.tx_pow_nonce == 0 && self.tx_pow_bits == 0) {
+            hasher.update(self.tx_pow_nonce.to_le_bytes());
+            hasher.update([self.tx_pow_bits]);
         }
         hasher.finalize().into()
     }
@@ -717,6 +769,9 @@ impl Transaction {
         offset += 2;
 
         let input_count = read_u32(bytes, &mut offset)? as usize;
+        if input_count > bytes.len().saturating_sub(offset) / MIN_TRANSACTION_INPUT_BYTES {
+            return None;
+        }
         let mut inputs = Vec::with_capacity(input_count);
         for _ in 0..input_count {
             let previous_txid = read_array::<48>(bytes, &mut offset)?;
@@ -731,6 +786,9 @@ impl Transaction {
         }
 
         let output_count = read_u32(bytes, &mut offset)? as usize;
+        if output_count > bytes.len().saturating_sub(offset) / MIN_TRANSACTION_OUTPUT_BYTES {
+            return None;
+        }
         let mut outputs = Vec::with_capacity(output_count);
         for _ in 0..output_count {
             let value_atoms = read_u64(bytes, &mut offset)?;
@@ -748,17 +806,12 @@ impl Transaction {
             return None;
         }
         let lock_time = read_u32(bytes, &mut offset)?;
-        let (tx_pow_nonce, tx_pow_bits) = if offset == bytes.len() {
-            (0, 0)
-        } else {
-            let tx_pow_nonce = read_u64(bytes, &mut offset)?;
-            let tx_pow_bits = *bytes.get(offset)?;
-            offset += 1;
-            if offset != bytes.len() {
-                return None;
-            }
-            (tx_pow_nonce, tx_pow_bits)
-        };
+        let tx_pow_nonce = read_u64(bytes, &mut offset)?;
+        let tx_pow_bits = *bytes.get(offset)?;
+        offset += 1;
+        if offset != bytes.len() {
+            return None;
+        }
         Some(Self {
             version,
             inputs,
@@ -882,6 +935,71 @@ mod tests {
 
         assert_ne!(base.full_bytes(), with_pow.full_bytes());
         assert_ne!(base.wtxid(), with_pow.wtxid());
+        assert_ne!(
+            base.witness_commitment_hash(),
+            with_pow.witness_commitment_hash()
+        );
+    }
+
+    #[test]
+    fn witness_commitment_hash_ignores_block_specific_commit_refs() {
+        let mut base = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![4; 32],
+            }],
+            lock_time: 0,
+            witness: TxWitness {
+                signature: vec![1; FALCON_512_SIGNATURE_BYTES],
+                pubkey: vec![2; FALCON_512_PUBLIC_KEY_BYTES],
+                input_refs: vec![WitnessInputRef {
+                    input_index: 0,
+                    sig_ref_short: [3, 4],
+                    witness_commit_ref: [5; 16],
+                }],
+                additional_signers: vec![],
+            }
+            .canonical_bytes(),
+            tx_pow_nonce: 7,
+            tx_pow_bits: 19,
+        };
+        let base_hash = base.witness_commitment_hash();
+        let mut witness = TxWitness::from_bytes(&base.witness).expect("decode witness");
+        witness.input_refs[0].witness_commit_ref = [9; 16];
+        base.witness = witness.canonical_bytes();
+        assert_eq!(base_hash, base.witness_commitment_hash());
+    }
+
+    #[test]
+    fn malformed_witness_bytes_change_commitment_hash() {
+        let base = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [1; 48],
+                output_index: 0,
+                unlocking_script: vec![1, 2, 3],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 1_000,
+                locking_script: vec![4; 32],
+            }],
+            lock_time: 0,
+            witness: vec![],
+            tx_pow_nonce: 0,
+            tx_pow_bits: 0,
+        };
+        let mut malformed = base.clone();
+        malformed.witness = vec![0xde, 0xad, 0xbe, 0xef];
+        assert_ne!(
+            base.witness_commitment_hash(),
+            malformed.witness_commitment_hash()
+        );
     }
 
     #[test]
@@ -1027,6 +1145,33 @@ mod tests {
         let encoded = tx.full_bytes();
         let decoded = Transaction::from_full_bytes(&encoded).expect("decode tx");
         assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn full_bytes_requires_explicit_pow_tail() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxInput {
+                previous_txid: [9; 48],
+                output_index: 3,
+                unlocking_script: vec![1, 2, 3, 4],
+            }],
+            outputs: vec![TxOutput {
+                value_atoms: 500,
+                locking_script: vec![5; 32],
+            }],
+            lock_time: 44,
+            witness: vec![],
+            tx_pow_nonce: 7,
+            tx_pow_bits: 18,
+        };
+        let mut truncated = tx.full_bytes();
+        truncated.truncate(
+            truncated
+                .len()
+                .saturating_sub(TX_POW_NONCE_BYTES + TX_POW_BITS_BYTES),
+        );
+        assert!(Transaction::from_full_bytes(&truncated).is_none());
     }
 
     #[test]

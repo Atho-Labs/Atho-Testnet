@@ -76,9 +76,10 @@ pub(crate) fn render_word_grid(
     id_source: &str,
     auto_resize_on_paste: bool,
 ) {
-    let columns = mnemonic_grid_columns(ui.available_width(), words.len());
+    let available_width = widgets::finite_available_width(ui, 480.0);
+    let columns = mnemonic_grid_columns(available_width, words.len());
     let spacing = (columns.saturating_sub(1)) as f32 * 8.0;
-    let card_width = ((ui.available_width() - spacing) / columns as f32).clamp(92.0, 160.0);
+    let card_width = ((available_width - spacing) / columns as f32).clamp(92.0, 160.0);
 
     egui::Grid::new(id_source)
         .num_columns(columns)
@@ -160,6 +161,7 @@ fn normalize_word(word: &str) -> String {
 }
 
 fn mnemonic_grid_columns(available_width: f32, word_count: usize) -> usize {
+    let available_width = widgets::finite_layout_space(available_width, 480.0);
     let preferred = if word_count > 24 { 6 } else { 4 }.min(word_count.max(1));
     let mut columns = preferred.max(1);
     while columns > 1 {
@@ -199,5 +201,11 @@ mod tests {
         assert_eq!(mnemonic_grid_columns(360.0, 12), 2);
         assert_eq!(mnemonic_grid_columns(220.0, 12), 1);
         assert_eq!(mnemonic_grid_columns(900.0, 48), 6);
+    }
+
+    #[test]
+    fn mnemonic_grid_columns_handle_non_finite_widths() {
+        assert_eq!(mnemonic_grid_columns(f32::NAN, 12), 3);
+        assert_eq!(mnemonic_grid_columns(f32::INFINITY, 12), 3);
     }
 }

@@ -4,6 +4,7 @@
 //! Command-line mining client for requesting work from a running Atho node.
 
 use atho_core::network::Network;
+use atho_node::config::NodeConfig;
 use atho_node::mining_backend::{MiningAcceleratorInfo, MiningBackendKind, MiningController};
 use atho_rpc::request::RpcRequest;
 use atho_rpc::response::RpcResponse;
@@ -80,7 +81,7 @@ fn run() -> Result<(), String> {
         .rpc_addr
         .clone()
         .unwrap_or_else(|| default_rpc_address(network));
-    let client = RpcClient::new(rpc_address.clone());
+    let client = rpc_client_for_network(network, rpc_address.clone());
     let _ = atho_node::dev::append_log(
         "miner",
         &format!(
@@ -131,6 +132,23 @@ fn run() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(250));
     }
     Ok(())
+}
+
+fn rpc_client_for_network(network: Network, rpc_address: String) -> RpcClient {
+    let config = NodeConfig::from_env(network);
+    if config.rpc_auth.enabled {
+        if config.rpc_auth.cookie_auth {
+            if let Ok(Some(secret)) = config.load_rpc_cookie_secret() {
+                return RpcClient::with_cookie(rpc_address, secret);
+            }
+        }
+        return RpcClient::with_auth(
+            rpc_address,
+            config.rpc_auth.username,
+            config.rpc_auth.password,
+        );
+    }
+    RpcClient::new(rpc_address)
 }
 
 /// Requests a template, mines it locally, and submits the solved block.

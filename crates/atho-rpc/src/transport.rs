@@ -61,7 +61,13 @@ impl AthoErrorMeta for RpcTransportError {
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     address: String,
-    auth: Option<(String, String)>,
+    auth: Option<RpcClientAuth>,
+}
+
+#[derive(Debug, Clone)]
+enum RpcClientAuth {
+    Password { username: String, password: String },
+    Cookie { secret: String },
 }
 
 impl RpcClient {
@@ -79,16 +85,36 @@ impl RpcClient {
     ) -> Self {
         Self {
             address: address.into(),
-            auth: Some((username.into(), password.into())),
+            auth: Some(RpcClientAuth::Password {
+                username: username.into(),
+                password: password.into(),
+            }),
+        }
+    }
+
+    pub fn with_cookie(address: impl Into<String>, secret: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+            auth: Some(RpcClientAuth::Cookie {
+                secret: secret.into(),
+            }),
         }
     }
 
     pub fn call(&self, request: &RpcRequest) -> Result<RpcResponse, RpcTransportError> {
         let mut stream = connect_stream(&self.address)?;
         match &self.auth {
-            Some((username, password)) => {
+            Some(RpcClientAuth::Password { username, password }) => {
                 let authenticated =
                     RpcRequest::authenticated(username.clone(), password.clone(), request.clone());
+                write_message(&mut stream, &authenticated)?;
+            }
+            Some(RpcClientAuth::Cookie { secret }) => {
+                let authenticated = RpcRequest::authenticated(
+                    String::from(atho_node_compat::rpc_cookie_user()),
+                    secret.clone(),
+                    request.clone(),
+                );
                 write_message(&mut stream, &authenticated)?;
             }
             None => write_message(&mut stream, request)?,
@@ -96,6 +122,12 @@ impl RpcClient {
         let mut reader = BufReader::new(stream);
         let response: RpcResponse = read_message(&mut reader)?;
         Ok(response)
+    }
+}
+
+mod atho_node_compat {
+    pub fn rpc_cookie_user() -> &'static str {
+        "__cookie__"
     }
 }
 

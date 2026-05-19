@@ -1131,6 +1131,11 @@ fn inspect_existing_rpc_endpoint(network: Network, rpc_address: &str) -> Existin
 fn rpc_client_for_network(network: Network, rpc_address: String) -> RpcClient {
     let config = atho_node::config::NodeConfig::from_env(network);
     if config.rpc_auth.enabled {
+        if config.rpc_auth.cookie_auth {
+            if let Ok(Some(secret)) = config.load_rpc_cookie_secret() {
+                return RpcClient::with_cookie(rpc_address, secret);
+            }
+        }
         RpcClient::with_auth(
             rpc_address,
             config.rpc_auth.username,

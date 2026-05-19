@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 atho-core = { path = "../crates/atho-core" }
 atho-crypto = { path = "../crates/atho-crypto" }
-atho-node = { path = "../crates/atho-node" }
+atho-node = { path = "../crates/atho-node", features = ["devtools"] }
 atho-storage = { path = "../crates/atho-storage" }
 atho-p2p = { path = "../crates/atho-p2p" }
 atho-rpc = { path = "../crates/atho-rpc" }

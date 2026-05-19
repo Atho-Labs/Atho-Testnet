@@ -13,7 +13,7 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().clamp(320.0, 700.0);
+        let card_width = widgets::clamped_available_width(ui, 320.0, 700.0, 520.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Create Wallet").size(22.0).strong());
@@ -208,7 +208,7 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().clamp(320.0, 700.0);
+        let card_width = widgets::clamped_available_width(ui, 320.0, 700.0, 520.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Import Wallet").size(22.0).strong());
@@ -374,7 +374,7 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let mut wallet_folder_browse_clicked = false;
 
     widgets::dialog_frame().show(ui, |ui| {
-        let card_width = ui.available_width().clamp(320.0, 580.0);
+        let card_width = widgets::clamped_available_width(ui, 320.0, 580.0, 460.0);
         ui.set_width(card_width);
         ui.set_max_width(card_width);
         ui.label(egui::RichText::new("Open Wallet").size(22.0).strong());
@@ -445,9 +445,10 @@ fn form_label(ui: &mut egui::Ui, label: &str) {
 
 fn render_browse_row(ui: &mut egui::Ui, text: &mut String, button_label: &str, clicked: &mut bool) {
     ui.horizontal(|ui| {
+        let input_width = widgets::reserved_width(ui.available_width(), 110.0, 140.0, 360.0);
         ui.add(
             egui::TextEdit::singleline(text)
-                .desired_width((ui.available_width() - 110.0).max(140.0))
+                .desired_width(input_width)
                 .hint_text("Select a wallet path"),
         );
         if ui

@@ -7,22 +7,36 @@
 //! Atho's local tooling so tests, binaries, and the Qt client all agree on
 //! where to place temporary state and how to append diagnostic output.
 
+#[cfg(any(test, feature = "devtools"))]
 use crate::config::NodeConfig;
+#[cfg(any(test, feature = "devtools"))]
 use crate::mempool::MempoolEntry;
+#[cfg(any(test, feature = "devtools"))]
 use crate::miner::Miner;
+#[cfg(any(test, feature = "devtools"))]
 use crate::node::Node;
+#[cfg(any(test, feature = "devtools"))]
 use crate::validation::{derive_sig_ref_short, derive_witness_commit_ref};
+#[cfg(any(test, feature = "devtools"))]
 use atho_core::address::public_key_digest;
 use atho_core::block::Block;
+#[cfg(any(test, feature = "devtools"))]
 use atho_core::consensus::pow::{clamp_target, initial_target_for_network, DIFFICULTY_PROFILE};
+#[cfg(any(test, feature = "devtools"))]
 use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
+#[cfg(any(test, feature = "devtools"))]
 use atho_core::consensus::tx_policy::{minimum_required_fee_atoms, solve_transaction_pow};
 use atho_core::network::Network;
-use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+use atho_core::transaction::Transaction;
+#[cfg(any(test, feature = "devtools"))]
+use atho_core::transaction::{TxInput, TxOutput, TxWitness};
+#[cfg(any(test, feature = "devtools"))]
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
 use atho_errors::AthoError;
+#[cfg(any(test, feature = "devtools"))]
 use atho_p2p::relay::RelayLoop;
 use atho_storage::chainstate::Chainstate;
+#[cfg(any(test, feature = "devtools"))]
 use atho_storage::utxo::UtxoEntry;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -344,6 +358,7 @@ pub fn publish_audit_exports() -> std::io::Result<(PathBuf, PathBuf, PathBuf, Pa
     Ok((chain, txs, inputs, outputs))
 }
 
+#[cfg(any(test, feature = "devtools"))]
 pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     let _guard = dev_lock().lock().expect("dev lock poisoned");
     ensure_layout_locked()?;
@@ -407,6 +422,14 @@ pub fn mine_once(network: Network) -> std::io::Result<PathBuf> {
     Ok(audit_dir().join("chain.tsv"))
 }
 
+#[cfg(not(any(test, feature = "devtools")))]
+pub fn mine_once(_network: Network) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::other(
+        "dev mining requires the atho-node `devtools` feature",
+    ))
+}
+
+#[cfg(any(test, feature = "devtools"))]
 pub(crate) fn signed_spend_transaction(
     network: Network,
     seed_txid: [u8; 48],
@@ -422,6 +445,7 @@ pub(crate) fn signed_spend_transaction(
     )
 }
 
+#[cfg(any(test, feature = "devtools"))]
 pub(crate) fn signed_spend_transaction_with_signer_seed(
     network: Network,
     seed_txid: [u8; 48],
@@ -501,6 +525,7 @@ pub(crate) fn signed_spend_transaction_with_signer_seed(
     Err(std::io::Error::other("failed to stabilize dev spend fee"))
 }
 
+#[cfg(any(test, feature = "devtools"))]
 fn signing_keypair(network: Network, seed_txid: [u8; 48]) -> std::io::Result<FalconKeypair> {
     let mut seed = Vec::with_capacity(network.id().len() + seed_txid.len());
     seed.extend_from_slice(network.id().as_bytes());
@@ -509,6 +534,7 @@ fn signing_keypair(network: Network, seed_txid: [u8; 48]) -> std::io::Result<Fal
         .map_err(|err| std::io::Error::other(format!("falcon-512 rs keygen failed: {err:?}")))
 }
 
+#[cfg(any(test, feature = "devtools"))]
 pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, Vec<u8>) {
     let (txid, value_atoms) = match network {
         Network::Mainnet => ([0x11; 48], 25_000),
@@ -520,6 +546,7 @@ pub(crate) fn seed_utxo(network: Network) -> ([u8; 48], u64, Vec<u8>) {
     (txid, value_atoms, locking_script)
 }
 
+#[cfg(any(test, feature = "devtools"))]
 pub(crate) fn locking_script_for_seed(network: Network, seed_txid: [u8; 48]) -> Vec<u8> {
     public_key_digest(
         network,

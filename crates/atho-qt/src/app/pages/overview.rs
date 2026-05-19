@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let summary = app.wallet_balance_summary().clone();
     let rows = app.wallet_activity_rows().to_vec();
-    let stacked = ui.available_width() < 760.0;
+    let stacked = widgets::finite_available_width(ui, 760.0) < 760.0;
     let chain_synced = app.view_model.chain_synced();
 
     if stacked {

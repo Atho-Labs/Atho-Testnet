@@ -31,6 +31,8 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::{fs::File, io::Write, os::unix::fs::PermissionsExt};
 
 type RawEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -58,6 +60,7 @@ const LEGACY_ADDRESSES_DIR: &str = "addresses";
 const SNAPSHOT_KEY: &[u8; 10] = b"chainstate";
 const SCHEMA_VERSION_KEY: &[u8; 14] = b"schema_version";
 const STORAGE_METADATA_KEY: &[u8; 16] = b"storage_metadata";
+const STORAGE_RUNTIME_STATE_KEY: &[u8; 21] = b"storage_runtime_state";
 const STORAGE_MAGIC: [u8; 4] = *b"ATHO";
 const SOFTWARE_STORAGE_VERSION: u32 = 1;
 
@@ -218,9 +221,21 @@ pub struct StorageMetadata {
     pub last_opened_unix: u64,
 }
 
+/// Persisted runtime safety markers used to detect unclean shutdowns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageRuntimeState {
+    pub last_clean_shutdown: bool,
+    pub last_runtime_started_unix: u64,
+    pub last_shutdown_unix: u64,
+    pub last_recovery_check_unix: u64,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitFaultPoint {
+    AfterArchiveWrite,
+    AfterSnapshotWrite,
+    AfterStateWrite,
     BeforeCommit,
 }
 
@@ -289,6 +304,8 @@ impl Database {
         };
         database.ensure_storage_metadata()?;
         database.ensure_schema_version()?;
+        database.ensure_runtime_state()?;
+        database.run_startup_consistency_checks()?;
         Ok(database)
     }
 
@@ -323,6 +340,13 @@ impl Database {
 
     pub fn load_storage_metadata(&self) -> Result<Option<StorageMetadata>, StorageError> {
         match self.get(Dataset::Meta, STORAGE_METADATA_KEY)? {
+            Some(bytes) => deserialize_record(&bytes).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_runtime_state(&self) -> Result<Option<StorageRuntimeState>, StorageError> {
+        match self.get(Dataset::Meta, STORAGE_RUNTIME_STATE_KEY)? {
             Some(bytes) => deserialize_record(&bytes).map(Some),
             None => Ok(None),
         }
@@ -676,6 +700,12 @@ impl Database {
         utxos: &[UtxoEntry],
         appended_block: Option<(u64, &Block)>,
     ) -> Result<(), StorageError> {
+        let commit_journal = CommitJournalGuard::begin(
+            self.network,
+            "commit",
+            snapshot.height,
+            appended_block.map(|(_, block)| block.header.block_hash()),
+        )?;
         let snapshot_value = bincode::serialize(snapshot).map_err(|_| StorageError::CorruptData)?;
         let serialized_utxos = if appended_block.is_none() {
             let mut serialized = Vec::with_capacity(utxos.len());
@@ -712,6 +742,8 @@ impl Database {
             let mut txn = state.env.begin_rw_txn()?;
             if let Some((height, block, location)) = archive_append {
                 write_block_archive(&mut txn, state, self.network, height, block, location)?;
+                #[cfg(test)]
+                maybe_inject_commit_fault(CommitFaultPoint::AfterArchiveWrite)?;
             }
             txn.put(
                 state.meta,
@@ -719,6 +751,8 @@ impl Database {
                 &snapshot_value,
                 WriteFlags::empty(),
             )?;
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::AfterSnapshotWrite)?;
             if let Some((_, block)) = appended_block {
                 apply_utxo_delta(&mut txn, state, self.network, block)?;
             } else if let Some(serialized_utxos) = &serialized_utxos {
@@ -734,10 +768,14 @@ impl Database {
                 rebuild_height_index(&mut txn, state, snapshot.tip_hash)?;
             }
             #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::AfterStateWrite)?;
+            #[cfg(test)]
             maybe_inject_commit_fault(CommitFaultPoint::BeforeCommit)?;
             txn.commit()?;
             Ok(())
-        })
+        })?;
+        commit_journal.finish()?;
+        Ok(())
     }
 
     /// Replaces the canonical chainstate image and rebuilds the raw archive from
@@ -748,6 +786,12 @@ impl Database {
         utxos: &[UtxoEntry],
         blocks: &[Block],
     ) -> Result<(), StorageError> {
+        let commit_journal = CommitJournalGuard::begin(
+            self.network,
+            "replace",
+            snapshot.height,
+            Some(snapshot.tip_hash),
+        )?;
         let snapshot_value = bincode::serialize(snapshot).map_err(|_| StorageError::CorruptData)?;
         let mut serialized_utxos = Vec::with_capacity(utxos.len());
         for utxo in utxos {
@@ -781,6 +825,8 @@ impl Database {
                 &snapshot_value,
                 WriteFlags::empty(),
             )?;
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::AfterSnapshotWrite)?;
             for (key, value) in &serialized_utxos {
                 txn.put(
                     state.utxos,
@@ -789,9 +835,15 @@ impl Database {
                     WriteFlags::empty(),
                 )?;
             }
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::AfterStateWrite)?;
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::BeforeCommit)?;
             txn.commit()?;
             Ok(())
-        })
+        })?;
+        commit_journal.finish()?;
+        Ok(())
     }
 
     pub fn upsert_peer(&self, record: &PeerRecord) -> Result<(), StorageError> {
@@ -853,6 +905,24 @@ impl Database {
         Ok(records)
     }
 
+    pub fn mark_runtime_started(&self) -> Result<(), StorageError> {
+        let now = current_unix_seconds();
+        self.update_runtime_state(|state| {
+            state.last_clean_shutdown = false;
+            state.last_runtime_started_unix = now;
+        })
+        .map(|_| ())
+    }
+
+    pub fn mark_clean_shutdown(&self) -> Result<(), StorageError> {
+        let now = current_unix_seconds();
+        self.update_runtime_state(|state| {
+            state.last_clean_shutdown = true;
+            state.last_shutdown_unix = now;
+        })
+        .map(|_| ())
+    }
+
     fn ensure_schema_version(&self) -> Result<(), StorageError> {
         match self.get(Dataset::Meta, SCHEMA_VERSION_KEY)? {
             Some(bytes) => {
@@ -876,6 +946,21 @@ impl Database {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_runtime_state(&self) -> Result<(), StorageError> {
+        if self.load_runtime_state()?.is_some() {
+            return Ok(());
+        }
+        let value = bincode::serialize(&StorageRuntimeState {
+            last_clean_shutdown: true,
+            last_runtime_started_unix: 0,
+            last_shutdown_unix: 0,
+            last_recovery_check_unix: 0,
+        })
+        .map_err(|_| StorageError::CorruptData)?;
+        self.put(Dataset::Meta, STORAGE_RUNTIME_STATE_KEY, &value)?;
         Ok(())
     }
 
@@ -931,6 +1016,138 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn run_startup_consistency_checks(&self) -> Result<(), StorageError> {
+        let journal_path = path::storage_commit_journal_path(self.network);
+        let journal_present = journal_path.exists();
+        let runtime_state = self.load_runtime_state()?.unwrap_or(StorageRuntimeState {
+            last_clean_shutdown: true,
+            last_runtime_started_unix: 0,
+            last_shutdown_unix: 0,
+            last_recovery_check_unix: 0,
+        });
+        if runtime_state.last_clean_shutdown && !journal_present {
+            return Ok(());
+        }
+
+        self.verify_persisted_chainstate_consistency()?;
+        if journal_present {
+            let _ = fs::remove_file(&journal_path);
+        }
+        let now = current_unix_seconds();
+        self.update_runtime_state(|state| {
+            state.last_clean_shutdown = true;
+            state.last_recovery_check_unix = now;
+        })?;
+        Ok(())
+    }
+
+    fn verify_persisted_chainstate_consistency(&self) -> Result<(), StorageError> {
+        let snapshot = self.load_chainstate_snapshot()?;
+        let mut main_chain_records = self
+            .list_block_records()?
+            .into_iter()
+            .filter(|record| record.main_chain)
+            .collect::<Vec<_>>();
+        main_chain_records.sort_by_key(|record| record.height);
+        let tip_record = main_chain_records.last().cloned();
+        match (snapshot, tip_record) {
+            (None, None) => return Ok(()),
+            (Some(snapshot), Some(record)) => {
+                if snapshot.height != record.height || snapshot.tip_hash != record.block_hash {
+                    return Err(StorageError::PersistedTipMismatch);
+                }
+                if main_chain_records.len() != snapshot.height as usize + 1 {
+                    return Err(StorageError::IncompleteBlockHistory);
+                }
+                if snapshot.tip_header.as_ref().is_some_and(|header| {
+                    header.block_hash() != snapshot.tip_hash || header.height != snapshot.height
+                }) {
+                    return Err(StorageError::PersistedTipMismatch);
+                }
+
+                // Dirty-start recovery replays the canonical block history from
+                // genesis so we verify the persisted UTXO table against the
+                // blocks themselves instead of trusting the snapshot alone.
+                let mut replay = crate::chainstate::Chainstate::fresh(self.network);
+                let hardcoded_genesis = genesis::genesis_state(self.network).block;
+                for (expected_height, record) in main_chain_records.iter().enumerate() {
+                    let expected_height = expected_height as u64;
+                    if record.height != expected_height {
+                        return Err(StorageError::IncompleteBlockHistory);
+                    }
+                    let indexed_hash = self
+                        .load_block_hash_by_height(expected_height)?
+                        .ok_or(StorageError::IncompleteBlockHistory)?;
+                    if indexed_hash != record.block_hash {
+                        return Err(StorageError::PersistedTipMismatch);
+                    }
+                    let block = self
+                        .load_block(record.block_hash)?
+                        .ok_or(StorageError::IncompleteBlockHistory)?;
+                    if block.header.block_hash() != record.block_hash
+                        || block.header.height != expected_height
+                    {
+                        return Err(StorageError::CorruptData);
+                    }
+                    if expected_height == 0 {
+                        if block.header != hardcoded_genesis.header
+                            || block.transactions != hardcoded_genesis.transactions
+                        {
+                            return Err(StorageError::PersistedGenesisMismatch);
+                        }
+                        continue;
+                    }
+                    replay
+                        .connect_block(&block)
+                        .map_err(|_| StorageError::CorruptData)?;
+                }
+
+                if replay.height != snapshot.height || replay.tip_hash != snapshot.tip_hash {
+                    return Err(StorageError::PersistedTipMismatch);
+                }
+                if snapshot
+                    .tip_header
+                    .as_ref()
+                    .is_some_and(|header| replay.tip.as_ref() != Some(header))
+                {
+                    return Err(StorageError::PersistedTipMismatch);
+                }
+
+                let mut persisted_utxos = self.load_utxos()?;
+                if persisted_utxos
+                    .iter()
+                    .any(|entry| entry.network != self.network)
+                {
+                    return Err(StorageError::CrossNetworkReplay);
+                }
+                let mut rebuilt_utxos = replay.utxo_entries().cloned().collect::<Vec<_>>();
+                sort_utxos_for_consistency_check(&mut persisted_utxos);
+                sort_utxos_for_consistency_check(&mut rebuilt_utxos);
+                if persisted_utxos != rebuilt_utxos {
+                    return Err(StorageError::CorruptData);
+                }
+                Ok(())
+            }
+            _ => Err(StorageError::IncompleteBlockHistory),
+        }
+    }
+
+    fn update_runtime_state<F>(&self, update: F) -> Result<StorageRuntimeState, StorageError>
+    where
+        F: FnOnce(&mut StorageRuntimeState),
+    {
+        let mut state = self.load_runtime_state()?.unwrap_or(StorageRuntimeState {
+            last_clean_shutdown: true,
+            last_runtime_started_unix: 0,
+            last_shutdown_unix: 0,
+            last_recovery_check_unix: 0,
+        });
+        update(&mut state);
+        let value = bincode::serialize(&state).map_err(|_| StorageError::CorruptData)?;
+        self.put(Dataset::Meta, STORAGE_RUNTIME_STATE_KEY, &value)?;
+        Ok(state)
     }
 
     fn get(&self, dataset: Dataset, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
@@ -1080,6 +1297,39 @@ fn current_unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("storage.tmp");
+    let tmp_path = path.with_file_name(format!("{file_name}.tmp"));
+    #[cfg(unix)]
+    {
+        let mut file = File::create(&tmp_path)?;
+        fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, bytes)?;
+    }
+    fs::rename(&tmp_path, path)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Dataset {
     fn db(self, state: &DatabaseState) -> LmdbDatabase {
         match self {
@@ -1092,6 +1342,50 @@ impl Dataset {
             Dataset::Peers => state.peers,
             Dataset::Addresses => state.addresses,
             Dataset::PeerHealth => state.peer_health,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CommitJournalGuard {
+    path: PathBuf,
+    finished: bool,
+}
+
+impl CommitJournalGuard {
+    fn begin(
+        network: Network,
+        operation: &str,
+        height: u64,
+        tip_hash: Option<[u8; 48]>,
+    ) -> Result<Self, StorageError> {
+        let path = path::storage_commit_journal_path(network);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let body = format!(
+            "network={}\noperation={}\nheight={}\ntip_hash={}\nstarted_at_unix={}\n",
+            network.id(),
+            operation,
+            height,
+            tip_hash
+                .map(hex::encode)
+                .unwrap_or_else(|| String::from("none")),
+            current_unix_seconds()
+        );
+        atomic_write_owner_only(&path, body.as_bytes())?;
+        Ok(Self {
+            path,
+            finished: false,
+        })
+    }
+
+    fn finish(mut self) -> Result<(), StorageError> {
+        self.finished = true;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(StorageError::Io(err)),
         }
     }
 }
@@ -1379,6 +1673,19 @@ fn utxo_key(txid: [u8; 48], output_index: u32) -> Vec<u8> {
     key
 }
 
+fn sort_utxos_for_consistency_check(utxos: &mut [UtxoEntry]) {
+    utxos.sort_by(|left, right| {
+        left.txid
+            .cmp(&right.txid)
+            .then(left.output_index.cmp(&right.output_index))
+            .then(left.value_atoms.cmp(&right.value_atoms))
+            .then(left.created_height.cmp(&right.created_height))
+            .then(left.is_coinbase.cmp(&right.is_coinbase))
+            .then(left.locking_script.cmp(&right.locking_script))
+            .then(left.network.id().cmp(right.network.id()))
+    });
+}
+
 #[cfg(test)]
 fn maybe_inject_commit_fault(point: CommitFaultPoint) -> Result<(), StorageError> {
     let Some(fault) = COMMIT_FAULT.get() else {
@@ -1395,9 +1702,9 @@ fn maybe_inject_commit_fault(point: CommitFaultPoint) -> Result<(), StorageError
     if active.remaining_hits == 0 {
         *guard = None;
     }
-    Err(StorageError::Io(std::io::Error::other(
-        "fault injected before LMDB commit",
-    )))
+    Err(StorageError::Io(std::io::Error::other(format!(
+        "fault injected at storage commit point {point:?}"
+    ))))
 }
 
 #[cfg(test)]
@@ -1708,6 +2015,74 @@ mod tests {
     }
 
     #[test]
+    fn full_snapshot_commit_faults_leave_prior_snapshot_intact() {
+        let root = temp_data_dir("snapshot-faults");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+
+        let genesis = sample_block(Network::Regnet, 0, [0; 48]);
+        let first = sample_block(Network::Regnet, 1, genesis.header.block_hash());
+        let second = sample_block(Network::Regnet, 2, first.header.block_hash());
+        database.append_block(0, &genesis).expect("append genesis");
+        database.append_block(1, &first).expect("append first");
+        database.append_block(2, &second).expect("append second");
+
+        let initial_snapshot = ChainstateSnapshot {
+            height: 1,
+            tip_hash: first.header.block_hash(),
+            tip_header: None,
+        };
+        let initial_utxos = vec![output_entry(Network::Regnet, &first.transactions[0], 0, 1)];
+        database
+            .save_chainstate_snapshot(&initial_snapshot, &initial_utxos)
+            .expect("persist initial snapshot");
+
+        let replacement_snapshot = ChainstateSnapshot {
+            height: 2,
+            tip_hash: second.header.block_hash(),
+            tip_header: None,
+        };
+        let replacement_utxos = vec![
+            output_entry(Network::Regnet, &first.transactions[0], 0, 1),
+            output_entry(Network::Regnet, &second.transactions[0], 0, 2),
+        ];
+
+        for point in [
+            CommitFaultPoint::AfterSnapshotWrite,
+            CommitFaultPoint::AfterStateWrite,
+            CommitFaultPoint::BeforeCommit,
+        ] {
+            Database::inject_commit_fault_for_test(point, 1);
+            let result =
+                database.save_chainstate_snapshot(&replacement_snapshot, &replacement_utxos);
+            Database::clear_commit_fault_for_test();
+
+            assert!(
+                matches!(result, Err(StorageError::Io(_))),
+                "fault point {point:?}"
+            );
+            let persisted_snapshot = database
+                .load_chainstate_snapshot()
+                .expect("load snapshot")
+                .expect("snapshot present");
+            assert_eq!(
+                persisted_snapshot.height, initial_snapshot.height,
+                "fault point {point:?}"
+            );
+            assert_eq!(
+                persisted_snapshot.tip_hash, initial_snapshot.tip_hash,
+                "fault point {point:?}"
+            );
+
+            let mut persisted_utxos = database.load_utxos().expect("load utxos");
+            let mut expected_utxos = initial_utxos.clone();
+            sort_utxos_for_consistency_check(&mut persisted_utxos);
+            sort_utxos_for_consistency_check(&mut expected_utxos);
+            assert_eq!(persisted_utxos, expected_utxos, "fault point {point:?}");
+        }
+    }
+
+    #[test]
     fn load_block_rebuilds_when_raw_archive_has_wrong_network_magic() {
         let root = temp_data_dir("raw-cross-network");
         let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
@@ -1743,5 +2118,55 @@ mod tests {
         assert_eq!(recovered.header.block_hash(), block_hash);
         assert_eq!(recovered.header.network_id, Network::Regnet);
         assert_eq!(recovered.transactions, block.transactions);
+    }
+
+    #[test]
+    fn runtime_state_tracks_started_and_clean_shutdown_markers() {
+        let root = temp_data_dir("runtime-state");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+
+        database.mark_runtime_started().expect("mark started");
+        let started = database
+            .load_runtime_state()
+            .expect("runtime state")
+            .expect("present runtime state");
+        assert!(!started.last_clean_shutdown);
+        assert!(started.last_runtime_started_unix > 0);
+
+        database.mark_clean_shutdown().expect("mark clean");
+        let stopped = database
+            .load_runtime_state()
+            .expect("runtime state after stop")
+            .expect("present runtime state after stop");
+        assert!(stopped.last_clean_shutdown);
+        assert!(stopped.last_shutdown_unix > 0);
+    }
+
+    #[test]
+    fn unclean_runtime_state_runs_startup_self_check_and_clears_commit_journal() {
+        let root = temp_data_dir("startup-self-check");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let database = Database::open(Network::Regnet).expect("open db");
+        database.mark_runtime_started().expect("mark started");
+        CommitJournalGuard::begin(Network::Regnet, "commit", 0, None)
+            .expect("write journal")
+            .finish()
+            .expect("remove initial journal");
+        fs::write(
+            path::storage_commit_journal_path(Network::Regnet),
+            b"stale-journal",
+        )
+        .expect("rewrite stale journal");
+        drop(database);
+
+        let reopened = Database::open(Network::Regnet).expect("reopen db");
+        let runtime_state = reopened
+            .load_runtime_state()
+            .expect("runtime state after reopen")
+            .expect("present runtime state after reopen");
+        assert!(runtime_state.last_clean_shutdown);
+        assert!(runtime_state.last_recovery_check_unix > 0);
+        assert!(!path::storage_commit_journal_path(Network::Regnet).exists());
     }
 }

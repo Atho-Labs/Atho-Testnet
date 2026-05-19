@@ -249,6 +249,7 @@ pub(crate) struct WalletManagementForm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeSettingsForm {
     pub(crate) rpc_auth_enabled: bool,
+    pub(crate) rpc_cookie_auth: bool,
     pub(crate) rpc_user: String,
     pub(crate) rpc_password: String,
     pub(crate) wallet_enabled: bool,
@@ -258,6 +259,11 @@ pub(crate) struct NodeSettingsForm {
     pub(crate) prune_mib: String,
     pub(crate) db_cache_mib: String,
     pub(crate) max_peer_connections: String,
+    pub(crate) fast_sync_enabled: bool,
+    pub(crate) background_validation_enabled: bool,
+    pub(crate) checkpoint_sync_enabled: bool,
+    pub(crate) bootstrap_snapshot_path: String,
+    pub(crate) bootstrap_snapshot_hash: String,
 }
 
 impl NodeSettingsForm {
@@ -268,8 +274,9 @@ impl NodeSettingsForm {
     pub(crate) fn from_config(config: &NodeConfig) -> Self {
         Self {
             rpc_auth_enabled: config.rpc_auth.enabled,
+            rpc_cookie_auth: config.rpc_auth.cookie_auth,
             rpc_user: config.rpc_auth.username.clone(),
-            rpc_password: config.rpc_auth.password.clone(),
+            rpc_password: String::new(),
             wallet_enabled: config.wallet.enabled,
             wallet_require_encryption: config.wallet.require_encryption,
             max_mempool_mib: bytes_to_mib_ceil(config.mempool.max_vbytes as u64).to_string(),
@@ -277,6 +284,11 @@ impl NodeSettingsForm {
             prune_mib: bytes_to_mib_ceil(config.storage.prune_target_bytes).to_string(),
             db_cache_mib: bytes_to_mib_ceil(config.storage.db_cache_bytes).to_string(),
             max_peer_connections: config.peers.max_connections.to_string(),
+            fast_sync_enabled: config.sync.fast_body_download,
+            background_validation_enabled: config.sync.background_validation,
+            checkpoint_sync_enabled: config.sync.checkpoint_anchored_sync,
+            bootstrap_snapshot_path: config.sync.bootstrap_snapshot_path.clone(),
+            bootstrap_snapshot_hash: config.sync.bootstrap_snapshot_hash.clone(),
         }
     }
 }
