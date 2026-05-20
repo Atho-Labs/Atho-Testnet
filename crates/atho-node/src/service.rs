@@ -631,6 +631,7 @@ impl NodeService {
             "stop" => self.command_stop(args),
             "addnode" => self.command_addnode(args),
             "disconnectnode" => self.command_disconnectnode(args),
+            "setminingrewardaddress" => self.command_setminingrewardaddress(args),
             "sendrawtransaction" => self.command_sendrawtransaction(args),
             _ => Err(atho_rpc::error::RpcError::method_not_found()),
         }
@@ -2853,6 +2854,7 @@ impl NodeService {
             "next_target": hex::encode(node.difficulty_target_for_next_block()),
             "mempool_transaction_count": node.mempool_len(),
             "mempool_total_fee_atoms": node.mempool_total_fee_atoms(),
+            "mining_reward_address": node.config.mining_reward_address.as_str(),
             "headers_synced": self.orchestrator.sync.sync_state().headers_synced,
             "safe_to_mine": fast.safe_to_mine,
             "chain_validation_status": fast.chain_validation_status,
@@ -2861,6 +2863,47 @@ impl NodeService {
             "pending_validation_blocks": fast.pending_validation_blocks,
             "best_downloaded_body_height": fast.best_downloaded_body_height,
             "best_validated_height": fast.best_validated_height,
+        }))
+    }
+
+    fn command_setminingrewardaddress(
+        &mut self,
+        args: &[String],
+    ) -> Result<Value, atho_rpc::error::RpcError> {
+        let address = self.parse_single_string_arg("setminingrewardaddress", args, "address")?;
+        let address = address.trim();
+        if address.is_empty() {
+            return Err(atho_rpc::error::RpcError::invalid_request(
+                "setminingrewardaddress expects a non-empty address",
+            ));
+        }
+        let (payment_digest, network) = decode_base56_address(address).map_err(|err| {
+            atho_rpc::error::RpcError::invalid_request(format!(
+                "mining reward address is not a valid Atho address: {err}"
+            ))
+        })?;
+        if network != self.network() {
+            return Err(atho_rpc::error::RpcError::invalid_request(format!(
+                "mining reward address targets {} but node is on {}",
+                network.id(),
+                self.network().id()
+            )));
+        }
+
+        self.orchestrator.runtime.node.config.mining_reward_address = address.to_string();
+        let _ = dev::append_log(
+            "athod",
+            &format!(
+                "updated runtime mining reward address network={} address={}",
+                network.id(),
+                address
+            ),
+        );
+        Ok(json!({
+            "address": address,
+            "network": network.id(),
+            "payment_digest": hex::encode(payment_digest),
+            "updated": true,
         }))
     }
 
@@ -4359,6 +4402,35 @@ mod tests {
         assert_eq!(command.data["is_valid"], true);
         assert_eq!(command.data["address"], address);
         assert_eq!(command.data["matches_active_network"], true);
+    }
+
+    #[test]
+    fn execute_command_setminingrewardaddress_updates_runtime_config() {
+        let root = temp_data_dir("command-set-mining-reward-address");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
+        let address = encode_base56_address(Network::Testnet, &[8u8; 32]);
+        let response = service.handle_mut(RpcRequest::ExecuteCommand(CommandInvocation::new(
+            "setminingrewardaddress",
+            vec![address.clone()],
+        )));
+        let RpcResponse::Command(command) = response else {
+            panic!("unexpected response: {response:?}");
+        };
+
+        assert_eq!(command.command, "setminingrewardaddress");
+        assert_eq!(command.data["address"], address);
+        assert_eq!(
+            service
+                .orchestrator
+                .runtime
+                .node
+                .config
+                .mining_reward_address,
+            address
+        );
     }
 
     #[test]

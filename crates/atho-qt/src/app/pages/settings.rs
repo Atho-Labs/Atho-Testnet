@@ -74,10 +74,13 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             }
         });
         ui.add_space(10.0);
-        ui.checkbox(
+        let rotate_response = ui.checkbox(
             &mut app.ui_state.rotate_coinbase_address,
             "Rotate coinbase to a fresh receive address",
         );
+        if rotate_response.changed() {
+            app.set_rotate_coinbase_address(app.ui_state.rotate_coinbase_address);
+        }
         widgets::muted_label(
             ui,
             "Off by default. The current spend path signs one wallet address at a time, so rotating every mining reward can fragment spendable balance.",
@@ -474,6 +477,36 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             &atho_node::config::NodeConfig::config_file_path()
                 .to_string_lossy()
                 .into_owned(),
+        );
+        ui.add_space(10.0);
+        ui.label("Default miner address");
+        ui.horizontal(|ui| {
+            let address_input_width = widgets::finite_available_width(ui, 520.0);
+            ui.add_sized(
+                [address_input_width, 26.0],
+                egui::TextEdit::singleline(&mut app.node_settings_form.mining_reward_address),
+            );
+            if ui
+                .add_enabled(app.wallet.is_some(), egui::Button::new("Use Current Receive"))
+                .clicked()
+            {
+                match app.wallet_mining_reward_address() {
+                    Some(address) => {
+                        app.node_settings_form.mining_reward_address = address.address;
+                        app.last_error = None;
+                        app.send_status = String::from("Default miner address staged");
+                    }
+                    None => {
+                        app.last_error = Some(String::from(
+                            "Load or create a wallet before choosing a miner address",
+                        ));
+                    }
+                }
+            }
+        });
+        widgets::muted_label(
+            ui,
+            "Saved into atho.conf as miningrewardaddress. Mining updates the running local node before requesting a block template.",
         );
         ui.add_space(10.0);
         ui.checkbox(&mut app.node_settings_form.rpc_auth_enabled, "Enable RPC auth");

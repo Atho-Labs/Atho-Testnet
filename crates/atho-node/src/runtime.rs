@@ -193,6 +193,16 @@ pub fn load_config_from_env() -> Result<NodeConfig, RuntimeError> {
 
 /// Runs the full Atho node with live RPC and P2P listeners.
 pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
+    if let Err(err) = config.ensure_operator_config_file() {
+        let _ = dev::append_log(
+            "athod",
+            &format!(
+                "operator config ensure failed network={} path={} error={err}",
+                config.network.id(),
+                NodeConfig::config_file_path().display()
+            ),
+        );
+    }
     config.apply_process_overrides();
     let _ = dev::append_log("athod", &format!("starting on {}", config.network.id()));
     let _ = dev::append_log("p2p", &format!("runtime network={}", config.network.id()));

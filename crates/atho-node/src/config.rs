@@ -284,6 +284,22 @@ impl NodeConfig {
         atomic_write_owner_only(&path, self.to_operator_config_text()?.as_bytes())
     }
 
+    pub fn ensure_operator_config_file(&self) -> io::Result<bool> {
+        let path = Self::config_file_path();
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(false),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists but is not a file", path.display()),
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.write_operator_config_file()?;
+                Ok(true)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn to_operator_config_text(&self) -> io::Result<String> {
         let prune_mib = bytes_to_mib_ceil(self.storage.prune_target_bytes);
         let db_cache_mib = bytes_to_mib_ceil(self.storage.db_cache_bytes);
@@ -1071,6 +1087,30 @@ walletrequireencryption=1
         assert!(text.contains("rpccookieauth=1"));
         assert!(text.contains("miningrewardaddress="));
         assert!(!text.contains("rpcpassword="));
+    }
+
+    #[test]
+    fn ensure_operator_config_file_creates_missing_file_once() {
+        let path = std::env::temp_dir().join(format!(
+            "atho-conf-test-{}-{}.conf",
+            std::process::id(),
+            "ensure-create"
+        ));
+        let _ = fs::remove_file(&path);
+        std::env::set_var(ATHO_CONF_FILE_ENV, &path);
+
+        let config = NodeConfig::new(Network::Testnet);
+        assert!(config.ensure_operator_config_file().expect("create config"));
+        assert!(!config
+            .ensure_operator_config_file()
+            .expect("preserve existing config"));
+        let text = fs::read_to_string(&path).expect("read config");
+
+        std::env::remove_var(ATHO_CONF_FILE_ENV);
+        let _ = fs::remove_file(&path);
+
+        assert!(text.contains("network=testnet"));
+        assert!(text.contains("miningrewardaddress="));
     }
 
     #[test]

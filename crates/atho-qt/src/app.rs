@@ -27,8 +27,8 @@ use atho_node::mining_backend::{
     MiningAcceleratorInfo, MiningBackendKind, MiningController, MiningDeviceType,
 };
 use atho_node::validation::finalize_witness_commit_refs;
-use atho_rpc::command::CommandResponse;
 use atho_rpc::command::{command_definition, help_payload, parse_command_line, search_commands};
+use atho_rpc::command::{CommandInvocation, CommandResponse};
 use atho_rpc::error::RpcError;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
 use atho_rpc::response::{
@@ -239,6 +239,12 @@ struct WalletScanOutcome {
     wallet_activity_cache: Vec<WalletActivityRow>,
 }
 
+#[derive(Debug, Clone)]
+struct MiningRewardTarget {
+    address: String,
+    locking_script: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct WalletPreparationJob {
     started_at: Instant,
@@ -363,6 +369,16 @@ impl DesktopApp {
     }
 
     pub fn new_with_rpc(network: Network, rpc_address: Option<String>) -> Self {
+        let initial_config = atho_node::config::NodeConfig::from_env(network);
+        let initial_config_error = initial_config
+            .ensure_operator_config_file()
+            .err()
+            .map(|err| {
+                format!(
+                    "Node config file could not be created at {}: {err}",
+                    atho_node::config::NodeConfig::config_file_path().display()
+                )
+            });
         let connection = match rpc_address {
             Some(address) => ReadOnlyNodeConnection::with_rpc_address(network, address),
             None => ReadOnlyNodeConnection::new(network),
@@ -384,7 +400,7 @@ impl DesktopApp {
             ui_state: UiState {
                 mining_cores: available_cores,
                 mining_backend: configured_backend,
-                rotate_coinbase_address: false,
+                rotate_coinbase_address: display_preferences.rotate_coinbase_address,
                 ..UiState::default()
             },
             view_model: ViewModel::default(),
@@ -407,7 +423,7 @@ impl DesktopApp {
             import_form: ImportWalletForm::new(network),
             open_form: OpenWalletForm::new(network),
             wallet_management_form: WalletManagementForm::new(network),
-            node_settings_form: NodeSettingsForm::load(network),
+            node_settings_form: NodeSettingsForm::from_config(&initial_config),
             last_error: None,
             active_tab: NavTab::Overview,
             send_to: String::new(),
@@ -487,6 +503,9 @@ impl DesktopApp {
             show_storage_recovery_notice_dialog: false,
             show_wallet_encryption_notice_dialog: false,
         };
+        if let Some(err) = initial_config_error {
+            app.last_error = Some(err);
+        }
 
         app.view_model.network_label = app.connection.network().id().to_string();
         app.view_model.sync_stage = if app.connection.has_local_node() {
@@ -2345,6 +2364,24 @@ impl DesktopApp {
             return;
         }
 
+        let reward_target = match self.mining_reward_target() {
+            Ok(target) => target,
+            Err(err) => {
+                self.ui_state.generate_coins = false;
+                self.mining_status = err.clone();
+                self.last_error = Some(err);
+                self.mining_failure_count = 0;
+                return;
+            }
+        };
+        if let Err(err) = self.apply_mining_reward_target(&reward_target) {
+            self.ui_state.generate_coins = false;
+            self.mining_status = err.clone();
+            self.last_error = Some(err);
+            self.mining_failure_count = 0;
+            return;
+        }
+
         let rpc_address = self.connection.rpc_address().to_string();
         let cores = self.clamp_mining_cores(self.ui_state.mining_cores);
         self.ui_state.mining_cores = cores;
@@ -2352,7 +2389,7 @@ impl DesktopApp {
         let requested_backend = self.mining_backend_status_hint();
         let mining_backend = self.ui_state.mining_backend;
         let connection = self.connection.clone();
-        let reward_script = self.mining_reward_script();
+        let reward_script = Some(reward_target.locking_script);
         let stop_requested = Arc::new(AtomicBool::new(false));
         let mining_stop_requested = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
@@ -2395,9 +2432,34 @@ impl DesktopApp {
         });
     }
 
+    fn mining_reward_target(&mut self) -> Result<MiningRewardTarget, String> {
+        if !self.ui_state.rotate_coinbase_address {
+            let configured = self.node_settings_form.mining_reward_address.trim();
+            if !configured.is_empty() {
+                return self.validate_mining_reward_address(configured);
+            }
+        }
+
+        let address = self.wallet_mining_reward_address().ok_or_else(|| {
+            String::from("Load or create a wallet with at least one receive address before mining")
+        })?;
+        self.node_settings_form.mining_reward_address = address.address.clone();
+        Ok(MiningRewardTarget {
+            address: address.address,
+            locking_script: address.payment_digest.to_vec(),
+        })
+    }
+
+    #[cfg(test)]
     fn mining_reward_script(&mut self) -> Option<Vec<u8>> {
+        self.mining_reward_target()
+            .ok()
+            .map(|target| target.locking_script)
+    }
+
+    fn wallet_mining_reward_address(&mut self) -> Option<WalletAddress> {
         if let Some(address) = self.current_receive_address.as_ref() {
-            return Some(address.payment_digest.to_vec());
+            return Some(address.clone());
         }
 
         let fallback = if let Some(wallet) = self.wallet_ref() {
@@ -2414,7 +2476,7 @@ impl DesktopApp {
 
         if let Some(address) = fallback {
             self.current_receive_address = Some(address.clone());
-            return Some(address.payment_digest.to_vec());
+            return Some(address);
         }
 
         let (address, snapshot) = {
@@ -2436,7 +2498,57 @@ impl DesktopApp {
                 &format!("persist mining reward address failed error={err}"),
             );
         }
-        Some(address.payment_digest.to_vec())
+        Some(address)
+    }
+
+    fn validate_mining_reward_address(&self, address: &str) -> Result<MiningRewardTarget, String> {
+        let (payment_digest, network) = decode_base56_address(address)
+            .map_err(|err| format!("Default miner address is invalid: {err}"))?;
+        if network != self.connection.network() {
+            return Err(format!(
+                "Default miner address belongs to {} not {}",
+                network.id(),
+                self.connection.network().id()
+            ));
+        }
+        Ok(MiningRewardTarget {
+            address: address.to_string(),
+            locking_script: payment_digest.to_vec(),
+        })
+    }
+
+    fn apply_mining_reward_target(&mut self, target: &MiningRewardTarget) -> Result<(), String> {
+        self.persist_mining_reward_address_config(&target.address)?;
+        self.update_runtime_mining_reward_address(&target.address)
+    }
+
+    fn persist_mining_reward_address_config(&mut self, address: &str) -> Result<(), String> {
+        let mut config = atho_node::config::NodeConfig::from_env(self.connection.network());
+        config.network = self.connection.network();
+        config.mining_reward_address = address.trim().to_string();
+        config
+            .write_operator_config_file()
+            .map_err(|err| err.to_string())?;
+        self.node_settings_form.mining_reward_address = config.mining_reward_address;
+        Ok(())
+    }
+
+    fn update_runtime_mining_reward_address(&self, address: &str) -> Result<(), String> {
+        let response = self
+            .connection
+            .request(RpcRequest::ExecuteCommand(CommandInvocation::new(
+                "setminingrewardaddress",
+                vec![address.to_string()],
+            )));
+        match response {
+            RpcResponse::Command(command) if command.command == "setminingrewardaddress" => Ok(()),
+            RpcResponse::Error(err) => Err(format!(
+                "Could not update the running node's miner address: {err}"
+            )),
+            other => Err(format!(
+                "Unexpected response while updating miner address: {other:?}"
+            )),
+        }
     }
 
     fn stop_mining_job(&mut self) {
@@ -2897,6 +3009,11 @@ impl DesktopApp {
         config.rpc_auth.enabled = self.node_settings_form.rpc_auth_enabled;
         config.rpc_auth.cookie_auth = self.node_settings_form.rpc_cookie_auth;
         config.rpc_auth.username = self.node_settings_form.rpc_user.trim().to_string();
+        config.mining_reward_address = self
+            .node_settings_form
+            .mining_reward_address
+            .trim()
+            .to_string();
         config.wallet.enabled = self.node_settings_form.wallet_enabled;
         config.wallet.require_encryption = self.node_settings_form.wallet_require_encryption;
         config.mempool.max_vbytes =
@@ -2937,6 +3054,9 @@ impl DesktopApp {
 
         if config.rpc_auth.enabled && config.rpc_auth.username.is_empty() {
             return Err(String::from("RPC auth requires an operator username"));
+        }
+        if !config.mining_reward_address.is_empty() {
+            self.validate_mining_reward_address(&config.mining_reward_address)?;
         }
         if config.rpc_auth.enabled && !config.rpc_auth.cookie_auth {
             let updating_hash = !self.node_settings_form.rpc_password.trim().is_empty();
@@ -3001,6 +3121,12 @@ impl DesktopApp {
         config
             .write_operator_config_file()
             .map_err(|err| err.to_string())?;
+        if !config.mining_reward_address.is_empty()
+            && self.ui_state.connected
+            && self.view_model.running
+        {
+            self.update_runtime_mining_reward_address(&config.mining_reward_address)?;
+        }
         self.node_settings_form = NodeSettingsForm::from_config(&config);
         Ok(format!(
             "Node settings saved to {}. Restart the local node for runtime-only changes.",
@@ -4058,6 +4184,17 @@ impl DesktopApp {
             }
         }
         self.display_preferences = self.display_preferences.with_send_input_unit(unit);
+        let _ = self.persist_client_display_preferences();
+    }
+
+    pub(crate) fn set_rotate_coinbase_address(&mut self, enabled: bool) {
+        self.ui_state.rotate_coinbase_address = enabled;
+        if self.display_preferences.rotate_coinbase_address == enabled {
+            return;
+        }
+        self.display_preferences = self
+            .display_preferences
+            .with_rotate_coinbase_address(enabled);
         let _ = self.persist_client_display_preferences();
     }
 

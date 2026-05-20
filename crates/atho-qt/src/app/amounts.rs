@@ -127,9 +127,11 @@ impl InputUnit {
 
 /// Persisted client-side display preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub(crate) struct ClientDisplayPreferences {
     pub(crate) display_unit: DisplayUnit,
     pub(crate) send_input_unit: InputUnit,
+    pub(crate) rotate_coinbase_address: bool,
 }
 
 impl ClientDisplayPreferences {
@@ -140,6 +142,11 @@ impl ClientDisplayPreferences {
 
     pub(crate) fn with_send_input_unit(mut self, unit: InputUnit) -> Self {
         self.send_input_unit = unit;
+        self
+    }
+
+    pub(crate) fn with_rotate_coinbase_address(mut self, enabled: bool) -> Self {
+        self.rotate_coinbase_address = enabled;
         self
     }
 }
