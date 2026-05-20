@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.2.0-beta`
+- Release line: `v0.2.0`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -130,9 +130,9 @@ cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
-## v0.2.0-beta Patch Notes
+## v0.2.0 Patch Notes
 
-This beta branch folds the latest Alpha hardening work into a simplified testnet distribution. The goal is to carry forward the consensus/runtime/security improvements without making operators, wallets, or testers sort through mainnet-specific surface area.
+This stable testnet release folds the latest Alpha hardening work into a simplified public testnet distribution. The goal is to carry forward the consensus/runtime/security improvements without making operators, wallets, or testers sort through mainnet-specific surface area.
 
 ### Consensus and Security Hardening
 
