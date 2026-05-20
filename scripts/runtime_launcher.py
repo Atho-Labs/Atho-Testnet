@@ -33,8 +33,6 @@ SOURCE_PATHS = (
 RUNTIME_DIRS = ("db", "logs", "wallet", "audit", "quarantine")
 BUILD_STAMP = ".atho-launch-build.stamp"
 ENTRY_SCRIPT_NAMES = {
-    "mainnet": "runmainnet.py",
-    "regnet": "runregnet.py",
     "testnet": "runtestnet.py",
 }
 SUPPORTED_ENTRY_NETWORKS = frozenset(ENTRY_SCRIPT_NAMES)
@@ -46,13 +44,8 @@ RESERVED_FORWARDED_FLAGS = {
     "--data-dir",
 }
 NETWORK_TOKENS = {
-    "mainnet",
-    "atho-mainnet",
     "testnet",
     "atho-testnet",
-    "regnet",
-    "regtest",
-    "atho-regnet",
 }
 
 
@@ -150,8 +143,7 @@ def normalize_entry_network(network: str) -> str:
     network = network.strip().lower()
     if network not in SUPPORTED_ENTRY_NETWORKS:
         raise LauncherError(
-            f"unsupported launcher network {network!r}; supported launchers are "
-            + ", ".join(sorted(SUPPORTED_ENTRY_NETWORKS))
+            f"unsupported launcher network {network!r}; Atho-Testnet only launches testnet"
         )
     return network
 

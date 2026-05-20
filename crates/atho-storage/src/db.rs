@@ -819,6 +819,8 @@ impl Database {
             for ((height, location), block) in archived.iter().zip(blocks.iter()) {
                 write_block_archive(&mut txn, state, self.network, *height, block, *location)?;
             }
+            #[cfg(test)]
+            maybe_inject_commit_fault(CommitFaultPoint::AfterArchiveWrite)?;
             txn.put(
                 state.meta,
                 &SNAPSHOT_KEY,

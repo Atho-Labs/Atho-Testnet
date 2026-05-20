@@ -1,82 +1,185 @@
-# Atho
+# Atho Testnet
 
-Atho is a post-quantum payment-focused blockchain built around Proof-of-Work, UTXO accounting, Falcon-512 signatures, and SHA3 hashing.
+This branch is the public **Atho testnet-only** release track built from the latest Alpha codebase and hardening work. It keeps the repo focused on the public test network: one launcher, one README, the white paper, the Rust code, and the validation/runtime pieces needed to run nodes, wallets, mining, explorer reads, and transaction broadcast on testnet.
 
-This repository contains the desktop client, node, wallet, miner, API, and validation code for Atho.
+Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha documentation/report surface are intentionally removed from this branch. Use `Atho-Alpha` for broader mainnet and internal engineering work.
 
-## What Is Atho?
+- Website: <https://atho.io>
+- Explorer: <https://atho.io/explore/>
+- Testnet repo target: `Atho-Labs/Atho-Testnet`
+- Release line: `v0.2.0-beta`
+- Public testnet peers:
+  - `162.222.206.163:9100`
+  - `74.208.219.116:9100`
+- Public testnet API nodes:
+  - `https://testnet-node1.atho.io/api/v1`
+  - `https://testnet-node2.atho.io/api/v1`
 
-Atho is a Rust blockchain implementation for payment infrastructure. It uses a UTXO transaction model, Proof-of-Work block production, Falcon transaction signatures, a desktop wallet, local RPC, a read-only HTTP API, and P2P networking.
+## What This Branch Is
 
-## Quick Build
+This is a **testnet product branch**, not a full multi-network source distribution. The consensus/runtime code remains the current Atho implementation, but the public repo surface is simplified around testnet operation and testnet support.
 
-Install Rust first if `cargo` is missing:
+That means:
+
+- `runtestnet.py` is the only public desktop launcher
+- the README is testnet-specific
+- the white paper is kept at the repo root
+- broad Alpha audit/report files are removed from the public branch surface
+- public testnet wallet/API flows are documented here instead of spread across many docs
+
+## Requirements
+
+- Rust and Cargo
+- Python 3
+- A normal C/C++ toolchain
+- OpenCL headers are optional; if GPU prerequisites are missing, the launcher can still fall back to CPU-oriented builds
+
+## Quick Start
+
+Install Rust if `cargo` is not already available:
 
 ```bash
 curl https://sh.rustup.rs -sSf | sh
 ```
 
-Build the project:
+Build:
 
 ```bash
 cargo build
 ```
 
-Launch mainnet:
-
-```bash
-python3 runmainnet.py
-```
-
-That launcher starts the desktop client and a managed local node. If binaries are missing or stale, it rebuilds them before handing off to `atho-qt`.
-
-You can mine from the client after sync. Standalone miner, GPU build, and operator commands live in the docs instead of the main README.
-
-## Other Networks
-
-Public testnet:
+Run the public testnet client:
 
 ```bash
 python3 runtestnet.py
 ```
 
-Local regnet:
+That launcher starts the desktop client together with a managed local testnet node. If local binaries are missing or stale, the launcher can rebuild before handing off to `atho-qt`.
+
+Useful launcher flags:
 
 ```bash
-python3 runregnet.py
+python3 runtestnet.py --dry-run
+python3 runtestnet.py --rebuild
+python3 runtestnet.py --data-dir ~/.atho-testnet
+python3 runtestnet.py --network-overrides-local
 ```
 
-## Power Users
+## Node Commands
 
-For direct `cargo run` commands, node-only operation, standalone mining, GPU builds, CLI usage, and testing commands, use:
+Run the node directly:
 
-- [Setup Guide](docs/setup.md)
-- [Commands](docs/commands.md)
-- [Mining](docs/mining.md)
-- [Testing](docs/testing.md)
+```bash
+cargo run -p atho-node --bin athod -- --network testnet
+```
 
-## Documentation
+Check node status:
 
-- [White Paper (PDF)](ATHO_WHITE_PAPER.pdf)
-- [Monetary Policy Attachment (PDF)](ATHO_MONETARY_POLICY_AND_150_YEAR_SUPPLY_SCHEDULE.pdf)
-- [Setup Guide](docs/setup.md)
-- [Commands](docs/commands.md)
-- [Configuration](docs/configuration.md)
-- [Mining](docs/mining.md)
-- [Testing](docs/testing.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Architecture](docs/architecture.md)
-- [Consensus](docs/consensus.md)
-- [API](docs/api.md)
-- [Production API Guide](docs/ATHO_PRODUCTION_API_GUIDE.md)
-- [Production Deployment Guide](docs/ATHO_PRODUCTION_DEPLOYMENT_GUIDE.md)
-- [Reports](docs/reports/README.md)
+```bash
+cargo run -p atho-node --bin athod -- status --network testnet
+```
 
-Historical release notes live in [docs/archive/release-notes.md](docs/archive/release-notes.md). Audit and engineering reports live in [docs/reports/README.md](docs/reports/README.md).
+Verify local runtime and genesis wiring:
 
-## Security Notice
+```bash
+cargo run -p atho-node --bin athod -- verify --network testnet
+```
 
-Never commit private keys, wallet files, seed phrases, local databases, node identity files, API tokens, RPC cookies, `.env` files, production secrets, or generated chain data. The repo `.gitignore` excludes these local artifacts by default.
+## Public API and Wallet Endpoints
+
+The public testnet nodes expose read APIs plus transaction broadcast routes for desktop and mobile wallet flows.
+
+Public API bases:
+
+- `https://testnet-node1.atho.io/api/v1`
+- `https://testnet-node2.atho.io/api/v1`
+
+Common read routes:
+
+- `GET /health`
+- `GET /network`
+- `GET /network/stats`
+- `GET /blocks/<height-or-hash>`
+- `GET /transactions/<txid>`
+- `GET /mempool`
+
+Public transaction submission routes now available for wallets:
+
+- `POST /tx/broadcast`
+- `POST /tx/sendraw`
+- `POST /sendrawtransaction`
+
+This matters for:
+
+- desktop wallet send flows
+- mobile wallet send flows
+- explorer-backed wallet integrations
+- testnet external app integration work
+
+## White Paper
+
+- [ATHO_WHITE_PAPER.pdf](ATHO_WHITE_PAPER.pdf)
+
+## Validation Commands
+
+Recommended quick validation pass:
+
+```bash
+python3 -m unittest tests.test_runtime_launcher
+cargo check --workspace
+cargo check --manifest-path fuzz/Cargo.toml --all-targets
+```
+
+## v0.2.0-beta Patch Notes
+
+This beta branch folds the latest Alpha hardening work into a simplified testnet distribution. The goal is to carry forward the consensus/runtime/security improvements without making operators, wallets, or testers sort through mainnet-specific surface area.
+
+### Consensus and Security Hardening
+
+- Removed fee metadata from consensus trust assumptions by recomputing fees from committed transactions during validation instead of trusting uncommitted block-side totals.
+- Bound transaction PoW fields into the committed transaction identity path so alternate raw transactions cannot share the same effective block commitments while differing in consensus-relevant tx-PoW bytes.
+- Tightened coinbase rules so witness and tx-PoW edge cases are no longer left loose in consensus-critical validation.
+- Added a future timestamp ceiling so miners cannot push block timestamps arbitrarily far ahead.
+- Hardened binary decoding paths to reject non-canonical shortened transaction encodings that previously defaulted tx-PoW fields.
+- Added parser allocation sanity rails to reduce malformed-count memory abuse risk in transaction and block decoding.
+- Removed publicly derivable mining reward key behavior from real mainnet/testnet payout handling; public mining now uses explicit configured payout addresses instead of predictable reward secrets.
+
+### Sync, Reorg, and Storage Work
+
+- Improved branch reconstruction and cross-peer side-branch recovery so higher-work forks can be rebuilt even when blocks arrive out of order or from different peers.
+- Hardened reorg recovery against locally mined isolated forks and archived side-branch replay cases.
+- Expanded crash/fault coverage around snapshot commit, chainstate mutation, and replace-path recovery so failed state transitions are less likely to leave ambiguous persistence outcomes.
+- Tightened startup recovery checks by replaying canonical history against persisted UTXO state instead of trusting only tip/snapshot metadata.
+- Locked down `dev_seed_chainstate` and other sharp dev-only helpers so they are no longer normal production-facing surfaces.
+
+### API and Wallet Integration Updates
+
+- Enabled the public testnet wallet broadcast endpoints needed for external wallets and mobile wallet transaction submission.
+- Kept the public testnet API nodes on HTTPS and validated they expose the correct `atho-testnet` identity.
+- Preserved read-only public explorer/API flows while allowing controlled public testnet transaction relay.
+
+### Explorer and Website Fixes
+
+- Fixed the explorer’s stale expected testnet genesis hash so the public API no longer gets falsely flagged as the wrong network.
+- Fixed the explorer and homepage uptime display so uptime is derived from canonical uptime seconds and continues advancing even when block production is quiet.
+- Rebuilt the public website upload bundle and synced those explorer fixes into the website repository.
+
+### UI and Runtime Fixes
+
+- Patched the Qt settings/miner layout crash caused by non-finite egui sizing values reaching hit-test code.
+- Preserved the managed local-node launch flow while simplifying the public launcher surface down to `runtestnet.py`.
+
+### Release Surface Simplification
+
+- Removed `runmainnet.py` and `runregnet.py` from this branch.
+- Removed the large Alpha doc/report surface from this branch, keeping the public repo focused on testnet use.
+- Rewrote the README for testnet operators, testers, explorers, and wallet integrators.
+
+## Notes
+
+- This branch is intentionally testnet-focused.
+- Quiet block gaps should not be interpreted as explorer or chain uptime loss.
+- For broad multi-network development and the full Alpha engineering surface, use the `Atho-Alpha` repository instead.
 
 ## License
 

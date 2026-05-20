@@ -97,6 +97,7 @@ impl NodeRuntime {
     }
 
     /// Loads persisted state when available and otherwise creates a fresh node.
+    #[cfg(any(test, feature = "devtools"))]
     pub fn load_or_new(config: NodeConfig) -> Self {
         Self {
             node: Node::load_or_new(config),

@@ -116,6 +116,8 @@ pub struct SyncConfig {
     pub checkpoint_anchored_sync: bool,
     pub bootstrap_snapshot_path: String,
     pub bootstrap_snapshot_hash: String,
+    pub bootstrap_snapshot_signer_public_key: String,
+    pub bootstrap_snapshot_signature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +220,12 @@ impl NodeConfig {
             std::env::var("ATHO_BOOTSTRAP_SNAPSHOT").unwrap_or(config.sync.bootstrap_snapshot_path);
         config.sync.bootstrap_snapshot_hash = std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_HASH")
             .unwrap_or(config.sync.bootstrap_snapshot_hash);
+        config.sync.bootstrap_snapshot_signer_public_key =
+            std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_SIGNER_PUBKEY")
+                .unwrap_or(config.sync.bootstrap_snapshot_signer_public_key);
+        config.sync.bootstrap_snapshot_signature =
+            std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_SIGNATURE")
+                .unwrap_or(config.sync.bootstrap_snapshot_signature);
         config.wallet.enabled = env_bool("ATHO_WALLET_ENABLED", config.wallet.enabled);
         config.wallet.require_encryption = env_bool(
             "ATHO_WALLET_REQUIRE_ENCRYPTION",
@@ -310,6 +318,8 @@ impl NodeConfig {
                 "checkpointsync={}\n",
                 "bootstrapsnapshot={}\n",
                 "bootstrapsnapshothash={}\n",
+                "bootstrapsnapshotsignerpubkey={}\n",
+                "bootstrapsnapshotsignature={}\n",
                 "api={}\n",
                 "apiwallet={}\n",
                 "apimining={}\n"
@@ -333,6 +343,8 @@ impl NodeConfig {
             bool_as_conf(self.sync.checkpoint_anchored_sync),
             self.sync.bootstrap_snapshot_path,
             self.sync.bootstrap_snapshot_hash,
+            self.sync.bootstrap_snapshot_signer_public_key,
+            self.sync.bootstrap_snapshot_signature,
             bool_as_conf(self.api.enabled),
             bool_as_conf(self.api.wallet_enabled),
             bool_as_conf(self.api.mining_enabled)
@@ -371,6 +383,14 @@ impl NodeConfig {
         std::env::set_var(
             "ATHO_BOOTSTRAP_SNAPSHOT_HASH",
             &self.sync.bootstrap_snapshot_hash,
+        );
+        std::env::set_var(
+            "ATHO_BOOTSTRAP_SNAPSHOT_SIGNER_PUBKEY",
+            &self.sync.bootstrap_snapshot_signer_public_key,
+        );
+        std::env::set_var(
+            "ATHO_BOOTSTRAP_SNAPSHOT_SIGNATURE",
+            &self.sync.bootstrap_snapshot_signature,
         );
         std::env::set_var("ATHO_MINING_REWARD_ADDRESS", &self.mining_reward_address);
     }
@@ -457,6 +477,12 @@ impl NodeConfig {
         }
         if let Some(value) = file.get("bootstrapsnapshothash") {
             self.sync.bootstrap_snapshot_hash = value.to_string();
+        }
+        if let Some(value) = file.get("bootstrapsnapshotsignerpubkey") {
+            self.sync.bootstrap_snapshot_signer_public_key = value.to_string();
+        }
+        if let Some(value) = file.get("bootstrapsnapshotsignature") {
+            self.sync.bootstrap_snapshot_signature = value.to_string();
         }
     }
 
@@ -623,6 +649,8 @@ impl Default for SyncConfig {
             checkpoint_anchored_sync: true,
             bootstrap_snapshot_path: String::new(),
             bootstrap_snapshot_hash: String::new(),
+            bootstrap_snapshot_signer_public_key: String::new(),
+            bootstrap_snapshot_signature: String::new(),
         }
     }
 }

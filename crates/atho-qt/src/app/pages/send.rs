@@ -130,8 +130,9 @@ fn render_send_form(
 
                     ui.label(egui::RichText::new("Label:").size(13.0).strong())
                         .on_hover_text("Optional local note for this payment.");
+                    let label_width = widgets::finite_available_width(ui, 240.0);
                     ui.add_sized(
-                        [ui.available_width(), 28.0],
+                        [label_width, 28.0],
                         egui::TextEdit::singleline(&mut app.send_label)
                             .hint_text("Optional payment label"),
                     );

@@ -2924,6 +2924,16 @@ impl DesktopApp {
             .bootstrap_snapshot_hash
             .trim()
             .to_string();
+        config.sync.bootstrap_snapshot_signer_public_key = self
+            .node_settings_form
+            .bootstrap_snapshot_signer_public_key
+            .trim()
+            .to_string();
+        config.sync.bootstrap_snapshot_signature = self
+            .node_settings_form
+            .bootstrap_snapshot_signature
+            .trim()
+            .to_string();
 
         if config.rpc_auth.enabled && config.rpc_auth.username.is_empty() {
             return Err(String::from("RPC auth requires an operator username"));

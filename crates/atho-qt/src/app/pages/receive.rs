@@ -196,9 +196,10 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
             .spacing([12.0, 9.0])
             .min_col_width(120.0)
             .show(ui, |ui| {
+                let row_input_width = widgets::finite_available_width(ui, 320.0);
                 ui.label(egui::RichText::new("Label:").size(13.0).strong());
                 ui.add_sized(
-                    [ui.available_width(), 30.0],
+                    [row_input_width, 30.0],
                     egui::TextEdit::singleline(&mut app.receive_label)
                         .hint_text("Optional internal label")
                         .desired_width(f32::INFINITY),
@@ -216,7 +217,7 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
                 ui.label(egui::RichText::new("Message:").size(13.0).strong());
                 ui.add_sized(
-                    [ui.available_width(), 30.0],
+                    [row_input_width, 30.0],
                     egui::TextEdit::singleline(&mut app.receive_message)
                         .hint_text("Optional payment note")
                         .desired_width(f32::INFINITY),

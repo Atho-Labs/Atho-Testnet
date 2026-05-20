@@ -581,18 +581,31 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(10.0);
         ui.label("Trusted snapshot bundle");
+        let snapshot_input_width = widgets::finite_available_width(ui, 420.0);
         ui.add_sized(
-            [f32::INFINITY, 26.0],
+            [snapshot_input_width, 26.0],
             egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_path),
         );
         ui.label("Trusted snapshot SHA3-384");
         ui.add_sized(
-            [f32::INFINITY, 26.0],
+            [snapshot_input_width, 26.0],
             egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_hash),
+        );
+        ui.label("Trusted snapshot signer pubkey (hex)");
+        ui.add_sized(
+            [snapshot_input_width, 26.0],
+            egui::TextEdit::singleline(
+                &mut app.node_settings_form.bootstrap_snapshot_signer_public_key,
+            ),
+        );
+        ui.label("Trusted snapshot signature (hex)");
+        ui.add_sized(
+            [snapshot_input_width, 26.0],
+            egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_signature),
         );
         widgets::muted_label(
             ui,
-            "Optional. When set on a fresh node, Atho can import this snapshot bundle before regular sync. The hash pin protects the startup path from accidental or tampered files.",
+            "Optional. When set on a fresh node, Atho can import this snapshot bundle before regular sync. Public networks should pin the bundle hash and verify a trusted Falcon package signature so fast sync stays cheap without trusting an unsigned file.",
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {

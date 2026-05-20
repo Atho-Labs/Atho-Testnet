@@ -265,8 +265,9 @@ fn render_recent_transactions(
                     widgets::row_value_signed(ui, row.amount_atoms, display_unit);
                 });
             });
+            let label_width = widgets::finite_available_width(ui, 220.0);
             let response = ui.add_sized(
-                [ui.available_width(), 0.0],
+                [label_width, 0.0],
                 egui::Label::new(
                     egui::RichText::new(&row.label)
                         .size(11.0)

@@ -207,6 +207,7 @@ pub struct NodeService {
 
 impl NodeService {
     /// Creates a new service with a fresh orchestrator.
+    #[cfg(any(test, feature = "devtools"))]
     pub fn new(config: NodeConfig) -> Self {
         let network = config.network;
         Self {

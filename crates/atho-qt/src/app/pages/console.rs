@@ -547,7 +547,8 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                     widgets::PANEL_STROKE
                                 },
                             ));
-                        let response = ui.add_sized([ui.available_width(), 30.0], button);
+                        let button_width = widgets::finite_available_width(ui, 280.0);
+                        let response = ui.add_sized([button_width, 30.0], button);
                         let row_rect = response.rect;
                         if response.clicked() {
                             app.debug_selected_peer = Some(peer.remote_addr.clone());

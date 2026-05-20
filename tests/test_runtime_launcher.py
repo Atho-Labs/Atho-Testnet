@@ -171,42 +171,38 @@ class RuntimeLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             release_dir = self.make_release_dir(root)
-            for script_name, network in (
-                ("runmainnet.py", "mainnet"),
-                ("runtestnet.py", "testnet"),
-                ("runregnet.py", "regnet"),
-            ):
-                with self.subTest(script_name=script_name):
-                    data_dir = root / f"{network}-data"
-                    result = subprocess.run(
-                        [
-                            sys.executable,
-                            "-B",
-                            str(REPO_ROOT / script_name),
-                            "--dry-run",
-                            "--release-dir",
-                            str(release_dir),
-                            "--data-dir",
-                            str(data_dir),
-                        ],
-                        cwd=REPO_ROOT,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                    )
-                    self.assertEqual(
-                        result.returncode,
-                        0,
-                        msg=(
-                            f"{script_name} failed\nstdout:\n{result.stdout}\n"
-                            f"stderr:\n{result.stderr}"
-                        ),
-                    )
-                    self.assertIn(f"[atho-launch] network={network}", result.stdout)
-                    self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
-                    self.assertIn(f"--network {network} --local-node", result.stdout)
-                    self.assertTrue((data_dir / "db").is_dir())
-                    self.assertTrue((data_dir / "logs").is_dir())
+            script_name = "runtestnet.py"
+            network = "testnet"
+            data_dir = root / f"{network}-data"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(REPO_ROOT / script_name),
+                    "--dry-run",
+                    "--release-dir",
+                    str(release_dir),
+                    "--data-dir",
+                    str(data_dir),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=(
+                    f"{script_name} failed\nstdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}"
+                ),
+            )
+            self.assertIn(f"[atho-launch] network={network}", result.stdout)
+            self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
+            self.assertIn(f"--network {network} --local-node", result.stdout)
+            self.assertTrue((data_dir / "db").is_dir())
+            self.assertTrue((data_dir / "logs").is_dir())
 
     def test_startup_scripts_work_outside_repo_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,31 +210,32 @@ class RuntimeLauncherTests(unittest.TestCase):
             release_dir = self.make_release_dir(root)
             outside_cwd = root / "outside"
             outside_cwd.mkdir()
-            for script_name, network in (
-                ("runmainnet.py", "mainnet"),
-                ("runtestnet.py", "testnet"),
-                ("runregnet.py", "regnet"),
-            ):
-                with self.subTest(script_name=script_name):
-                    data_dir = root / f"external-{network}-data"
-                    result = subprocess.run(
-                        [
-                            sys.executable,
-                            "-B",
-                            str(REPO_ROOT / script_name),
-                            "--dry-run",
-                            "--release-dir",
-                            str(release_dir),
-                            "--data-dir",
-                            str(data_dir),
-                        ],
-                        cwd=outside_cwd,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, msg=result.stderr)
-                    self.assertIn(f"[atho-launch] network={network}", result.stdout)
+            script_name = "runtestnet.py"
+            network = "testnet"
+            data_dir = root / f"external-{network}-data"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(REPO_ROOT / script_name),
+                    "--dry-run",
+                    "--release-dir",
+                    str(release_dir),
+                    "--data-dir",
+                    str(data_dir),
+                ],
+                cwd=outside_cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn(f"[atho-launch] network={network}", result.stdout)
+
+    def test_testnet_release_surface_keeps_single_launcher(self) -> None:
+        self.assertTrue((REPO_ROOT / "runtestnet.py").is_file())
+        self.assertFalse((REPO_ROOT / "runmainnet.py").exists())
+        self.assertFalse((REPO_ROOT / "runregnet.py").exists())
 
     def test_gpu_build_help_mentions_host_requirements(self) -> None:
         message = runtime_launcher.gpu_build_help()

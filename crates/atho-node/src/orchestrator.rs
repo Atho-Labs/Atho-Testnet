@@ -17,6 +17,7 @@ pub struct NodeOrchestrator {
 }
 
 impl NodeOrchestrator {
+    #[cfg(any(test, feature = "devtools"))]
     pub fn new(config: NodeConfig) -> Self {
         let network = config.network;
         Self {

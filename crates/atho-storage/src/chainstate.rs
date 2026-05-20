@@ -176,6 +176,7 @@ impl Chainstate {
         }
     }
 
+    #[cfg(test)]
     pub fn load_or_new(network: Network) -> Self {
         Self::try_load_or_recover(network)
             .unwrap_or_else(|err| panic!("failed to load chainstate for {}: {}", network.id(), err))
@@ -3714,6 +3715,110 @@ mod tests {
             .expect("present snapshot");
         assert_eq!(snapshot.height, before_height);
         assert_eq!(snapshot.tip_hash, before_tip_hash);
+    }
+
+    #[test]
+    fn select_branch_replace_path_faults_preserve_canonical_state() {
+        let root = temp_workspace("select-branch-replace-faults");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = CurrentDirGuard::switch_to(&root);
+        let _prune = EnvVarGuard::set("ATHO_PRUNETEST_PRUNE_DEPTH", "2");
+        let _reorg = EnvVarGuard::set("ATHO_PRUNETEST_MAX_REORG_DEPTH", "16");
+
+        let genesis_timestamp = genesis::genesis_state(Network::Prunetest)
+            .block
+            .header
+            .timestamp;
+        let main_1 = {
+            let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("state");
+            let block = build_coinbase_successor_with_script(
+                &state,
+                canonical_test_lock(11),
+                genesis_timestamp.saturating_add(1),
+            );
+            state.connect_block(&block).expect("connect main one");
+            for (offset, script_tag) in [(2, 12u8), (3, 13), (4, 14), (5, 15)] {
+                let next = build_coinbase_successor_with_script(
+                    &state,
+                    canonical_test_lock(script_tag),
+                    genesis_timestamp.saturating_add(offset),
+                );
+                state.connect_block(&next).expect("connect main suffix");
+            }
+            block
+        };
+
+        let replacement_branch = {
+            let mut fork_state = Chainstate::new(Network::Prunetest);
+            fork_state
+                .connect_block(&main_1)
+                .expect("connect fork anchor");
+            let mut branch = Vec::new();
+            for (offset, script_tag) in [(6, 21u8), (7, 22), (8, 23), (9, 24), (10, 25)] {
+                let next = build_coinbase_successor_with_script(
+                    &fork_state,
+                    canonical_test_lock(script_tag),
+                    genesis_timestamp.saturating_add(offset),
+                );
+                fork_state
+                    .connect_block(&next)
+                    .expect("connect replacement branch");
+                branch.push(next);
+            }
+            branch
+        };
+
+        for point in [
+            CommitFaultPoint::AfterArchiveWrite,
+            CommitFaultPoint::AfterSnapshotWrite,
+            CommitFaultPoint::AfterStateWrite,
+            CommitFaultPoint::BeforeCommit,
+        ] {
+            let mut state = Chainstate::try_load_or_new(Network::Prunetest).expect("reload");
+            let before_height = state.height;
+            let before_tip_hash = state.tip_hash;
+            let before_blocks: Vec<_> = state
+                .canonical_blocks()
+                .expect("canonical before")
+                .iter()
+                .map(|block| block.header.block_hash())
+                .collect();
+            let before_utxos: Vec<_> = state.utxo_entries().cloned().collect();
+
+            Database::inject_commit_fault_for_test(point, 1);
+            let result = state.select_branch(&replacement_branch);
+            Database::clear_commit_fault_for_test();
+
+            assert!(
+                matches!(result, Err(StorageError::Io(_))),
+                "fault point {point:?}: {result:?}"
+            );
+            assert_eq!(state.height, before_height, "fault point {point:?}");
+            assert_eq!(state.tip_hash, before_tip_hash, "fault point {point:?}");
+            assert_eq!(
+                state
+                    .canonical_blocks()
+                    .expect("canonical after")
+                    .iter()
+                    .map(|block| block.header.block_hash())
+                    .collect::<Vec<_>>(),
+                before_blocks,
+                "fault point {point:?}"
+            );
+            assert_eq!(
+                state.utxo_entries().cloned().collect::<Vec<_>>(),
+                before_utxos,
+                "fault point {point:?}"
+            );
+
+            let db = Database::open(Network::Prunetest).expect("database");
+            let snapshot = db
+                .load_chainstate_snapshot()
+                .expect("snapshot load")
+                .expect("snapshot present");
+            assert_eq!(snapshot.height, before_height, "fault point {point:?}");
+            assert_eq!(snapshot.tip_hash, before_tip_hash, "fault point {point:?}");
+        }
     }
 
     proptest! {
