@@ -14,9 +14,9 @@ use crate::service::NodeService;
 use atho_core::address::decode_base56_address;
 use atho_core::consensus::{params::consensus_params_for_network, subsidy};
 use atho_core::constants::{
-    ATOMS_PER_ATHO, BLOCKS_PER_YEAR, MAX_STANDARD_INPUTS, MAX_STANDARD_OUTPUTS,
-    MAX_TRANSACTION_RAW_BYTES, MIN_OUTPUT_AMOUNT_ATOMS, MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE,
-    MIN_TX_FEE_ATOMS, TX_POW_MAX_BITS, TX_POW_MIN_BITS,
+    ATOMS_PER_ATHO, BLOCKS_PER_YEAR, DECIMALS, DEFAULT_WALLET_MIN_CONFIRMATIONS,
+    MAX_STANDARD_INPUTS, MAX_STANDARD_OUTPUTS, MAX_TRANSACTION_RAW_BYTES, MIN_OUTPUT_AMOUNT_ATOMS,
+    MIN_RELAY_FEE_RATE_ATOMS_PER_VBYTE, MIN_TX_FEE_ATOMS, TX_POW_MAX_BITS, TX_POW_MIN_BITS,
 };
 use atho_core::network::Network;
 use atho_rpc::command::CommandInvocation;
@@ -749,9 +749,10 @@ fn address_summary_value(
     ensure_explorer_index_available(service)?;
     let limit = parse_limit(query, 25, 100)?;
     let offset = parse_offset(query)?;
+    let min_confirmations = parse_min_confirmations(query)?;
     service
         .explorer_index()
-        .address_summary_value(network, address, limit, offset)
+        .address_summary_value(network, address, min_confirmations, limit, offset)
         .ok_or(ApiError {
             status: 404,
             code: "not_found",
@@ -768,9 +769,17 @@ fn address_utxos_value(
     ensure_explorer_index_available(service)?;
     let limit = parse_limit(query, 25, 100)?;
     let offset = parse_offset(query)?;
+    let min_confirmations = parse_min_confirmations(query)?;
     service
         .explorer_index()
-        .address_utxos_value(network, service.node_ref().height(), address, limit, offset)
+        .address_utxos_value(
+            network,
+            service.node_ref().height(),
+            address,
+            min_confirmations,
+            limit,
+            offset,
+        )
         .ok_or(ApiError {
             status: 404,
             code: "not_found",
@@ -1044,7 +1053,9 @@ fn network_stats_value(service: &NodeService) -> Result<Value, ApiError> {
     let status = service.node_status();
     let diagnostics = &status.network_diagnostics;
     let known_nodes = service.known_node_count();
-    let uptime_seconds = unix_timestamp().saturating_sub(chain.genesis_timestamp);
+    let chain_uptime_seconds = unix_timestamp().saturating_sub(chain.genesis_timestamp);
+    let node_uptime_seconds = service.runtime_uptime_seconds();
+    let node_uptime = format_uptime(node_uptime_seconds);
     let supply = supply_snapshot(service, status.network);
     let genesis_hash = hex::encode(atho_core::genesis::genesis_hash(status.network));
     let latest_block_hash = hex::encode(chain.tip_hash);
@@ -1064,7 +1075,7 @@ fn network_stats_value(service: &NodeService) -> Result<Value, ApiError> {
         format_u128_atoms_decimal(supply.total_mined_supply_atoms)
     );
     let average_block_time = format_duration_seconds(chain.average_block_time_millis);
-    let network_uptime = format_uptime(uptime_seconds);
+    let chain_uptime = format_uptime(chain_uptime_seconds);
     let circulating_supply = format!(
         "{} ATHO",
         format_u128_atoms_decimal(chain.circulating_supply_atoms)
@@ -1116,8 +1127,14 @@ fn network_stats_value(service: &NodeService) -> Result<Value, ApiError> {
         "total_mined_supply": total_mined_supply,
         "average_block_time_seconds": chain.average_block_time_millis as f64 / 1_000.0,
         "average_block_time": average_block_time,
-        "network_uptime_seconds": uptime_seconds,
-        "network_uptime": network_uptime,
+        "network_uptime_seconds": node_uptime_seconds,
+        "network_uptime": node_uptime,
+        "node_started_at_unix": service.runtime_started_at_unix(),
+        "node_uptime_seconds": node_uptime_seconds,
+        "node_uptime": node_uptime,
+        "genesis_timestamp": chain.genesis_timestamp,
+        "chain_uptime_seconds": chain_uptime_seconds,
+        "chain_uptime": chain_uptime,
         "circulating_supply_atoms": chain.circulating_supply_atoms.to_string(),
         "circulating_supply": circulating_supply,
         "burned_supply_atoms": supply.burned_supply_atoms.to_string(),
@@ -1157,7 +1174,9 @@ fn network_hashrate_value(service: &NodeService) -> Result<Value, ApiError> {
 
 fn network_uptime_value(service: &NodeService) -> Result<Value, ApiError> {
     let chain = service.chain_stats();
-    let uptime_seconds = unix_timestamp().saturating_sub(chain.genesis_timestamp);
+    let chain_uptime_seconds = unix_timestamp().saturating_sub(chain.genesis_timestamp);
+    let node_uptime_seconds = service.runtime_uptime_seconds();
+    let node_uptime = format_uptime(node_uptime_seconds);
     let network = service.network();
     Ok(json!({
         "network_id": network.id(),
@@ -1165,9 +1184,17 @@ fn network_uptime_value(service: &NodeService) -> Result<Value, ApiError> {
         "genesis_hash": hex::encode(atho_core::genesis::genesis_hash(network)),
         "api_version": "v1",
         "node_version": env!("CARGO_PKG_VERSION"),
+        "running": service.is_running(),
+        "node_started_at_unix": service.runtime_started_at_unix(),
+        "node_uptime_seconds": node_uptime_seconds,
+        "node_uptime": node_uptime,
         "genesis_timestamp": chain.genesis_timestamp,
-        "uptime_seconds": uptime_seconds,
-        "uptime": format_uptime(uptime_seconds),
+        "chain_uptime_seconds": chain_uptime_seconds,
+        "chain_uptime": format_uptime(chain_uptime_seconds),
+        "network_uptime_seconds": node_uptime_seconds,
+        "network_uptime": node_uptime,
+        "uptime_seconds": node_uptime_seconds,
+        "uptime": node_uptime,
     }))
 }
 
@@ -1497,6 +1524,20 @@ fn parse_offset(query: &BTreeMap<String, String>) -> Result<usize, ApiError> {
         .map(|value| value.unwrap_or(0))
 }
 
+fn parse_min_confirmations(query: &BTreeMap<String, String>) -> Result<u64, ApiError> {
+    query
+        .get("min_confirmations")
+        .or_else(|| query.get("minconf"))
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| ApiError {
+                status: 400,
+                code: "invalid_input",
+            })
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(DEFAULT_WALLET_MIN_CONFIRMATIONS))
+}
+
 fn allow_rate_limit(bucket: &mut VecDeque<u64>, limit: usize, now: u64) -> bool {
     while bucket
         .front()
@@ -1606,13 +1647,13 @@ fn render_mempool_entry_value(
 fn format_atoms_decimal(atoms: u64) -> String {
     let whole = atoms / ATOMS_PER_ATHO;
     let fractional = atoms % ATOMS_PER_ATHO;
-    format!("{whole}.{fractional:012}")
+    format!("{whole}.{fractional:0DECIMALS$}")
 }
 
 fn format_u128_atoms_decimal(atoms: u128) -> String {
     let whole = atoms / ATOMS_PER_ATHO as u128;
     let fractional = atoms % ATOMS_PER_ATHO as u128;
-    format!("{whole}.{fractional:012}")
+    format!("{whole}.{fractional:0DECIMALS$}")
 }
 
 fn format_scaled_decimal(value: u64, scale_digits: usize) -> String {
@@ -1974,7 +2015,7 @@ mod tests {
         .expect("mempool tx");
         assert_eq!(tx_view["source"], "mempool");
         assert_eq!(tx_view["fee_atoms"], 1_500);
-        assert_eq!(tx_view["fee_atho"], "0.000000001500");
+        assert_eq!(tx_view["fee_atho"], "0.00001500");
         assert_eq!(tx_view["transaction"]["txid"], txid);
 
         let stats = route_request(
@@ -2432,6 +2473,26 @@ mod tests {
             stats["block_reward_atoms"],
             subsidy::block_subsidy_atoms_for_network(Network::Regnet, 1)
         );
+        assert_eq!(stats["node_uptime_seconds"], 0);
+        assert_eq!(
+            stats["network_uptime_seconds"],
+            stats["node_uptime_seconds"]
+        );
+        assert!(stats["chain_uptime_seconds"].as_u64().is_some());
+        let uptime = route_request(
+            &config,
+            &mut service,
+            Network::Regnet,
+            "/api/v1/network/uptime",
+            &BTreeMap::new(),
+        )
+        .expect("network uptime");
+        assert_eq!(uptime["uptime_seconds"], uptime["node_uptime_seconds"]);
+        assert_eq!(
+            uptime["network_uptime_seconds"],
+            uptime["node_uptime_seconds"]
+        );
+        assert!(uptime["chain_uptime_seconds"].as_u64().is_some());
         assert_eq!(
             stats["total_mined_supply_atoms"],
             subsidy::cumulative_issued_through_height_for_network(Network::Regnet, 0).to_string()
@@ -2476,7 +2537,7 @@ mod tests {
         assert_eq!(supply["max_supply_atoms"], Value::Null);
         assert_eq!(supply["max_supply"], Value::Null);
         assert_eq!(supply["max_supply_label"], "No Fixed Cap");
-        assert_eq!(supply["current_block_reward_atoms"], 5_000_000_000_000u64);
+        assert_eq!(supply["current_block_reward_atoms"], 5_000_000_000u64);
         assert_eq!(supply["next_halving_height"], 1_260_000);
         assert_eq!(supply["blocks_until_halving"], 1_260_000);
         assert_eq!(supply["emission_epoch"], 0);

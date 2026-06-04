@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.2.0`
+- Release line: `v0.3.0`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,47 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.0 Patch Notes
+
+This release refreshes the public testnet-only distribution from the current Alpha codebase after the accounting, emission, wallet-confirmation, and stability updates. It is intended as the clean testnet reset line for the updated Atho rules.
+
+### Accounting and Emission Update
+
+- Switched public monetary accounting to Bitcoin-style E-8 units: `1 ATHO = 100,000,000 atoms`.
+- Set the base fee policy to `1 atom/vbyte`, keeping normal payments cheap while preserving exact integer accounting.
+- Set the standard dust threshold to `100 atoms`.
+- Updated the block schedule to 100-second target blocks, 864 blocks/day, and a 1,260,000-block halving interval.
+- Updated subsidy rules to start at `50.00000000 ATHO` per block, halve through Era 7, and then use a permanent `0.39062500 ATHO` tail reward from block `8,820,000`.
+- Regenerated the testnet genesis/accounting path for the new model. Existing pre-v0.3.0 testnet databases should be treated as incompatible with this reset line.
+
+### Confirmation and Wallet Policy
+
+- Normal transactions are considered confirmed once included in a valid best-chain block.
+- Coinbase rewards keep the hard consensus maturity rule of 100 confirmations before they can be spent.
+- Wallet confirmation depth is now wallet/application policy instead of a hard consensus delay for normal transactions.
+- The official wallet defaults to 3 confirmations and exposes a user setting for the desired normal-transaction confirmation depth.
+- RPC/API balance and UTXO flows expose confirmation filtering so external wallets, merchants, and apps can choose their own risk level.
+
+### Stability and Address Safety
+
+- Hardened Qt layout sizing so non-finite widget geometry cannot trigger the egui hit-test panic seen in the desktop client.
+- Added network-mismatch protection before attaching a wallet to the Qt session.
+- Made configured mining reward addresses network-scoped, so a valid address from another network is ignored/reset before startup mining paths can use it.
+- Improved Qt test isolation so wallet tests do not read the operator’s real wallet storage.
+
+### Explorer, API, and Testnet Operations
+
+- Updated node explorer/API monetary formatting to report E-8 atom values consistently.
+- Verified public testnet supply and genesis coinbase accounting as `50.00000000 ATHO` / `5,000,000,000 atoms`.
+- Kept the public testnet nodes as full-node services, with mining controlled by local/operator clients.
+- Refreshed the bundled white paper at the repo root with the new accounting, emission, block size, TPS, and confirmation-policy information.
+
+### Release Surface
+
+- Kept this repo testnet-only: `runtestnet.py`, one README, one white paper, Rust code, validation tests, runtime scripts, and fuzz targets.
+- Kept `runmainnet.py`, `runregnet.py`, and the large Alpha engineering/report documentation out of this public testnet release.
+- Published as `v0.3.0` because the accounting/emission model changes require a clean testnet generation boundary.
 
 ## v0.2.0 Patch Notes
 

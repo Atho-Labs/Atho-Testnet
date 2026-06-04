@@ -53,16 +53,18 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         if app.create_form.encrypt_wallet {
             ui.add_space(8.0);
             form_label(ui, "Wallet passphrase");
+            let password_width = widgets::finite_widget_width(ui, 520.0, 180.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.create_form.wallet_password)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(password_width)
                     .password(!app.create_form.show_passwords),
             );
             ui.add_space(8.0);
             form_label(ui, "Confirm passphrase");
+            let confirm_width = widgets::finite_widget_width(ui, 520.0, 180.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.create_form.wallet_password_confirm)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(confirm_width)
                     .password(!app.create_form.show_passwords),
             );
         } else {
@@ -71,9 +73,10 @@ pub(crate) fn render_create(app: &mut DesktopApp, ui: &mut egui::Ui) {
         }
         ui.add_space(8.0);
         form_label(ui, "Seed passphrase (optional)");
+        let seed_width = widgets::finite_widget_width(ui, 520.0, 180.0);
         ui.add(
             egui::TextEdit::singleline(&mut app.create_form.mnemonic_passphrase)
-                .desired_width(f32::INFINITY)
+                .desired_width(seed_width)
                 .password(!app.create_form.show_passwords),
         );
         ui.checkbox(&mut app.create_form.show_passwords, "Show passphrases");
@@ -266,16 +269,18 @@ pub(crate) fn render_import(app: &mut DesktopApp, ui: &mut egui::Ui) {
         if app.import_form.encrypt_wallet {
             ui.add_space(8.0);
             form_label(ui, "Wallet passphrase");
+            let password_width = widgets::finite_widget_width(ui, 520.0, 180.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.import_form.wallet_password)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(password_width)
                     .password(!app.import_form.show_passwords),
             );
             ui.add_space(8.0);
             form_label(ui, "Confirm passphrase");
+            let confirm_width = widgets::finite_widget_width(ui, 520.0, 180.0);
             ui.add(
                 egui::TextEdit::singleline(&mut app.import_form.wallet_password_confirm)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(confirm_width)
                     .password(!app.import_form.show_passwords),
             );
         } else {
@@ -398,9 +403,10 @@ pub(crate) fn render_open(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(8.0);
         form_label(ui, "Wallet password");
+        let password_width = widgets::finite_widget_width(ui, 460.0, 180.0);
         ui.add(
             egui::TextEdit::singleline(&mut app.open_form.wallet_password)
-                .desired_width(f32::INFINITY)
+                .desired_width(password_width)
                 .password(!app.open_form.show_password),
         );
         ui.checkbox(&mut app.open_form.show_password, "Show passphrase");
@@ -445,7 +451,12 @@ fn form_label(ui: &mut egui::Ui, label: &str) {
 
 fn render_browse_row(ui: &mut egui::Ui, text: &mut String, button_label: &str, clicked: &mut bool) {
     ui.horizontal(|ui| {
-        let input_width = widgets::reserved_width(ui.available_width(), 110.0, 140.0, 360.0);
+        let input_width = widgets::reserved_width(
+            widgets::finite_available_width(ui, 360.0),
+            110.0,
+            140.0,
+            360.0,
+        );
         ui.add(
             egui::TextEdit::singleline(text)
                 .desired_width(input_width)

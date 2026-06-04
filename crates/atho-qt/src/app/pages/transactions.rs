@@ -16,7 +16,8 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         let chain_synced = app.view_model.chain_synced();
 
         ui.horizontal(|ui| {
-            let search_width = widgets::reserved_width(ui.available_width(), 170.0, 220.0, 420.0);
+            let search_width =
+                widgets::reserved_width(widgets::finite_available_width(ui, 420.0), 170.0, 220.0, 420.0);
             egui::ComboBox::from_id_source("tx_date_filter")
                 .selected_text(
                     DATE_FILTERS[app.transaction_date_filter.min(DATE_FILTERS.len() - 1)],

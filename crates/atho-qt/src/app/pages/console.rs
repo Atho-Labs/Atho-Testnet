@@ -263,8 +263,12 @@ fn render_console_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             );
             prompt.on_hover_text("Enter a local Atho RPC command.");
             let run_width = 68.0;
-            let input_width =
-                widgets::reserved_width(ui.available_width(), run_width + 8.0, 220.0, 420.0);
+            let input_width = widgets::reserved_width(
+                widgets::finite_available_width(ui, 420.0),
+                run_width + 8.0,
+                220.0,
+                420.0,
+            );
             let response = ui.add_sized(
                 [input_width, 28.0],
                 egui::TextEdit::singleline(&mut app.debug_console_input)
@@ -436,7 +440,12 @@ fn render_network_traffic_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             widgets::section_header(ui, "Network Traffic");
             ui.add_space(10.0);
             let desired = egui::vec2(
-                widgets::reserved_width(ui.available_width(), 8.0, 320.0, 420.0),
+                widgets::reserved_width(
+                    widgets::finite_available_width(ui, 420.0),
+                    8.0,
+                    320.0,
+                    420.0,
+                ),
                 280.0,
             );
             let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
@@ -503,19 +512,19 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             }
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [48.0, 0.0],
+                    [48.0, 18.0],
                     egui::Label::new(egui::RichText::new("Node").strong()),
                 );
                 ui.add_sized(
-                    [220.0, 0.0],
+                    [220.0, 18.0],
                     egui::Label::new(egui::RichText::new("Peer / Service").strong()),
                 );
                 ui.add_sized(
-                    [90.0, 0.0],
+                    [90.0, 18.0],
                     egui::Label::new(egui::RichText::new("Type").strong()),
                 );
                 ui.add_sized(
-                    [70.0, 0.0],
+                    [70.0, 18.0],
                     egui::Label::new(egui::RichText::new("Height").strong()),
                 );
             });
@@ -547,25 +556,25 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                                     widgets::PANEL_STROKE
                                 },
                             ));
-                        let button_width = widgets::finite_available_width(ui, 280.0);
-                        let response = ui.add_sized([button_width, 30.0], button);
+                        let row_width = widgets::finite_widget_width(ui, 420.0, 300.0);
+                        let response = ui.add_sized([row_width, 30.0], button);
                         let row_rect = response.rect;
                         if response.clicked() {
                             app.debug_selected_peer = Some(peer.remote_addr.clone());
                         }
                         ui.allocate_ui_at_rect(row_rect.shrink2(egui::vec2(6.0, 4.0)), |ui| {
                             ui.horizontal(|ui| {
-                                ui.add_sized([48.0, 0.0], egui::Label::new(index.to_string()));
+                                ui.add_sized([48.0, 18.0], egui::Label::new(index.to_string()));
                                 ui.add_sized(
-                                    [220.0, 0.0],
+                                    [220.0, 18.0],
                                     egui::Label::new(widgets::elide_text(&peer.remote_addr, 28)),
                                 );
                                 ui.add_sized(
-                                    [90.0, 0.0],
+                                    [90.0, 18.0],
                                     egui::Label::new(connection_type_label(peer.direction)),
                                 );
                                 ui.add_sized(
-                                    [70.0, 0.0],
+                                    [70.0, 18.0],
                                     egui::Label::new(
                                         peer.best_height
                                             .map(|height| height.to_string())
@@ -585,14 +594,14 @@ fn render_peers_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
                             widgets::panel_frame().show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
-                                        [220.0, 0.0],
+                                        [220.0, 18.0],
                                         egui::Label::new(widgets::elide_text(
                                             &peer.remote_addr,
                                             28,
                                         )),
                                     );
                                     ui.add_sized(
-                                        [90.0, 0.0],
+                                        [90.0, 18.0],
                                         egui::Label::new(connection_type_label(peer.direction)),
                                     );
                                     widgets::muted_label(ui, "Handshake pending");

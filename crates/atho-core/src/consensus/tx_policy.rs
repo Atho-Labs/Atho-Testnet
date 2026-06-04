@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn required_fee_examples_match_policy_floor() {
-        for (vbytes, expected) in [(250usize, 500u64), (500, 500), (650, 650), (2_500, 2_500)] {
+        for (vbytes, expected) in [(250usize, 250u64), (500, 500), (650, 650), (2_500, 2_500)] {
             let mut tx = sample_tx(2, 2_000);
             while tx.vsize_bytes() < vbytes {
                 tx.witness.push(0);

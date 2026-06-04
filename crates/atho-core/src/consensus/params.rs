@@ -5,8 +5,9 @@
 
 use crate::constants::{
     ATOMS_PER_ATHO, BLOCK_TIME_SECONDS, COINBASE_MATURITY_BLOCKS, DECIMALS,
-    HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ATOMS, MIN_TX_FEE_ATOMS,
-    STANDARD_TX_CONFIRMATIONS,
+    DEFAULT_SAFE_CONFIRMATIONS, DEFAULT_WALLET_MIN_CONFIRMATIONS, HALVING_INTERVAL_BLOCKS,
+    HIGH_VALUE_CONFIRMATIONS, INITIAL_BLOCK_REWARD_ATOMS, MIN_TX_FEE_ATOMS,
+    NORMAL_TX_VALID_AFTER_CONFIRMATIONS,
 };
 use crate::network::Network;
 
@@ -25,8 +26,14 @@ pub struct ConsensusParams {
     pub halving_interval_blocks: u64,
     /// Required confirmations before coinbase outputs are spendable.
     pub coinbase_maturity_blocks: u64,
-    /// Default wallet-facing confirmation threshold for standard payments.
-    pub standard_tx_confirmations: u64,
+    /// Consensus confirmation count where normal transactions are valid to spend.
+    pub normal_tx_valid_after_confirmations: u64,
+    /// Default wallet-facing minimum confirmation filter for normal payments.
+    pub default_wallet_min_confirmations: u64,
+    /// Recommended wallet label threshold for stronger settlement display.
+    pub default_safe_confirmations: u64,
+    /// Recommended wallet/exchange threshold for high-value payments.
+    pub high_value_confirmations: u64,
     /// Minimum relay/mining fee floor in atoms.
     pub min_tx_fee_atoms: u64,
     /// Target inter-block time used by scheduling and UX.
@@ -41,7 +48,10 @@ pub const CONSENSUS_PARAMS: ConsensusParams = ConsensusParams {
     initial_block_reward_atoms: INITIAL_BLOCK_REWARD_ATOMS,
     halving_interval_blocks: HALVING_INTERVAL_BLOCKS,
     coinbase_maturity_blocks: COINBASE_MATURITY_BLOCKS,
-    standard_tx_confirmations: STANDARD_TX_CONFIRMATIONS,
+    normal_tx_valid_after_confirmations: NORMAL_TX_VALID_AFTER_CONFIRMATIONS,
+    default_wallet_min_confirmations: DEFAULT_WALLET_MIN_CONFIRMATIONS,
+    default_safe_confirmations: DEFAULT_SAFE_CONFIRMATIONS,
+    high_value_confirmations: HIGH_VALUE_CONFIRMATIONS,
     min_tx_fee_atoms: MIN_TX_FEE_ATOMS,
     block_time_seconds: BLOCK_TIME_SECONDS,
 };
@@ -74,20 +84,37 @@ mod tests {
         );
         assert_eq!(params.halving_interval_blocks, 1_260_000);
         assert_eq!(params.coinbase_maturity_blocks, 100);
-        assert_eq!(params.standard_tx_confirmations, 6);
-        assert_eq!(params.min_tx_fee_atoms, 500);
+        assert_eq!(params.normal_tx_valid_after_confirmations, 1);
+        assert_eq!(params.default_wallet_min_confirmations, 3);
+        assert_eq!(params.default_safe_confirmations, 6);
+        assert_eq!(params.high_value_confirmations, 20);
+        assert_eq!(params.min_tx_fee_atoms, 1);
         assert_eq!(params.block_time_seconds, 100);
     }
 
     #[test]
-    fn all_networks_share_current_confirmation_and_maturity_policy() {
+    fn all_networks_share_current_wallet_and_maturity_policy() {
         let mainnet = consensus_params_for_network(Network::Mainnet);
         let testnet = consensus_params_for_network(Network::Testnet);
 
         assert_eq!(mainnet.coinbase_maturity_blocks, COINBASE_MATURITY_BLOCKS);
-        assert_eq!(mainnet.standard_tx_confirmations, STANDARD_TX_CONFIRMATIONS);
+        assert_eq!(
+            mainnet.normal_tx_valid_after_confirmations,
+            NORMAL_TX_VALID_AFTER_CONFIRMATIONS
+        );
+        assert_eq!(
+            mainnet.default_wallet_min_confirmations,
+            DEFAULT_WALLET_MIN_CONFIRMATIONS
+        );
         assert_eq!(testnet.coinbase_maturity_blocks, COINBASE_MATURITY_BLOCKS);
-        assert_eq!(testnet.standard_tx_confirmations, STANDARD_TX_CONFIRMATIONS);
+        assert_eq!(
+            testnet.normal_tx_valid_after_confirmations,
+            NORMAL_TX_VALID_AFTER_CONFIRMATIONS
+        );
+        assert_eq!(
+            testnet.default_wallet_min_confirmations,
+            DEFAULT_WALLET_MIN_CONFIRMATIONS
+        );
         assert_eq!(
             testnet.initial_block_reward_atoms,
             mainnet.initial_block_reward_atoms

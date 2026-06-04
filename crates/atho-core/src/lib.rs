@@ -29,14 +29,18 @@ mod tests {
 
     #[test]
     fn carries_forward_protocol_basics() {
-        assert_eq!(DECIMALS, 12);
-        assert_eq!(ATOMS_PER_ATHO, 1_000_000_000_000);
-        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 5_000_000_000_000);
-        assert_eq!(TAIL_REWARD_ATOMS, 625_000_000_000);
+        assert_eq!(DECIMALS, 8);
+        assert_eq!(ATOMS_PER_ATHO, 100_000_000);
+        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 5_000_000_000);
+        assert_eq!(TAIL_REWARD_ATOMS, 39_062_500);
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_260_000);
         assert_eq!(COINBASE_MATURITY_BLOCKS, 100);
-        assert_eq!(STANDARD_TX_CONFIRMATIONS, 6);
-        assert_eq!(MIN_TX_FEE_ATOMS, 500);
+        assert_eq!(NORMAL_TX_VALID_AFTER_CONFIRMATIONS, 1);
+        assert_eq!(DEFAULT_WALLET_MIN_CONFIRMATIONS, 3);
+        assert_eq!(DEFAULT_SAFE_CONFIRMATIONS, 6);
+        assert_eq!(HIGH_VALUE_CONFIRMATIONS, 20);
+        assert_eq!(MIN_TX_FEE_ATOMS, 1);
+        assert_eq!(DUST_RELAY_VALUE_ATOMS, 100);
         assert_eq!(BLOCK_TIME_SECONDS, 100);
         assert_eq!(MAX_BLOCK_VBYTES, 3_000_000);
         assert_eq!(MAX_BLOCK_RAW_BYTES, 12_000_000);
@@ -51,7 +55,7 @@ mod tests {
         assert_eq!(TX_WITNESS_FIXED_BYTES, 1_575);
         assert_eq!(MAX_WITNESS_INPUT_REFS, 13_796);
         assert_eq!(ADDRESS_CHECKSUM_BYTES, 4);
-        assert_eq!(GENESIS_COINBASE_ATOMS, 5_000_000_000_000);
+        assert_eq!(GENESIS_COINBASE_ATOMS, 5_000_000_000);
     }
 
     #[test]

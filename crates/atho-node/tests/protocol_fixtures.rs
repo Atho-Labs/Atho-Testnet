@@ -13,9 +13,9 @@ use atho_core::network::Network;
 use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
 use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
 use atho_node::validation::{
-    derive_sig_ref_short, derive_witness_commit_ref, validate_transaction,
+    derive_sig_ref_short, derive_witness_commit_ref, validate_block_without_pow,
+    validate_transaction,
 };
-use atho_storage::validation::validate_block_without_pow;
 
 fn signing_keypair() -> FalconKeypair {
     generate_from_seed(b"atho-protocol-fixture").expect("deterministic falcon keypair")

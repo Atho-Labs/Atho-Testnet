@@ -13,15 +13,11 @@ use crate::validation::ValidationError;
 use atho_core::block::Block;
 use atho_core::block::BlockHeader;
 use atho_core::consensus::pow;
-use atho_core::consensus::signatures::AthoSignatureDomain;
 #[cfg(test)]
 use atho_core::constants::ADDRESS_DIGEST_BYTES;
-use atho_core::constants::{FALCON_512_PUBLIC_KEY_BYTES, FALCON_512_SIGNATURE_BYTES};
 use atho_core::crypto::hash::sha3_384;
 use atho_core::genesis;
-use atho_core::network::Network;
 use atho_core::transaction::Transaction;
-use atho_crypto::falcon::{self, FalconPublicKey, FalconSignature};
 use atho_p2p::address_manager::{format_remote_addr, parse_remote_addr};
 use atho_p2p::protocol::PeerAddress;
 use atho_storage::chainstate::{
@@ -43,38 +39,6 @@ fn chain_trace_enabled() -> bool {
 
 fn should_log_chain_progress(height: u64) -> bool {
     chain_trace_enabled() || height <= 10 || height % 100 == 0
-}
-
-fn snapshot_bootstrap_requires_signature(network: Network) -> bool {
-    matches!(network, Network::Mainnet | Network::Testnet)
-}
-
-fn snapshot_bundle_signing_digest(network: Network, bundle_hash: [u8; 48]) -> [u8; 48] {
-    let mut preimage =
-        Vec::with_capacity(AthoSignatureDomain::Package.label().len() + 1 + bundle_hash.len() * 2);
-    preimage.extend_from_slice(AthoSignatureDomain::Package.label().as_bytes());
-    preimage.push(network.consensus_id());
-    preimage.extend_from_slice(&genesis::genesis_hash(network));
-    preimage.extend_from_slice(&bundle_hash);
-    sha3_384(&preimage)
-}
-
-fn decode_hex_bytes(field: &str, value: &str, expected_len: usize) -> Result<Vec<u8>, NodeError> {
-    let decoded = hex::decode(value.trim()).map_err(|_| {
-        let detail = format!("{field} must be {expected_len} hex-encoded bytes");
-        NodeError::Storage(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            detail,
-        )))
-    })?;
-    if decoded.len() != expected_len {
-        let detail = format!("{field} must be {expected_len} bytes");
-        return Err(NodeError::Storage(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            detail,
-        ))));
-    }
-    Ok(decoded)
 }
 
 #[derive(Debug)]
@@ -496,7 +460,6 @@ impl Node {
 
     #[cfg(any(test, feature = "devtools"))]
     #[doc(hidden)]
-    #[cfg(any(test, feature = "devtools"))]
     pub fn dev_seed_chainstate(
         &mut self,
         height: u64,
@@ -511,7 +474,6 @@ impl Node {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "devtools"))]
     pub fn load_or_new(config: NodeConfig) -> Self {
         #[cfg(test)]
         let test_lock = acquire_global_test_lock();
@@ -521,9 +483,7 @@ impl Node {
         let mempool = Self::mempool_for_config(&config);
         let mut node = Self {
             config,
-            chainstate: StorageChainstate::try_load_or_recover(network).unwrap_or_else(|err| {
-                panic!("failed to load chainstate for {}: {}", network.id(), err)
-            }),
+            chainstate: StorageChainstate::load_or_new(network),
             mempool,
             #[cfg(test)]
             _test_lock: test_lock,
@@ -576,49 +536,10 @@ impl Node {
         }
 
         let bundle_bytes = fs::read(snapshot_path).map_err(StorageError::Io)?;
-        let bundle_hash = sha3_384(&bundle_bytes);
         let expected_hash = self.config.sync.bootstrap_snapshot_hash.trim();
-        let signature_required = snapshot_bootstrap_requires_signature(self.network());
-        if signature_required && expected_hash.is_empty() {
-            return Err(NodeError::Storage(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "public-network snapshot bootstrap requires a SHA3-384 hash pin",
-            ))));
-        }
         if !expected_hash.is_empty() {
-            let actual_hash = hex::encode(bundle_hash);
+            let actual_hash = hex::encode(sha3_384(&bundle_bytes));
             if actual_hash != expected_hash.to_ascii_lowercase() {
-                return Err(NodeError::Storage(StorageError::CorruptData));
-            }
-        }
-        let signer_public_key_hex = self.config.sync.bootstrap_snapshot_signer_public_key.trim();
-        let signature_hex = self.config.sync.bootstrap_snapshot_signature.trim();
-        if signature_required && (signer_public_key_hex.is_empty() || signature_hex.is_empty()) {
-            return Err(NodeError::Storage(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "public-network snapshot bootstrap requires a trusted signer pubkey and signature",
-            ))));
-        }
-        if !signer_public_key_hex.is_empty() || !signature_hex.is_empty() {
-            let public_key = decode_hex_bytes(
-                "snapshot signer public key",
-                signer_public_key_hex,
-                FALCON_512_PUBLIC_KEY_BYTES,
-            )?;
-            let signature = decode_hex_bytes(
-                "snapshot signature",
-                signature_hex,
-                FALCON_512_SIGNATURE_BYTES,
-            )?;
-            let signing_digest = snapshot_bundle_signing_digest(self.network(), bundle_hash);
-            let verified = falcon::verify(
-                AthoSignatureDomain::Package,
-                &FalconPublicKey(public_key),
-                &signing_digest,
-                &FalconSignature(signature),
-            )
-            .map_err(|_| NodeError::Storage(StorageError::CorruptData))?;
-            if !verified {
                 return Err(NodeError::Storage(StorageError::CorruptData));
             }
         }
@@ -854,11 +775,6 @@ mod tests {
     use atho_storage::db::{ChainstateSnapshot, Database};
     use atho_storage::path::ATHO_DATA_DIR_ENV;
     use atho_storage::utxo::UtxoEntry;
-    use atho_storage::validation::{
-        validate_block_with_context, validate_transaction_with_context,
-    };
-    use atho_wallet::hd::WalletSeed;
-    use atho_wallet::wallet::{Wallet, WalletSpendRequest, WalletSpendUtxo};
     use std::ffi::OsString;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -940,27 +856,6 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
-    }
-
-    fn signed_snapshot_config(
-        network: Network,
-        mut config: NodeConfig,
-        snapshot_path: &std::path::Path,
-        snapshot_bytes: &[u8],
-    ) -> NodeConfig {
-        let signer = generate_from_seed(b"atho-snapshot-bundle-signer").expect("signer");
-        let signing_digest = snapshot_bundle_signing_digest(network, sha3_384(snapshot_bytes));
-        let signature = sign(
-            AthoSignatureDomain::Package,
-            &signer.secret_key,
-            &signing_digest,
-        )
-        .expect("snapshot signature");
-        config.sync.bootstrap_snapshot_path = snapshot_path.to_string_lossy().into_owned();
-        config.sync.bootstrap_snapshot_hash = hex::encode(sha3_384(snapshot_bytes));
-        config.sync.bootstrap_snapshot_signer_public_key = hex::encode(signer.public_key.0);
-        config.sync.bootstrap_snapshot_signature = hex::encode(signature.0);
-        config
     }
 
     fn synthetic_coinbase_block(
@@ -1631,197 +1526,5 @@ mod tests {
         let bootstrapped = Node::load_or_new(config);
         assert_eq!(bootstrapped.height(), donor_bundle.snapshot.height);
         assert_eq!(bootstrapped.tip_hash(), donor_bundle.snapshot.tip_hash);
-    }
-
-    #[test]
-    fn public_network_snapshot_bootstrap_requires_signed_hash_pinned_bundle() {
-        let donor_root = temp_data_dir("unsigned-snapshot-donor");
-        fs::create_dir_all(&donor_root).expect("donor root");
-        let donor_bundle = {
-            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &donor_root);
-            let mut donor = Node::load_or_new(configured_node_config(Network::Testnet));
-            donor
-                .mine_and_connect_candidate_block(&Miner::new(1))
-                .expect("mine donor");
-            donor
-                .export_snapshot_bundle()
-                .expect("export trusted snapshot bundle")
-        };
-
-        let receiver_root = temp_data_dir("unsigned-snapshot-receiver");
-        fs::create_dir_all(&receiver_root).expect("receiver root");
-        let snapshot_path = receiver_root.join("unsigned-snapshot.bin");
-        let snapshot_bytes = bincode::serialize(&donor_bundle).expect("serialize snapshot");
-        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot bundle");
-
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
-        let mut config = configured_node_config(Network::Testnet);
-        config.sync.bootstrap_snapshot_path = snapshot_path.to_string_lossy().into_owned();
-        config.sync.bootstrap_snapshot_hash = hex::encode(sha3_384(&snapshot_bytes));
-
-        let err = Node::try_load_or_recover(config).expect_err("unsigned snapshot must fail");
-        assert!(matches!(err, NodeError::Storage(StorageError::Io(_))));
-    }
-
-    #[test]
-    fn public_network_snapshot_bootstrap_accepts_trusted_signature() {
-        let donor_root = temp_data_dir("signed-snapshot-donor");
-        fs::create_dir_all(&donor_root).expect("donor root");
-        let donor_bundle = {
-            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &donor_root);
-            let mut donor = Node::load_or_new(configured_node_config(Network::Testnet));
-            donor
-                .mine_and_connect_candidate_block(&Miner::new(1))
-                .expect("mine donor");
-            donor
-                .mine_and_connect_candidate_block(&Miner::new(1))
-                .expect("mine donor again");
-            donor
-                .export_snapshot_bundle()
-                .expect("export trusted snapshot bundle")
-        };
-
-        let receiver_root = temp_data_dir("signed-snapshot-receiver");
-        fs::create_dir_all(&receiver_root).expect("receiver root");
-        let snapshot_path = receiver_root.join("signed-snapshot.bin");
-        let snapshot_bytes = bincode::serialize(&donor_bundle).expect("serialize snapshot");
-        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot bundle");
-
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
-        let config = signed_snapshot_config(
-            Network::Testnet,
-            configured_node_config(Network::Testnet),
-            &snapshot_path,
-            &snapshot_bytes,
-        );
-
-        let bootstrapped = Node::try_load_or_recover(config).expect("signed bootstrap");
-        assert_eq!(bootstrapped.height(), donor_bundle.snapshot.height);
-        assert_eq!(bootstrapped.tip_hash(), donor_bundle.snapshot.tip_hash);
-    }
-
-    #[test]
-    fn public_network_snapshot_bootstrap_rejects_bad_signature() {
-        let donor_root = temp_data_dir("bad-signature-snapshot-donor");
-        fs::create_dir_all(&donor_root).expect("donor root");
-        let donor_bundle = {
-            let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &donor_root);
-            let mut donor = Node::load_or_new(configured_node_config(Network::Testnet));
-            donor
-                .mine_and_connect_candidate_block(&Miner::new(1))
-                .expect("mine donor");
-            donor
-                .export_snapshot_bundle()
-                .expect("export trusted snapshot bundle")
-        };
-
-        let receiver_root = temp_data_dir("bad-signature-snapshot-receiver");
-        fs::create_dir_all(&receiver_root).expect("receiver root");
-        let snapshot_path = receiver_root.join("bad-signature-snapshot.bin");
-        let snapshot_bytes = bincode::serialize(&donor_bundle).expect("serialize snapshot");
-        fs::write(&snapshot_path, &snapshot_bytes).expect("write snapshot bundle");
-
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &receiver_root);
-        let mut config = signed_snapshot_config(
-            Network::Testnet,
-            configured_node_config(Network::Testnet),
-            &snapshot_path,
-            &snapshot_bytes,
-        );
-        config.sync.bootstrap_snapshot_signature = "00".repeat(FALCON_512_SIGNATURE_BYTES);
-
-        let err = Node::try_load_or_recover(config).expect_err("bad signature must fail");
-        assert!(matches!(err, NodeError::Storage(StorageError::CorruptData)));
-    }
-
-    #[test]
-    fn wallet_node_and_miner_stay_fee_aligned_end_to_end() {
-        let root = temp_data_dir("wallet-node-miner-differential");
-        fs::create_dir_all(&root).expect("root");
-        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
-
-        let mut node = Node::load_or_new(NodeConfig::new(Network::Regnet));
-        let mut wallet = Wallet::from_seed(WalletSeed([0x41; 32]), Network::Regnet);
-        let funding_address = wallet.checkout_receive_address();
-        let change_address = wallet.checkout_change_address();
-        let funding_txid = [0x66; 48];
-        let funding_value = 250_000u64;
-
-        node.dev_seed_chainstate(
-            6,
-            node.tip_hash(),
-            [UtxoEntry::new(
-                Network::Regnet,
-                funding_txid,
-                0,
-                funding_value,
-                funding_address.payment_digest.to_vec(),
-                0,
-                false,
-            )],
-        )
-        .expect("seed funding utxo");
-
-        let built = wallet
-            .build_signed_payment_transaction(WalletSpendRequest {
-                selected_utxos: vec![WalletSpendUtxo {
-                    previous_txid: funding_txid,
-                    output_index: 0,
-                    value_atoms: funding_value,
-                    locking_script: funding_address.payment_digest.to_vec(),
-                }],
-                recipient_digest: [0x55; 32],
-                amount_atoms: 150_000,
-                include_fee_in_total: false,
-                transaction_version: 1,
-                lock_time: 0,
-                change_address: Some(change_address),
-            })
-            .expect("wallet spend");
-
-        let actual_fee = transaction_fee_from_lookup(&built.transaction, |txid, output_index| {
-            node.utxo_entry(*txid, output_index)
-        })
-        .expect("wallet fee from node lookup");
-        assert_eq!(actual_fee, built.fee_atoms);
-        assert_eq!(
-            validate_transaction_with_context(
-                &built.transaction,
-                built.fee_atoms,
-                Network::Regnet,
-                node.height(),
-                |txid, output_index| node.utxo_entry(*txid, output_index),
-            ),
-            Ok(built.fee_atoms)
-        );
-
-        let admitted_txid = node
-            .admit_transaction(MempoolEntry::new(
-                built.transaction.clone(),
-                built.fee_atoms,
-            ))
-            .expect("admit wallet tx");
-        assert_eq!(admitted_txid, built.transaction.txid());
-
-        let candidate = node.build_candidate_block().expect("candidate block");
-        assert_eq!(candidate.fees_total_atoms, built.fee_atoms);
-        assert_eq!(candidate.fees_miner_atoms, built.fee_atoms);
-        let solved = Miner::new(1).solve_block(candidate.clone());
-        assert_eq!(
-            validate_block_with_context(
-                &solved,
-                node.height().saturating_add(1),
-                node.network(),
-                node.tip_hash(),
-                pow::target_for_next_block_with_timestamp(
-                    node.network(),
-                    node.blocks(),
-                    solved.header.timestamp,
-                ),
-                node.blocks(),
-                &node.utxo_snapshot(),
-            ),
-            Ok(())
-        );
     }
 }

@@ -3,12 +3,13 @@
 
 //! Amount-formatting and input-unit helpers for the desktop client.
 
-use atho_core::constants::ATOMS_PER_ATHO;
+use atho_core::constants::{
+    ATOMS_PER_ATHO, DECIMALS, DEFAULT_WALLET_MIN_CONFIRMATIONS, NORMAL_TX_VALID_AFTER_CONFIRMATIONS,
+};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const ATOMS_PER_MILLIATHO: u64 = 1_000_000_000;
-pub(crate) const ATOMS_PER_MICROATHO: u64 = 1_000_000;
-pub(crate) const ATOMS_PER_NANOATHO: u64 = 1_000;
+pub(crate) const ATOMS_PER_MILLIATHO: u64 = ATOMS_PER_ATHO / 1_000;
+pub(crate) const ATOMS_PER_MICROATHO: u64 = ATOMS_PER_ATHO / 1_000_000;
 
 /// Display unit preferences used when showing balances and history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -30,19 +31,18 @@ impl DisplayUnit {
             Self::Atho => "ATHO",
             Self::MilliAtho => "mATHO",
             Self::MicroAtho => "μATHO",
-            Self::NanoAtho => "nATHO",
+            Self::NanoAtho => "atoms",
             Self::Atom => "atoms",
         }
     }
 
     /// Returns the full set of supported display units.
-    pub(crate) fn variants() -> [DisplayUnit; 6] {
+    pub(crate) fn variants() -> [DisplayUnit; 5] {
         [
             Self::Auto,
             Self::Atho,
             Self::MilliAtho,
             Self::MicroAtho,
-            Self::NanoAtho,
             Self::Atom,
         ]
     }
@@ -57,8 +57,6 @@ impl DisplayUnit {
                     Self::MilliAtho
                 } else if amount_atoms >= ATOMS_PER_MICROATHO {
                     Self::MicroAtho
-                } else if amount_atoms >= ATOMS_PER_NANOATHO {
-                    Self::NanoAtho
                 } else {
                     Self::Atom
                 }
@@ -86,20 +84,14 @@ impl InputUnit {
             Self::Atho => "ATHO",
             Self::MilliAtho => "mATHO",
             Self::MicroAtho => "μATHO",
-            Self::NanoAtho => "nATHO",
+            Self::NanoAtho => "atoms",
             Self::Atom => "atoms",
         }
     }
 
     /// Returns the full set of supported amount-entry units.
-    pub(crate) fn variants() -> [InputUnit; 5] {
-        [
-            Self::Atho,
-            Self::MilliAtho,
-            Self::MicroAtho,
-            Self::NanoAtho,
-            Self::Atom,
-        ]
+    pub(crate) fn variants() -> [InputUnit; 4] {
+        [Self::Atho, Self::MilliAtho, Self::MicroAtho, Self::Atom]
     }
 
     /// Returns the atoms-per-unit factor used for parsing.
@@ -108,7 +100,7 @@ impl InputUnit {
             Self::Atho => ATOMS_PER_ATHO,
             Self::MilliAtho => ATOMS_PER_MILLIATHO,
             Self::MicroAtho => ATOMS_PER_MICROATHO,
-            Self::NanoAtho => ATOMS_PER_NANOATHO,
+            Self::NanoAtho => 1,
             Self::Atom => 1,
         }
     }
@@ -116,22 +108,34 @@ impl InputUnit {
     /// Returns the maximum decimal precision allowed for this unit.
     pub(crate) fn max_decimals(self) -> usize {
         match self {
-            Self::Atho => 12,
-            Self::MilliAtho => 9,
-            Self::MicroAtho => 6,
-            Self::NanoAtho => 3,
+            Self::Atho => DECIMALS,
+            Self::MilliAtho => DECIMALS.saturating_sub(3),
+            Self::MicroAtho => DECIMALS.saturating_sub(6),
+            Self::NanoAtho => 0,
             Self::Atom => 0,
         }
     }
 }
 
-/// Persisted client-side display preferences.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Persisted client-side wallet and display preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ClientDisplayPreferences {
     pub(crate) display_unit: DisplayUnit,
     pub(crate) send_input_unit: InputUnit,
     pub(crate) rotate_coinbase_address: bool,
+    pub(crate) min_confirmations: u64,
+}
+
+impl Default for ClientDisplayPreferences {
+    fn default() -> Self {
+        Self {
+            display_unit: DisplayUnit::default(),
+            send_input_unit: InputUnit::default(),
+            rotate_coinbase_address: false,
+            min_confirmations: DEFAULT_WALLET_MIN_CONFIRMATIONS,
+        }
+    }
 }
 
 impl ClientDisplayPreferences {
@@ -147,6 +151,11 @@ impl ClientDisplayPreferences {
 
     pub(crate) fn with_rotate_coinbase_address(mut self, enabled: bool) -> Self {
         self.rotate_coinbase_address = enabled;
+        self
+    }
+
+    pub(crate) fn with_min_confirmations(mut self, confirmations: u64) -> Self {
+        self.min_confirmations = confirmations.max(NORMAL_TX_VALID_AFTER_CONFIRMATIONS);
         self
     }
 }
@@ -256,20 +265,17 @@ fn format_amount_in_fixed_unit(amount_atoms: u64, unit: DisplayUnit) -> String {
     match unit {
         DisplayUnit::Atho => format!(
             "{} ATHO",
-            format_amount_components(amount_atoms, ATOMS_PER_ATHO, 12, true)
+            format_amount_components(amount_atoms, ATOMS_PER_ATHO, DECIMALS, true)
         ),
         DisplayUnit::MilliAtho => format!(
             "{} mATHO",
-            format_amount_components(amount_atoms, ATOMS_PER_MILLIATHO, 9, false)
+            format_amount_components(amount_atoms, ATOMS_PER_MILLIATHO, DECIMALS - 3, false)
         ),
         DisplayUnit::MicroAtho => format!(
             "{} μATHO",
-            format_amount_components(amount_atoms, ATOMS_PER_MICROATHO, 6, false)
+            format_amount_components(amount_atoms, ATOMS_PER_MICROATHO, DECIMALS - 6, false)
         ),
-        DisplayUnit::NanoAtho => format!(
-            "{} nATHO",
-            format_amount_components(amount_atoms, ATOMS_PER_NANOATHO, 3, false)
-        ),
+        DisplayUnit::NanoAtho => format_atom_label(amount_atoms),
         DisplayUnit::Atom | DisplayUnit::Auto => format_atom_label(amount_atoms),
     }
 }
@@ -338,50 +344,36 @@ mod tests {
             format_amount_atoms(ATOMS_PER_MICROATHO, DisplayUnit::MicroAtho),
             "1 μATHO"
         );
-        assert_eq!(
-            format_amount_atoms(ATOMS_PER_NANOATHO, DisplayUnit::NanoAtho),
-            "1 nATHO"
-        );
         assert_eq!(format_amount_atoms(1, DisplayUnit::Atom), "1 atom");
         assert_eq!(format_amount_atoms(650, DisplayUnit::Atom), "650 atoms");
+        assert_eq!(format_amount_atoms(650, DisplayUnit::NanoAtho), "650 atoms");
         assert_eq!(
-            format_amount_atoms(650, DisplayUnit::NanoAtho),
-            "0.650 nATHO"
+            format_amount_atoms(39_062_500, DisplayUnit::Atho),
+            "0.390625 ATHO"
         );
         assert_eq!(
-            format_amount_atoms(625_000_000_000, DisplayUnit::Atho),
-            "0.625 ATHO"
+            format_amount_atoms(5_000_000_000, DisplayUnit::Atho),
+            "50 ATHO"
         );
         assert_eq!(
-            format_amount_atoms(5_000_000_000_000, DisplayUnit::Atho),
-            "5 ATHO"
+            format_amount_atoms(123_456_789, DisplayUnit::MicroAtho),
+            "1,234,567.89 μATHO"
         );
         assert_eq!(
-            format_amount_atoms(12_458_300_000_000, DisplayUnit::MicroAtho),
-            "12,458,300 μATHO"
-        );
-        assert_eq!(
-            format_amount_atoms(12_458_300_000_000, DisplayUnit::Atom),
-            "12,458,300,000,000 atoms"
+            format_amount_atoms(123_456_789, DisplayUnit::Atom),
+            "123,456,789 atoms"
         );
     }
 
     #[test]
     fn auto_display_selects_expected_ladder_step() {
         assert_eq!(
-            format_amount_atoms(1_500_000_000_000, DisplayUnit::Auto),
+            format_amount_atoms(150_000_000, DisplayUnit::Auto),
             "1.5 ATHO"
         );
-        assert_eq!(
-            format_amount_atoms(5_000_000_000, DisplayUnit::Auto),
-            "5 mATHO"
-        );
-        assert_eq!(
-            format_amount_atoms(25_000_000, DisplayUnit::Auto),
-            "25 μATHO"
-        );
-        assert_eq!(format_amount_atoms(50_000, DisplayUnit::Auto), "50 nATHO");
-        assert_eq!(format_amount_atoms(650, DisplayUnit::Auto), "650 atoms");
+        assert_eq!(format_amount_atoms(500_000, DisplayUnit::Auto), "5 mATHO");
+        assert_eq!(format_amount_atoms(2_500, DisplayUnit::Auto), "25 μATHO");
+        assert_eq!(format_amount_atoms(50, DisplayUnit::Auto), "50 atoms");
     }
 
     #[test]
@@ -399,26 +391,20 @@ mod tests {
             ATOMS_PER_MICROATHO
         );
         assert_eq!(
-            parse_amount_to_atoms("0.000000001", InputUnit::Atho).unwrap(),
-            ATOMS_PER_NANOATHO
-        );
-        assert_eq!(
-            parse_amount_to_atoms("0.000000000001", InputUnit::Atho).unwrap(),
+            parse_amount_to_atoms("0.00000001", InputUnit::Atho).unwrap(),
             1
         );
-        assert!(parse_amount_to_atoms("0.0000000000001", InputUnit::Atho).is_err());
+        assert!(parse_amount_to_atoms("0.000000001", InputUnit::Atho).is_err());
         assert_eq!(
-            parse_amount_to_atoms("0.000000001", InputUnit::MilliAtho).unwrap(),
+            parse_amount_to_atoms("0.00001", InputUnit::MilliAtho).unwrap(),
             1
         );
         assert_eq!(
-            parse_amount_to_atoms("0.000001", InputUnit::MicroAtho).unwrap(),
+            parse_amount_to_atoms("0.01", InputUnit::MicroAtho).unwrap(),
             1
         );
-        assert_eq!(
-            parse_amount_to_atoms("0.001", InputUnit::NanoAtho).unwrap(),
-            1
-        );
+        assert_eq!(parse_amount_to_atoms("1", InputUnit::NanoAtho).unwrap(), 1);
+        assert!(parse_amount_to_atoms("0.001", InputUnit::NanoAtho).is_err());
         assert_eq!(parse_amount_to_atoms("650", InputUnit::Atom).unwrap(), 650);
         assert!(parse_amount_to_atoms("0.1", InputUnit::Atom).is_err());
     }

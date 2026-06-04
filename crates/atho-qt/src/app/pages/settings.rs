@@ -6,6 +6,9 @@
 use crate::app::{
     mnemonic_ui, widgets, CreateWalletForm, DesktopApp, ImportWalletForm, LaunchPage,
 };
+use atho_core::constants::{
+    DEFAULT_SAFE_CONFIRMATIONS, DEFAULT_WALLET_MIN_CONFIRMATIONS, HIGH_VALUE_CONFIRMATIONS,
+};
 use atho_node::mining_backend::MiningBackendKind;
 use atho_rpc::response::{NetworkPeerDiagnostics, NetworkPeerDirection};
 use eframe::egui;
@@ -84,6 +87,47 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         widgets::muted_label(
             ui,
             "Off by default. The current spend path signs one wallet address at a time, so rotating every mining reward can fragment spendable balance.",
+        );
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Spendable confirmations");
+            let current_confirmations = app.wallet_min_confirmations();
+            let mut selected_confirmations = current_confirmations;
+            egui::ComboBox::from_id_source("wallet_min_confirmations_preset")
+                .selected_text(confirmation_count_label(current_confirmations))
+                .show_ui(ui, |ui| {
+                    for confirmations in [
+                        1,
+                        DEFAULT_WALLET_MIN_CONFIRMATIONS,
+                        DEFAULT_SAFE_CONFIRMATIONS,
+                        HIGH_VALUE_CONFIRMATIONS,
+                        100,
+                    ] {
+                        ui.selectable_value(
+                            &mut selected_confirmations,
+                            confirmations,
+                            confirmation_count_label(confirmations),
+                        );
+                    }
+                });
+            if selected_confirmations != current_confirmations {
+                app.set_wallet_min_confirmations(selected_confirmations);
+            }
+            let mut custom_confirmations = app.wallet_min_confirmations();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut custom_confirmations)
+                        .clamp_range(1..=10_000)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                app.set_wallet_min_confirmations(custom_confirmations);
+            }
+        });
+        widgets::muted_label(
+            ui,
+            "Normal transactions remain consensus-valid at 1 confirmation. This wallet setting controls when received outputs are shown as available and selected for spending.",
         );
     });
 
@@ -255,16 +299,18 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(8.0);
         ui.label("Passphrase");
+        let backup_password_width = widgets::finite_widget_width(ui, 520.0, 180.0);
         ui.add(
             egui::TextEdit::singleline(&mut app.wallet_management_form.backup_password)
-                .desired_width(f32::INFINITY)
+                .desired_width(backup_password_width)
                 .password(!app.wallet_management_form.show_passwords),
         );
         ui.add_space(8.0);
         ui.label("Confirm passphrase");
+        let backup_confirm_width = widgets::finite_widget_width(ui, 520.0, 180.0);
         ui.add(
             egui::TextEdit::singleline(&mut app.wallet_management_form.backup_password_confirm)
-                .desired_width(f32::INFINITY)
+                .desired_width(backup_confirm_width)
                 .password(!app.wallet_management_form.show_passwords),
         );
         ui.checkbox(
@@ -614,31 +660,20 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
         );
         ui.add_space(10.0);
         ui.label("Trusted snapshot bundle");
-        let snapshot_input_width = widgets::finite_available_width(ui, 420.0);
+        let snapshot_input_width = widgets::finite_widget_width(ui, 520.0, 220.0);
         ui.add_sized(
             [snapshot_input_width, 26.0],
             egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_path),
         );
         ui.label("Trusted snapshot SHA3-384");
+        let snapshot_hash_width = widgets::finite_widget_width(ui, 520.0, 220.0);
         ui.add_sized(
-            [snapshot_input_width, 26.0],
+            [snapshot_hash_width, 26.0],
             egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_hash),
-        );
-        ui.label("Trusted snapshot signer pubkey (hex)");
-        ui.add_sized(
-            [snapshot_input_width, 26.0],
-            egui::TextEdit::singleline(
-                &mut app.node_settings_form.bootstrap_snapshot_signer_public_key,
-            ),
-        );
-        ui.label("Trusted snapshot signature (hex)");
-        ui.add_sized(
-            [snapshot_input_width, 26.0],
-            egui::TextEdit::singleline(&mut app.node_settings_form.bootstrap_snapshot_signature),
         );
         widgets::muted_label(
             ui,
-            "Optional. When set on a fresh node, Atho can import this snapshot bundle before regular sync. Public networks should pin the bundle hash and verify a trusted Falcon package signature so fast sync stays cheap without trusting an unsigned file.",
+            "Optional. When set on a fresh node, Atho can import this snapshot bundle before regular sync. The hash pin protects the startup path from accidental or tampered files.",
         );
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -977,6 +1012,14 @@ fn format_recent(last_unix: Option<u64>) -> String {
     }
 }
 
+fn confirmation_count_label(confirmations: u64) -> String {
+    format!(
+        "{} confirmation{}",
+        confirmations,
+        if confirmations == 1 { "" } else { "s" }
+    )
+}
+
 fn format_quality(peer: &NetworkPeerDiagnostics) -> String {
     match (peer.quality_score, peer.consecutive_failures) {
         (Some(score), Some(failures)) => format!("{score} / fail {failures}"),
@@ -1006,7 +1049,12 @@ fn render_browse_save_row(
     filter: Option<(&str, &[&str])>,
 ) {
     ui.horizontal(|ui| {
-        let input_width = widgets::reserved_width(ui.available_width(), 112.0, 160.0, 420.0);
+        let input_width = widgets::reserved_width(
+            widgets::finite_available_width(ui, 420.0),
+            112.0,
+            160.0,
+            420.0,
+        );
         ui.add(egui::TextEdit::singleline(value).desired_width(input_width));
         if ui
             .add_sized([96.0, 28.0], egui::Button::new(button_label))

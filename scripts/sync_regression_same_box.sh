@@ -7,7 +7,7 @@ set -euo pipefail
 roots=()
 for root in \
   "$PWD" \
-  "$HOME/Desktop/Atho-Testnet" \
+  "$HOME/Desktop/Atho-Alpha-main" \
   "$HOME/Desktop/Atho-Testnet-release" \
   "$HOME/Desktop/Atho-Testnet-main"; do
   if [[ -f "$root/Cargo.toml" ]]; then

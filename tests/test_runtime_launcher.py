@@ -171,14 +171,12 @@ class RuntimeLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             release_dir = self.make_release_dir(root)
-            script_name = "runtestnet.py"
-            network = "testnet"
-            data_dir = root / f"{network}-data"
+            data_dir = root / "testnet-data"
             result = subprocess.run(
                 [
                     sys.executable,
                     "-B",
-                    str(REPO_ROOT / script_name),
+                    str(REPO_ROOT / "runtestnet.py"),
                     "--dry-run",
                     "--release-dir",
                     str(release_dir),
@@ -194,15 +192,32 @@ class RuntimeLauncherTests(unittest.TestCase):
                 result.returncode,
                 0,
                 msg=(
-                    f"{script_name} failed\nstdout:\n{result.stdout}\n"
+                    f"runtestnet.py failed\nstdout:\n{result.stdout}\n"
                     f"stderr:\n{result.stderr}"
                 ),
             )
-            self.assertIn(f"[atho-launch] network={network}", result.stdout)
-            self.assertIn(f"[atho-launch] env ATHO_NETWORK={network}", result.stdout)
-            self.assertIn(f"--network {network} --local-node", result.stdout)
+            self.assertIn("[atho-launch] network=testnet", result.stdout)
+            self.assertIn("[atho-launch] env ATHO_NETWORK=testnet", result.stdout)
+            self.assertIn("--network testnet --local-node", result.stdout)
             self.assertTrue((data_dir / "db").is_dir())
             self.assertTrue((data_dir / "logs").is_dir())
+
+    def test_public_branch_contains_only_testnet_launcher(self) -> None:
+        self.assertTrue((REPO_ROOT / "runtestnet.py").is_file())
+        self.assertFalse((REPO_ROOT / "runmainnet.py").exists())
+        self.assertFalse((REPO_ROOT / "runregnet.py").exists())
+
+        with self.assertRaisesRegex(
+            runtime_launcher.LauncherError,
+            "supported launchers are testnet",
+        ):
+            runtime_launcher.parse_launcher_args("mainnet", ["--dry-run"])
+
+        with self.assertRaisesRegex(
+            runtime_launcher.LauncherError,
+            "supported launchers are testnet",
+        ):
+            runtime_launcher.parse_launcher_args("regnet", ["--dry-run"])
 
     def test_startup_scripts_work_outside_repo_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -210,14 +225,12 @@ class RuntimeLauncherTests(unittest.TestCase):
             release_dir = self.make_release_dir(root)
             outside_cwd = root / "outside"
             outside_cwd.mkdir()
-            script_name = "runtestnet.py"
-            network = "testnet"
-            data_dir = root / f"external-{network}-data"
+            data_dir = root / "external-testnet-data"
             result = subprocess.run(
                 [
                     sys.executable,
                     "-B",
-                    str(REPO_ROOT / script_name),
+                    str(REPO_ROOT / "runtestnet.py"),
                     "--dry-run",
                     "--release-dir",
                     str(release_dir),
@@ -230,12 +243,7 @@ class RuntimeLauncherTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertIn(f"[atho-launch] network={network}", result.stdout)
-
-    def test_testnet_release_surface_keeps_single_launcher(self) -> None:
-        self.assertTrue((REPO_ROOT / "runtestnet.py").is_file())
-        self.assertFalse((REPO_ROOT / "runmainnet.py").exists())
-        self.assertFalse((REPO_ROOT / "runregnet.py").exists())
+            self.assertIn("[atho-launch] network=testnet", result.stdout)
 
     def test_gpu_build_help_mentions_host_requirements(self) -> None:
         message = runtime_launcher.gpu_build_help()

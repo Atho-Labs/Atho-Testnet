@@ -11,7 +11,7 @@ use atho_core::consensus::tx_policy::solve_transaction_pow;
 use atho_core::consensus::{pow, rules};
 use atho_core::constants::{
     ADDRESS_DIGEST_BYTES, COINBASE_MATURITY_BLOCKS, MAX_TRANSACTION_SIZE_BYTES,
-    MIN_TX_FEE_PER_VBYTE_ATOMS, STANDARD_TX_CONFIRMATIONS,
+    MIN_TX_FEE_PER_VBYTE_ATOMS, NORMAL_TX_VALID_AFTER_CONFIRMATIONS,
 };
 use atho_core::genesis;
 use atho_core::network::Network;
@@ -486,7 +486,7 @@ fn tx_structure_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
         let mut prng = SplitMix64::new(hash_seed(seed, i as u64));
         let kind = prng.next_usize(15);
         let spend_height = if kind == 13 {
-            utxo.created_height + STANDARD_TX_CONFIRMATIONS - 2
+            utxo.created_height.saturating_sub(1)
         } else {
             10
         };
@@ -1018,14 +1018,8 @@ fn fee_attack(cases: usize, seed: u64) -> Result<CategoryReport, String> {
                 );
             }
             6 => {
-                assert_eq!(
-                    subsidy::get_block_reward_atoms(1_259_999),
-                    5_000_000_000_000
-                );
-                assert_eq!(
-                    subsidy::get_block_reward_atoms(1_260_000),
-                    2_500_000_000_000
-                );
+                assert_eq!(subsidy::get_block_reward_atoms(1_259_999), 5_000_000_000);
+                assert_eq!(subsidy::get_block_reward_atoms(1_260_000), 2_500_000_000);
             }
             _ => {
                 let _rate = tx.feerate_atoms_per_vbyte(fee);
@@ -1356,7 +1350,7 @@ fn confirmation_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
         let kind = hash_seed(seed, i as u64) as usize % 6;
         let outcome = catch_unwind(AssertUnwindSafe(|| match kind {
             0 => {
-                let spend_height = utxo.created_height + STANDARD_TX_CONFIRMATIONS - 1;
+                let spend_height = utxo.created_height + NORMAL_TX_VALID_AFTER_CONFIRMATIONS - 1;
                 assert_eq!(
                     validate_transaction_with_context(
                         &tx,
@@ -1375,7 +1369,7 @@ fn confirmation_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
                 );
             }
             1 => {
-                let spend_height = utxo.created_height + STANDARD_TX_CONFIRMATIONS - 2;
+                let spend_height = utxo.created_height.saturating_sub(1);
                 let err = validate_transaction_with_context(
                     &tx,
                     fee,
@@ -1408,10 +1402,13 @@ fn confirmation_attack(cases: usize, seed: u64) -> Result<CategoryReport, String
             }
             4 => {
                 let future = UtxoEntry::new(Network::Mainnet, [2; 48], 0, 1, vec![1], 10, false);
-                assert_eq!(future.confirmation_count(0), 1);
+                assert_eq!(future.confirmation_count(0), 0);
             }
             _ => {
-                assert_eq!(utxo.required_confirmations(), STANDARD_TX_CONFIRMATIONS);
+                assert_eq!(
+                    utxo.required_confirmations(),
+                    NORMAL_TX_VALID_AFTER_CONFIRMATIONS
+                );
             }
         }));
         match outcome {

@@ -54,7 +54,7 @@ fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
 
     widgets::panel_frame().show(ui, |ui| {
         ui.set_min_height(300.0);
-        if ui.available_width() > 820.0 {
+        if widgets::finite_available_width(ui, 820.0) > 820.0 {
             ui.columns(2, |columns| {
                 render_request_form(app, &mut columns[0]);
                 render_receive_detail_card(
@@ -168,9 +168,10 @@ fn render_request_payment_tab(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui.add_space(8.0);
             widgets::muted_label(ui, "Selected base56 receiving address");
             let mut selected_address = request.address;
+            let selected_width = widgets::finite_widget_width(ui, 520.0, 220.0);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut selected_address)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(selected_width)
                     .interactive(false),
             );
             response.context_menu(|ui| {
@@ -196,13 +197,12 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
             .spacing([12.0, 9.0])
             .min_col_width(120.0)
             .show(ui, |ui| {
-                let row_input_width = widgets::finite_available_width(ui, 320.0);
                 ui.label(egui::RichText::new("Label:").size(13.0).strong());
+                let label_width = widgets::finite_widget_width(ui, 420.0, 220.0);
                 ui.add_sized(
-                    [row_input_width, 30.0],
+                    [label_width, 30.0],
                     egui::TextEdit::singleline(&mut app.receive_label)
-                        .hint_text("Optional internal label")
-                        .desired_width(f32::INFINITY),
+                        .hint_text("Optional internal label"),
                 );
                 ui.end_row();
 
@@ -210,17 +210,16 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 ui.add_sized(
                     [320.0, 30.0],
                     egui::TextEdit::singleline(&mut app.receive_amount)
-                        .hint_text("Amount, for example 50000000")
-                        .desired_width(f32::INFINITY),
+                        .hint_text("Amount, for example 50000000"),
                 );
                 ui.end_row();
 
                 ui.label(egui::RichText::new("Message:").size(13.0).strong());
+                let message_width = widgets::finite_widget_width(ui, 420.0, 220.0);
                 ui.add_sized(
-                    [row_input_width, 30.0],
+                    [message_width, 30.0],
                     egui::TextEdit::singleline(&mut app.receive_message)
-                        .hint_text("Optional payment note")
-                        .desired_width(f32::INFINITY),
+                        .hint_text("Optional payment note"),
                 );
                 ui.end_row();
             });
@@ -286,9 +285,10 @@ fn render_request_form(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 }
             });
             let mut address_text = app.current_receive_address_text();
+            let current_address_width = widgets::finite_widget_width(ui, 520.0, 220.0);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut address_text)
-                    .desired_width(f32::INFINITY)
+                    .desired_width(current_address_width)
                     .interactive(false),
             );
             response.context_menu(|ui| {

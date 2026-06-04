@@ -16,6 +16,7 @@ use atho_core::block::{merkle_root, Block};
 use atho_core::consensus::tx_policy::minimum_required_fee_atoms;
 use atho_core::constants::{
     DUST_RELAY_VALUE_ATOMS, MAX_TRANSACTION_RAW_BYTES, MAX_TRANSACTION_VBYTES,
+    NORMAL_TX_VALID_AFTER_CONFIRMATIONS,
 };
 use atho_core::crypto::hash::sha3_256;
 use atho_core::network::Network;
@@ -1056,6 +1057,7 @@ impl DesktopApp {
             let status = self.connection.status();
             Self::wallet_scan_height(&status)
         };
+        let min_confirmations = self.wallet_min_confirmations();
         let reserved_inputs = self.mempool_reserved_inputs();
         let address_digests = &self.wallet_address_digests_cache;
         let mut owned = utxos
@@ -1078,10 +1080,11 @@ impl DesktopApp {
         });
         let available_owned = owned
             .iter()
-            .filter(|utxo| utxo.is_spendable_at(current_height))
+            .filter(|utxo| Self::wallet_policy_allows_utxo(utxo, current_height, min_confirmations))
             .cloned()
             .collect::<Vec<_>>();
-        let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
+        let balance_summary =
+            wallet_ledger::summarize_wallet_utxos(&owned, current_height, min_confirmations);
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
         let activity = match Self::request_wallet_activity_rows(
             &self.connection,
@@ -1135,6 +1138,15 @@ impl DesktopApp {
 
     fn wallet_balance_atoms(&self) -> u64 {
         self.wallet_balance_cache
+    }
+
+    fn wallet_policy_allows_utxo(
+        utxo: &UtxoEntry,
+        current_height: u64,
+        min_confirmations: u64,
+    ) -> bool {
+        utxo.is_spendable_at(current_height)
+            && utxo.confirmation_count(current_height) >= min_confirmations
     }
 
     #[cfg(test)]
@@ -1278,6 +1290,7 @@ impl DesktopApp {
         receive_addresses: Vec<WalletAddress>,
         wallet_scan_nonce: u64,
         scan_limit: usize,
+        min_confirmations: u64,
         cancel_requested: Arc<AtomicBool>,
     ) -> Result<WalletScanOutcome, String> {
         if cancel_requested.load(Ordering::Acquire) {
@@ -1346,10 +1359,11 @@ impl DesktopApp {
         });
         let available_owned = owned
             .iter()
-            .filter(|utxo| utxo.is_spendable_at(current_height))
+            .filter(|utxo| Self::wallet_policy_allows_utxo(utxo, current_height, min_confirmations))
             .cloned()
             .collect::<Vec<_>>();
-        let balance_summary = wallet_ledger::summarize_wallet_utxos(&owned, current_height);
+        let balance_summary =
+            wallet_ledger::summarize_wallet_utxos(&owned, current_height, min_confirmations);
         let available_balance = available_owned.iter().map(|utxo| utxo.value_atoms).sum();
         let wallet_activity_cache =
             Self::request_wallet_activity_rows(&connection, &wallet_addresses_cache)?;
@@ -1493,6 +1507,7 @@ impl DesktopApp {
         };
         let connection = self.connection.clone();
         let wallet_scan_nonce = self.wallet_scan_nonce;
+        let min_confirmations = self.wallet_min_confirmations();
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let worker_cancel_requested = Arc::clone(&cancel_requested);
         let (sender, receiver) = mpsc::channel();
@@ -1523,6 +1538,7 @@ impl DesktopApp {
                 receive_addresses,
                 wallet_scan_nonce,
                 scan_limit,
+                min_confirmations,
                 worker_cancel_requested,
             );
             let _ = sender.send(result);
@@ -3041,16 +3057,6 @@ impl DesktopApp {
             .bootstrap_snapshot_hash
             .trim()
             .to_string();
-        config.sync.bootstrap_snapshot_signer_public_key = self
-            .node_settings_form
-            .bootstrap_snapshot_signer_public_key
-            .trim()
-            .to_string();
-        config.sync.bootstrap_snapshot_signature = self
-            .node_settings_form
-            .bootstrap_snapshot_signature
-            .trim()
-            .to_string();
 
         if config.rpc_auth.enabled && config.rpc_auth.username.is_empty() {
             return Err(String::from("RPC auth requires an operator username"));
@@ -3355,6 +3361,16 @@ impl DesktopApp {
         wallet_password: String,
         registry_entry: Option<WalletRegistryEntry>,
     ) {
+        let active_network = self.connection.network();
+        if wallet.network != active_network {
+            self.last_error = Some(format!(
+                "Wallet belongs to {} but the client is connected to {}",
+                wallet.network.cli_arg(),
+                active_network.cli_arg()
+            ));
+            self.send_status = String::from("Wallet network mismatch");
+            return;
+        }
         self.clear_wallet_state();
         self.wallet_session_password = Some(wallet_password);
         let fallback_entry = registry_entry.unwrap_or_else(|| {
@@ -4128,7 +4144,7 @@ impl DesktopApp {
             "Spendable outputs must be at least {}",
             format_amount_atoms(
                 Self::wallet_min_output_amount_atoms(network),
-                DisplayUnit::NanoAtho
+                DisplayUnit::MicroAtho
             )
         )
     }
@@ -4163,6 +4179,12 @@ impl DesktopApp {
         self.display_preferences.send_input_unit
     }
 
+    pub(crate) fn wallet_min_confirmations(&self) -> u64 {
+        self.display_preferences
+            .min_confirmations
+            .max(NORMAL_TX_VALID_AFTER_CONFIRMATIONS)
+    }
+
     pub(crate) fn set_display_unit(&mut self, unit: DisplayUnit) {
         if self.display_preferences.display_unit == unit {
             return;
@@ -4184,6 +4206,20 @@ impl DesktopApp {
             }
         }
         self.display_preferences = self.display_preferences.with_send_input_unit(unit);
+        let _ = self.persist_client_display_preferences();
+    }
+
+    pub(crate) fn set_wallet_min_confirmations(&mut self, confirmations: u64) {
+        let confirmations = confirmations.max(NORMAL_TX_VALID_AFTER_CONFIRMATIONS);
+        if self.wallet_min_confirmations() == confirmations {
+            return;
+        }
+        self.display_preferences = self
+            .display_preferences
+            .with_min_confirmations(confirmations);
+        self.wallet_cache_dirty = true;
+        self.wallet_scan_nonce = self.wallet_scan_nonce.wrapping_add(1);
+        self.cancel_wallet_scan_job("wallet confirmation policy changed");
         let _ = self.persist_client_display_preferences();
     }
 
@@ -5092,8 +5128,22 @@ pub(crate) fn default_wallet_name(network: Network) -> String {
     next_available_wallet_name(network)
 }
 
+fn qt_wallet_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::var_os(atho_storage::path::ATHO_WALLET_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| atho_storage::path::sandbox_root().join("wallet"))
+    }
+
+    #[cfg(not(test))]
+    {
+        atho_storage::path::wallet_root()
+    }
+}
+
 fn wallet_storage_root(network: Network) -> PathBuf {
-    atho_node::dev::wallet_dir().join(network.id())
+    qt_wallet_root().join(network.id())
 }
 
 fn wallet_registry_path(network: Network) -> PathBuf {
@@ -5212,13 +5262,13 @@ fn startup_wallet_metadata_path(network: Network) -> PathBuf {
 }
 
 fn client_display_preferences_path(network: Network) -> PathBuf {
-    atho_storage::path::wallet_root()
+    qt_wallet_root()
         .join(network.id())
         .join("client-display.json")
 }
 
 fn recipient_address_book_path(network: Network) -> PathBuf {
-    atho_storage::path::wallet_root()
+    qt_wallet_root()
         .join(network.id())
         .join("recipient-address-book.json")
 }
@@ -5891,7 +5941,7 @@ mod tests {
     use atho_core::block::{merkle_root, witness_root, Block, BlockHeader};
     use atho_core::consensus::pow;
     use atho_core::consensus::signatures::{transaction_signing_digest, AthoSignatureDomain};
-    use atho_core::constants::{atoms_per_atho_for_network, STANDARD_TX_CONFIRMATIONS};
+    use atho_core::constants::{atoms_per_atho_for_network, NORMAL_TX_VALID_AFTER_CONFIRMATIONS};
     use atho_core::network::Network;
     use atho_core::transaction::{Transaction, TxInput, TxOutput, TxWitness, WitnessInputRef};
     use atho_crypto::falcon::{generate_from_seed, sign, FalconKeypair};
@@ -6075,6 +6125,10 @@ mod tests {
     ) -> ([u8; 48], u64) {
         let mut funding_wallet = test_wallet(0x73);
         let funding_address = funding_wallet.checkout_receive_address();
+        let change_address = funding_wallet.checkout_change_address();
+        let fee_buffer_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 2, 1)
+            .saturating_add(DUST_RELAY_VALUE_ATOMS);
+        let funding_value_atoms = value_atoms.saturating_add(fee_buffer_atoms);
         let mut funding_utxo = None;
         let seeded = app.with_local_system_for_test(|system| {
             system.sandbox_with_node_mut(|node| {
@@ -6082,10 +6136,10 @@ mod tests {
                     Network::Regnet,
                     [0x6b; 48],
                     0,
-                    value_atoms,
+                    funding_value_atoms,
                     funding_address.payment_digest.to_vec(),
                     node.height()
-                        .saturating_sub(STANDARD_TX_CONFIRMATIONS.saturating_sub(1)),
+                        .saturating_sub(NORMAL_TX_VALID_AFTER_CONFIRMATIONS.saturating_sub(1)),
                     false,
                 );
                 node.dev_seed_chainstate(node.height(), node.tip_hash(), [utxo.clone()])
@@ -6096,16 +6150,22 @@ mod tests {
         assert!(seeded.is_some(), "expected local test backend");
 
         let funding_utxo = funding_utxo.expect("funding utxo");
-        let fee_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 1, 1);
-        let credited_atoms = value_atoms.saturating_sub(fee_atoms);
+        let credited_atoms = value_atoms;
         let transaction = build_wallet_test_spend(
             &funding_wallet,
             std::slice::from_ref(&funding_utxo),
             recipient_digest,
             credited_atoms,
             false,
-            None,
+            Some(change_address),
         );
+        let fee_atoms = funding_value_atoms
+            .checked_sub(
+                transaction
+                    .checked_output_value_atoms()
+                    .expect("funding transaction outputs"),
+            )
+            .expect("funding transaction fee");
         match app.request(RpcRequest::SubmitTransaction {
             transaction,
             fee_atoms,
@@ -6375,38 +6435,30 @@ mod tests {
     fn parses_decimal_atho_amounts_with_commas() {
         let scale = atoms_per_atho_for_network(Network::Mainnet);
         let atoms =
-            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "10,000.445444444444").unwrap();
-        assert_eq!(atoms, 10_000 * scale + 445_444_444_444);
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "10,000.44544444").unwrap();
+        assert_eq!(atoms, 10_000 * scale + 44_544_444);
         assert_eq!(
             DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.938449").unwrap(),
-            938_449_000_000
-        );
-        assert_eq!(
-            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.938449").unwrap(),
-            938_449_000_000
+            93_844_900
         );
         assert_eq!(
             DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "1").unwrap(),
             scale
         );
         assert_eq!(
-            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.000000000001").unwrap(),
+            DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.00000001").unwrap(),
             1
         );
-        assert!(DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.0000000000001").is_err());
+        assert!(DesktopApp::parse_send_amount_atoms(InputUnit::Atho, "0.000000001").is_err());
     }
 
     #[test]
     fn formats_atho_amounts_for_input() {
         let scale = atoms_per_atho_for_network(Network::Mainnet);
-        let atoms = 10_000 * scale + 445_444_444_444;
+        let atoms = 10_000 * scale + 44_544_444;
         assert_eq!(
             DesktopApp::format_send_amount_input(InputUnit::Atho, atoms),
-            "10,000.445444444444"
-        );
-        assert_eq!(
-            DesktopApp::format_send_amount_input(InputUnit::Atho, scale),
-            "1"
+            "10,000.44544444"
         );
         assert_eq!(
             DesktopApp::format_send_amount_input(InputUnit::Atho, scale),
@@ -6422,12 +6474,15 @@ mod tests {
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
 
         let mut first = DesktopApp::new(Network::Regnet);
-        first.set_display_unit(DisplayUnit::NanoAtho);
+        assert_eq!(first.wallet_min_confirmations(), 3);
+        first.set_display_unit(DisplayUnit::MicroAtho);
         first.set_send_input_unit(InputUnit::Atom);
+        first.set_wallet_min_confirmations(6);
 
         let second = DesktopApp::new(Network::Regnet);
-        assert_eq!(second.display_unit(), DisplayUnit::NanoAtho);
+        assert_eq!(second.display_unit(), DisplayUnit::MicroAtho);
         assert_eq!(second.send_input_unit(), InputUnit::Atom);
+        assert_eq!(second.wallet_min_confirmations(), 6);
     }
 
     #[test]
@@ -6442,7 +6497,7 @@ mod tests {
         app.send_amount = DesktopApp::format_send_amount_input(InputUnit::Atho, atoms);
 
         app.set_send_input_unit(InputUnit::MilliAtho);
-        assert_eq!(app.send_amount, "1.25");
+        assert_eq!(app.send_amount, "12,500");
 
         app.set_send_input_unit(InputUnit::Atom);
         assert_eq!(app.send_amount, "1,250,000,000");
@@ -6645,17 +6700,22 @@ mod tests {
             false,
         );
 
+        let fee_atoms = DesktopApp::estimate_fee(Network::Regnet, 1, 1, 1);
+        let amount_atoms = funding
+            .value_atoms
+            .saturating_sub(fee_atoms)
+            .saturating_sub(DUST_RELAY_VALUE_ATOMS - 1);
         let tx = build_wallet_test_spend(
             &wallet,
             std::slice::from_ref(&funding),
             [0x22; 32],
-            9_000,
+            amount_atoms,
             false,
             Some(change_address),
         );
 
         assert_eq!(tx.outputs.len(), 1);
-        assert_eq!(tx.outputs[0].value_atoms, 9_000);
+        assert_eq!(tx.outputs[0].value_atoms, amount_atoms);
     }
 
     #[test]
@@ -7017,6 +7077,28 @@ mod tests {
             Wallet::load_from_datafile(wallet_path.as_path(), "").expect("reload persisted wallet");
         assert!(!persisted.address_book.snapshot().is_empty());
         assert!(persisted.snapshot.receive_count >= 1);
+    }
+
+    #[test]
+    fn load_or_create_wallet_rejects_wrong_network_wallet() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Testnet);
+        let wallet = Wallet::from_mnemonic(
+            MnemonicPhrase::from_entropy(&[0x45u8; 32], MnemonicLength::Words24).unwrap(),
+            "",
+            Network::Mainnet,
+        );
+
+        app.load_or_create_wallet(wallet, String::from("wallet.dat"), String::new(), None);
+
+        assert!(app.wallet_ref().is_none());
+        assert!(app.current_wallet_id.is_none());
+        assert_eq!(app.send_status, "Wallet network mismatch");
+        assert!(app
+            .last_error
+            .as_deref()
+            .expect("error")
+            .contains("mainnet"));
     }
 
     #[test]
@@ -7470,6 +7552,7 @@ mod tests {
         let last = wallet.checkout_receive_address();
         app.wallet = Some(wallet);
         app.current_receive_address = None;
+        app.node_settings_form.mining_reward_address.clear();
 
         let reward_script = app.mining_reward_script().expect("reward script");
 
@@ -7926,7 +8009,7 @@ mod tests {
             .iter()
             .any(|row| row.kind == WalletActivityKind::Mined));
 
-        let pre_funding_ready_height = STANDARD_TX_CONFIRMATIONS.saturating_sub(1).max(1);
+        let pre_funding_ready_height = NORMAL_TX_VALID_AFTER_CONFIRMATIONS.saturating_sub(1).max(1);
         if app.view_model.block_count < pre_funding_ready_height {
             mine_local_blocks(
                 &app.connection,
@@ -7963,26 +8046,32 @@ mod tests {
             },
         );
         app.force_wallet_cache_refresh_for_test();
-        // Standard transactions are intentionally not spendable immediately. Keep this lifecycle
-        // test aligned with consensus by asserting the inbound payment is pending until the
-        // configured confirmation threshold is crossed.
+        let funding_block_height = app.view_model.block_count;
+        let wallet_policy_ready_height =
+            funding_block_height.saturating_add(app.wallet_min_confirmations().saturating_sub(1));
         assert!(app.wallet_balance_summary().pending_atoms >= credited_funding_atoms);
-        assert!(app.wallet_balance_summary().available_atoms < credited_funding_atoms);
+        if app.view_model.block_count < wallet_policy_ready_height {
+            mine_local_blocks(
+                &app.connection,
+                wallet_policy_ready_height.saturating_sub(app.view_model.block_count),
+            );
+            wait_until_without_wallet_scan(
+                "external funding reaches wallet confirmation policy",
+                &mut app,
+                Duration::from_secs(20),
+                |app| app.view_model.block_count >= wallet_policy_ready_height,
+            );
+        }
+        app.force_wallet_cache_refresh_for_test();
+        // Consensus accepts the normal output after 1 confirmation, while the
+        // official wallet default waits for its user-selected confirmation policy.
+        assert!(app.wallet_balance_summary().available_atoms >= credited_funding_atoms);
         assert!(app
             .wallet_activity_rows()
             .iter()
             .any(|row| row.kind == WalletActivityKind::Received));
 
-        let maturity_target_height = pre_funding_ready_height + STANDARD_TX_CONFIRMATIONS;
-        mine_local_blocks(&app.connection, STANDARD_TX_CONFIRMATIONS.saturating_sub(1));
-        wait_until_without_wallet_scan(
-            "funding matures under standard confirmation rules",
-            &mut app,
-            Duration::from_secs(20),
-            |app| app.view_model.block_count >= maturity_target_height,
-        );
-        app.force_wallet_cache_refresh_for_test();
-        assert!(app.wallet_balance_summary().available_atoms >= credited_funding_atoms);
+        let maturity_target_height = app.view_model.block_count;
         let available_before_send = app.wallet_balance_summary().available_atoms;
 
         let mut recipient_wallet = Wallet::from_mnemonic(

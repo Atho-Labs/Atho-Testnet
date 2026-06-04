@@ -69,9 +69,11 @@ impl UtxoEntry {
     }
 
     pub fn confirmation_count(&self, spend_height: u64) -> u64 {
-        spend_height
-            .saturating_sub(self.created_height)
-            .saturating_add(1)
+        if spend_height < self.created_height {
+            0
+        } else {
+            spend_height - self.created_height + 1
+        }
     }
 
     pub fn required_confirmations(&self) -> u64 {
@@ -79,7 +81,7 @@ impl UtxoEntry {
         if self.is_coinbase {
             params.coinbase_maturity_blocks
         } else {
-            params.standard_tx_confirmations
+            params.normal_tx_valid_after_confirmations
         }
     }
 
@@ -439,13 +441,15 @@ mod tests {
         assert!(!testnet_coinbase.is_spendable_at(10 + 98));
         assert!(testnet_coinbase.is_spendable_at(10 + 99));
 
-        assert_eq!(mainnet_payment.required_confirmations(), 6);
-        assert!(!mainnet_payment.is_spendable_at(10 + 4));
-        assert!(mainnet_payment.is_spendable_at(10 + 5));
+        assert_eq!(mainnet_payment.required_confirmations(), 1);
+        assert!(mainnet_payment.is_spendable_at(10));
 
-        assert_eq!(testnet_payment.required_confirmations(), 6);
-        assert!(!testnet_payment.is_spendable_at(10 + 4));
-        assert!(testnet_payment.is_spendable_at(10 + 5));
+        assert_eq!(testnet_payment.required_confirmations(), 1);
+        assert!(testnet_payment.is_spendable_at(10));
+
+        let future_payment = UtxoEntry::new(Network::Mainnet, [5; 48], 0, 100, vec![5], 10, false);
+        assert_eq!(future_payment.confirmation_count(9), 0);
+        assert!(!future_payment.is_spendable_at(9));
     }
 
     #[test]

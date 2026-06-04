@@ -73,8 +73,12 @@ fn render_send_form(
                             "Enter a base56 Atho address for the active network. Example: R... on regnet.",
                         );
                     ui.horizontal(|ui| {
-                        let address_width =
-                            widgets::reserved_width(ui.available_width(), 102.0, 220.0, 420.0);
+                        let address_width = widgets::reserved_width(
+                            widgets::finite_available_width(ui, 420.0),
+                            102.0,
+                            220.0,
+                            420.0,
+                        );
                         let address_response = ui.add_sized(
                             [address_width, 28.0],
                             egui::TextEdit::singleline(&mut app.send_to)
@@ -130,7 +134,7 @@ fn render_send_form(
 
                     ui.label(egui::RichText::new("Label:").size(13.0).strong())
                         .on_hover_text("Optional local note for this payment.");
-                    let label_width = widgets::finite_available_width(ui, 240.0);
+                    let label_width = widgets::finite_widget_width(ui, 420.0, 220.0);
                     ui.add_sized(
                         [label_width, 28.0],
                         egui::TextEdit::singleline(&mut app.send_label)
@@ -141,7 +145,7 @@ fn render_send_form(
                     ui.label(egui::RichText::new("Amount:").size(13.0).strong())
                         .on_hover_text(
                             format!(
-                                "Up to {} decimal places are supported for {} input. Spendable outputs must be at least 1 nATHO / 1,000 atoms.",
+                                "Up to {} decimal places are supported for {} input. Spendable outputs must be at least 1 μATHO / 100 atoms.",
                                 app.send_input_unit().max_decimals(),
                                 app.send_input_unit().label(),
                             ),
@@ -197,7 +201,7 @@ fn render_send_form(
             ui.add_space(8.0);
             widgets::muted_label(
                 ui,
-                "The current spend path can combine spendable wallet-owned inputs into one grouped-signature transaction. Minimum output: 1 nATHO / 1,000 atoms. “Use max spendable” fills the largest amount currently spendable in one transaction.",
+                "The current spend path can combine spendable wallet-owned inputs into one grouped-signature transaction. Minimum output: 1 μATHO / 100 atoms. “Use max spendable” fills the largest amount currently spendable in one transaction.",
             );
             ui.add_space(8.0);
             ui.separator();
@@ -246,7 +250,7 @@ fn render_send_actions(
     send_in_progress: bool,
 ) {
     let send_enabled = send_block_reason.is_none() && !send_in_progress;
-    let compact = ui.available_width() < 760.0;
+    let compact = widgets::finite_available_width(ui, 760.0) < 760.0;
     let send_hover_reason = if send_in_progress {
         Some("A transaction is already being finalized")
     } else {

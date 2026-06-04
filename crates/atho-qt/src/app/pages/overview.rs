@@ -253,21 +253,21 @@ fn render_recent_transactions(
         for row in rows.iter().take(6) {
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [68.0, 0.0],
+                    [68.0, 18.0],
                     egui::Label::new(
                         egui::RichText::new(&row.when)
                             .size(11.0)
                             .color(widgets::MUTED),
                     ),
                 );
-                ui.add_sized([84.0, 0.0], egui::Label::new(row.kind.label()));
+                ui.add_sized([84.0, 18.0], egui::Label::new(row.kind.label()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     widgets::row_value_signed(ui, row.amount_atoms, display_unit);
                 });
             });
-            let label_width = widgets::finite_available_width(ui, 220.0);
+            let label_width = widgets::finite_widget_width(ui, 420.0, 120.0);
             let response = ui.add_sized(
-                [label_width, 0.0],
+                [label_width, 18.0],
                 egui::Label::new(
                     egui::RichText::new(&row.label)
                         .size(11.0)

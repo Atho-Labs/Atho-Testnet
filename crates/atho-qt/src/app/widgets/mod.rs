@@ -33,12 +33,24 @@ pub(crate) fn finite_layout_space(value: f32, fallback: f32) -> f32 {
     }
 }
 
+pub(crate) fn finite_widget_layout_space(value: f32, fallback: f32, minimum: f32) -> f32 {
+    finite_layout_space(value, fallback).max(minimum.max(1.0))
+}
+
 pub(crate) fn finite_available_width(ui: &egui::Ui, fallback: f32) -> f32 {
     finite_layout_space(ui.available_width(), fallback)
 }
 
 pub(crate) fn finite_available_height(ui: &egui::Ui, fallback: f32) -> f32 {
     finite_layout_space(ui.available_height(), fallback)
+}
+
+pub(crate) fn finite_widget_width(ui: &egui::Ui, fallback: f32, minimum: f32) -> f32 {
+    finite_widget_layout_space(ui.available_width(), fallback, minimum)
+}
+
+pub(crate) fn finite_widget_height(ui: &egui::Ui, fallback: f32, minimum: f32) -> f32 {
+    finite_widget_layout_space(ui.available_height(), fallback, minimum)
 }
 
 pub(crate) fn clamped_available_width(ui: &egui::Ui, min: f32, max: f32, fallback: f32) -> f32 {
@@ -162,9 +174,10 @@ pub(crate) fn elided_label(ui: &mut egui::Ui, text: &str, max_chars: usize) -> e
 }
 
 pub(crate) fn text_input(ui: &mut egui::Ui, text: &mut String, hint: &str) {
+    let width = finite_widget_width(ui, 420.0, 160.0);
     ui.add(
         egui::TextEdit::singleline(text)
-            .desired_width(f32::INFINITY)
+            .desired_width(width)
             .hint_text(hint),
     );
 }
@@ -249,5 +262,16 @@ mod tests {
         assert_eq!(reserved_width(f32::NAN, 112.0, 160.0, 420.0), 308.0);
         assert_eq!(reserved_width(200.0, 112.0, 160.0, 420.0), 160.0);
         assert_eq!(reserved_width(600.0, 112.0, 160.0, 420.0), 488.0);
+    }
+
+    #[test]
+    fn finite_widget_dimensions_keep_positive_geometry() {
+        assert_eq!(finite_widget_layout_space(f32::NAN, 0.0, 1.0), 1.0);
+        assert_eq!(finite_widget_layout_space(0.0, 420.0, 1.0), 1.0);
+        assert_eq!(
+            finite_widget_layout_space(f32::INFINITY, 420.0, 160.0),
+            420.0
+        );
+        assert_eq!(finite_widget_layout_space(80.0, 420.0, 160.0), 160.0);
     }
 }

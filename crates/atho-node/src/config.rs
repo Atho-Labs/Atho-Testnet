@@ -2,7 +2,7 @@
 // Copyright (c) Atho contributors
 
 //! Node configuration defaults and runtime selection helpers.
-use atho_core::address::address_from_public_key;
+use atho_core::address::{address_from_public_key, decode_base56_address};
 use atho_core::network::Network;
 use atho_crypto::falcon;
 use getrandom::getrandom;
@@ -116,8 +116,6 @@ pub struct SyncConfig {
     pub checkpoint_anchored_sync: bool,
     pub bootstrap_snapshot_path: String,
     pub bootstrap_snapshot_hash: String,
-    pub bootstrap_snapshot_signer_public_key: String,
-    pub bootstrap_snapshot_signature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,17 +218,12 @@ impl NodeConfig {
             std::env::var("ATHO_BOOTSTRAP_SNAPSHOT").unwrap_or(config.sync.bootstrap_snapshot_path);
         config.sync.bootstrap_snapshot_hash = std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_HASH")
             .unwrap_or(config.sync.bootstrap_snapshot_hash);
-        config.sync.bootstrap_snapshot_signer_public_key =
-            std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_SIGNER_PUBKEY")
-                .unwrap_or(config.sync.bootstrap_snapshot_signer_public_key);
-        config.sync.bootstrap_snapshot_signature =
-            std::env::var("ATHO_BOOTSTRAP_SNAPSHOT_SIGNATURE")
-                .unwrap_or(config.sync.bootstrap_snapshot_signature);
         config.wallet.enabled = env_bool("ATHO_WALLET_ENABLED", config.wallet.enabled);
         config.wallet.require_encryption = env_bool(
             "ATHO_WALLET_REQUIRE_ENCRYPTION",
             config.wallet.require_encryption,
         );
+        config.normalize_network_scoped_values();
         config.clamp_user_tunable_bounds();
         config
     }
@@ -334,8 +327,6 @@ impl NodeConfig {
                 "checkpointsync={}\n",
                 "bootstrapsnapshot={}\n",
                 "bootstrapsnapshothash={}\n",
-                "bootstrapsnapshotsignerpubkey={}\n",
-                "bootstrapsnapshotsignature={}\n",
                 "api={}\n",
                 "apiwallet={}\n",
                 "apimining={}\n"
@@ -359,8 +350,6 @@ impl NodeConfig {
             bool_as_conf(self.sync.checkpoint_anchored_sync),
             self.sync.bootstrap_snapshot_path,
             self.sync.bootstrap_snapshot_hash,
-            self.sync.bootstrap_snapshot_signer_public_key,
-            self.sync.bootstrap_snapshot_signature,
             bool_as_conf(self.api.enabled),
             bool_as_conf(self.api.wallet_enabled),
             bool_as_conf(self.api.mining_enabled)
@@ -399,14 +388,6 @@ impl NodeConfig {
         std::env::set_var(
             "ATHO_BOOTSTRAP_SNAPSHOT_HASH",
             &self.sync.bootstrap_snapshot_hash,
-        );
-        std::env::set_var(
-            "ATHO_BOOTSTRAP_SNAPSHOT_SIGNER_PUBKEY",
-            &self.sync.bootstrap_snapshot_signer_public_key,
-        );
-        std::env::set_var(
-            "ATHO_BOOTSTRAP_SNAPSHOT_SIGNATURE",
-            &self.sync.bootstrap_snapshot_signature,
         );
         std::env::set_var("ATHO_MINING_REWARD_ADDRESS", &self.mining_reward_address);
     }
@@ -494,11 +475,17 @@ impl NodeConfig {
         if let Some(value) = file.get("bootstrapsnapshothash") {
             self.sync.bootstrap_snapshot_hash = value.to_string();
         }
-        if let Some(value) = file.get("bootstrapsnapshotsignerpubkey") {
-            self.sync.bootstrap_snapshot_signer_public_key = value.to_string();
+    }
+
+    fn normalize_network_scoped_values(&mut self) {
+        let configured = self.mining_reward_address.trim();
+        if configured.is_empty() {
+            return;
         }
-        if let Some(value) = file.get("bootstrapsnapshotsignature") {
-            self.sync.bootstrap_snapshot_signature = value.to_string();
+        if let Ok((_, decoded_network)) = decode_base56_address(configured) {
+            if decoded_network != self.network {
+                self.mining_reward_address = default_mining_reward_address(self.network);
+            }
         }
     }
 
@@ -665,8 +652,6 @@ impl Default for SyncConfig {
             checkpoint_anchored_sync: true,
             bootstrap_snapshot_path: String::new(),
             bootstrap_snapshot_hash: String::new(),
-            bootstrap_snapshot_signer_public_key: String::new(),
-            bootstrap_snapshot_signature: String::new(),
         }
     }
 }
@@ -929,6 +914,59 @@ fn restrict_owner_only_permissions(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{acquire_global_test_lock, TestLockGuard};
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+        _lock: TestLockGuard,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn set_value(key: &'static str, value: &str) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let lock = acquire_global_test_lock();
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn defaults_match_public_read_only_api_profile() {
@@ -1010,6 +1048,42 @@ mod tests {
         assert!(!NodeConfig::new(Network::Prunetest)
             .mining_reward_address
             .is_empty());
+    }
+
+    #[test]
+    fn wrong_network_configured_mining_reward_address_is_ignored() {
+        let wrong_network_address = default_mining_reward_address(Network::Regnet);
+        let path = std::env::temp_dir().join(format!(
+            "atho-conf-test-{}-{}.conf",
+            std::process::id(),
+            "wrong-network-reward"
+        ));
+        fs::write(
+            &path,
+            format!("miningrewardaddress={wrong_network_address}\n"),
+        )
+        .expect("write config");
+        let _conf = EnvVarGuard::set_path(ATHO_CONF_FILE_ENV, &path);
+        let _env_reward = EnvVarGuard::clear("ATHO_MINING_REWARD_ADDRESS");
+
+        let config = NodeConfig::from_env(Network::Testnet);
+
+        let _ = fs::remove_file(&path);
+        assert!(config.mining_reward_address.is_empty());
+    }
+
+    #[test]
+    fn wrong_network_env_mining_reward_address_is_reset_to_selected_network() {
+        let wrong_network_address = default_mining_reward_address(Network::Regnet);
+        let expected_address = default_mining_reward_address(Network::Prunetest);
+        let _conf = EnvVarGuard::clear(ATHO_CONF_FILE_ENV);
+        let _env_reward =
+            EnvVarGuard::set_value("ATHO_MINING_REWARD_ADDRESS", &wrong_network_address);
+
+        let config = NodeConfig::from_env(Network::Prunetest);
+
+        assert_eq!(config.mining_reward_address, expected_address);
+        assert_ne!(config.mining_reward_address, wrong_network_address);
     }
 
     #[test]

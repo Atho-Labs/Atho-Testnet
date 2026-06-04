@@ -103,9 +103,7 @@ pub(crate) fn render_word_grid(
                         if editable {
                             let response = ui.add_sized(
                                 [card_width - 16.0, 28.0],
-                                egui::TextEdit::singleline(&mut words[index])
-                                    .hint_text("word")
-                                    .desired_width(f32::INFINITY),
+                                egui::TextEdit::singleline(&mut words[index]).hint_text("word"),
                             );
                             if response.changed() {
                                 maybe_distribution =

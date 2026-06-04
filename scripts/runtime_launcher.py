@@ -44,8 +44,13 @@ RESERVED_FORWARDED_FLAGS = {
     "--data-dir",
 }
 NETWORK_TOKENS = {
+    "mainnet",
+    "atho-mainnet",
     "testnet",
     "atho-testnet",
+    "regnet",
+    "regtest",
+    "atho-regnet",
 }
 
 
@@ -143,7 +148,8 @@ def normalize_entry_network(network: str) -> str:
     network = network.strip().lower()
     if network not in SUPPORTED_ENTRY_NETWORKS:
         raise LauncherError(
-            f"unsupported launcher network {network!r}; Atho-Testnet only launches testnet"
+            f"unsupported launcher network {network!r}; supported launchers are "
+            + ", ".join(sorted(SUPPORTED_ENTRY_NETWORKS))
         )
     return network
 

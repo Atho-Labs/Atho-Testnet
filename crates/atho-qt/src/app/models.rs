@@ -265,8 +265,6 @@ pub(crate) struct NodeSettingsForm {
     pub(crate) checkpoint_sync_enabled: bool,
     pub(crate) bootstrap_snapshot_path: String,
     pub(crate) bootstrap_snapshot_hash: String,
-    pub(crate) bootstrap_snapshot_signer_public_key: String,
-    pub(crate) bootstrap_snapshot_signature: String,
 }
 
 impl NodeSettingsForm {
@@ -293,11 +291,6 @@ impl NodeSettingsForm {
             checkpoint_sync_enabled: config.sync.checkpoint_anchored_sync,
             bootstrap_snapshot_path: config.sync.bootstrap_snapshot_path.clone(),
             bootstrap_snapshot_hash: config.sync.bootstrap_snapshot_hash.clone(),
-            bootstrap_snapshot_signer_public_key: config
-                .sync
-                .bootstrap_snapshot_signer_public_key
-                .clone(),
-            bootstrap_snapshot_signature: config.sync.bootstrap_snapshot_signature.clone(),
         }
     }
 }

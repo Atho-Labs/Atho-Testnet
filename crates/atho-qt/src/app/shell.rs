@@ -242,12 +242,12 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
 
             ui.horizontal(|ui| {
                 let available = widgets::finite_available_width(ui, 760.0);
-                let available_height = widgets::finite_available_height(ui, 28.0);
                 let right_width = (available * 0.34).clamp(220.0, 320.0);
                 let left_width = (available - right_width - 6.0).max(140.0);
+                let status_height = widgets::finite_widget_height(ui, 24.0, 1.0);
 
                 ui.allocate_ui_with_layout(
-                    egui::vec2(left_width, available_height),
+                    egui::vec2(left_width, status_height),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -305,9 +305,10 @@ fn render_status_bar(app: &mut DesktopApp, ctx: &egui::Context) {
                 );
 
                 ui.add_space(6.0);
-                let right_available_width = widgets::finite_available_width(ui, right_width);
+                let right_available = widgets::finite_widget_width(ui, right_width, 120.0);
+                let right_height = widgets::finite_widget_height(ui, 24.0, 1.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(right_available_width, available_height),
+                    egui::vec2(right_available, right_height),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;

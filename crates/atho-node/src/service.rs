@@ -207,7 +207,6 @@ pub struct NodeService {
 
 impl NodeService {
     /// Creates a new service with a fresh orchestrator.
-    #[cfg(any(test, feature = "devtools"))]
     pub fn new(config: NodeConfig) -> Self {
         let network = config.network;
         Self {
@@ -1159,6 +1158,19 @@ impl NodeService {
 
     pub fn is_running(&self) -> bool {
         self.orchestrator.runtime.running
+    }
+
+    pub fn runtime_started_at_unix(&self) -> Option<u64> {
+        self.orchestrator.runtime.started_at_unix
+    }
+
+    pub fn runtime_uptime_seconds(&self) -> u64 {
+        if !self.orchestrator.runtime.running {
+            return 0;
+        }
+        let now = unix_timestamp();
+        let started_at = self.orchestrator.runtime.started_at_unix.unwrap_or(now);
+        now.saturating_sub(started_at)
     }
 
     pub fn height(&self) -> u64 {
@@ -3592,13 +3604,17 @@ fn format_scaled_decimal(value: u64, scale_digits: usize) -> String {
 }
 
 fn render_utxo_value(spend_height: u64, entry: &UtxoEntry) -> Value {
+    let confirmations = entry.confirmation_count(spend_height);
+    let required_confirmations = entry.required_confirmations();
     json!({
         "txid": hex::encode(entry.txid),
         "vout": entry.output_index,
         "value_atoms": entry.value_atoms,
         "value_atho": format_atoms_decimal(entry.network, entry.value_atoms),
-        "confirmations": entry.confirmation_count(spend_height),
+        "confirmations": confirmations,
         "coinbase": entry.is_coinbase,
+        "required_confirmations": required_confirmations,
+        "remaining_confirmations": required_confirmations.saturating_sub(confirmations),
         "spendable": entry.is_spendable_at(spend_height),
         "locking_script_hex": hex::encode(&entry.locking_script),
         "address_hint": script_address_hint(entry.network, &entry.locking_script),
@@ -4435,18 +4451,15 @@ mod tests {
 
     #[test]
     fn format_atoms_decimal_keeps_exact_integer_scale() {
-        assert_eq!(format_atoms_decimal(Network::Mainnet, 1), "0.000000000001");
+        assert_eq!(format_atoms_decimal(Network::Mainnet, 1), "0.00000001");
+        assert_eq!(format_atoms_decimal(Network::Mainnet, 100), "0.00000100");
         assert_eq!(
-            format_atoms_decimal(Network::Mainnet, 1_000),
-            "0.000000001000"
+            format_atoms_decimal(Network::Mainnet, 100_000_000),
+            "1.00000000"
         );
         assert_eq!(
-            format_atoms_decimal(Network::Mainnet, 1_000_000_000_000),
-            "1.000000000000"
-        );
-        assert_eq!(
-            format_atoms_decimal(Network::Mainnet, 12_345_678_901_234),
-            "12.345678901234"
+            format_atoms_decimal(Network::Mainnet, 1_234_567_890),
+            "12.34567890"
         );
     }
 

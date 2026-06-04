@@ -478,8 +478,8 @@
     "severity": "error",
     "title": "Dust Output Rejected",
     "explanation": "The transaction creates an output below Atho's relay dust floor.",
-    "common_cause": "A wallet or sender attempted to create an output smaller than the 1,000-atom relay minimum.",
-    "suggested_fix": "Raise every spendable output to at least 1,000 atoms or combine the value into fees.",
+    "common_cause": "A wallet or sender attempted to create an output smaller than the 100-atom relay minimum.",
+    "suggested_fix": "Raise every spendable output to at least 100 atoms or combine the value into fees.",
     "user_facing": true,
     "consensus_critical": false
   },
@@ -1074,6 +1074,17 @@
     "explanation": "The selected mining backend failed to process the current job.",
     "common_cause": "The backend is unavailable, misconfigured, or returned invalid output.",
     "suggested_fix": "Inspect the backend-specific code and retry with CPU fallback if needed.",
+    "user_facing": true,
+    "consensus_critical": false
+  },
+  {
+    "code": "ATHO-MINE-003",
+    "category": "mining",
+    "severity": "error",
+    "title": "Mining Reward Address Required",
+    "explanation": "The node cannot build a production mining template until a valid payout address is configured.",
+    "common_cause": "Mining was started on a non-dev network without ATHO_MINING_REWARD_ADDRESS or atho.conf miningrewardaddress.",
+    "suggested_fix": "Configure a same-network payout address before requesting or solving block templates.",
     "user_facing": true,
     "consensus_critical": false
   },

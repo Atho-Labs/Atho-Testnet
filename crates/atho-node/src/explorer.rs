@@ -13,7 +13,7 @@ use crate::error::NodeError;
 use crate::node::Node;
 use atho_core::address::encode_base56_address;
 use atho_core::block::Block;
-use atho_core::constants::ATOMS_PER_ATHO;
+use atho_core::constants::{ATOMS_PER_ATHO, DECIMALS};
 use atho_core::network::Network;
 use atho_core::transaction::Transaction;
 use atho_storage::utxo::UtxoEntry;
@@ -248,26 +248,51 @@ impl ExplorerIndex {
         &self,
         network: Network,
         address: &str,
+        min_confirmations: u64,
         limit: usize,
         offset: usize,
     ) -> Option<Value> {
         let record = self.addresses.get(address)?;
         let slice = paginate(&record.transactions, limit, offset);
-        let (spendable_atoms, immature_atoms) =
-            record
-                .utxos
-                .iter()
-                .fold((0u64, 0u64), |(spendable, immature), utxo| {
-                    if utxo.is_spendable_at(self.tip_height) {
-                        (spendable.saturating_add(utxo.value_atoms), immature)
+        let (spendable_atoms, immature_atoms, policy_balance_atoms, policy_spendable_atoms) =
+            record.utxos.iter().fold(
+                (0u64, 0u64, 0u64, 0u64),
+                |(spendable, immature, policy_balance, policy_spendable), utxo| {
+                    let confirmations = utxo.confirmation_count(self.tip_height);
+                    let meets_policy = confirmations >= min_confirmations;
+                    let spendable_now = utxo.is_spendable_at(self.tip_height);
+                    let policy_balance = if meets_policy {
+                        policy_balance.saturating_add(utxo.value_atoms)
                     } else {
-                        (spendable, immature.saturating_add(utxo.value_atoms))
+                        policy_balance
+                    };
+                    let policy_spendable = if meets_policy && spendable_now {
+                        policy_spendable.saturating_add(utxo.value_atoms)
+                    } else {
+                        policy_spendable
+                    };
+                    if spendable_now {
+                        (
+                            spendable.saturating_add(utxo.value_atoms),
+                            immature,
+                            policy_balance,
+                            policy_spendable,
+                        )
+                    } else {
+                        (
+                            spendable,
+                            immature.saturating_add(utxo.value_atoms),
+                            policy_balance,
+                            policy_spendable,
+                        )
                     }
-                });
+                },
+            );
         Some(json!({
             "address": address,
             "network": network.domain_tag(),
             "payment_digest_hex": hex::encode(record.payment_digest),
+            "min_confirmations": min_confirmations,
             "tx_count": record.transactions.len(),
             "utxo_count": record.utxos.len(),
             "balance_atoms": record.balance_atoms,
@@ -276,8 +301,12 @@ impl ExplorerIndex {
             "spendable_atho": format_atoms_decimal(spendable_atoms),
             "immature_atoms": immature_atoms,
             "immature_atho": format_atoms_decimal(immature_atoms),
+            "policy_balance_atoms": policy_balance_atoms,
+            "policy_balance_atho": format_atoms_decimal(policy_balance_atoms),
+            "policy_spendable_atoms": policy_spendable_atoms,
+            "policy_spendable_atho": format_atoms_decimal(policy_spendable_atoms),
             "pending_delta_atoms": "0",
-            "pending_delta_atho": "0.000000000000",
+            "pending_delta_atho": format_atoms_decimal(0),
             "transactions": slice,
             "page": {
                 "limit": limit,
@@ -293,24 +322,33 @@ impl ExplorerIndex {
         network: Network,
         current_height: u64,
         address: &str,
+        min_confirmations: u64,
         limit: usize,
         offset: usize,
     ) -> Option<Value> {
         let record = self.addresses.get(address)?;
-        let utxos = paginate(&record.utxos, limit, offset)
+        let filtered = record
+            .utxos
             .iter()
-            .map(|entry| render_utxo_value(current_height, network, entry))
+            .filter(|entry| entry.confirmation_count(current_height) >= min_confirmations)
+            .cloned()
+            .collect::<Vec<_>>();
+        let utxos = paginate(&filtered, limit, offset)
+            .iter()
+            .map(|entry| render_utxo_value(current_height, network, entry, min_confirmations))
             .collect::<Vec<_>>();
         Some(json!({
             "address": address,
             "network": network.domain_tag(),
+            "min_confirmations": min_confirmations,
             "utxo_count": record.utxos.len(),
+            "filtered_utxo_count": filtered.len(),
             "utxos": utxos,
             "page": {
                 "limit": limit,
                 "offset": offset,
                 "returned": utxos.len(),
-                "total": record.utxos.len(),
+                "total": filtered.len(),
             }
         }))
     }
@@ -713,14 +751,24 @@ fn script_address_hint(network: Network, locking_script: &[u8]) -> Option<String
     Some(encode_base56_address(network, &digest))
 }
 
-fn render_utxo_value(spend_height: u64, network: Network, entry: &UtxoEntry) -> Value {
+fn render_utxo_value(
+    spend_height: u64,
+    network: Network,
+    entry: &UtxoEntry,
+    min_confirmations: u64,
+) -> Value {
+    let confirmations = entry.confirmation_count(spend_height);
+    let required_confirmations = entry.required_confirmations();
     json!({
         "txid": hex::encode(entry.txid),
         "vout": entry.output_index,
         "value_atoms": entry.value_atoms,
         "value_atho": format_atoms_decimal(entry.value_atoms),
-        "confirmations": entry.confirmation_count(spend_height),
+        "confirmations": confirmations,
         "coinbase": entry.is_coinbase,
+        "required_confirmations": required_confirmations,
+        "remaining_confirmations": required_confirmations.saturating_sub(confirmations),
+        "meets_min_confirmations": confirmations >= min_confirmations,
         "spendable": entry.is_spendable_at(spend_height),
         "created_height": entry.created_height,
         "locking_script_hex": hex::encode(&entry.locking_script),
@@ -731,7 +779,7 @@ fn render_utxo_value(spend_height: u64, network: Network, entry: &UtxoEntry) -> 
 fn format_atoms_decimal(atoms: u64) -> String {
     let whole = atoms / ATOMS_PER_ATHO;
     let fractional = atoms % ATOMS_PER_ATHO;
-    format!("{whole}.{fractional:012}")
+    format!("{whole}.{fractional:0DECIMALS$}")
 }
 
 fn format_signed_atoms_decimal(atoms: i128) -> String {
@@ -740,9 +788,9 @@ fn format_signed_atoms_decimal(atoms: i128) -> String {
     let whole = magnitude / ATOMS_PER_ATHO as u128;
     let fractional = magnitude % ATOMS_PER_ATHO as u128;
     if negative {
-        format!("-{whole}.{fractional:012}")
+        format!("-{whole}.{fractional:0DECIMALS$}")
     } else {
-        format!("{whole}.{fractional:012}")
+        format!("{whole}.{fractional:0DECIMALS$}")
     }
 }
 
@@ -833,10 +881,11 @@ mod tests {
         });
         let index = ExplorerIndex::rebuild(service.node_ref()).expect("index");
         let summary = index
-            .address_summary_value(Network::Regnet, &address, 10, 0)
+            .address_summary_value(Network::Regnet, &address, 1, 10, 0)
             .expect("address summary");
         assert_eq!(summary["address"], address);
         assert_eq!(summary["utxo_count"], 1);
         assert_eq!(summary["balance_atoms"], 12_345);
+        assert_eq!(summary["policy_balance_atoms"], 12_345);
     }
 }
