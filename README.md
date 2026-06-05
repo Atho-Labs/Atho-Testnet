@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.3`
+- Release line: `v0.3.4`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,22 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.4 Patch Notes
+
+This patch fixes the remaining terminal-header sync loop where a node could reach the advertised target height, receive `0` additional headers, and still keep re-requesting headers because stale same-height peer metadata survived maintenance.
+
+### Terminal Header Sync Fix
+
+- Treats an empty `Headers` response as a valid end-of-sync marker when the local database tip is already at or above the advertised target and there is no pending header, body, compact-block, or side-branch work.
+- Re-primes the relay sync target from the local database tip and local chainwork on that terminal empty response.
+- Updates the peer's remembered tip to the local tip when the peer proves there are no more headers, clearing stale same-height fork fingerprints that could restart the loop.
+- Stops considering a different same-height tip hash as a reason to re-request headers unless the peer proves higher cumulative chainwork.
+
+### Regression Coverage
+
+- Added a regression for the `local_height == target_height`, `headers count == 0` case to prove maintenance does not queue another `getheaders` request afterward.
+- Re-ran the stale-target regression suite to keep the previous `v0.3.2` and `v0.3.3` sync-loop fixes covered.
 
 ## v0.3.3 Patch Notes
 

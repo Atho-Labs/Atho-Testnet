@@ -1352,14 +1352,13 @@ impl NodeSync {
                     }
                 }
                 self.relay.accept_headers_from_peer(peer, &headers)?;
+                if header_count == 0 && self.finish_empty_terminal_headers_if_caught_up(peer, node)
+                {
+                    self.push_address_discovery_events(peer, node, outbound);
+                    return Ok(());
+                }
                 if header_count == 0 && node.height() < self.relay.sync_state().best_height {
-                    let stats = self.downloader.stats();
-                    if stats.pending_blocks == 0
-                        && stats.inflight_blocks == 0
-                        && self.pending_header_blocks.is_empty()
-                        && self.pending_compact_blocks.is_empty()
-                        && self.side_branches.is_empty()
-                    {
+                    if self.header_sync_work_idle() {
                         self.connections.replace_peer_tip(
                             peer,
                             node.height(),
@@ -1941,11 +1940,7 @@ impl NodeSync {
             .remote_best_height(remote_addr)
             .unwrap_or(0);
         let target_height = self.sync_state().best_height.max(remote_height);
-        let remote_tip = self.connections.remote_tip_hash(remote_addr);
-        let local_satisfies_remote = remote_tip.is_none_or(|tip| {
-            node.height() > remote_height
-                || (node.height() == remote_height && Hash48::from(node.tip_hash()) == tip)
-        });
+        let local_satisfies_remote = self.local_tip_satisfies_peer_observation(remote_addr, node);
         if node.height() >= target_height
             && self.sync_state().local_tip_satisfies_target(
                 node.height(),
@@ -1960,6 +1955,55 @@ impl NodeSync {
             return self.downloader.is_idle() && self.pending_header_blocks.is_empty();
         }
         self.downloader.is_idle()
+    }
+
+    fn local_tip_satisfies_peer_observation(&self, remote_addr: &str, node: &Node) -> bool {
+        let remote_height = self
+            .connections
+            .remote_best_height(remote_addr)
+            .unwrap_or(node.height());
+        if node.height() != remote_height {
+            return node.height() > remote_height;
+        }
+
+        let local_chainwork = Hash48::from(node.chainwork_bytes());
+        self.connections
+            .remote_chainwork(remote_addr)
+            .filter(|work| *work != Hash48::ZERO)
+            .is_none_or(|remote_chainwork| local_chainwork >= remote_chainwork)
+    }
+
+    fn header_sync_work_idle(&self) -> bool {
+        self.downloader.is_idle()
+            && self.pending_header_blocks.is_empty()
+            && self.pending_compact_blocks.is_empty()
+            && self.side_branches.is_empty()
+    }
+
+    fn finish_empty_terminal_headers_if_caught_up(&mut self, peer: &str, node: &Node) -> bool {
+        let target_height = self.sync_state().best_height.max(
+            self.connections
+                .remote_best_height(peer)
+                .unwrap_or(node.height()),
+        );
+        if node.height() < target_height || !self.header_sync_work_idle() {
+            return false;
+        }
+
+        self.connections
+            .replace_peer_tip(peer, node.height(), Hash48::from(node.tip_hash()));
+        self.prime_relay_from_node_locator(node);
+        self.header_requests_started.remove(peer);
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "empty terminal headers completed sync peer={} local_height={} target_height={}",
+                peer,
+                node.height(),
+                self.sync_state().best_height
+            ),
+        );
+        true
     }
 
     fn header_request_inflight(&self, remote_addr: &str) -> bool {
@@ -6435,6 +6479,83 @@ mod tests {
         assert_eq!(local.sync.sync_state().best_height, local.node.height());
         assert!(local.sync.sync_state().headers_synced);
         assert!(outbound.iter().all(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::Send {
+                    message: NetworkMessage {
+                        payload: MessagePayload::GetHeaders(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn empty_headers_at_target_clear_stale_peer_tip_without_re_requesting() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut remote = SandboxPeer::new("remote", Network::Regnet);
+        local
+            .node
+            .dev_seed_chainstate(526, [0x52; 48], Vec::<UtxoEntry>::new())
+            .expect("seed local synced tip");
+        local.sync.prime(&local.node);
+        remote.sync.prime(&remote.node);
+        let _ = connect_handshake_only(&mut local, &mut remote);
+
+        let stale_peer_tip = Hash48::from([0x24; 48]);
+        local
+            .sync
+            .connections
+            .replace_peer_tip(&remote.id, local.node.height(), stale_peer_tip);
+        local.sync.relay.reset_sync_target_at(
+            local.node.height(),
+            Some(Hash48::from(local.node.tip_hash())),
+            Some(local.node.height()),
+        );
+        local.sync.relay.mark_headers_synced();
+
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .handle_message(
+                &remote.id,
+                NetworkMessage::new(
+                    Network::Regnet,
+                    MessagePayload::Headers {
+                        headers: Vec::new(),
+                    },
+                ),
+                &mut local.node,
+                &mut outbound,
+            )
+            .expect("empty terminal headers");
+
+        assert!(local.sync.sync_state().headers_synced);
+        assert_eq!(local.sync.sync_state().best_height, local.node.height());
+        assert_eq!(
+            local.sync.connections().remote_tip_hash(&remote.id),
+            Some(Hash48::from(local.node.tip_hash()))
+        );
+        assert!(outbound.iter().all(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::Send {
+                    message: NetworkMessage {
+                        payload: MessagePayload::GetHeaders(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+
+        let maintenance = local
+            .sync
+            .maintain_peer_sync(&remote.id, &local.node)
+            .expect("maintenance after terminal empty headers");
+        assert!(maintenance.iter().all(|event| {
             !matches!(
                 event,
                 ConnectionEvent::Send {
