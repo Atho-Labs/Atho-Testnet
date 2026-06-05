@@ -846,18 +846,19 @@ impl NodeSync {
     }
 
     fn refresh_sync_target_from_live_peers(&mut self, node: &Node) {
-        let peer_best_height = self
-            .connections
-            .peer_snapshots()
-            .into_iter()
-            .filter(|peer| peer.handshake_ready)
-            .filter_map(|peer| peer.best_height)
-            .max();
-        self.relay.refresh_sync_target_at(
+        self.relay.note_local_tip_at(
             node.height(),
             Some(Hash48::from(node.tip_hash())),
-            peer_best_height,
+            Some(Hash48::from(node.chainwork_bytes())),
         );
+        for peer in self.connections.peer_snapshots() {
+            if !peer.handshake_ready {
+                continue;
+            }
+            if let (Some(height), Some(tip_hash)) = (peer.best_height, peer.tip_hash) {
+                self.relay.observe_tip_at(height, Some(tip_hash), peer.chainwork);
+            }
+        }
     }
 
     fn note_peer_disconnected(&mut self, peer: &str, node: &Node) {
@@ -873,18 +874,19 @@ impl NodeSync {
     }
 
     fn note_local_chain_progress(&mut self, node: &Node) {
-        let peer_best_height = self
-            .connections
-            .peer_snapshots()
-            .into_iter()
-            .filter(|peer| peer.handshake_ready)
-            .filter_map(|peer| peer.best_height)
-            .max();
-        self.relay.note_local_chain_progress_at(
+        self.relay.note_local_tip_at(
             node.height(),
             Some(Hash48::from(node.tip_hash())),
-            peer_best_height,
+            Some(Hash48::from(node.chainwork_bytes())),
         );
+        for peer in self.connections.peer_snapshots() {
+            if !peer.handshake_ready {
+                continue;
+            }
+            if let (Some(height), Some(tip_hash)) = (peer.best_height, peer.tip_hash) {
+                self.relay.observe_tip_at(height, Some(tip_hash), peer.chainwork);
+            }
+        }
         self.mark_block_state(
             node.tip_hash(),
             node.height(),
@@ -918,7 +920,7 @@ impl NodeSync {
         }
 
         let stats = self.downloader.stats();
-        if node.height() >= self.sync_state().best_height
+        if self.chain_synced(node)
             && stats.pending_blocks == 0
             && stats.inflight_blocks == 0
             && self.pending_header_blocks.is_empty()
@@ -1136,9 +1138,10 @@ impl NodeSync {
     }
 
     fn prime_relay_from_node_locator(&mut self, node: &Node) {
-        self.relay.prime_with_locator(
+        self.relay.prime_with_locator_and_chainwork(
             node.height(),
             Some(Hash48::from(node.tip_hash())),
+            Some(Hash48::from(node.chainwork_bytes())),
             node.block_locator_hashes()
                 .into_iter()
                 .map(Hash48::from)
@@ -1822,12 +1825,21 @@ impl NodeSync {
         {
             return false;
         }
-        let target_height = self.sync_state().best_height.max(
-            self.connections
-                .remote_best_height(remote_addr)
-                .unwrap_or(0),
-        );
-        if node.height() >= target_height {
+        let remote_height = self.connections.remote_best_height(remote_addr).unwrap_or(0);
+        let target_height = self.sync_state().best_height.max(remote_height);
+        let remote_tip = self.connections.remote_tip_hash(remote_addr);
+        let local_satisfies_remote = remote_tip.is_none_or(|tip| {
+            node.height() > remote_height
+                || (node.height() == remote_height && Hash48::from(node.tip_hash()) == tip)
+        });
+        if node.height() >= target_height
+            && self.sync_state().local_tip_satisfies_target(
+                node.height(),
+                Some(Hash48::from(node.tip_hash())),
+                Some(Hash48::from(node.chainwork_bytes())),
+            )
+            && local_satisfies_remote
+        {
             return false;
         }
         if !self.sync_state().headers_synced {
@@ -1854,7 +1866,13 @@ impl NodeSync {
                 .remote_best_height(remote_addr)
                 .unwrap_or(node.height()),
         );
-        if node.height() >= target_height {
+        if node.height() >= target_height
+            && self.sync_state().local_tip_satisfies_target(
+                node.height(),
+                Some(Hash48::from(node.tip_hash())),
+                Some(Hash48::from(node.chainwork_bytes())),
+            )
+        {
             self.header_requests_started.remove(remote_addr);
             return None;
         }
@@ -2906,7 +2924,12 @@ impl NodeSync {
     }
 
     fn chain_synced(&self, node: &Node) -> bool {
-        self.sync_state().headers_synced && node.height() >= self.sync_state().best_height
+        self.sync_state().headers_synced
+            && self.sync_state().local_tip_satisfies_target(
+                node.height(),
+                Some(Hash48::from(node.tip_hash())),
+                Some(Hash48::from(node.chainwork_bytes())),
+            )
     }
 
     fn mark_block_state(&mut self, hash: [u8; 48], height: u64, state: BlockValidationState) {
@@ -5923,6 +5946,29 @@ mod tests {
                 .map(BlockValidationState::as_str),
             Some("TEMP_STORED_UNTRUSTED")
         );
+    }
+
+    #[test]
+    fn same_height_preferred_fork_tip_is_not_considered_synced_or_safe_to_mine() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .mine_and_connect_candidate_block(&Miner::new(1))
+            .expect("mine local block");
+        peer.sync.prime(&peer.node);
+        let local_height = peer.node.height();
+        let preferred_remote_tip = Hash48::from([0; 48]);
+        assert_ne!(Hash48::from(peer.node.tip_hash()), preferred_remote_tip);
+
+        peer.sync
+            .relay
+            .observe_tip_at(local_height, Some(preferred_remote_tip), None);
+
+        assert!(!peer.sync.chain_synced(&peer.node));
+        let diagnostics = peer.sync.fast_download_diagnostics(&peer.node);
+        assert_eq!(diagnostics.best_header_height, local_height);
+        assert_eq!(diagnostics.chain_validation_status, "headers_syncing");
+        assert!(!diagnostics.safe_to_mine);
+        assert!(!diagnostics.safe_to_serve);
     }
 
     #[test]

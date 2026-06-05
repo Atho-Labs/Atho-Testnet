@@ -99,6 +99,30 @@ impl RelayLoop {
         );
     }
 
+    pub fn prime_with_locator_and_chainwork(
+        &mut self,
+        best_height: u64,
+        best_tip: Option<Hash48>,
+        best_chainwork: Option<Hash48>,
+        locator_hashes: Vec<Hash48>,
+    ) {
+        self.sync.prime_with_locator_and_chainwork(
+            best_height,
+            best_tip,
+            best_chainwork,
+            locator_hashes,
+        );
+        crate::audit::append_log(
+            "p2p",
+            &format!(
+                "relay primed network={} height={} dns_seeds={}",
+                self.network.id(),
+                self.sync.best_height,
+                self.params.dns_seeds.len()
+            ),
+        );
+    }
+
     pub fn accept_version(
         &mut self,
         remote_addr: impl Into<String>,
@@ -106,9 +130,11 @@ impl RelayLoop {
     ) -> Result<(), ProtocolError> {
         let remote_addr = remote_addr.into();
         self.peers.accept_version(remote_addr.clone(), version)?;
-        let local_best_height = self.sync.best_height;
-        self.sync.best_height = self.sync.best_height.max(version.best_height);
-        self.sync.headers_synced = version.best_height <= local_best_height;
+        self.sync.observe_tip(
+            version.best_height,
+            Some(version.tip_hash),
+            Some(version.chainwork),
+        );
         crate::audit::append_log(
             "p2p",
             &format!(
@@ -181,9 +207,28 @@ impl RelayLoop {
             }
         }
         if local_best_height >= self.sync.best_height {
-            self.sync.headers_synced = true;
-            self.sync.clear_requested_header_locators();
+            self.sync.note_local_tip(local_best_height, local_tip, None);
         }
+    }
+
+    pub fn note_local_tip_at(
+        &mut self,
+        local_best_height: u64,
+        local_tip: Option<Hash48>,
+        local_chainwork: Option<Hash48>,
+    ) {
+        self.sync
+            .note_local_tip(local_best_height, local_tip, local_chainwork);
+    }
+
+    pub fn observe_tip_at(
+        &mut self,
+        observed_height: u64,
+        observed_tip: Option<Hash48>,
+        observed_chainwork: Option<Hash48>,
+    ) -> bool {
+        self.sync
+            .observe_tip(observed_height, observed_tip, observed_chainwork)
     }
 
     pub fn note_observed_tip(
@@ -206,18 +251,16 @@ impl RelayLoop {
         observed_height: u64,
         observed_tip: [u8; 48],
     ) {
-        let advanced_target = observed_height > self.sync.best_height;
-        if observed_height >= self.sync.best_height {
-            self.sync.best_height = observed_height;
-            self.sync.best_tip = Some(Hash48::from(observed_tip));
-        }
-        self.sync.best_height = self.sync.best_height.max(local_best_height);
-        if local_best_height >= self.sync.best_height {
-            self.sync.headers_synced = true;
-            self.sync.clear_requested_header_locators();
-            self.sync.best_tip = local_tip;
-        } else if advanced_target {
-            self.sync.headers_synced = false;
+        self.sync.observe_tip(
+            observed_height,
+            Some(Hash48::from(observed_tip)),
+            None,
+        );
+        if self
+            .sync
+            .local_tip_satisfies_target(local_best_height, local_tip, None)
+        {
+            self.sync.note_local_tip(local_best_height, local_tip, None);
         }
     }
 
@@ -244,7 +287,7 @@ impl RelayLoop {
         self.sync.best_height = target_height;
 
         if local_best_height >= self.sync.best_height {
-            self.sync.headers_synced = true;
+            self.sync.note_local_tip(local_best_height, local_tip, None);
         } else if target_advanced {
             self.sync.headers_synced = false;
         }
@@ -267,9 +310,7 @@ impl RelayLoop {
             .max(local_best_height);
         self.sync.best_height = target_height;
         if local_best_height >= target_height {
-            self.sync.headers_synced = true;
-            self.sync.clear_requested_header_locators();
-            self.sync.best_tip = local_tip;
+            self.sync.note_local_tip(local_best_height, local_tip, None);
             if let Some(local_tip) = local_tip {
                 self.sync.locator_hashes.retain(|hash| *hash != local_tip);
                 self.sync.locator_hashes.insert(0, local_tip);
@@ -349,6 +390,28 @@ fn unix_timestamp() -> i64 {
 mod tests {
     use super::*;
 
+    fn version_with_tip(
+        network: Network,
+        best_height: u64,
+        tip_hash: [u8; 48],
+        chainwork: [u8; 48],
+    ) -> VersionMessage {
+        VersionMessage {
+            protocol_version: rules::PROTOCOL_VERSION,
+            min_protocol_version: crate::config::MIN_SUPPORTED_PROTOCOL_VERSION,
+            services: LOCAL_NODE_SERVICES,
+            timestamp_unix: 1_700_000_000,
+            network,
+            user_agent: String::from("/Atho:0.1.0/"),
+            best_height,
+            ruleset_version: rules::RULESET_VERSION_V1,
+            relay: true,
+            genesis_hash: Hash48::from(genesis::genesis_hash(network)),
+            tip_hash: Hash48::from(tip_hash),
+            chainwork: Hash48::from(chainwork),
+        }
+    }
+
     #[test]
     fn relay_loop_tracks_configured_dns_seeds_and_builds_versions() {
         let relay = RelayLoop::new(Network::Mainnet);
@@ -369,6 +432,52 @@ mod tests {
             }
             _ => panic!("expected version message"),
         }
+    }
+
+    #[test]
+    fn version_with_same_height_heavier_work_unsyncs_headers() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        relay.prime_with_locator_and_chainwork(
+            12,
+            Some(Hash48::from([0x80; 48])),
+            Some(Hash48::from([0x10; 48])),
+            vec![Hash48::from([0x80; 48])],
+        );
+
+        relay
+            .accept_version(
+                "peer",
+                &version_with_tip(Network::Regnet, 12, [0x70; 48], [0x11; 48]),
+            )
+            .expect("accept version");
+
+        assert_eq!(relay.sync.best_height, 12);
+        assert_eq!(relay.sync.best_tip, Some(Hash48::from([0x70; 48])));
+        assert_eq!(relay.sync.best_chainwork, Some(Hash48::from([0x11; 48])));
+        assert!(!relay.sync.headers_synced);
+    }
+
+    #[test]
+    fn version_with_same_height_weaker_work_keeps_local_target_synced() {
+        let mut relay = RelayLoop::new(Network::Regnet);
+        relay.prime_with_locator_and_chainwork(
+            12,
+            Some(Hash48::from([0x80; 48])),
+            Some(Hash48::from([0x10; 48])),
+            vec![Hash48::from([0x80; 48])],
+        );
+
+        relay
+            .accept_version(
+                "peer",
+                &version_with_tip(Network::Regnet, 12, [0x01; 48], [0x09; 48]),
+            )
+            .expect("accept version");
+
+        assert_eq!(relay.sync.best_height, 12);
+        assert_eq!(relay.sync.best_tip, Some(Hash48::from([0x80; 48])));
+        assert_eq!(relay.sync.best_chainwork, Some(Hash48::from([0x10; 48])));
+        assert!(relay.sync.headers_synced);
     }
 
     #[test]

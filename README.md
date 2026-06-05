@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.0`
+- Release line: `v0.3.1`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,28 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.1 Patch Notes
+
+This patch release carries the Alpha fork-healing and sync-readiness fixes into the public testnet-only distribution. It is meant for node operators and wallet testers who saw nodes appear synced while they were actually sitting on a same-height fork or unresolved side branch.
+
+### Fork Recovery and Chain Selection
+
+- Made P2P sync targets fork-aware by tracking the best advertised height, tip hash, and chainwork together.
+- Treated same-height competing tips as unresolved until headers and blocks prove the local tip satisfies the best known work target.
+- Preserved peer tip hash and chainwork in live peer snapshots so reconnect and disconnect recovery does not collapse back to height-only sync decisions.
+- Kept side-branch/orphan recovery active while a fork is unresolved, allowing the node to keep requesting headers and missing parents instead of reporting a false synced state.
+
+### Mining, API, and Wallet Readiness
+
+- Updated node sync readiness so `safe_to_mine` and `safe_to_serve` stay false while the local tip is behind the best known fork target, even when the heights match.
+- Updated RPC, HTTP API, daemon status, and Qt wallet status to use fork-aware `safe_to_serve` rather than height-only checks.
+- Prevented the desktop client from showing synced or starting wallet-ready flows on an unresolved same-height fork.
+
+### Regression Coverage
+
+- Added regression coverage for same-height preferred fork tips not being considered synced or safe to mine.
+- Added P2P regression coverage for same-height peers with higher chainwork forcing header sync, while weaker same-height peers do not disturb the local tip.
 
 ## v0.3.0 Patch Notes
 

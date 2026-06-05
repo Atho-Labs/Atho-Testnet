@@ -7,6 +7,7 @@ use crate::protocol::{GetHeadersMessage, Hash48, ProtocolError};
 use atho_core::block::{Block, BlockHeader};
 use atho_core::consensus::pow;
 use atho_core::network::Network;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 const MAX_OUTSTANDING_HEADER_LOCATORS_PER_PEER: usize = 16;
@@ -16,6 +17,7 @@ pub struct SyncState {
     pub best_height: u64,
     pub headers_synced: bool,
     pub best_tip: Option<Hash48>,
+    pub best_chainwork: Option<Hash48>,
     pub inflight_headers_peer: Option<String>,
     pub locator_hashes: Vec<Hash48>,
     pub(crate) requested_locator_hashes: Vec<Hash48>,
@@ -28,7 +30,13 @@ impl SyncState {
         let best_tip = blocks
             .last()
             .map(|block| Hash48::from(block.header.block_hash()));
-        self.prime_with_locator(best_height, best_tip, block_locator(blocks));
+        let best_chainwork = Some(chainwork_hash(blocks));
+        self.prime_with_locator_and_chainwork(
+            best_height,
+            best_tip,
+            best_chainwork,
+            block_locator(blocks),
+        );
     }
 
     pub fn prime_with_locator(
@@ -37,8 +45,19 @@ impl SyncState {
         best_tip: Option<Hash48>,
         locator_hashes: Vec<Hash48>,
     ) {
+        self.prime_with_locator_and_chainwork(best_height, best_tip, None, locator_hashes);
+    }
+
+    pub fn prime_with_locator_and_chainwork(
+        &mut self,
+        best_height: u64,
+        best_tip: Option<Hash48>,
+        best_chainwork: Option<Hash48>,
+        locator_hashes: Vec<Hash48>,
+    ) {
         self.best_height = best_height;
         self.best_tip = best_tip;
+        self.best_chainwork = known_chainwork(best_chainwork);
         self.locator_hashes = locator_hashes;
         self.clear_requested_header_locators();
         self.headers_synced = true;
@@ -206,6 +225,79 @@ impl SyncState {
         Ok(())
     }
 
+    pub fn observe_tip(
+        &mut self,
+        observed_height: u64,
+        observed_tip: Option<Hash48>,
+        observed_chainwork: Option<Hash48>,
+    ) -> bool {
+        let current = ChainTipCandidate {
+            height: self.best_height,
+            tip: self.best_tip,
+            chainwork: self.best_chainwork,
+        };
+        let observed = ChainTipCandidate {
+            height: observed_height,
+            tip: observed_tip,
+            chainwork: known_chainwork(observed_chainwork),
+        };
+        if compare_tip_candidates(&observed, &current).is_gt() {
+            self.best_height = observed.height;
+            self.best_tip = observed.tip;
+            self.best_chainwork = observed.chainwork;
+            self.headers_synced = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn note_local_tip(
+        &mut self,
+        local_height: u64,
+        local_tip: Option<Hash48>,
+        local_chainwork: Option<Hash48>,
+    ) {
+        let local = ChainTipCandidate {
+            height: local_height,
+            tip: local_tip,
+            chainwork: known_chainwork(local_chainwork),
+        };
+        let target = ChainTipCandidate {
+            height: self.best_height,
+            tip: self.best_tip,
+            chainwork: self.best_chainwork,
+        };
+        if compare_tip_candidates(&local, &target).is_ge() {
+            self.best_height = local.height;
+            self.best_tip = local.tip;
+            self.best_chainwork = local.chainwork.or(self.best_chainwork);
+            self.headers_synced = true;
+            self.clear_requested_header_locators();
+        } else {
+            self.headers_synced = false;
+        }
+    }
+
+    pub fn local_tip_satisfies_target(
+        &self,
+        local_height: u64,
+        local_tip: Option<Hash48>,
+        local_chainwork: Option<Hash48>,
+    ) -> bool {
+        let local = ChainTipCandidate {
+            height: local_height,
+            tip: local_tip,
+            chainwork: known_chainwork(local_chainwork),
+        };
+        let target = ChainTipCandidate {
+            height: self.best_height,
+            tip: self.best_tip,
+            chainwork: self.best_chainwork,
+        };
+        compare_tip_candidates(&local, &target).is_ge()
+    }
+
     pub fn clear_requested_header_locators(&mut self) {
         self.inflight_headers_peer = None;
         self.requested_locator_hashes.clear();
@@ -238,6 +330,51 @@ pub fn block_locator(blocks: &[Block]) -> Vec<Hash48> {
     }
 
     hashes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainTipCandidate {
+    height: u64,
+    tip: Option<Hash48>,
+    chainwork: Option<Hash48>,
+}
+
+fn known_chainwork(chainwork: Option<Hash48>) -> Option<Hash48> {
+    chainwork.filter(|work| *work != Hash48::ZERO)
+}
+
+fn compare_tip_candidates(candidate: &ChainTipCandidate, current: &ChainTipCandidate) -> Ordering {
+    match (candidate.chainwork, current.chainwork) {
+        (Some(candidate_work), Some(current_work)) if candidate_work != current_work => {
+            return candidate_work.cmp(&current_work);
+        }
+        _ => {}
+    }
+
+    candidate
+        .height
+        .cmp(&current.height)
+        .then_with(|| match (candidate.tip, current.tip) {
+            (Some(candidate_tip), Some(current_tip)) if candidate_tip != current_tip => {
+                current_tip.cmp(&candidate_tip)
+            }
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            _ => Ordering::Equal,
+        })
+}
+
+fn chainwork_hash(blocks: &[Block]) -> Hash48 {
+    let bytes = pow::accumulated_chain_work(blocks).to_bytes_be();
+    let mut out = [0u8; 48];
+    let out_len = out.len();
+    if bytes.len() >= out_len {
+        out.copy_from_slice(&bytes[bytes.len() - out_len..]);
+    } else {
+        let start = out_len - bytes.len();
+        out[start..].copy_from_slice(&bytes);
+    }
+    Hash48::from(out)
 }
 
 #[cfg(test)]

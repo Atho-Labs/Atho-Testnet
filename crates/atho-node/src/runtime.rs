@@ -245,9 +245,9 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     println!("athod running on {} rpc={rpc_address}", network.id());
     let status = {
         let guard = system.lock().expect("node runtime mutex poisoned");
-        guard.status()
+        guard.node_status()
     };
-    let chain_synced = status.headers_synced && status.block_count >= status.sync_best_height;
+    let chain_synced = status.headers_synced && status.network_diagnostics.safe_to_serve;
     println!(
         "node status height={} target={} mempool={} headers_synced={} chain_synced={}",
         status.block_count,

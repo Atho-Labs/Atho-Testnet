@@ -699,7 +699,7 @@ impl NodeService {
             || status.network_diagnostics.safe_to_serve;
         status.running
             && status.headers_synced
-            && status.block_count >= status.sync_best_height
+            && status.network_diagnostics.safe_to_serve
             && Self::has_required_ready_peer(status)
             && validation_safe
     }
@@ -4558,6 +4558,9 @@ mod tests {
         assert!(reason.contains("sync_target_height=9"));
 
         status.block_count = 9;
+        status.network_diagnostics.safe_to_mine = true;
+        status.network_diagnostics.safe_to_serve = true;
+        status.network_diagnostics.chain_validation_status.clear();
         assert!(NodeService::transaction_submission_sync_block_reason(&status).is_none());
 
         status.headers_synced = false;
@@ -4590,6 +4593,12 @@ mod tests {
 
         let mut regnet = status;
         regnet.network = Network::Regnet;
+        regnet.network_diagnostics.safe_to_mine = true;
+        regnet.network_diagnostics.safe_to_serve = true;
+        regnet
+            .network_diagnostics
+            .chain_validation_status
+            .clear();
         assert!(NodeService::transaction_submission_sync_block_reason(&regnet).is_none());
     }
 

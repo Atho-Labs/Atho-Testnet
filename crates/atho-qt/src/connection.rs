@@ -58,6 +58,7 @@ pub struct ConnectionStatus {
     pub connecting_peers: Vec<NetworkPeerDiagnostics>,
     pub running: bool,
     pub headers_synced: bool,
+    pub safe_to_serve: bool,
     pub sync_best_height: u64,
     pub connected: bool,
     pub startup_error: Option<String>,
@@ -477,6 +478,7 @@ impl ReadOnlyNodeConnection {
                 connecting_peers: Vec::new(),
                 running: false,
                 headers_synced: false,
+                safe_to_serve: false,
                 sync_best_height: 0,
                 connected: false,
                 startup_error: Some(startup_error.clone()),
@@ -569,6 +571,7 @@ impl ReadOnlyNodeConnection {
                         connecting_peers: Vec::new(),
                         running: false,
                         headers_synced: false,
+                        safe_to_serve: false,
                         sync_best_height: 0,
                         connected: false,
                         startup_error: Some(startup_error.clone()),
@@ -639,6 +642,7 @@ fn collect_rpc_status(
                 connecting_peers: Vec::new(),
                 running: false,
                 headers_synced: false,
+                safe_to_serve: false,
                 sync_best_height: 0,
                 connected: false,
                 startup_error: Some(startup_error),
@@ -712,6 +716,7 @@ fn collect_rpc_status(
         connecting_peers: Vec::new(),
         running: false,
         headers_synced: false,
+        safe_to_serve: false,
         sync_best_height: block_count_reply.unwrap_or(0),
         connected: false,
         startup_error: None,
@@ -780,6 +785,7 @@ fn connection_status_from_node_status(
         connecting_peers: status.network_diagnostics.connecting_peers,
         running: status.running,
         headers_synced: status.headers_synced,
+        safe_to_serve: status.network_diagnostics.safe_to_serve,
         sync_best_height: status.sync_best_height,
         connected,
         startup_error: None,
@@ -828,6 +834,7 @@ fn degrade_rpc_status(input: DegradedRpcStatusInput<'_>) -> ConnectionStatus {
         connecting_peers: Vec::new(),
         running: false,
         headers_synced: false,
+        safe_to_serve: false,
         sync_best_height: block_count_reply.unwrap_or(0),
         connected: false,
         startup_error: None,
@@ -1869,6 +1876,8 @@ mod tests {
                         sync_best_height: block_count,
                         network_diagnostics: NetworkDiagnostics {
                             peer_count: 1,
+                            safe_to_mine: true,
+                            safe_to_serve: true,
                             inbound_peer_count: 0,
                             outbound_peer_count: 1,
                             connecting_peer_count: 0,
@@ -2019,7 +2028,11 @@ mod tests {
                         running: true,
                         headers_synced: true,
                         sync_best_height: 3,
-                        network_diagnostics: NetworkDiagnostics::default(),
+                        network_diagnostics: NetworkDiagnostics {
+                            safe_to_mine: true,
+                            safe_to_serve: true,
+                            ..NetworkDiagnostics::default()
+                        },
                     }),
                 )
                 .expect("status response"),
@@ -2117,7 +2130,11 @@ mod tests {
                                 running: true,
                                 headers_synced: true,
                                 sync_best_height: 0,
-                                network_diagnostics: NetworkDiagnostics::default(),
+                                network_diagnostics: NetworkDiagnostics {
+                                    safe_to_mine: true,
+                                    safe_to_serve: true,
+                                    ..NetworkDiagnostics::default()
+                                },
                             }),
                         )
                         .expect("legacy status response");
@@ -2188,6 +2205,8 @@ mod tests {
                         sync_best_height: 2,
                         network_diagnostics: NetworkDiagnostics {
                             peer_count: 1,
+                            safe_to_mine: true,
+                            safe_to_serve: true,
                             inbound_peer_count: 0,
                             outbound_peer_count: 1,
                             connecting_peer_count: 0,
@@ -2261,7 +2280,11 @@ mod tests {
                     running,
                     headers_synced: true,
                     sync_best_height: 3,
-                    network_diagnostics: NetworkDiagnostics::default(),
+                    network_diagnostics: NetworkDiagnostics {
+                        safe_to_mine: running,
+                        safe_to_serve: running,
+                        ..NetworkDiagnostics::default()
+                    },
                 }),
                 other => RpcResponse::Error(RpcError::invalid_request(format!(
                     "unexpected request in single status server: {other:?}"
@@ -2423,6 +2446,7 @@ mod tests {
                 connecting_peers: Vec::new(),
                 running: true,
                 headers_synced: true,
+                safe_to_serve: true,
                 sync_best_height: 128,
                 connected: true,
                 startup_error: None,
@@ -2491,6 +2515,7 @@ mod tests {
                 connecting_peers: Vec::new(),
                 running: true,
                 headers_synced: true,
+                safe_to_serve: true,
                 sync_best_height: 128,
                 connected: true,
                 startup_error: None,

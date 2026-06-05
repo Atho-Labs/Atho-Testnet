@@ -557,6 +557,7 @@ impl DesktopApp {
         self.view_model.connecting_peers = status.connecting_peers.clone();
         self.view_model.running = status.running;
         self.view_model.headers_synced = status.headers_synced;
+        self.view_model.safe_to_serve = status.safe_to_serve;
         self.view_model.sync_best_height = status.sync_best_height.max(status.block_count);
         self.record_network_traffic_sample(&status);
         self.record_sync_progress_sample();
@@ -6379,6 +6380,7 @@ mod tests {
             }],
             running: true,
             headers_synced: true,
+            safe_to_serve: true,
             sync_best_height: 12,
             connected: true,
             startup_error: None,
@@ -6422,6 +6424,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: true,
+            safe_to_serve: false,
             sync_best_height: 128,
             connected: true,
             startup_error: None,
@@ -6616,6 +6619,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: false,
+            safe_to_serve: false,
             sync_best_height: 20,
             connected: true,
             startup_error: None,
@@ -6644,6 +6648,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: true,
+            safe_to_serve: true,
             sync_best_height: 20,
             connected: true,
             startup_error: None,
@@ -7716,6 +7721,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: true,
+            safe_to_serve: false,
             sync_best_height: 100,
             connected: true,
             startup_error: None,
@@ -7730,6 +7736,7 @@ mod tests {
 
         app.apply_connection_status(ConnectionStatus {
             block_count: 100,
+            safe_to_serve: true,
             sync_best_height: 100,
             ..unsynced
         });
@@ -7887,6 +7894,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: false,
+            safe_to_serve: false,
             sync_best_height: 1_000,
             connected: true,
             startup_error: None,
@@ -7925,6 +7933,7 @@ mod tests {
             connecting_peers: Vec::new(),
             running: true,
             headers_synced: true,
+            safe_to_serve: true,
             sync_best_height: 12,
             connected: true,
             startup_error: None,

@@ -215,7 +215,7 @@ fn show_status(args: &[String]) -> Result<(), String> {
     println!("headers_synced={}", status.headers_synced);
     println!(
         "chain_synced={}",
-        status.running && status.headers_synced && status.block_count >= status.sync_best_height
+        status.running && status.headers_synced && status.network_diagnostics.safe_to_serve
     );
     println!("block_count={}", status.block_count);
     println!("mempool_count={}", status.mempool_count);

@@ -26,6 +26,7 @@ pub struct ViewModel {
     pub sync_best_height: u64,
     pub running: bool,
     pub headers_synced: bool,
+    pub safe_to_serve: bool,
     pub ui_state: UiState,
     pub sync_stage: String,
 }
@@ -52,6 +53,7 @@ impl Default for ViewModel {
             sync_best_height: 0,
             running: false,
             headers_synced: false,
+            safe_to_serve: false,
             ui_state: UiState::default(),
             sync_stage: String::new(),
         }
@@ -66,6 +68,7 @@ impl ViewModel {
     pub fn chain_synced(&self) -> bool {
         self.running
             && self.headers_synced
+            && self.safe_to_serve
             && self.block_count >= self.sync_target_height()
             && self.has_required_ready_peer()
     }
@@ -147,6 +150,7 @@ mod tests {
             network_label: String::from("atho-mainnet"),
             running: true,
             headers_synced: true,
+            safe_to_serve: true,
             peer_count: 1,
             block_count: 0,
             sync_best_height: 128,
@@ -157,6 +161,7 @@ mod tests {
         assert_eq!(view.sync_progress(), 0.0);
 
         view.block_count = 128;
+        view.safe_to_serve = true;
         assert!(view.chain_synced());
         assert_eq!(view.sync_progress(), 1.0);
     }
@@ -167,6 +172,7 @@ mod tests {
             network_label: String::from("atho-testnet"),
             running: true,
             headers_synced: true,
+            safe_to_serve: true,
             block_count: 8,
             sync_best_height: 8,
             ..Default::default()
@@ -188,6 +194,7 @@ mod tests {
             network_label: String::from("atho-regnet"),
             running: true,
             headers_synced: false,
+            safe_to_serve: true,
             block_count: 128,
             sync_best_height: 128,
             ..Default::default()

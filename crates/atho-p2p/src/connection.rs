@@ -35,6 +35,8 @@ pub struct PeerSessionSnapshot {
     pub direction: ConnectionDirection,
     pub handshake_ready: bool,
     pub best_height: Option<u64>,
+    pub tip_hash: Option<Hash48>,
+    pub chainwork: Option<Hash48>,
     pub protocol_version: Option<u32>,
     pub services: Option<u64>,
     pub user_agent: Option<String>,
@@ -307,6 +309,20 @@ impl ConnectionManager {
         })
     }
 
+    pub fn remote_tip_hash(&self, remote_addr: &str) -> Option<Hash48> {
+        self.sessions
+            .get(remote_addr)
+            .and_then(|session| session.handshake.remote_version())
+            .map(|version| version.tip_hash)
+    }
+
+    pub fn remote_chainwork(&self, remote_addr: &str) -> Option<Hash48> {
+        self.sessions
+            .get(remote_addr)
+            .and_then(|session| session.handshake.remote_version())
+            .map(|version| version.chainwork)
+    }
+
     pub fn note_peer_tip(&mut self, remote_addr: &str, height: u64, tip_hash: Hash48) {
         if let Some(session) = self.sessions.get_mut(remote_addr) {
             session.handshake.note_remote_tip(height, tip_hash);
@@ -417,6 +433,8 @@ impl ConnectionManager {
                     direction: session.direction,
                     handshake_ready: session.handshake.is_ready(),
                     best_height: remote_version.map(|version| version.best_height),
+                    tip_hash: remote_version.map(|version| version.tip_hash),
+                    chainwork: remote_version.map(|version| version.chainwork),
                     protocol_version: remote_version.map(|version| version.protocol_version),
                     services: remote_version.map(|version| version.services),
                     user_agent: remote_version.map(|version| version.user_agent.clone()),

@@ -612,9 +612,12 @@ fn status_value(config: &ApiConfig, service: &NodeService) -> Result<Value, ApiE
         .chain_validation_status
         .is_empty()
         || status.network_diagnostics.safe_to_serve;
+    let peers_ok = status.network_diagnostics.peer_count > 0
+        || matches!(status.network, Network::Regnet | Network::Prunetest);
     let chain_synced = status.running
         && status.headers_synced
-        && status.block_count >= status.sync_best_height
+        && status.network_diagnostics.safe_to_serve
+        && peers_ok
         && validation_safe;
     let index_tip_hash = service.explorer_index().tip_hash();
     Ok(json!({
@@ -667,9 +670,12 @@ fn health_value(service: &NodeService) -> Result<Value, ApiError> {
         .chain_validation_status
         .is_empty()
         || status.network_diagnostics.safe_to_serve;
+    let peers_ok = status.network_diagnostics.peer_count > 0
+        || matches!(status.network, Network::Regnet | Network::Prunetest);
     let chain_synced = status.running
         && status.headers_synced
-        && status.block_count >= status.sync_best_height
+        && status.network_diagnostics.safe_to_serve
+        && peers_ok
         && validation_safe;
     let health = network_health_label(&status);
     Ok(json!({
@@ -1702,7 +1708,7 @@ fn network_health_label(status: &atho_rpc::response::NodeStatus) -> &'static str
     if !status.running {
         return "Offline";
     }
-    let chain_synced = status.headers_synced && status.block_count >= status.sync_best_height;
+    let chain_synced = status.headers_synced && status.network_diagnostics.safe_to_serve;
     let peers_ok = status.network_diagnostics.peer_count > 0
         || matches!(status.network, Network::Regnet | Network::Prunetest);
     let validation_safe = status
