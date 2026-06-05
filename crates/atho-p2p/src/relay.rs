@@ -164,6 +164,10 @@ impl RelayLoop {
         self.sync.headers_synced = false;
     }
 
+    pub fn mark_headers_synced(&mut self) {
+        self.sync.headers_synced = true;
+    }
+
     pub fn accept_headers(&mut self, headers: &[BlockHeader]) -> Result<(), ProtocolError> {
         self.sync.accept_headers(self.network, headers)
     }
@@ -251,11 +255,8 @@ impl RelayLoop {
         observed_height: u64,
         observed_tip: [u8; 48],
     ) {
-        self.sync.observe_tip(
-            observed_height,
-            Some(Hash48::from(observed_tip)),
-            None,
-        );
+        self.sync
+            .observe_tip(observed_height, Some(Hash48::from(observed_tip)), None);
         if self
             .sync
             .local_tip_satisfies_target(local_best_height, local_tip, None)

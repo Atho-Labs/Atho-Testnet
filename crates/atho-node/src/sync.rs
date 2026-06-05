@@ -856,7 +856,8 @@ impl NodeSync {
                 continue;
             }
             if let (Some(height), Some(tip_hash)) = (peer.best_height, peer.tip_hash) {
-                self.relay.observe_tip_at(height, Some(tip_hash), peer.chainwork);
+                self.relay
+                    .observe_tip_at(height, Some(tip_hash), peer.chainwork);
             }
         }
     }
@@ -884,7 +885,8 @@ impl NodeSync {
                 continue;
             }
             if let (Some(height), Some(tip_hash)) = (peer.best_height, peer.tip_hash) {
-                self.relay.observe_tip_at(height, Some(tip_hash), peer.chainwork);
+                self.relay
+                    .observe_tip_at(height, Some(tip_hash), peer.chainwork);
             }
         }
         self.mark_block_state(
@@ -1034,6 +1036,46 @@ impl NodeSync {
                 live_best_height,
                 node.height(),
                 now.saturating_sub(last_network_progress)
+            ),
+        );
+        true
+    }
+
+    fn live_peer_best_height(&self) -> Option<u64> {
+        self.connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+            .filter_map(|peer| peer.best_height)
+            .max()
+    }
+
+    fn lower_stale_sync_target_to_live_tip(&mut self, node: &Node, terminal_height: u64) -> bool {
+        let current_target = self.sync_state().best_height;
+        let live_best_height = self
+            .live_peer_best_height()
+            .unwrap_or(terminal_height)
+            .max(terminal_height);
+        if live_best_height >= current_target {
+            return false;
+        }
+
+        self.relay.reset_sync_target_at(
+            node.height(),
+            Some(Hash48::from(node.tip_hash())),
+            Some(live_best_height),
+        );
+        if terminal_height >= live_best_height {
+            self.relay.mark_headers_synced();
+        }
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "lowered stale sync target after terminal headers old_target={} live_target={} local_height={} terminal_height={}",
+                current_target,
+                live_best_height,
+                node.height(),
+                terminal_height
             ),
         );
         true
@@ -1262,6 +1304,23 @@ impl NodeSync {
                 }
                 self.relay.accept_headers_from_peer(peer, &headers)?;
                 if header_count == 0 && node.height() < self.relay.sync_state().best_height {
+                    let stats = self.downloader.stats();
+                    if stats.pending_blocks == 0
+                        && stats.inflight_blocks == 0
+                        && self.pending_header_blocks.is_empty()
+                        && self.pending_compact_blocks.is_empty()
+                        && self.side_branches.is_empty()
+                    {
+                        self.connections.replace_peer_tip(
+                            peer,
+                            node.height(),
+                            Hash48::from(node.tip_hash()),
+                        );
+                        self.lower_stale_sync_target_to_live_tip(node, node.height());
+                        if node.height() >= self.relay.sync_state().best_height {
+                            return Ok(());
+                        }
+                    }
                     self.reseed_locator_from_node(node);
                     self.relay.mark_headers_unsynced();
                     let _ = dev::append_log(
@@ -1281,6 +1340,9 @@ impl NodeSync {
                     let terminal_batch =
                         header_count < network_params(self.network).limits.max_headers_per_message;
                     self.note_observed_peer_tip(peer, last_header, node, terminal_batch);
+                    if terminal_batch {
+                        self.lower_stale_sync_target_to_live_tip(node, last_header.height);
+                    }
                 }
                 let headers_synced = self.relay.sync_state().headers_synced;
                 let _ = dev::append_log(
@@ -1825,7 +1887,10 @@ impl NodeSync {
         {
             return false;
         }
-        let remote_height = self.connections.remote_best_height(remote_addr).unwrap_or(0);
+        let remote_height = self
+            .connections
+            .remote_best_height(remote_addr)
+            .unwrap_or(0);
         let target_height = self.sync_state().best_height.max(remote_height);
         let remote_tip = self.connections.remote_tip_hash(remote_addr);
         let local_satisfies_remote = remote_tip.is_none_or(|tip| {
@@ -3491,6 +3556,26 @@ mod tests {
         let block = miner.solve_block(candidate);
         node.connect_block(&block).expect("connect mined block");
         block
+    }
+
+    fn solved_testnet_header(height: u64, previous_block_hash: [u8; 48]) -> BlockHeader {
+        let mut header = BlockHeader {
+            version: 1,
+            network_id: Network::Testnet,
+            height,
+            previous_block_hash,
+            merkle_root: [1; 48],
+            witness_root: [2; 48],
+            founders_hash_sha3_384: BlockHeader::consensus_founders_hash_sha3_384(),
+            founders_hash_sha3_512: BlockHeader::consensus_founders_hash_sha3_512(),
+            timestamp: 1_700_000_000 + height,
+            difficulty_target_or_bits: pow::initial_target_for_network(Network::Testnet),
+            nonce: 0,
+        };
+        while !pow::meets_target(&header.block_hash(), &header.difficulty_target_or_bits) {
+            header.nonce = header.nonce.checked_add(1).expect("header nonce space");
+        }
+        header
     }
 
     fn signed_missing_utxo_transaction(previous_txid: [u8; 48]) -> Transaction {
@@ -5949,11 +6034,11 @@ mod tests {
     }
 
     #[test]
-    fn same_height_preferred_fork_tip_is_not_considered_synced_or_safe_to_mine() {
+    fn same_height_equal_work_fork_tip_does_not_force_resync() {
         let mut peer = SandboxPeer::new("peer", Network::Regnet);
         peer.node
-            .mine_and_connect_candidate_block(&Miner::new(1))
-            .expect("mine local block");
+            .dev_seed_chainstate(1, [0x42; 48], Vec::<UtxoEntry>::new())
+            .expect("seed local chainstate");
         peer.sync.prime(&peer.node);
         let local_height = peer.node.height();
         let preferred_remote_tip = Hash48::from([0; 48]);
@@ -5962,6 +6047,31 @@ mod tests {
         peer.sync
             .relay
             .observe_tip_at(local_height, Some(preferred_remote_tip), None);
+
+        assert!(peer.sync.chain_synced(&peer.node));
+        let diagnostics = peer.sync.fast_download_diagnostics(&peer.node);
+        assert_eq!(diagnostics.best_header_height, local_height);
+        assert_eq!(diagnostics.chain_validation_status, "synced");
+        assert!(diagnostics.safe_to_mine);
+        assert!(diagnostics.safe_to_serve);
+    }
+
+    #[test]
+    fn same_height_higher_work_fork_tip_still_requires_sync() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(1, [0x42; 48], Vec::<UtxoEntry>::new())
+            .expect("seed local chainstate");
+        peer.sync.prime(&peer.node);
+        let local_height = peer.node.height();
+        let preferred_remote_tip = Hash48::from([0; 48]);
+        assert_ne!(Hash48::from(peer.node.tip_hash()), preferred_remote_tip);
+
+        peer.sync.relay.observe_tip_at(
+            local_height,
+            Some(preferred_remote_tip),
+            Some(Hash48::from([0xff; 48])),
+        );
 
         assert!(!peer.sync.chain_synced(&peer.node));
         let diagnostics = peer.sync.fast_download_diagnostics(&peer.node);
@@ -6182,6 +6292,93 @@ mod tests {
                 },
             } if peer == &remote.id
         )));
+    }
+
+    #[test]
+    fn terminal_headers_lower_stale_target_without_waiting_for_watchdog() {
+        let mut local = SandboxPeer::new("local", Network::Testnet);
+        let mut remote = SandboxPeer::new("remote", Network::Testnet);
+        let remote_header = solved_testnet_header(1, local.node.tip_hash());
+        remote.sync.prime(&remote.node);
+        let _ = connect_handshake_only(&mut local, &mut remote);
+
+        local.sync.relay.reset_sync_target_at(
+            local.node.height(),
+            Some(Hash48::from(local.node.tip_hash())),
+            Some(10),
+        );
+        local.sync.relay.mark_headers_unsynced();
+
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .handle_message(
+                &remote.id,
+                NetworkMessage::new(
+                    Network::Testnet,
+                    MessagePayload::Headers {
+                        headers: vec![remote_header],
+                    },
+                ),
+                &mut local.node,
+                &mut outbound,
+            )
+            .expect("terminal headers response");
+
+        assert_eq!(local.sync.sync_state().best_height, 1);
+        assert!(local.sync.sync_state().headers_synced);
+        assert_eq!(
+            local.sync.connections().remote_best_height(&remote.id),
+            Some(1)
+        );
+        assert_eq!(outbound_getdata_hashes(&outbound).len(), 1);
+    }
+
+    #[test]
+    fn empty_headers_while_idle_lowers_stale_target_instead_of_looping() {
+        let mut local = SandboxPeer::new("local", Network::Regnet);
+        let mut remote = SandboxPeer::new("remote", Network::Regnet);
+        local.sync.prime(&local.node);
+        remote.sync.prime(&remote.node);
+        let _ = connect_handshake_only(&mut local, &mut remote);
+
+        local.sync.relay.reset_sync_target_at(
+            local.node.height(),
+            Some(Hash48::from(local.node.tip_hash())),
+            Some(10),
+        );
+        local.sync.relay.mark_headers_unsynced();
+
+        let mut outbound = Vec::new();
+        local
+            .sync
+            .handle_message(
+                &remote.id,
+                NetworkMessage::new(
+                    Network::Regnet,
+                    MessagePayload::Headers {
+                        headers: Vec::new(),
+                    },
+                ),
+                &mut local.node,
+                &mut outbound,
+            )
+            .expect("empty headers response");
+
+        assert_eq!(local.sync.sync_state().best_height, local.node.height());
+        assert!(local.sync.sync_state().headers_synced);
+        assert!(outbound.iter().all(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::Send {
+                    message: NetworkMessage {
+                        payload: MessagePayload::GetHeaders(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]

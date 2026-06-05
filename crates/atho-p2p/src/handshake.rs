@@ -84,6 +84,7 @@ impl HandshakeState {
             if height >= version.best_height {
                 version.best_height = height;
                 version.tip_hash = tip_hash;
+                version.chainwork = Hash48::ZERO;
             }
         }
     }
@@ -94,6 +95,7 @@ impl HandshakeState {
         if let Some(version) = self.remote_version.as_mut() {
             version.best_height = height;
             version.tip_hash = tip_hash;
+            version.chainwork = Hash48::ZERO;
         }
     }
 
@@ -218,6 +220,42 @@ mod tests {
         assert!(ready
             .iter()
             .any(|action| matches!(action, HandshakeAction::Ready { best_height: 11 })));
+    }
+
+    #[test]
+    fn observed_tip_changes_clear_stale_version_chainwork() {
+        let local = version_message(Network::Mainnet, 10);
+        let mut remote = version_message(Network::Mainnet, 11);
+        if let MessagePayload::Version(version) = &mut remote.payload {
+            version.chainwork = Hash48::from([0x80; 48]);
+        }
+        let (mut outbound, init) =
+            HandshakeState::outbound(Network::Mainnet, local.clone()).expect("outbound");
+        let _ = outbound.receive(&remote, &local).expect("version");
+        let _ = outbound
+            .receive(
+                &NetworkMessage::new(Network::Mainnet, MessagePayload::Verack),
+                &local,
+            )
+            .expect("verack");
+        assert_ne!(
+            outbound.remote_version().expect("remote version").chainwork,
+            Hash48::ZERO
+        );
+
+        outbound.note_remote_tip(12, Hash48::from([0x12; 48]));
+        assert_eq!(
+            outbound.remote_version().expect("remote version").chainwork,
+            Hash48::ZERO
+        );
+
+        outbound.replace_remote_tip(10, Hash48::from([0x10; 48]));
+        assert_eq!(
+            outbound.remote_version().expect("remote version").chainwork,
+            Hash48::ZERO
+        );
+
+        assert_eq!(init.len(), 1);
     }
 
     trait IntoSendMessage {

@@ -351,17 +351,7 @@ fn compare_tip_candidates(candidate: &ChainTipCandidate, current: &ChainTipCandi
         _ => {}
     }
 
-    candidate
-        .height
-        .cmp(&current.height)
-        .then_with(|| match (candidate.tip, current.tip) {
-            (Some(candidate_tip), Some(current_tip)) if candidate_tip != current_tip => {
-                current_tip.cmp(&candidate_tip)
-            }
-            (Some(_), None) => Ordering::Greater,
-            (None, Some(_)) => Ordering::Less,
-            _ => Ordering::Equal,
-        })
+    candidate.height.cmp(&current.height)
 }
 
 fn chainwork_hash(blocks: &[Block]) -> Hash48 {
@@ -575,6 +565,27 @@ mod tests {
             state.accept_headers(Network::Mainnet, &[header]),
             Err(ProtocolError::InvalidHeadersSequence)
         );
+    }
+
+    #[test]
+    fn same_height_equal_work_tip_does_not_force_resync() {
+        let mut state = SyncState {
+            best_height: 12,
+            best_tip: Some(Hash48::from([0x80; 48])),
+            best_chainwork: Some(Hash48::from([0x10; 48])),
+            headers_synced: true,
+            ..Default::default()
+        };
+
+        assert!(!state.observe_tip(12, Some(Hash48::from([0x70; 48])), None));
+        assert_eq!(state.best_height, 12);
+        assert_eq!(state.best_tip, Some(Hash48::from([0x80; 48])));
+        assert!(state.headers_synced);
+        assert!(state.local_tip_satisfies_target(
+            12,
+            Some(Hash48::from([0x42; 48])),
+            Some(Hash48::from([0x10; 48])),
+        ));
     }
 
     #[test]

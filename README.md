@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.1`
+- Release line: `v0.3.2`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,23 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.2 Patch Notes
+
+This patch fixes the sync loop seen after `v0.3.1`, where a node could download to a live peer's terminal height and then keep re-requesting headers forever instead of accepting that the stale advertised target was unreachable.
+
+### Sync Loop Fix
+
+- Cleared stale peer chainwork whenever a peer's remembered tip changes after the version handshake. This prevents old version-handshake work from poisoning later terminal-header sync decisions.
+- Stopped treating a different same-height tip hash as a required sync target unless the peer proves higher cumulative work.
+- Kept same-height higher-work peers as a real sync target, so heavier forks still force catch-up.
+- Lowered stale sync targets immediately when terminal headers or idle empty-header responses prove the live peer set is shorter than an old advertised target.
+
+### Regression Coverage
+
+- Added coverage for stale terminal headers lowering the target without waiting for the watchdog.
+- Added coverage for idle empty-header responses not looping forever.
+- Added coverage for equal-height/equal-work fork tips staying usable while same-height/higher-work peers still force sync.
 
 ## v0.3.1 Patch Notes
 
