@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.2`
+- Release line: `v0.3.3`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,21 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.3 Patch Notes
+
+This patch is a follow-up hardening pass for the `v0.3.2` sync-loop fix. It keeps corrected sync targets fast by dropping stale queued download work above the newly proven live tip.
+
+### Stale Work Pruning
+
+- Added downloader support for forgetting pending, in-flight, completed, and hinted block work in one cleanup path.
+- When terminal headers lower a stale sync target, the node now prunes header queues, compact-block work, validation state, and body-download work above the corrected live height.
+- This prevents old unreachable target work from wasting requests or keeping the sync engine looking busy after the node has already learned the peer's real terminal height.
+
+### Regression Coverage
+
+- Added downloader coverage for removing pending, in-flight, completed, and hinted hashes.
+- Extended terminal-header sync coverage to prove stale above-target in-flight work is cleared when the live target is corrected.
 
 ## v0.3.2 Patch Notes
 

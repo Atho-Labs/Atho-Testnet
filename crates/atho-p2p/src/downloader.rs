@@ -158,6 +158,19 @@ impl BlockDownloadScheduler {
         self.completed.contains(&Hash48::from(hash))
     }
 
+    pub fn forget_blocks<I>(&mut self, hashes: I) -> usize
+    where
+        I: IntoIterator<Item = [u8; 48]>,
+    {
+        let mut removed = 0usize;
+        for hash in hashes.into_iter().map(Hash48::from) {
+            if self.forget_hash(hash) {
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
     pub fn forget_completed(&mut self, hash: [u8; 48]) -> bool {
         self.completed.remove(&Hash48::from(hash))
     }
@@ -211,6 +224,27 @@ impl BlockDownloadScheduler {
             }
         }
         self.inflight_started.remove(&hash);
+    }
+
+    fn forget_hash(&mut self, hash: Hash48) -> bool {
+        let mut removed = self.completed.remove(&hash);
+        let pending_len = self.pending.len();
+        self.pending.retain(|candidate| *candidate != hash);
+        removed |= self.pending.len() != pending_len;
+        if self.inflight_owner.remove(&hash).is_some() {
+            removed = true;
+        }
+        if self.inflight_started.remove(&hash).is_some() {
+            removed = true;
+        }
+        for inflight in self.inflight_by_peer.values_mut() {
+            let before = inflight.len();
+            inflight.retain(|candidate| *candidate != hash);
+            removed |= inflight.len() != before;
+        }
+        removed |= self.peer_hints.remove(&hash).is_some();
+        removed |= self.failed_peers.remove(&hash).is_some();
+        removed
     }
 
     pub fn is_inflight(&self, hash: [u8; 48]) -> bool {
@@ -812,6 +846,28 @@ mod tests {
         assert_eq!(scheduler.stats().inflight_blocks, 1);
         assert!(scheduler.is_inflight([2; 48]));
         assert!(scheduler.assignments(3, 3).is_empty());
+    }
+
+    #[test]
+    fn forget_blocks_removes_pending_inflight_completed_and_hints() {
+        let mut scheduler = BlockDownloadScheduler::default();
+        scheduler.note_peer_ready("left");
+        scheduler.note_peer_ready("right");
+        scheduler.note_headers("left", [[1; 48], [2; 48]]);
+        scheduler.note_headers("right", [[4; 48]]);
+        let assigned = scheduler.assignments(1, 1);
+        assert_eq!(assigned.len(), 1);
+        scheduler.note_block_received([3; 48]);
+
+        assert_eq!(scheduler.forget_blocks([[1; 48], [2; 48], [3; 48]]), 3);
+
+        let stats = scheduler.stats();
+        assert_eq!(stats.pending_blocks, 1);
+        assert_eq!(stats.inflight_blocks, 0);
+        assert_eq!(stats.completed_blocks, 0);
+        let remaining = scheduler.assignments(1, 1);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].inventory[0].hash.into_inner(), [4; 48]);
     }
 
     #[test]

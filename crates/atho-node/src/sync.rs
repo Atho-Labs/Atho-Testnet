@@ -1065,20 +1065,69 @@ impl NodeSync {
             Some(Hash48::from(node.tip_hash())),
             Some(live_best_height),
         );
+        let pruned_work = self.prune_download_work_above_height(live_best_height);
         if terminal_height >= live_best_height {
             self.relay.mark_headers_synced();
         }
         let _ = dev::append_log(
             "p2p",
             &format!(
-                "lowered stale sync target after terminal headers old_target={} live_target={} local_height={} terminal_height={}",
+                "lowered stale sync target after terminal headers old_target={} live_target={} local_height={} terminal_height={} pruned_work={}",
                 current_target,
                 live_best_height,
                 node.height(),
-                terminal_height
+                terminal_height,
+                pruned_work
             ),
         );
         true
+    }
+
+    fn prune_download_work_above_height(&mut self, max_height: u64) -> usize {
+        let mut hashes = BTreeSet::new();
+        let stale_header_heights = self
+            .pending_header_blocks
+            .range(max_height.saturating_add(1)..)
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>();
+        let mut pruned = 0usize;
+        for height in stale_header_heights {
+            if let Some(blocks_at_height) = self.pending_header_blocks.remove(&height) {
+                for hash in blocks_at_height.keys().copied() {
+                    hashes.insert(hash);
+                }
+                pruned = pruned.saturating_add(blocks_at_height.len());
+            }
+        }
+
+        for (hash, height) in self.block_validation_heights.clone() {
+            if height <= max_height {
+                continue;
+            }
+            if self
+                .block_validation_states
+                .get(&hash)
+                .is_some_and(|state| {
+                    matches!(
+                        state,
+                        BlockValidationState::Connected | BlockValidationState::Finalized
+                    )
+                })
+            {
+                continue;
+            }
+            hashes.insert(hash);
+        }
+
+        let hashes = hashes.into_iter().collect::<Vec<_>>();
+        for hash in &hashes {
+            self.pending_compact_blocks.remove(hash);
+            self.side_branches.remove(hash);
+            self.block_validation_states.remove(hash);
+            self.block_validation_heights.remove(hash);
+        }
+        pruned = pruned.saturating_add(self.downloader.forget_blocks(hashes));
+        pruned
     }
 
     fn maybe_trigger_stale_recovery(
@@ -6308,6 +6357,18 @@ mod tests {
             Some(10),
         );
         local.sync.relay.mark_headers_unsynced();
+        let stale_hash = [9; 48];
+        local
+            .sync
+            .note_pending_header_block(&remote.id, 9, stale_hash);
+        local.sync.downloader.note_headers(&remote.id, [stale_hash]);
+        let stale_assignment = local
+            .sync
+            .downloader
+            .assignment_for_peer(&remote.id, 1, 1)
+            .expect("stale assignment");
+        assert_eq!(stale_assignment.inventory[0].hash.into_inner(), stale_hash);
+        assert!(local.sync.downloader.is_inflight(stale_hash));
 
         let mut outbound = Vec::new();
         local
@@ -6331,6 +6392,12 @@ mod tests {
             local.sync.connections().remote_best_height(&remote.id),
             Some(1)
         );
+        assert!(!local.sync.downloader.is_inflight(stale_hash));
+        assert!(!local
+            .sync
+            .block_validation_heights
+            .contains_key(&stale_hash));
+        assert!(!local.sync.pending_header_blocks.contains_key(&9));
         assert_eq!(outbound_getdata_hashes(&outbound).len(), 1);
     }
 
