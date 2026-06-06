@@ -15,6 +15,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
     let rows = app.wallet_activity_rows().to_vec();
     let stacked = widgets::finite_available_width(ui, 760.0) < 760.0;
     let chain_synced = app.view_model.chain_synced();
+    let wallet_loaded = app.wallet_ref().is_some();
 
     if stacked {
         render_balances_panel(app, ui, &summary);
@@ -23,6 +24,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
             ui,
             app.ui_state.connected,
             chain_synced,
+            wallet_loaded,
             app.display_unit(),
             &rows,
         );
@@ -33,6 +35,7 @@ pub(crate) fn render(app: &mut DesktopApp, ui: &mut egui::Ui) {
                 &mut columns[1],
                 app.ui_state.connected,
                 chain_synced,
+                wallet_loaded,
                 app.display_unit(),
                 &rows,
             );
@@ -64,24 +67,39 @@ fn render_balances_panel(
             .show(ui, |ui| {
                 widgets::row_label(ui, "Available:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &app.format_amount(summary.available_atoms));
+                    if app.wallet_ref().is_some() {
+                        widgets::row_value(ui, &app.format_amount(summary.available_atoms));
+                    } else {
+                        widgets::row_value(ui, "Open wallet");
+                    }
                 });
                 ui.end_row();
 
                 widgets::row_label(ui, "Pending:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &app.format_amount(summary.pending_atoms));
+                    if app.wallet_ref().is_some() {
+                        widgets::row_value(ui, &app.format_amount(summary.pending_atoms));
+                    } else {
+                        widgets::row_value(ui, "Open wallet");
+                    }
                 });
                 ui.end_row();
 
                 widgets::row_label(ui, "Total:");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    widgets::row_value(ui, &app.format_amount(summary.total_atoms));
+                    if app.wallet_ref().is_some() {
+                        widgets::row_value(ui, &app.format_amount(summary.total_atoms));
+                    } else {
+                        widgets::row_value(ui, "Open wallet");
+                    }
                 });
                 ui.end_row();
             });
 
-        if !app.ui_state.connected {
+        if app.wallet_ref().is_none() {
+            ui.add_space(12.0);
+            widgets::muted_label(ui, "Open or unlock a wallet to display balances.");
+        } else if !app.ui_state.connected {
             ui.add_space(12.0);
             widgets::muted_label(
                 ui,
@@ -206,6 +224,7 @@ fn render_recent_transactions(
     ui: &mut egui::Ui,
     connected: bool,
     chain_synced: bool,
+    wallet_loaded: bool,
     display_unit: DisplayUnit,
     rows: &[crate::app::WalletActivityRow],
 ) {
@@ -234,7 +253,9 @@ fn render_recent_transactions(
         ui.add_space(8.0);
 
         if rows.is_empty() {
-            if !connected {
+            if !wallet_loaded {
+                widgets::muted_label(ui, "Open or unlock a wallet to display recent activity.");
+            } else if !connected {
                 widgets::muted_label(ui, "Wallet history is unavailable while the node is disconnected.");
                 widgets::muted_label(ui, "Reconnect to Atho Core to refresh recent activity.");
             } else if !chain_synced {

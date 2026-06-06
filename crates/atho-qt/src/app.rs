@@ -538,6 +538,7 @@ impl DesktopApp {
 
     fn apply_connection_status(&mut self, status: ConnectionStatus) {
         let previously_synced = self.view_model.chain_synced();
+        let runtime_was_ready = self.ui_state.connected && self.view_model.running;
         let previous_block_count = self.view_model.block_count;
         let previous_mempool_count = self.view_model.mempool_count;
         let previous_tip_hash = self.view_model.tip_hash;
@@ -622,6 +623,9 @@ impl DesktopApp {
             self.ui_state.wallet_snapshot = wallet.snapshot.clone();
         }
         self.ui_state.set_connected(status.connected);
+        if self.wallet.is_some() && status.connected && status.running && !runtime_was_ready {
+            self.ensure_loaded_wallet_mining_reward_address("node connected");
+        }
     }
 
     fn wallet_mut(&mut self) -> Option<&mut Wallet> {
@@ -1116,12 +1120,14 @@ impl DesktopApp {
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} balance_atoms={} height={}",
+                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} available_atoms={} pending_atoms={} total_atoms={} height={}",
                 self.wallet_discovery_scan_limit,
                 self.wallet_addresses_cache.len(),
                 self.wallet_owned_utxos_cache.len(),
                 self.wallet_utxos_cache.len(),
-                self.wallet_balance_cache,
+                self.wallet_balance_summary_cache.available_atoms,
+                self.wallet_balance_summary_cache.pending_atoms,
+                self.wallet_balance_summary_cache.total_atoms,
                 current_height
             ),
         );
@@ -1612,12 +1618,14 @@ impl DesktopApp {
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} balance_atoms={} mempool_changed_during_scan={}",
+                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} available_atoms={} pending_atoms={} total_atoms={} mempool_changed_during_scan={}",
                 outcome.scan_limit,
                 self.wallet_addresses_cache.len(),
                 self.wallet_owned_utxos_cache.len(),
                 self.wallet_utxos_cache.len(),
-                self.wallet_balance_cache,
+                self.wallet_balance_summary_cache.available_atoms,
+                self.wallet_balance_summary_cache.pending_atoms,
+                self.wallet_balance_summary_cache.total_atoms,
                 outcome.mempool_changed_during_scan
             ),
         );
@@ -2064,6 +2072,7 @@ impl DesktopApp {
                 );
             }
         }
+        self.ensure_loaded_wallet_mining_reward_address("wallet loaded");
         if self.wallet_scan_rpc_ready() {
             self.start_wallet_scan_job();
         }
@@ -2474,6 +2483,7 @@ impl DesktopApp {
     }
 
     fn mining_reward_target(&mut self) -> Result<MiningRewardTarget, String> {
+        self.ensure_loaded_wallet_mining_reward_address("mining reward target requested");
         if !self.ui_state.rotate_coinbase_address {
             let configured = self
                 .node_settings_form
@@ -2538,6 +2548,59 @@ impl DesktopApp {
                 .into_iter()
                 .any(|record| wallet.address_for_path(record.path).payment_digest == payment_digest)
         })
+    }
+
+    fn ensure_loaded_wallet_mining_reward_address(&mut self, reason: &str) {
+        let Some(address) = self.wallet_mining_reward_address() else {
+            return;
+        };
+        let configured = self
+            .node_settings_form
+            .mining_reward_address
+            .trim()
+            .to_string();
+        let configured_target = if configured.is_empty() {
+            None
+        } else {
+            self.validate_mining_reward_address(&configured).ok()
+        };
+        let configured_belongs_to_wallet = configured_target
+            .as_ref()
+            .is_some_and(|target| self.mining_reward_target_belongs_to_loaded_wallet(target));
+        if configured_belongs_to_wallet {
+            return;
+        }
+
+        let old_address = if configured.is_empty() {
+            String::from("<empty>")
+        } else {
+            configured
+        };
+        let _ = atho_node::dev::append_log(
+            "atho-qt",
+            &format!(
+                "replacing stale configured mining reward address reason={} old={} new={}",
+                reason, old_address, address.address
+            ),
+        );
+        if let Err(err) = self.persist_mining_reward_address_config(&address.address) {
+            self.last_error = Some(format!(
+                "Wallet loaded, but miner reward address save failed: {err}"
+            ));
+            let _ = atho_node::dev::append_log(
+                "atho-qt",
+                &format!("persist mining reward address config failed error={err}"),
+            );
+            return;
+        }
+        if self.ui_state.connected && self.view_model.running {
+            if let Err(err) = self.update_runtime_mining_reward_address(&address.address) {
+                let _ = atho_node::dev::append_log(
+                    "atho-qt",
+                    &format!("runtime mining reward address update deferred error={err}"),
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -7141,6 +7204,7 @@ mod tests {
     fn attach_wallet_generates_and_persists_initial_receive_address() {
         let root = temp_sandbox_root("attach-wallet-persist");
         fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -7375,6 +7439,9 @@ mod tests {
 
     #[test]
     fn apply_wallet_recovery_window_updates_scan_target_and_wallet_setting() {
+        let root = temp_sandbox_root("wallet-recovery-window");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
@@ -7636,6 +7703,9 @@ mod tests {
 
     #[test]
     fn mining_reward_script_falls_back_to_last_receive_address() {
+        let root = temp_sandbox_root("mining-reward-script-fallback");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Mainnet);
         let mut wallet = Wallet::from_mnemonic(
@@ -7663,6 +7733,9 @@ mod tests {
 
     #[test]
     fn mining_reward_target_replaces_stale_configured_address_with_loaded_wallet() {
+        let root = temp_sandbox_root("mining-reward-target-stale");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
         let mut stale_wallet = test_wallet(0x31);
@@ -7687,6 +7760,39 @@ mod tests {
     }
 
     #[test]
+    fn attach_wallet_persists_loaded_wallet_as_mining_reward_address() {
+        let root = temp_sandbox_root("attach-wallet-mining-reward");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut stale_wallet = test_wallet(0x34);
+        let stale_address = stale_wallet.checkout_receive_address();
+        app.node_settings_form.mining_reward_address = stale_address.address;
+
+        let wallet = test_wallet(0x35);
+        app.attach_wallet(
+            wallet,
+            root.join("wallet.dat").to_string_lossy().into_owned(),
+        );
+
+        let current = app
+            .current_receive_address
+            .as_ref()
+            .expect("current receive address");
+        let persisted =
+            fs::read_to_string(atho_node::config::NodeConfig::config_file_path()).expect("config");
+        assert_eq!(
+            app.node_settings_form.mining_reward_address,
+            current.address
+        );
+        assert!(
+            persisted.contains(&format!("miningrewardaddress={}", current.address)),
+            "unexpected config contents:\n{persisted}"
+        );
+    }
+
+    #[test]
     fn mining_reward_target_keeps_configured_address_when_no_wallet_is_loaded() {
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
@@ -7707,6 +7813,9 @@ mod tests {
 
     #[test]
     fn mining_is_blocked_until_chain_sync_completes() {
+        let root = temp_sandbox_root("mining-blocked-chain-sync");
+        fs::create_dir_all(&root).expect("root");
+        let _data = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
         let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
         let mut app = DesktopApp::new(Network::Regnet);
         let wallet = Wallet::from_mnemonic(
