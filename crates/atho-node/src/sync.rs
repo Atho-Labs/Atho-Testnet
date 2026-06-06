@@ -37,6 +37,8 @@ const MAX_ORPHAN_PARENT_REQUESTS_PER_PASS: usize = 16;
 const BRIDGE_PARENT_STAGE_LOOKAHEAD: u64 = 128;
 const POST_HANDSHAKE_PROTOCOL_ERROR_SCORE: u32 = 50;
 const ADDR_SPAM_MISBEHAVIOR_SCORE: u32 = 10;
+const PEER_UNSERVED_ADVERTISED_HEIGHT_SCORE: u32 = 25;
+const PEER_UNSERVED_ADVERTISED_HEIGHT_REASON: &str = "terminal_headers_below_advertised";
 const ADDR_DISCOVERY_INTERVAL_SECS: u64 = 5 * 60;
 const ADDR_RELAY_INTERVAL_SECS: u64 = 5 * 60;
 
@@ -116,6 +118,16 @@ pub struct FastDownloadDiagnostics {
     pub max_pending_validation_blocks: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PeerSyncInconsistencySummary {
+    pub best_advertised_peer_height: u64,
+    pub best_serviceable_peer_height: u64,
+    pub unresolved_advertised_height: bool,
+    pub inconsistent_peer_count: usize,
+    pub healthy_sync_peer_count: usize,
+    pub sync_warning: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum NodeSyncError {
     #[error(transparent)]
@@ -153,6 +165,7 @@ pub struct NodeSync {
     last_sync_metrics_log_unix: u64,
     last_stale_recovery_unix: u64,
     stale_recovery_count: u64,
+    peer_sync_observations: BTreeMap<String, PeerSyncObservation>,
     last_urgent_bridge_parent_request_unix: BTreeMap<[u8; 48], u64>,
     block_validation_states: BTreeMap<[u8; 48], BlockValidationState>,
     block_validation_heights: BTreeMap<[u8; 48], u64>,
@@ -179,6 +192,23 @@ struct SideBranchBlock {
     peers: BTreeSet<String>,
     first_seen_order: u64,
     last_seen_order: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerSyncObservation {
+    advertised_best_height: Option<u64>,
+    served_terminal_height: Option<u64>,
+    inconsistency_count: u32,
+    last_inconsistency_reason: Option<String>,
+}
+
+impl PeerSyncObservation {
+    fn has_unserved_advertised_height(&self) -> bool {
+        matches!(
+            (self.advertised_best_height, self.served_terminal_height),
+            (Some(advertised), Some(served)) if advertised > served
+        ) && self.last_inconsistency_reason.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -358,6 +388,7 @@ impl NodeSync {
             last_sync_metrics_log_unix: 0,
             last_stale_recovery_unix: 0,
             stale_recovery_count: 0,
+            peer_sync_observations: BTreeMap::new(),
             last_urgent_bridge_parent_request_unix: BTreeMap::new(),
             block_validation_states: BTreeMap::new(),
             block_validation_heights: BTreeMap::new(),
@@ -401,6 +432,50 @@ impl NodeSync {
         self.connections.banned_count()
     }
 
+    pub fn peer_sync_inconsistency_summary(&self) -> PeerSyncInconsistencySummary {
+        let mut summary = PeerSyncInconsistencySummary::default();
+        let mut best_healthy_height = 0u64;
+        for peer in self
+            .connections
+            .peer_snapshots()
+            .into_iter()
+            .filter(|peer| peer.handshake_ready)
+        {
+            let observation = self.peer_sync_observations.get(&peer.remote_addr);
+            let advertised_height = observation
+                .and_then(|observation| observation.advertised_best_height)
+                .or(peer.best_height)
+                .unwrap_or(0);
+            let served_terminal_height =
+                observation.and_then(|observation| observation.served_terminal_height);
+
+            summary.best_advertised_peer_height =
+                summary.best_advertised_peer_height.max(advertised_height);
+            if let Some(served_terminal_height) = served_terminal_height {
+                summary.best_serviceable_peer_height = summary
+                    .best_serviceable_peer_height
+                    .max(served_terminal_height);
+            }
+
+            if observation.is_some_and(PeerSyncObservation::has_unserved_advertised_height) {
+                summary.inconsistent_peer_count = summary.inconsistent_peer_count.saturating_add(1);
+            } else {
+                summary.healthy_sync_peer_count = summary.healthy_sync_peer_count.saturating_add(1);
+                best_healthy_height = best_healthy_height.max(advertised_height);
+            }
+        }
+
+        summary.best_serviceable_peer_height = summary
+            .best_serviceable_peer_height
+            .max(best_healthy_height);
+        summary.unresolved_advertised_height = summary.inconsistent_peer_count > 0
+            && summary.best_advertised_peer_height > summary.best_serviceable_peer_height;
+        if summary.unresolved_advertised_height {
+            summary.sync_warning = Some(String::from("peer_advertised_unserved_height"));
+        }
+        summary
+    }
+
     pub fn fast_download_diagnostics(&self, node: &Node) -> FastDownloadDiagnostics {
         let limits = network_params(self.network).limits;
         let finalized_checkpoint = node.finalized_checkpoint().ok().flatten();
@@ -433,13 +508,16 @@ impl NodeSync {
             && limits.enable_checkpoint_anchored_sync
             && limits.enable_background_validation;
         let background_validation_enabled = limits.enable_background_validation;
+        let unresolved_advertised_height = self.has_unresolved_advertised_height(node);
         let safe_to_serve = self.chain_synced(node) && pending_validation_blocks == 0;
         let safe_to_mine = if limits.require_full_validation_before_mining {
             safe_to_serve
         } else {
             self.chain_synced(node)
         };
-        let chain_validation_status = if !self.sync_state().headers_synced {
+        let chain_validation_status = if unresolved_advertised_height {
+            String::from("peer_advertised_unserved_height")
+        } else if !self.sync_state().headers_synced {
             String::from("headers_syncing")
         } else if pending_validation_blocks > 0 && validation_lag_blocks > 0 {
             String::from("body_download_ahead")
@@ -817,6 +895,7 @@ impl NodeSync {
                     if let Some(version) = self.connections.remote_version(&peer).cloned() {
                         self.relay.accept_version(peer.clone(), &version)?;
                     }
+                    self.note_peer_advertised_height(&peer, best_height);
                     self.downloader.note_peer_ready(peer.clone());
                     self.record_peer_observation(node, &peer, best_height)?;
                     let _ = dev::append_log(
@@ -1052,6 +1131,22 @@ impl NodeSync {
 
     fn lower_stale_sync_target_to_live_tip(&mut self, node: &Node, terminal_height: u64) -> bool {
         let current_target = self.sync_state().best_height;
+        let peer_sync_summary = self.peer_sync_inconsistency_summary();
+        if peer_sync_summary.unresolved_advertised_height
+            && peer_sync_summary.best_advertised_peer_height > terminal_height
+        {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "refusing to lower sync target due to unresolved advertised height current_target={} best_advertised={} best_serviceable={} inconsistent_peers={}",
+                    current_target,
+                    peer_sync_summary.best_advertised_peer_height,
+                    peer_sync_summary.best_serviceable_peer_height,
+                    peer_sync_summary.inconsistent_peer_count
+                ),
+            );
+            return false;
+        }
         let live_best_height = self
             .live_peer_best_height()
             .unwrap_or(terminal_height)
@@ -1358,6 +1453,12 @@ impl NodeSync {
                     return Ok(());
                 }
                 if header_count == 0 && node.height() < self.relay.sync_state().best_height {
+                    if self.mark_peer_terminal_below_advertised(peer, node.height()) {
+                        self.relay.mark_headers_unsynced();
+                        self.reseed_locator_from_node(node);
+                        self.push_address_discovery_events(peer, node, outbound);
+                        return Ok(());
+                    }
                     if self.header_sync_work_idle() {
                         self.connections.replace_peer_tip(
                             peer,
@@ -1387,8 +1488,15 @@ impl NodeSync {
                 if let Some(last_header) = headers.last() {
                     let terminal_batch =
                         header_count < network_params(self.network).limits.max_headers_per_message;
-                    self.note_observed_peer_tip(peer, last_header, node, terminal_batch);
-                    if terminal_batch {
+                    let terminal_below_advertised = terminal_batch
+                        && self.mark_peer_terminal_below_advertised(peer, last_header.height);
+                    if terminal_below_advertised {
+                        self.relay.mark_headers_unsynced();
+                    } else {
+                        self.note_peer_served_terminal_height(peer, last_header.height);
+                        self.note_observed_peer_tip(peer, last_header, node, terminal_batch);
+                    }
+                    if terminal_batch && !terminal_below_advertised {
                         self.lower_stale_sync_target_to_live_tip(node, last_header.height);
                     }
                 }
@@ -1423,7 +1531,19 @@ impl NodeSync {
                     self.handle_received_block(peer, block, node, outbound)?;
                 }
                 if !self.relay.sync_state().headers_synced {
-                    self.queue_getheaders(peer, outbound);
+                    if self.peer_has_unserved_advertised_height(peer) {
+                        let _ = dev::append_log(
+                            "p2p",
+                            &format!(
+                                "not re-requesting headers from inconsistent peer={} local_height={} target_height={}",
+                                peer,
+                                node.height(),
+                                self.relay.sync_state().best_height
+                            ),
+                        );
+                    } else {
+                        self.queue_getheaders(peer, outbound);
+                    }
                 } else {
                     self.record_getaddr_sent(peer, now_unix());
                     outbound.push(ConnectionEvent::Send {
@@ -1706,6 +1826,100 @@ impl NodeSync {
         }
     }
 
+    fn note_peer_advertised_height(&mut self, peer: &str, advertised_height: u64) {
+        let observation = self
+            .peer_sync_observations
+            .entry(peer.to_string())
+            .or_default();
+        observation.advertised_best_height = Some(advertised_height);
+        if observation
+            .served_terminal_height
+            .is_some_and(|served| served >= advertised_height)
+        {
+            observation.last_inconsistency_reason = None;
+        }
+    }
+
+    fn note_peer_served_terminal_height(&mut self, peer: &str, served_terminal_height: u64) {
+        let observation = self
+            .peer_sync_observations
+            .entry(peer.to_string())
+            .or_default();
+        observation.served_terminal_height = Some(served_terminal_height);
+        if observation
+            .advertised_best_height
+            .is_none_or(|advertised| served_terminal_height >= advertised)
+        {
+            observation.last_inconsistency_reason = None;
+        }
+    }
+
+    fn peer_advertised_height(&self, peer: &str) -> Option<u64> {
+        self.peer_sync_observations
+            .get(peer)
+            .and_then(|observation| observation.advertised_best_height)
+            .or_else(|| self.connections.remote_best_height(peer))
+    }
+
+    fn peer_has_unserved_advertised_height(&self, peer: &str) -> bool {
+        self.peer_sync_observations
+            .get(peer)
+            .is_some_and(PeerSyncObservation::has_unserved_advertised_height)
+    }
+
+    fn has_unresolved_advertised_height(&self, node: &Node) -> bool {
+        let summary = self.peer_sync_inconsistency_summary();
+        summary.unresolved_advertised_height && summary.best_advertised_peer_height > node.height()
+    }
+
+    fn mark_peer_terminal_below_advertised(
+        &mut self,
+        peer: &str,
+        served_terminal_height: u64,
+    ) -> bool {
+        let advertised_height = self
+            .peer_advertised_height(peer)
+            .unwrap_or(served_terminal_height);
+        if advertised_height <= served_terminal_height {
+            self.note_peer_served_terminal_height(peer, served_terminal_height);
+            return false;
+        }
+
+        let was_already_unresolved = self.peer_has_unserved_advertised_height(peer);
+        {
+            let observation = self
+                .peer_sync_observations
+                .entry(peer.to_string())
+                .or_default();
+            observation.advertised_best_height = Some(advertised_height);
+            observation.served_terminal_height = Some(served_terminal_height);
+            observation.inconsistency_count = observation.inconsistency_count.saturating_add(1);
+            observation.last_inconsistency_reason =
+                Some(String::from(PEER_UNSERVED_ADVERTISED_HEIGHT_REASON));
+        }
+
+        let banned = if was_already_unresolved {
+            self.connections.ban_score(peer)
+                >= network_params(self.network).limits.ban_score_threshold
+        } else {
+            self.connections
+                .record_misbehavior(peer.to_string(), PEER_UNSERVED_ADVERTISED_HEIGHT_SCORE)
+        };
+        let _ = dev::append_log(
+            "p2p",
+            &format!(
+                "peer inconsistent peer={} advertised_height={} served_terminal_height={} height_delta={} banned={} reason={}",
+                peer,
+                advertised_height,
+                served_terminal_height,
+                advertised_height.saturating_sub(served_terminal_height),
+                banned,
+                PEER_UNSERVED_ADVERTISED_HEIGHT_REASON
+            ),
+        );
+        true
+    }
+
     fn record_peer_observation(
         &self,
         node: &mut Node,
@@ -1927,6 +2141,9 @@ impl NodeSync {
         if self.header_request_inflight(remote_addr) {
             return false;
         }
+        if self.peer_has_unserved_advertised_height(remote_addr) {
+            return false;
+        }
         if !self
             .connections
             .peer_snapshots()
@@ -1958,6 +2175,9 @@ impl NodeSync {
     }
 
     fn local_tip_satisfies_peer_observation(&self, remote_addr: &str, node: &Node) -> bool {
+        if self.peer_has_unserved_advertised_height(remote_addr) {
+            return false;
+        }
         let remote_height = self
             .connections
             .remote_best_height(remote_addr)
@@ -1992,6 +2212,7 @@ impl NodeSync {
 
         self.connections
             .replace_peer_tip(peer, node.height(), Hash48::from(node.tip_hash()));
+        self.note_peer_served_terminal_height(peer, node.height());
         self.prime_relay_from_node_locator(node);
         self.header_requests_started.remove(peer);
         let _ = dev::append_log(
@@ -3083,6 +3304,7 @@ impl NodeSync {
 
     fn chain_synced(&self, node: &Node) -> bool {
         self.sync_state().headers_synced
+            && !self.has_unresolved_advertised_height(node)
             && self.sync_state().local_tip_satisfies_target(
                 node.height(),
                 Some(Hash48::from(node.tip_hash())),
@@ -6306,7 +6528,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_headers_response_can_lower_stale_peer_tip_height() {
+    fn terminal_headers_below_advertised_height_do_not_lower_sync_target() {
         let mut local = SandboxPeer::new("local", Network::Regnet);
         let mut remote = SandboxPeer::new("remote", Network::Regnet);
         remote
@@ -6335,11 +6557,43 @@ mod tests {
             )
             .expect("terminal headers response");
 
+        assert_eq!(local.sync.sync_state().best_height, 10);
+        assert!(!local.sync.sync_state().headers_synced);
         assert_eq!(
             local.sync.connections().remote_best_height(&remote.id),
-            Some(2),
-            "short getheaders responses are the peer's current tip and must be allowed to correct stale fork heights"
+            Some(10),
+            "a peer that cannot serve its advertised height must not lower the global sync target"
         );
+        assert!(
+            local.sync.connections().ban_score(&remote.id) >= PEER_UNSERVED_ADVERTISED_HEIGHT_SCORE
+        );
+        let summary = local.sync.peer_sync_inconsistency_summary();
+        assert!(summary.unresolved_advertised_height);
+        assert_eq!(summary.best_advertised_peer_height, 10);
+        assert_eq!(summary.best_serviceable_peer_height, 2);
+        assert_eq!(summary.inconsistent_peer_count, 1);
+        assert_eq!(
+            summary.sync_warning.as_deref(),
+            Some("peer_advertised_unserved_height")
+        );
+        assert!(outbound.iter().all(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::Send {
+                    message: NetworkMessage {
+                        payload: MessagePayload::GetHeaders(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+        let diagnostics = local.sync.fast_download_diagnostics(&local.node);
+        assert_eq!(
+            diagnostics.chain_validation_status,
+            "peer_advertised_unserved_height"
+        );
+        assert!(!diagnostics.safe_to_serve);
     }
 
     #[test]

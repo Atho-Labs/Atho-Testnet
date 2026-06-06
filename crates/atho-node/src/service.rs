@@ -762,6 +762,12 @@ impl NodeService {
             "addr_relay_peer_count": status.network_diagnostics.addr_relay_peer_count,
             "topology_health_score": status.network_diagnostics.topology_health_score,
             "topology_warnings": status.network_diagnostics.topology_warnings.clone(),
+            "best_advertised_peer_height": status.network_diagnostics.best_advertised_peer_height,
+            "best_serviceable_peer_height": status.network_diagnostics.best_serviceable_peer_height,
+            "unresolved_advertised_height": status.network_diagnostics.unresolved_advertised_height,
+            "inconsistent_peer_count": status.network_diagnostics.inconsistent_peer_count,
+            "healthy_sync_peer_count": status.network_diagnostics.healthy_sync_peer_count,
+            "sync_warning": status.network_diagnostics.sync_warning.clone(),
             "best_header_height": status.network_diagnostics.best_header_height,
             "best_downloaded_body_height": status.network_diagnostics.best_downloaded_body_height,
             "best_validated_height": status.network_diagnostics.best_validated_height,
@@ -808,6 +814,9 @@ impl NodeService {
             && !status.network_diagnostics.topology_warnings.is_empty()
         {
             warnings.push("p2p topology health is weak");
+        }
+        if status.network_diagnostics.unresolved_advertised_height {
+            warnings.push("peers advertised heights they did not serve");
         }
         if !status.network_diagnostics.safe_to_mine
             && !status
@@ -897,7 +906,7 @@ impl NodeService {
             .orchestrator
             .sync
             .fast_download_diagnostics(&self.orchestrator.runtime.node);
-        let (topology_health_score, topology_warnings) = Self::topology_health(
+        let (mut topology_health_score, mut topology_warnings) = Self::topology_health(
             self.network(),
             &peers,
             known_peer_count,
@@ -912,6 +921,16 @@ impl NodeService {
             addr_relay_peer_count,
             last_addr_received_time_unix,
         );
+        let peer_sync_inconsistency = self.orchestrator.sync.peer_sync_inconsistency_summary();
+        if let Some(sync_warning) = &peer_sync_inconsistency.sync_warning {
+            topology_warnings.push(format!(
+                "{sync_warning}: best_advertised={} best_serviceable={} inconsistent_peers={}",
+                peer_sync_inconsistency.best_advertised_peer_height,
+                peer_sync_inconsistency.best_serviceable_peer_height,
+                peer_sync_inconsistency.inconsistent_peer_count
+            ));
+            topology_health_score = topology_health_score.min(40);
+        }
 
         NetworkDiagnostics {
             peer_count,
@@ -943,6 +962,12 @@ impl NodeService {
             peer_db_path: database_dir(self.network()).display().to_string(),
             topology_health_score,
             topology_warnings,
+            best_advertised_peer_height: peer_sync_inconsistency.best_advertised_peer_height,
+            best_serviceable_peer_height: peer_sync_inconsistency.best_serviceable_peer_height,
+            unresolved_advertised_height: peer_sync_inconsistency.unresolved_advertised_height,
+            inconsistent_peer_count: peer_sync_inconsistency.inconsistent_peer_count,
+            healthy_sync_peer_count: peer_sync_inconsistency.healthy_sync_peer_count,
+            sync_warning: peer_sync_inconsistency.sync_warning,
             best_header_height: fast_download.best_header_height,
             best_downloaded_body_height: fast_download.best_downloaded_body_height,
             best_validated_height: fast_download.best_validated_height,
@@ -2552,6 +2577,12 @@ impl NodeService {
             "peer_db_path": status.network_diagnostics.peer_db_path,
             "topology_health_score": status.network_diagnostics.topology_health_score,
             "topology_warnings": status.network_diagnostics.topology_warnings.clone(),
+            "best_advertised_peer_height": status.network_diagnostics.best_advertised_peer_height,
+            "best_serviceable_peer_height": status.network_diagnostics.best_serviceable_peer_height,
+            "unresolved_advertised_height": status.network_diagnostics.unresolved_advertised_height,
+            "inconsistent_peer_count": status.network_diagnostics.inconsistent_peer_count,
+            "healthy_sync_peer_count": status.network_diagnostics.healthy_sync_peer_count,
+            "sync_warning": status.network_diagnostics.sync_warning.clone(),
             "sync_mode": status.network_diagnostics.sync_mode.clone(),
             "chain_validation_status": status.network_diagnostics.chain_validation_status.clone(),
             "best_header_height": status.network_diagnostics.best_header_height,

@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.4`
+- Release line: `v0.3.5`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,29 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.5 Patch Notes
+
+This patch hardens testnet sync against damaged or stale bootstrap nodes that advertise a high height but cannot serve headers through that height.
+
+### Advertised Height Safety
+
+- Tracks the height a peer advertised during handshake separately from the terminal header height it actually served.
+- Marks peers inconsistent when they advertise a higher height than they can serve.
+- Refuses to lower the global sync target from a peer that proved `terminal_headers_below_advertised`.
+- Stops re-requesting headers from that inconsistent peer while preserving the higher unresolved target for healthy peers.
+- Keeps `chain_synced=false` and `safe_to_serve=false` while a connected peer has an unresolved advertised height above the local tip.
+
+### Operator Diagnostics
+
+- Adds RPC/status fields for `best_advertised_peer_height`, `best_serviceable_peer_height`, `unresolved_advertised_height`, `inconsistent_peer_count`, `healthy_sync_peer_count`, and `sync_warning`.
+- Adds a topology warning when peers advertise heights they did not serve.
+- Sets `chain_validation_status=peer_advertised_unserved_height` for this condition so clients and explorers do not report clean sync.
+
+### Regression Coverage
+
+- Added a regression proving a peer that advertises height `10` but serves terminal headers only through `2` does not lower the sync target, is penalized, does not receive another `getheaders`, and leaves the node unsafe to serve.
+- Re-ran stale-target recovery tests to prove valid stale-target lowering still works when the higher target was not advertised by the terminal peer.
 
 ## v0.3.4 Patch Notes
 
