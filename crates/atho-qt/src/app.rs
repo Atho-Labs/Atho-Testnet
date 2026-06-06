@@ -87,6 +87,7 @@ const MIN_WALLET_DISCOVERY_SCAN_LIMIT: usize = 32;
 const MAX_WALLET_DISCOVERY_SCAN_LIMIT: usize = 20_000;
 const TEST_WALLET_DATAFILE_ITERATIONS: u32 = 10_000;
 const WALLET_PREPARATION_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+const WALLET_READINESS_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_SCAN_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const WALLET_SCAN_MAX_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 const WALLET_SCAN_BACKOFF_BASE: Duration = Duration::from_secs(2);
@@ -240,6 +241,7 @@ struct WalletScanOutcome {
     wallet_balance_cache: u64,
     wallet_balance_summary_cache: WalletBalanceSummary,
     wallet_activity_cache: Vec<WalletActivityRow>,
+    mempool_changed_during_scan: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1300,7 +1302,7 @@ impl DesktopApp {
             return Err(String::from("wallet scan cancelled"));
         }
         let status = connection.status();
-        let snapshot_token = Self::connection_snapshot_token(&status);
+        let chain_snapshot_token = Self::wallet_chain_snapshot_token(&status);
         if cancel_requested.load(Ordering::Acquire) {
             return Err(String::from("wallet scan cancelled"));
         }
@@ -1374,11 +1376,13 @@ impl DesktopApp {
             return Err(String::from("wallet scan cancelled"));
         }
         let end_status = connection.status();
-        if snapshot_token != Self::connection_snapshot_token(&end_status) {
+        if chain_snapshot_token != Self::wallet_chain_snapshot_token(&end_status) {
             return Err(String::from(
-                "wallet scan deferred: backend state changed during refresh",
+                "wallet scan deferred: backend chain changed during refresh",
             ));
         }
+        let mempool_changed_during_scan =
+            status.mempool_fingerprint != end_status.mempool_fingerprint;
 
         Ok(WalletScanOutcome {
             wallet_scan_nonce,
@@ -1390,6 +1394,7 @@ impl DesktopApp {
             wallet_balance_cache: available_balance,
             wallet_balance_summary_cache: balance_summary,
             wallet_activity_cache,
+            mempool_changed_during_scan,
         })
     }
 
@@ -1598,7 +1603,8 @@ impl DesktopApp {
         } else {
             false
         };
-        self.wallet_cache_dirty = self.wallet_cache_dirty || continue_scanning;
+        self.wallet_cache_dirty =
+            self.wallet_cache_dirty || continue_scanning || outcome.mempool_changed_during_scan;
         if !continue_scanning {
             self.wallet_readiness_gate_active = false;
         }
@@ -1606,12 +1612,13 @@ impl DesktopApp {
         let _ = atho_node::dev::append_log(
             "atho-qt",
             &format!(
-                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} balance_atoms={}",
+                "wallet cache refreshed scan_limit={} addresses={} owned_utxos={} spendable_utxos={} balance_atoms={} mempool_changed_during_scan={}",
                 outcome.scan_limit,
                 self.wallet_addresses_cache.len(),
                 self.wallet_owned_utxos_cache.len(),
                 self.wallet_utxos_cache.len(),
-                self.wallet_balance_cache
+                self.wallet_balance_cache,
+                outcome.mempool_changed_during_scan
             ),
         );
     }
@@ -1637,6 +1644,7 @@ impl DesktopApp {
                     return;
                 }
                 if err.contains("node RPC is not ready")
+                    || err.contains("backend chain changed during refresh")
                     || err.contains("backend state changed during refresh")
                 {
                     self.wallet_cache_dirty = true;
@@ -1659,6 +1667,11 @@ impl DesktopApp {
             }
             Err(mpsc::TryRecvError::Empty) => {
                 let timeout = Self::wallet_scan_stall_timeout(job.scan_limit);
+                if self.wallet_readiness_gate_active
+                    && job.started_at.elapsed() >= WALLET_READINESS_GATE_TIMEOUT
+                {
+                    self.release_wallet_readiness_gate("wallet initial scan still running");
+                }
                 if job.started_at.elapsed() >= timeout {
                     job.cancel_requested.store(true, Ordering::Release);
                     self.wallet_cache_dirty = true;
@@ -1772,17 +1785,13 @@ impl DesktopApp {
         status.block_count
     }
 
-    fn connection_snapshot_token(status: &ConnectionStatus) -> [u8; 32] {
+    fn wallet_chain_snapshot_token(status: &ConnectionStatus) -> [u8; 32] {
         let mut preimage = Vec::with_capacity(
-            status.network.id().len()
-                + core::mem::size_of::<u64>()
-                + status.tip_hash.len()
-                + status.mempool_fingerprint.len(),
+            status.network.id().len() + core::mem::size_of::<u64>() + status.tip_hash.len(),
         );
         preimage.extend_from_slice(status.network.id().as_bytes());
         preimage.extend_from_slice(&status.block_count.to_be_bytes());
         preimage.extend_from_slice(&status.tip_hash);
-        preimage.extend_from_slice(&status.mempool_fingerprint);
         sha3_256(&preimage)
     }
 
@@ -7889,6 +7898,29 @@ mod tests {
     }
 
     #[test]
+    fn slow_initial_wallet_scan_releases_readiness_gate_without_cancelling_scan() {
+        let mut app = DesktopApp::new(Network::Regnet);
+        let (_sender, receiver) = mpsc::channel();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        app.wallet_scan_job = Some(WalletScanJob {
+            started_at: Instant::now()
+                .checked_sub(WALLET_READINESS_GATE_TIMEOUT + Duration::from_millis(50))
+                .unwrap_or_else(Instant::now),
+            scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
+            cancel_requested: Arc::clone(&cancel_requested),
+            receiver,
+        });
+        app.wallet_readiness_gate_active = true;
+
+        app.poll_wallet_scan_job();
+
+        assert!(app.wallet_scan_job.is_some());
+        assert!(!app.wallet_readiness_gate_active);
+        assert!(!cancel_requested.load(Ordering::Acquire));
+        assert!(app.wallet_scan_retry_after.is_none());
+    }
+
+    #[test]
     fn wallet_preparation_timeout_fails_instead_of_looping() {
         let mut app = DesktopApp::new(Network::Regnet);
         let (_sender, receiver) = mpsc::channel();
@@ -7973,6 +8005,99 @@ mod tests {
         };
 
         assert_eq!(DesktopApp::wallet_scan_height(&status), 12);
+    }
+
+    #[test]
+    fn wallet_chain_snapshot_ignores_mempool_churn() {
+        let status = ConnectionStatus {
+            network: Network::Testnet,
+            rpc_address: String::from("127.0.0.1:18444"),
+            block_count: 12,
+            tip_hash: [0x11; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 3,
+            mempool_total_fee_atoms: 44,
+            mempool_fingerprint: [0x22; 32],
+            peer_count: 0,
+            inbound_peer_count: 0,
+            outbound_peer_count: 0,
+            connecting_peer_count: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            peers: Vec::new(),
+            connecting_peers: Vec::new(),
+            running: true,
+            headers_synced: true,
+            safe_to_serve: true,
+            sync_best_height: 12,
+            connected: true,
+            startup_error: None,
+        };
+
+        let mempool_updated = ConnectionStatus {
+            mempool_count: 7,
+            mempool_total_fee_atoms: 91,
+            mempool_fingerprint: [0x33; 32],
+            ..status.clone()
+        };
+        let chain_updated = ConnectionStatus {
+            block_count: 13,
+            tip_hash: [0x44; 48],
+            ..status.clone()
+        };
+        let network_updated = ConnectionStatus {
+            network: Network::Mainnet,
+            ..status.clone()
+        };
+
+        assert_eq!(
+            DesktopApp::wallet_chain_snapshot_token(&status),
+            DesktopApp::wallet_chain_snapshot_token(&mempool_updated)
+        );
+        assert_ne!(
+            DesktopApp::wallet_chain_snapshot_token(&status),
+            DesktopApp::wallet_chain_snapshot_token(&chain_updated)
+        );
+        assert_ne!(
+            DesktopApp::wallet_chain_snapshot_token(&status),
+            DesktopApp::wallet_chain_snapshot_token(&network_updated)
+        );
+    }
+
+    #[test]
+    fn wallet_scan_mempool_churn_applies_balance_and_queues_rescan() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        app.wallet = Some(test_wallet(6));
+        app.wallet_cache_dirty = false;
+        app.wallet_readiness_gate_active = true;
+        let nonce = app.wallet_scan_nonce;
+
+        app.apply_wallet_scan_outcome(WalletScanOutcome {
+            wallet_scan_nonce: nonce,
+            scan_limit: WALLET_DISCOVERY_SCAN_STEPS[0],
+            wallet_addresses_cache: Vec::new(),
+            receive_addresses: Vec::new(),
+            wallet_owned_utxos_cache: Vec::new(),
+            wallet_utxos_cache: Vec::new(),
+            wallet_balance_cache: 1_000,
+            wallet_balance_summary_cache: WalletBalanceSummary {
+                available_atoms: 1_000,
+                pending_atoms: 23,
+                total_atoms: 1_023,
+            },
+            wallet_activity_cache: Vec::new(),
+            mempool_changed_during_scan: true,
+        });
+
+        assert_eq!(app.wallet_balance_atoms(), 1_000);
+        assert_eq!(app.wallet_balance_summary().available_atoms, 1_000);
+        assert_eq!(app.wallet_balance_summary().pending_atoms, 23);
+        assert_eq!(app.wallet_balance_summary().total_atoms, 1_023);
+        assert!(app.wallet_cache_dirty);
+        assert!(!app.wallet_readiness_gate_active);
+        assert!(app.wallet_scan_retry_after.is_none());
     }
 
     #[test]

@@ -93,6 +93,9 @@ fn render_balances_panel(
                 ui,
                 "Wallet balances may still change while Atho is synchronizing to the network tip.",
             );
+        } else if app.wallet_scan_job.is_some() {
+            ui.add_space(12.0);
+            widgets::muted_label(ui, "Wallet balances are refreshing from the local node.");
         }
 
         ui.add_space(12.0);
