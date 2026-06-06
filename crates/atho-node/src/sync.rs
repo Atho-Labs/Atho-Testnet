@@ -525,7 +525,7 @@ impl NodeSync {
                     .unwrap_or(best_connected_height),
             )
             .max(best_connected_height);
-        let pending_validation_blocks = self.pending_untrusted_validation_blocks();
+        let pending_validation_blocks = self.pending_tip_validation_blocks(node);
         let validation_lag_blocks =
             best_downloaded_body_height.saturating_sub(best_connected_height);
         let fast_download_enabled = limits.enable_fast_body_download
@@ -841,7 +841,10 @@ impl NodeSync {
     }
 
     fn buffered_parent_bridge_active(&self, node: &Node) -> bool {
-        if self.side_branches.is_empty() || self.missing_buffered_parent_hashes(node).is_empty() {
+        if self.side_branches.is_empty()
+            || self.pending_tip_validation_blocks(node) == 0
+            || self.missing_buffered_parent_hashes(node).is_empty()
+        {
             return false;
         }
         let stale_after = self.block_request_retry_timeout().as_secs().min(2).max(1);
@@ -1107,7 +1110,7 @@ impl NodeSync {
             || stats.inflight_blocks != 0
             || !self.pending_header_blocks.is_empty()
             || !self.pending_compact_blocks.is_empty()
-            || !self.side_branches.is_empty()
+            || self.pending_tip_validation_blocks(node) != 0
         {
             return false;
         }
@@ -1473,7 +1476,11 @@ impl NodeSync {
                 self.relay.accept_headers_from_peer(peer, &headers)?;
                 if header_count == 0 && self.finish_empty_terminal_headers_if_caught_up(peer, node)
                 {
-                    self.push_address_discovery_events(peer, node, outbound);
+                    self.record_getaddr_sent(peer, now_unix());
+                    outbound.push(ConnectionEvent::Send {
+                        peer: peer.to_string(),
+                        message: NetworkMessage::new(self.network, MessagePayload::GetAddr),
+                    });
                     return Ok(());
                 }
                 if header_count == 0 && node.height() < self.relay.sync_state().best_height {
@@ -1483,7 +1490,7 @@ impl NodeSync {
                         self.push_address_discovery_events(peer, node, outbound);
                         return Ok(());
                     }
-                    if self.header_sync_work_idle() {
+                    if self.header_sync_work_idle(node) {
                         self.connections.replace_peer_tip(
                             peer,
                             node.height(),
@@ -2217,11 +2224,11 @@ impl NodeSync {
             .is_none_or(|remote_chainwork| local_chainwork >= remote_chainwork)
     }
 
-    fn header_sync_work_idle(&self) -> bool {
+    fn header_sync_work_idle(&self, node: &Node) -> bool {
         self.downloader.is_idle()
             && self.pending_header_blocks.is_empty()
             && self.pending_compact_blocks.is_empty()
-            && self.side_branches.is_empty()
+            && self.pending_tip_validation_blocks(node) == 0
     }
 
     fn finish_empty_terminal_headers_if_caught_up(&mut self, peer: &str, node: &Node) -> bool {
@@ -2230,7 +2237,7 @@ impl NodeSync {
                 .remote_best_height(peer)
                 .unwrap_or(node.height()),
         );
-        if node.height() < target_height || !self.header_sync_work_idle() {
+        if node.height() < target_height || !self.header_sync_work_idle(node) {
             return false;
         }
 
@@ -2738,7 +2745,7 @@ impl NodeSync {
                 "p2p",
                 &format!(
                     "fast body download paused by backpressure pending_validation={} untrusted_blocks={} untrusted_bytes={} max_pending={} max_untrusted={} max_untrusted_bytes={}",
-                    self.pending_untrusted_validation_blocks(),
+                    self.pending_tip_validation_blocks(node),
                     self.side_branches.len(),
                     self.side_branches.total_size_bytes(),
                     limits.max_pending_validation_blocks,
@@ -3397,13 +3404,38 @@ impl NodeSync {
         );
     }
 
-    fn pending_untrusted_validation_blocks(&self) -> usize {
-        self.side_branches.len().max(
+    fn pending_tip_validation_blocks(&self, node: &Node) -> usize {
+        let local_height = node.height();
+        let preferred_hashes = self.preferred_buffered_branch_hashes(node);
+        let side_branch_blocks = self
+            .side_branches
+            .blocks
+            .iter()
+            .filter(|(hash, entry)| {
+                entry.block.header.height > local_height || preferred_hashes.contains(*hash)
+            })
+            .count();
+        side_branch_blocks.max(
             self.block_validation_states
-                .values()
-                .filter(|state| state.is_untrusted_pending_validation())
+                .iter()
+                .filter(|(_, state)| state.is_untrusted_pending_validation())
+                .filter(|(hash, _)| {
+                    preferred_hashes.contains(*hash)
+                        || self
+                            .block_validation_heights
+                            .get(*hash)
+                            .is_some_and(|height| *height > local_height)
+                })
                 .count(),
         )
+    }
+
+    fn preferred_buffered_branch_hashes(&self, node: &Node) -> BTreeSet<[u8; 48]> {
+        self.best_buffered_branch(node)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|block| block.header.block_hash())
+            .collect()
     }
 
     fn checkpoint_anchor_allows_fast_download(&self, node: &Node) -> bool {
@@ -3420,7 +3452,7 @@ impl NodeSync {
 
     fn fast_body_download_backpressure_active(&self, node: &Node) -> bool {
         let limits = network_params(self.network).limits;
-        let pending_validation = self.pending_untrusted_validation_blocks();
+        let pending_validation = self.pending_tip_validation_blocks(node);
         pending_validation >= limits.max_pending_validation_blocks
             || self.side_branches.len() >= limits.max_untrusted_block_cache
             || self.side_branches.total_size_bytes() >= limits.max_untrusted_block_cache_bytes
@@ -6030,6 +6062,61 @@ mod tests {
     }
 
     #[test]
+    fn stale_same_height_side_branch_does_not_pause_mining_or_relay() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(5, synthetic_header_hash(5, 0x51), Vec::<UtxoEntry>::new())
+            .expect("seed local chain");
+        peer.sync.prime(&peer.node);
+
+        let stale =
+            synthetic_coinbase_block(Network::Regnet, 5, synthetic_header_hash(4, 0x91), 0x92);
+        let stale_hash = stale.header.block_hash();
+        peer.sync.side_branches.insert("remote", stale.clone());
+        peer.sync.mark_block_state(
+            stale_hash,
+            stale.header.height,
+            BlockValidationState::BodyDownloaded,
+        );
+
+        let diagnostics = peer.sync.fast_download_diagnostics(&peer.node);
+        assert_eq!(diagnostics.pending_validation_blocks, 0);
+        assert_eq!(diagnostics.untrusted_downloaded_blocks, 1);
+        assert_eq!(diagnostics.chain_validation_status, "synced");
+        assert!(diagnostics.safe_to_serve);
+        assert!(diagnostics.safe_to_mine);
+        assert_eq!(peer.sync.side_branches.len(), 1);
+        assert_eq!(peer.sync.pending_tip_validation_blocks(&peer.node), 0);
+        assert!(!peer.sync.buffered_parent_bridge_active(&peer.node));
+    }
+
+    #[test]
+    fn below_tip_parent_needed_by_future_branch_counts_only_future_tip_work() {
+        let mut peer = SandboxPeer::new("peer", Network::Regnet);
+        peer.node
+            .dev_seed_chainstate(5, synthetic_header_hash(5, 0x61), Vec::<UtxoEntry>::new())
+            .expect("seed local chain");
+        peer.sync.prime(&peer.node);
+
+        let parent =
+            synthetic_coinbase_block(Network::Regnet, 5, synthetic_header_hash(4, 0xA1), 0xA2);
+        let child = synthetic_coinbase_block(Network::Regnet, 6, parent.header.block_hash(), 0xA3);
+        for block in [&parent, &child] {
+            let hash = block.header.block_hash();
+            peer.sync.side_branches.insert("remote", block.clone());
+            peer.sync.mark_block_state(
+                hash,
+                block.header.height,
+                BlockValidationState::BodyDownloaded,
+            );
+        }
+
+        assert_eq!(peer.sync.side_branches.len(), 2);
+        assert_eq!(peer.sync.pending_tip_validation_blocks(&peer.node), 1);
+        assert!(!peer.sync.fast_download_diagnostics(&peer.node).safe_to_mine);
+    }
+
+    #[test]
     fn buffered_extension_connects_in_bounded_batches() {
         let _guard = EnvVarGuard::set(
             "ATHO_TEST_MAX_BUFFERED_EXTENSION_CONNECT_BLOCKS_PER_PASS",
@@ -6536,7 +6623,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_tip_height_mismatch_stays_buffered() {
+    fn recoverable_below_tip_height_mismatch_does_not_request_old_parent() {
         let mut peer = SandboxPeer::new("peer", Network::Regnet);
         let arbitrary_tip = [9; 48];
         peer.node
@@ -6557,8 +6644,10 @@ mod tests {
             .handle_received_block("peer", block, &mut peer.node, &mut outbound)
             .expect("recoverable branch mismatch");
 
-        assert!(outbound_getdata_hashes(&outbound).contains(&arbitrary_tip));
+        assert!(outbound_getdata_hashes(&outbound).is_empty());
         assert_eq!(peer.sync.side_branches.len(), 1);
+        assert_eq!(peer.sync.pending_tip_validation_blocks(&peer.node), 0);
+        assert!(!peer.sync.buffered_parent_bridge_active(&peer.node));
     }
 
     #[test]
@@ -6991,7 +7080,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_parent_repair_handles_backward_gap_without_panicking() {
+    fn orphan_parent_repair_ignores_stale_backward_gap_without_panicking() {
         let mut node = Node::new(NodeConfig::new(Network::Regnet));
         node.dev_seed_chainstate(3, synthetic_header_hash(3, 0xA3), Vec::<UtxoEntry>::new())
             .expect("seed local height");
@@ -7019,10 +7108,9 @@ mod tests {
         let mut outbound = Vec::new();
         sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
 
-        assert_eq!(
-            outbound_getdata_hashes(&outbound),
-            vec![missing_parent_hash]
-        );
+        assert!(outbound_getdata_hashes(&outbound).is_empty());
+        assert_eq!(sync.pending_tip_validation_blocks(&node), 0);
+        assert!(!sync.buffered_parent_bridge_active(&node));
     }
 
     #[test]

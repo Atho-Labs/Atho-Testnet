@@ -862,7 +862,6 @@ fn poll_tip_announcements(
     let state = lock_runtime_state(state);
     let tip_hash = state.tip_hash();
     if !state.p2p_block_relay_ready() {
-        *last_announced_tip = tip_hash;
         return None;
     }
     if tip_hash == *last_announced_tip {
@@ -2266,22 +2265,33 @@ mod tests {
     }
 
     #[test]
-    fn tip_announcements_wait_until_public_node_has_ready_peer() {
+    fn tip_announcements_do_not_forget_tip_while_relay_gated() {
         let service = Arc::new(Mutex::new(NodeService::new_ephemeral(NodeConfig::new(
-            Network::Testnet,
+            Network::Regnet,
         ))));
-        let tip_hash = {
-            let mut state = service.lock().expect("service lock");
-            state.start();
+        let initial_tip = {
+            let state = service.lock().expect("service lock");
             state.tip_hash()
         };
         let mut last_announced_tip = [0x99; 48];
 
         assert!(poll_tip_announcements(&service, &mut last_announced_tip).is_none());
         assert_eq!(
-            last_announced_tip, tip_hash,
-            "catch-up tips should be marked seen without relaying stale intermediate blocks"
+            last_announced_tip, [0x99; 48],
+            "relay-gated peers must not mark a tip announced before any message is sent"
         );
+
+        let mined_tip = {
+            let mut state = service.lock().expect("service lock");
+            state.start();
+            state.p2p_mine_local_block().expect("mine local block")
+        };
+
+        let messages = poll_tip_announcements(&service, &mut last_announced_tip)
+            .expect("tip announcement after relay becomes ready");
+        assert!(!messages.is_empty());
+        assert_ne!(initial_tip, mined_tip);
+        assert_eq!(last_announced_tip, mined_tip);
     }
 
     #[test]

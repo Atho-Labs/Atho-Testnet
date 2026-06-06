@@ -53,6 +53,7 @@ const HASHRATE_WINDOW_BLOCKS: usize = 120;
 const BLOCKTIME_WINDOW_BLOCKS: usize = 120;
 const FEE_WINDOW_BLOCKS: usize = 240;
 const FEE_WINDOW_TRANSACTIONS: u64 = 1_000;
+const MAX_TIP_COMPACT_ANNOUNCEMENT_BLOCKS: usize = 8;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1401,9 +1402,14 @@ impl NodeService {
             .map(|index| index.saturating_add(1))
             .unwrap_or(1);
 
+        let announce_from = blocks
+            .len()
+            .saturating_sub(MAX_TIP_COMPACT_ANNOUNCEMENT_BLOCKS)
+            .max(start_index);
+
         blocks
             .iter()
-            .skip(start_index)
+            .skip(announce_from)
             .map(|block| self.orchestrator.sync.relay_compact_block_message(block))
             .collect()
     }

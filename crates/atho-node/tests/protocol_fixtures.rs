@@ -133,7 +133,7 @@ fn protocol_fixture_freezes_core_parameters_and_validation() {
     let params = consensus_params_for_network(Network::Mainnet);
     assert_eq!(params.max_supply_atho, None);
     assert_eq!(params.halving_interval_blocks, 1_260_000);
-    assert_eq!(params.min_tx_fee_atoms, 500);
+    assert_eq!(params.min_tx_fee_atoms, 1);
     let tx = fixture_transaction();
     let minimum_fee = minimum_required_fee_atoms(Network::Mainnet, &tx)
         .max(tx.vsize_bytes() as u64 * MIN_TX_FEE_PER_VBYTE_ATOMS);

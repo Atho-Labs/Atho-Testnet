@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.7`
+- Release line: `v0.3.8`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,32 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.8 Patch Notes
+
+This patch carries the Alpha network-stability hardening into the public testnet build. It targets the live issue where nodes could look connected but sit on different tips, miners could pause after a new height, and stale fork debris could keep peers from relaying the current chain cleanly.
+
+### Fork Cache and Mining Liveness
+
+- Separates tip-affecting fork work from stale side-branch debris in sync diagnostics.
+- Keeps mining and block relay safe when old same-height or below-tip fork fragments are cached but cannot currently reorg the active chain.
+- Keeps future higher branches protected: below-tip parents that are needed by an above-tip candidate still count as active work until the branch is resolved.
+- Stops below-tip orphan parent repair from repeatedly requesting old parents that cannot advance the current tip.
+
+### Tip Relay and Propagation
+
+- Fixes the peer announcement cache so a node no longer marks a tip as announced while block relay is gated.
+- Announces the current tip once relay becomes safe again, which removes the reconnect-to-see-new-height failure mode.
+- Caps compact-tip catch-up bursts to the latest few blocks so recovered peers get the useful tip quickly without old relay floods.
+
+### Regression Coverage
+
+- Added regressions for stale same-height fork fragments not pausing mining or relay.
+- Added regressions for future branch parents still counting as active tip work.
+- Added regressions for below-tip mismatch and backward-gap repair staying quiet instead of looping.
+- Added a regression that gated tip relay does not forget the unsent tip.
+- Updated the protocol fixture to freeze the current 1 atom fee policy.
+- Re-ran the full `atho-node` test suite, protocol fixtures, and workspace check.
 
 ## v0.3.7 Patch Notes
 
