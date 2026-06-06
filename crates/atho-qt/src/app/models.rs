@@ -461,6 +461,9 @@ pub(crate) struct MiningStaleTemplate {
     pub(crate) previous_block_hash: [u8; 48],
     pub(crate) current_height: Option<u64>,
     pub(crate) current_tip_hash: Option<[u8; 48]>,
+    pub(crate) sync_target_height: Option<u64>,
+    pub(crate) headers_synced: Option<bool>,
+    pub(crate) safe_to_mine: Option<bool>,
     pub(crate) solved_block_hash: Option<[u8; 48]>,
 }
 

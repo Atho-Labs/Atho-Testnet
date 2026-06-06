@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.5`
+- Release line: `v0.3.6`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,29 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.6 Patch Notes
+
+This patch hardens public testnet mining against stale block templates during forks and fast network-tip movement.
+
+### Stale Template Mining Safety
+
+- Blocks `getblocktemplate` while the local node is still syncing, has no ready public peer, is behind the advertised network target, or is not safe to mine.
+- Rejects stale `submitblock` requests before they can enter chainstate when the submitted block no longer extends the active local tip.
+- Returns structured `ATHO-BLK-007` stale-template details with submitted height, expected height, submitted parent, current tip, local height, sync target, header sync, and safe-to-mine state.
+- Keeps `getmininginfo` explicit with `chain_synced`, `mining_allowed`, and `mining_blocked_reason` so operators can see exactly why mining is paused.
+
+### Wallet Miner Fork Recovery
+
+- Stops the desktop miner when the advertised sync target moves ahead of the local chain, even if the local tip hash has not changed yet.
+- Restarts mining from a fresh template instead of finishing work on an obsolete parent.
+- Adds stale-template logging with local height, sync target, header sync, safe-to-mine, current tip, and solved block hash when available.
+
+### Regression Coverage
+
+- Added a regression proving stale RPC-mined blocks are rejected before they can create a local RPC-side fork.
+- Added a regression proving mining templates are paused when a public peer target is above the local tip.
+- Added a Qt regression proving advertised target movement invalidates active mining work.
 
 ## v0.3.5 Patch Notes
 

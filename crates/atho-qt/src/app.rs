@@ -32,6 +32,8 @@ use atho_rpc::command::{command_definition, help_payload, parse_command_line, se
 use atho_rpc::command::{CommandInvocation, CommandResponse};
 use atho_rpc::error::RpcError;
 use atho_rpc::request::{RpcRequest, WalletHistoryAddress};
+#[cfg(test)]
+use atho_rpc::response::NetworkDiagnostics;
 use atho_rpc::response::{
     BlockTemplate, MempoolSpentInput, NodeStatus, RpcResponse,
     WalletActivityEntry as RpcWalletActivityEntry, WalletActivityKind as RpcWalletActivityKind,
@@ -2138,6 +2140,10 @@ impl DesktopApp {
                     .current_height
                     .map(|height| height.to_string())
                     .unwrap_or_else(|| String::from("unknown"));
+                let sync_target_height = stale
+                    .sync_target_height
+                    .map(|height| height.to_string())
+                    .unwrap_or_else(|| String::from("unknown"));
                 self.mining_status = format!(
                     "Mining template for height {} went stale; refreshing from height {}",
                     stale.height, current_height
@@ -2146,10 +2152,19 @@ impl DesktopApp {
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     &format!(
-                        "mining template stale height={} prev={} current_height={} current_tip={} solved_hash={}",
+                        "mining template stale height={} prev={} current_height={} sync_target_height={} headers_synced={} safe_to_mine={} current_tip={} solved_hash={}",
                         stale.height,
                         hex::encode(stale.previous_block_hash),
                         current_height,
+                        sync_target_height,
+                        stale
+                            .headers_synced
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| String::from("unknown")),
+                        stale
+                            .safe_to_mine
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| String::from("unknown")),
                         stale
                             .current_tip_hash
                             .map(hex::encode)
@@ -5666,18 +5681,28 @@ impl From<&BlockTemplate> for MiningTemplateTip {
 struct MiningTemplateStaleStatus {
     current_height: u64,
     current_tip_hash: [u8; 48],
+    sync_target_height: u64,
+    headers_synced: bool,
+    safe_to_mine: bool,
 }
 
 fn mining_template_stale_status_for_node(
     tip: MiningTemplateTip,
     status: &NodeStatus,
 ) -> Option<MiningTemplateStaleStatus> {
+    let target_ahead = status.sync_best_height > status.block_count;
+    let sync_not_mine_safe = !status.headers_synced || !status.network_diagnostics.safe_to_mine;
     if status.block_count.saturating_add(1) != tip.height
         || status.tip_hash != tip.previous_block_hash
+        || target_ahead
+        || sync_not_mine_safe
     {
         Some(MiningTemplateStaleStatus {
             current_height: status.block_count,
             current_tip_hash: status.tip_hash,
+            sync_target_height: status.sync_best_height,
+            headers_synced: status.headers_synced,
+            safe_to_mine: status.network_diagnostics.safe_to_mine,
         })
     } else {
         None
@@ -5704,6 +5729,9 @@ fn stale_mining_template_result(
         previous_block_hash: tip.previous_block_hash,
         current_height: status.map(|status| status.current_height),
         current_tip_hash: status.map(|status| status.current_tip_hash),
+        sync_target_height: status.map(|status| status.sync_target_height),
+        headers_synced: status.map(|status| status.headers_synced),
+        safe_to_mine: status.map(|status| status.safe_to_mine),
         solved_block_hash,
     })
 }
@@ -5739,6 +5767,7 @@ fn mining_error_is_retryable(error: &str) -> bool {
         || error.contains("not ready")
         || error.contains("temporar")
         || error.contains("stale")
+        || error.contains("sync")
         || error.contains("invalid block height")
         || error.contains("unexpected rpc response")
 }
@@ -5764,10 +5793,13 @@ fn spawn_mining_template_watcher(
                 let _ = atho_node::dev::append_log(
                     "atho-qt",
                     &format!(
-                        "mining template stale height={} prev={} current_height={} current_tip={}",
+                        "mining template stale height={} prev={} current_height={} sync_target_height={} headers_synced={} safe_to_mine={} current_tip={}",
                         tip.height,
                         hex::encode(tip.previous_block_hash),
                         status.current_height,
+                        status.sync_target_height,
+                        status.headers_synced,
+                        status.safe_to_mine,
                         hex::encode(status.current_tip_hash),
                     ),
                 );
@@ -7605,6 +7637,42 @@ mod tests {
     }
 
     #[test]
+    fn mining_template_goes_stale_when_network_target_moves_ahead() {
+        let previous_block_hash = [0x41; 48];
+        let tip = MiningTemplateTip {
+            height: 8,
+            previous_block_hash,
+        };
+        let status = NodeStatus {
+            network: Network::Testnet,
+            block_count: 7,
+            tip_hash: previous_block_hash,
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x42; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 9,
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                safe_to_mine: true,
+                safe_to_serve: true,
+                ..NetworkDiagnostics::default()
+            },
+        };
+
+        let stale = mining_template_stale_status_for_node(tip, &status)
+            .expect("advertised target above local height should invalidate mining work");
+        assert_eq!(stale.current_height, 7);
+        assert_eq!(stale.current_tip_hash, previous_block_hash);
+        assert_eq!(stale.sync_target_height, 9);
+        assert!(stale.headers_synced);
+        assert!(stale.safe_to_mine);
+    }
+
+    #[test]
     fn stale_mined_block_submit_refreshes_template_instead_of_failing() {
         let root = temp_sandbox_root("stale-mined-block");
         let data = root.join("data");
@@ -7639,6 +7707,7 @@ mod tests {
         let stale_status = mining_template_stale_status_for_node(template_tip, &node_status)
             .expect("template should be stale after a competing block advances the tip");
         assert_eq!(stale_status.current_height, 1);
+        assert_eq!(stale_status.sync_target_height, 1);
 
         let response = connection.request(RpcRequest::SubmitBlock(stale_block));
         let error = match response {
@@ -7652,6 +7721,9 @@ mod tests {
                 assert_eq!(stale.height, template_tip.height);
                 assert_eq!(stale.previous_block_hash, template_tip.previous_block_hash);
                 assert_eq!(stale.current_height, Some(1));
+                assert_eq!(stale.sync_target_height, Some(1));
+                assert_eq!(stale.headers_synced, Some(true));
+                assert_eq!(stale.safe_to_mine, Some(true));
                 assert_eq!(stale.solved_block_hash, Some(stale_block_hash));
             }
             other => panic!("expected stale-template retry, got {other:?}"),

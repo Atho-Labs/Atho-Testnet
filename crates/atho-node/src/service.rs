@@ -19,6 +19,7 @@ use crate::miner::Miner;
 use crate::orchestrator::NodeOrchestrator;
 use crate::sync::{NodeSyncError, SyncNotice};
 use crate::tcp_p2p::next_outbound_retry_delay;
+use crate::validation::ValidationError;
 use crate::wallet_history;
 use atho_core::address::{decode_base56_address, encode_base56_address};
 use atho_core::block::{Block, BlockHeader};
@@ -329,6 +330,11 @@ impl NodeService {
             },
             RpcRequest::ExecuteCommand(invocation) => self.execute_command(invocation),
             RpcRequest::GetBlockTemplate => {
+                let status = self.node_status();
+                if let Some(reason) = Self::mining_template_sync_block_reason(&status) {
+                    let _ = dev::append_log("athod", &format!("rpc template paused {reason}"));
+                    return RpcResponse::Error(atho_rpc::error::RpcError::invalid_request(reason));
+                }
                 match self.orchestrator.runtime.node.build_candidate_block() {
                     Ok(block) => {
                         let _ = dev::append_log(
@@ -417,18 +423,23 @@ impl NodeService {
             RpcRequest::SubmitBlock(block) => {
                 let block_hash = block.header.block_hash();
                 let block_summary = dev::summarize_block(&block);
-                let response = match self.orchestrator.runtime.node.submit_block(&block) {
-                    Ok(()) => {
-                        self.orchestrator
-                            .sync
-                            .prime(&self.orchestrator.runtime.node);
-                        self.refresh_runtime_views();
-                        RpcResponse::BlockSubmitted {
-                            accepted: true,
-                            block_hash,
+                let status = self.node_status();
+                let response = if let Some(err) = Self::stale_mined_block_error(&block, &status) {
+                    RpcResponse::Error(err)
+                } else {
+                    match self.orchestrator.runtime.node.submit_block(&block) {
+                        Ok(()) => {
+                            self.orchestrator
+                                .sync
+                                .prime(&self.orchestrator.runtime.node);
+                            self.refresh_runtime_views();
+                            RpcResponse::BlockSubmitted {
+                                accepted: true,
+                                block_hash,
+                            }
                         }
+                        Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                     }
-                    Err(err) => RpcResponse::Error(rpc_error_from_node(err)),
                 };
                 match &response {
                     RpcResponse::BlockSubmitted { accepted: true, .. } => {
@@ -699,9 +710,14 @@ impl NodeService {
             || status.network_diagnostics.safe_to_serve;
         status.running
             && status.headers_synced
+            && Self::local_height_reached_sync_target(status)
             && status.network_diagnostics.safe_to_serve
             && Self::has_required_ready_peer(status)
             && validation_safe
+    }
+
+    fn local_height_reached_sync_target(status: &NodeStatus) -> bool {
+        status.sync_best_height == 0 || status.block_count >= status.sync_best_height
     }
 
     fn public_network_requires_ready_peer(network: Network) -> bool {
@@ -724,8 +740,12 @@ impl NodeService {
             "headers are still synchronizing"
         } else if !Self::has_required_ready_peer(status) {
             "no ready network peers are connected"
-        } else {
+        } else if !Self::local_height_reached_sync_target(status) {
             "local chain tip is behind the advertised network target"
+        } else if !status.network_diagnostics.safe_to_serve {
+            "chain validation is still catching up"
+        } else {
+            "node is not ready"
         };
         Some(format!(
             "transaction submission is paused until the node is synced ({state}; local_height={} sync_target_height={} headers_synced={} running={} peer_count={})",
@@ -735,6 +755,69 @@ impl NodeService {
             status.running,
             status.network_diagnostics.peer_count
         ))
+    }
+
+    fn mining_template_sync_block_reason(status: &NodeStatus) -> Option<String> {
+        if Self::chain_synced(status) && status.network_diagnostics.safe_to_mine {
+            return None;
+        }
+
+        let state = if !status.running {
+            "node is not running"
+        } else if !status.headers_synced {
+            "headers are still synchronizing"
+        } else if !Self::has_required_ready_peer(status) {
+            "no ready network peers are connected"
+        } else if !Self::local_height_reached_sync_target(status) {
+            "local chain tip is behind the advertised network target"
+        } else if !status.network_diagnostics.safe_to_mine {
+            "chain validation is not safe for mining yet"
+        } else if !status.network_diagnostics.safe_to_serve {
+            "chain state is not safe to serve yet"
+        } else {
+            "node is not ready"
+        };
+        Some(format!(
+            "block template generation is paused until the node is synced ({state}; local_height={} sync_target_height={} headers_synced={} running={} peer_count={} safe_to_mine={} safe_to_serve={} validation_lag_blocks={})",
+            status.block_count,
+            status.sync_best_height,
+            status.headers_synced,
+            status.running,
+            status.network_diagnostics.peer_count,
+            status.network_diagnostics.safe_to_mine,
+            status.network_diagnostics.safe_to_serve,
+            status.network_diagnostics.validation_lag_blocks
+        ))
+    }
+
+    fn stale_mined_block_error(
+        block: &Block,
+        status: &NodeStatus,
+    ) -> Option<atho_rpc::error::RpcError> {
+        let expected_height = status.block_count.saturating_add(1);
+        let extends_active_tip = block.header.height == expected_height
+            && block.header.previous_block_hash == status.tip_hash;
+        if extends_active_tip
+            && Self::chain_synced(status)
+            && status.network_diagnostics.safe_to_mine
+        {
+            return None;
+        }
+
+        let mut err =
+            rpc_error_from_node(NodeError::Validation(ValidationError::InvalidBlockHeight));
+        err.details = Some(format!(
+            "stale mining template: submitted_height={} expected_height={} submitted_prev={} current_tip={} local_height={} sync_target_height={} headers_synced={} safe_to_mine={}",
+            block.header.height,
+            expected_height,
+            hex::encode(block.header.previous_block_hash),
+            hex::encode(status.tip_hash),
+            status.block_count,
+            status.sync_best_height,
+            status.headers_synced,
+            status.network_diagnostics.safe_to_mine
+        ));
+        Some(err)
     }
 
     fn render_status_value(status: &NodeStatus) -> Value {
@@ -2854,6 +2937,9 @@ impl NodeService {
         args: &[String],
     ) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("getblocktemplate", args)?;
+        if let Some(reason) = Self::mining_template_sync_block_reason(&self.node_status()) {
+            return Err(atho_rpc::error::RpcError::invalid_request(reason));
+        }
         let block = self
             .orchestrator
             .runtime
@@ -2866,6 +2952,9 @@ impl NodeService {
 
     fn command_gettemplateinfo(&self, args: &[String]) -> Result<Value, atho_rpc::error::RpcError> {
         self.expect_no_args("gettemplateinfo", args)?;
+        if let Some(reason) = Self::mining_template_sync_block_reason(&self.node_status()) {
+            return Err(atho_rpc::error::RpcError::invalid_request(reason));
+        }
         let block = self
             .orchestrator
             .runtime
@@ -2890,6 +2979,8 @@ impl NodeService {
         self.expect_no_args("getmininginfo", args)?;
         let node = &self.orchestrator.runtime.node;
         let fast = self.orchestrator.sync.fast_download_diagnostics(node);
+        let status = self.node_status();
+        let mining_blocked_reason = Self::mining_template_sync_block_reason(&status);
         Ok(json!({
             "network": self.network().id(),
             "height": node.height(),
@@ -2899,7 +2990,10 @@ impl NodeService {
             "mempool_total_fee_atoms": node.mempool_total_fee_atoms(),
             "mining_reward_address": node.config.mining_reward_address.as_str(),
             "headers_synced": self.orchestrator.sync.sync_state().headers_synced,
+            "chain_synced": Self::chain_synced(&status),
             "safe_to_mine": fast.safe_to_mine,
+            "mining_allowed": mining_blocked_reason.is_none(),
+            "mining_blocked_reason": mining_blocked_reason,
             "chain_validation_status": fast.chain_validation_status,
             "sync_mode": fast.sync_mode,
             "validation_lag_blocks": fast.validation_lag_blocks,
@@ -4352,7 +4446,8 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
 
-        let service = NodeService::new(NodeConfig::new(Network::Regnet));
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
         let response = service.handle(RpcRequest::GetBlockTemplate);
         let RpcResponse::BlockTemplate(template) = response else {
             panic!("unexpected response: {response:?}");
@@ -4371,6 +4466,56 @@ mod tests {
             template.block.transactions.len()
         );
         assert_eq!(template.fees_atoms, template.block.fees_total_atoms);
+    }
+
+    #[test]
+    fn getblocktemplate_pauses_until_public_node_has_ready_peer() {
+        let root = temp_data_dir("block-template-public-sync");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Testnet));
+        service.start();
+
+        let response = service.handle(RpcRequest::GetBlockTemplate);
+        let RpcResponse::Error(error) = response else {
+            panic!("expected getblocktemplate sync error, got {response:?}");
+        };
+        assert!(error
+            .details
+            .unwrap_or_default()
+            .contains("no ready network peers"));
+    }
+
+    #[test]
+    fn stale_mined_block_submit_is_rejected_before_creating_rpc_fork() {
+        let root = temp_data_dir("stale-rpc-mined-block");
+        fs::create_dir_all(&root).expect("root");
+        let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
+
+        let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
+        let response = service.handle(RpcRequest::GetBlockTemplate);
+        let RpcResponse::BlockTemplate(template) = response else {
+            panic!("expected block template, got {response:?}");
+        };
+        let stale_block = Miner::new(1).solve_block(template.block);
+
+        service
+            .p2p_mine_local_block()
+            .expect("competing local block");
+        assert_eq!(service.node_ref().height(), 1);
+
+        let response = service.handle_mut(RpcRequest::SubmitBlock(stale_block));
+        let RpcResponse::Error(error) = response else {
+            panic!("expected stale block submit error, got {response:?}");
+        };
+        assert_eq!(error.code, atho_errors::BLK_INVALID_HEIGHT.code.as_str());
+        assert!(error
+            .details
+            .unwrap_or_default()
+            .contains("stale mining template"));
+        assert_eq!(service.node_ref().height(), 1);
     }
 
     #[test]
@@ -4601,6 +4746,35 @@ mod tests {
     }
 
     #[test]
+    fn mining_template_is_paused_when_peer_target_is_above_local_tip() {
+        let status = NodeStatus {
+            network: Network::Testnet,
+            block_count: 7,
+            tip_hash: [0x2a; 48],
+            tip_timestamp: 1_777_416_445,
+            estimated_hashrate_hps: 0,
+            mempool_count: 0,
+            mempool_total_fee_atoms: 0,
+            mempool_fingerprint: [0x58; 32],
+            running: true,
+            headers_synced: true,
+            sync_best_height: 9,
+            network_diagnostics: NetworkDiagnostics {
+                peer_count: 1,
+                safe_to_mine: true,
+                safe_to_serve: true,
+                ..NetworkDiagnostics::default()
+            },
+        };
+
+        let reason = NodeService::mining_template_sync_block_reason(&status)
+            .expect("stale public node should not receive mining templates");
+        assert!(reason.contains("local chain tip is behind"));
+        assert!(reason.contains("local_height=7"));
+        assert!(reason.contains("sync_target_height=9"));
+    }
+
+    #[test]
     fn transaction_submission_requires_ready_peer_on_public_networks() {
         let status = NodeStatus {
             network: Network::Testnet,
@@ -4626,10 +4800,7 @@ mod tests {
         regnet.network = Network::Regnet;
         regnet.network_diagnostics.safe_to_mine = true;
         regnet.network_diagnostics.safe_to_serve = true;
-        regnet
-            .network_diagnostics
-            .chain_validation_status
-            .clear();
+        regnet.network_diagnostics.chain_validation_status.clear();
         assert!(NodeService::transaction_submission_sync_block_reason(&regnet).is_none());
     }
 
@@ -4881,6 +5052,7 @@ mod tests {
         let _guard = EnvVarGuard::set_path(ATHO_DATA_DIR_ENV, &root);
 
         let mut service = NodeService::new(NodeConfig::new(Network::Regnet));
+        service.start();
         service
             .orchestrator
             .runtime
