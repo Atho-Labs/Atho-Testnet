@@ -2475,9 +2475,35 @@ impl DesktopApp {
 
     fn mining_reward_target(&mut self) -> Result<MiningRewardTarget, String> {
         if !self.ui_state.rotate_coinbase_address {
-            let configured = self.node_settings_form.mining_reward_address.trim();
+            let configured = self
+                .node_settings_form
+                .mining_reward_address
+                .trim()
+                .to_string();
             if !configured.is_empty() {
-                return self.validate_mining_reward_address(configured);
+                let configured_target = self.validate_mining_reward_address(&configured)?;
+                if self.wallet.is_none()
+                    || self.mining_reward_target_belongs_to_loaded_wallet(&configured_target)
+                {
+                    return Ok(configured_target);
+                }
+
+                if let Some(address) = self.wallet_mining_reward_address() {
+                    let _ = atho_node::dev::append_log(
+                        "atho-qt",
+                        &format!(
+                            "replacing stale configured mining reward address old={} new={}",
+                            configured, address.address
+                        ),
+                    );
+                    self.node_settings_form.mining_reward_address = address.address.clone();
+                    return Ok(MiningRewardTarget {
+                        address: address.address,
+                        locking_script: address.payment_digest.to_vec(),
+                    });
+                }
+
+                return Ok(configured_target);
             }
         }
 
@@ -2488,6 +2514,29 @@ impl DesktopApp {
         Ok(MiningRewardTarget {
             address: address.address,
             locking_script: address.payment_digest.to_vec(),
+        })
+    }
+
+    fn mining_reward_target_belongs_to_loaded_wallet(&self, target: &MiningRewardTarget) -> bool {
+        let Ok(payment_digest) = <[u8; 32]>::try_from(target.locking_script.as_slice()) else {
+            return false;
+        };
+        if self
+            .current_receive_address
+            .as_ref()
+            .is_some_and(|address| address.payment_digest == payment_digest)
+        {
+            return true;
+        }
+        if self.wallet_address_digests_cache.contains(&payment_digest) {
+            return true;
+        }
+        self.wallet_ref().is_some_and(|wallet| {
+            wallet
+                .address_book
+                .snapshot()
+                .into_iter()
+                .any(|record| wallet.address_for_path(record.path).payment_digest == payment_digest)
         })
     }
 
@@ -7609,6 +7658,50 @@ mod tests {
                 .expect("current receive address")
                 .payment_digest,
             last.payment_digest
+        );
+    }
+
+    #[test]
+    fn mining_reward_target_replaces_stale_configured_address_with_loaded_wallet() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut stale_wallet = test_wallet(0x31);
+        let stale_address = stale_wallet.checkout_receive_address();
+        let mut active_wallet = test_wallet(0x32);
+        let active_address = active_wallet.checkout_receive_address();
+        app.wallet = Some(active_wallet);
+        app.current_receive_address = Some(active_address.clone());
+        app.node_settings_form.mining_reward_address = stale_address.address;
+
+        let target = app.mining_reward_target().expect("mining reward target");
+
+        assert_eq!(target.address, active_address.address);
+        assert_eq!(
+            target.locking_script,
+            active_address.payment_digest.to_vec()
+        );
+        assert_eq!(
+            app.node_settings_form.mining_reward_address,
+            active_address.address
+        );
+    }
+
+    #[test]
+    fn mining_reward_target_keeps_configured_address_when_no_wallet_is_loaded() {
+        let _local = EnvVarGuard::set_value("ATHO_QT_LOCAL", "1");
+        let mut app = DesktopApp::new(Network::Regnet);
+        let mut wallet = test_wallet(0x33);
+        let configured_address = wallet.checkout_receive_address();
+        app.wallet = None;
+        app.current_receive_address = None;
+        app.node_settings_form.mining_reward_address = configured_address.address.clone();
+
+        let target = app.mining_reward_target().expect("mining reward target");
+
+        assert_eq!(target.address, configured_address.address);
+        assert_eq!(
+            target.locking_script,
+            configured_address.payment_digest.to_vec()
         );
     }
 
