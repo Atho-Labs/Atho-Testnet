@@ -7,7 +7,7 @@ Mainnet-facing launch helpers, regnet launch helpers, and the large Alpha docume
 - Website: <https://atho.io>
 - Explorer: <https://atho.io/explore/>
 - Testnet repo target: `Atho-Labs/Atho-Testnet`
-- Release line: `v0.3.6`
+- Release line: `v0.3.7`
 - Public testnet peers:
   - `162.222.206.163:9100`
   - `74.208.219.116:9100`
@@ -129,6 +129,28 @@ python3 -m unittest tests.test_runtime_launcher
 cargo check --workspace
 cargo check --manifest-path fuzz/Cargo.toml --all-targets
 ```
+
+## v0.3.7 Patch Notes
+
+This patch hardens fork/orphan repair after live network reports showed nodes could panic while syncing across stale side branches, then leave the runtime in a poisoned-lock state.
+
+### Fork Repair Stability
+
+- Fixes a side-branch parent-repair boundary where a missing parent below the local tip could build an invalid inclusive height range and panic a P2P worker.
+- Keeps backward fork-parent gaps bounded and requestable so heavier fork candidates can still heal instead of crashing the sync worker.
+- Prunes buffered descendants when a side-branch root is proven invalid, preventing stale fork fragments from repeatedly poisoning later repair passes.
+- Removes pending compact/header work for invalid branch families so the downloader does not keep scheduling dead blocks.
+
+### Runtime Resilience
+
+- Recovers the node runtime mutex after a worker panic instead of letting status/RPC paths panic immediately from a poisoned lock.
+- Logs runtime lock recovery so operators can see when a worker failure happened instead of getting a silent dead node.
+
+### Regression Coverage
+
+- Added a regression for the backward missing-parent gap that previously triggered the `BTreeMap` range panic.
+- Added a regression proving invalid side-branch roots prune their buffered descendants.
+- Re-ran side-branch, terminal-header, node check, and P2P regression suites.
 
 ## v0.3.6 Patch Notes
 

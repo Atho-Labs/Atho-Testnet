@@ -31,11 +31,24 @@ use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const RPC_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn lock_node_system(system: &Arc<Mutex<AthoSystem>>) -> MutexGuard<'_, AthoSystem> {
+    match system.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let _ = dev::append_log(
+                "athod",
+                "recovering poisoned node runtime state lock after worker panic",
+            );
+            poisoned.into_inner()
+        }
+    }
+}
 
 /// Runtime-level launch failures before the node can serve traffic.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -210,11 +223,11 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
     let api_config = config.api.clone();
     let system = Arc::new(Mutex::new(AthoSystem::try_new(config)?));
     {
-        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        let mut guard = lock_node_system(&system);
         guard.start();
     }
     let rpc_auth = {
-        let guard = system.lock().expect("node runtime mutex poisoned");
+        let guard = lock_node_system(&system);
         guard.node_ref().config.rpc_auth.clone()
     };
     let p2p_address = p2p_bind_address(network);
@@ -226,25 +239,25 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         .saturating_mul(4)
         .max(8);
     let bootstrap_peers = {
-        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        let mut guard = lock_node_system(&system);
         guard.p2p_bootstrap_peers(bootstrap_limit)
     };
     for peer in initial_outbound_peers(network, bootstrap_peers) {
         p2p_runtime.maintain_outbound(peer);
     }
     validate_rpc_bind_address(&rpc_address, &rpc_auth).map_err(|err| {
-        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        let mut guard = lock_node_system(&system);
         guard.stop();
         err
     })?;
     let listener = TcpListener::bind(&rpc_address).map_err(|err| {
-        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        let mut guard = lock_node_system(&system);
         guard.stop();
         crate::error::NodeError::Runtime(RuntimeError::RpcBindFailed(err.to_string()))
     })?;
     println!("athod running on {} rpc={rpc_address}", network.id());
     let status = {
-        let guard = system.lock().expect("node runtime mutex poisoned");
+        let guard = lock_node_system(&system);
         guard.node_status()
     };
     let chain_synced = status.headers_synced && status.network_diagnostics.safe_to_serve;
@@ -264,7 +277,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         let shared = Arc::clone(&system);
         let bind = api_config.bind_address();
         let server = crate::api::bind_http_server(&api_config).map_err(|err| {
-            let mut guard = system.lock().expect("node runtime mutex poisoned");
+            let mut guard = lock_node_system(&system);
             guard.stop();
             NodeError::Runtime(RuntimeError::ApiBindFailed(err))
         })?;
@@ -279,7 +292,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                 }
             })
             .map_err(|err| {
-                let mut guard = system.lock().expect("node runtime mutex poisoned");
+                let mut guard = lock_node_system(&system);
                 guard.stop();
                 NodeError::Runtime(RuntimeError::ApiBindFailed(err.to_string()))
             })?;
@@ -325,7 +338,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
                 // RPC requests are always executed through the validated node
                 // service path; there is no direct mutation of chainstate here.
                 let response: RpcResponse = {
-                    let mut guard = system.lock().expect("node runtime mutex poisoned");
+                    let mut guard = lock_node_system(&system);
                     guard.handle_mut(request)
                 };
                 let shutdown_requested = response_requests_runtime_shutdown(&response);
@@ -349,7 +362,7 @@ pub fn run_with_config(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     {
-        let mut guard = system.lock().expect("node runtime mutex poisoned");
+        let mut guard = lock_node_system(&system);
         guard.stop();
     }
     let _ = dev::append_log("athod", "runtime stopped");

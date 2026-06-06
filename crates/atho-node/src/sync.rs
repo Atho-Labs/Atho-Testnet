@@ -324,6 +324,30 @@ impl SideBranchPool {
         }
     }
 
+    fn remove_descendants_of(&mut self, parent_hash: &[u8; 48]) -> Vec<Block> {
+        let mut stack = self
+            .children_by_parent
+            .get(parent_hash)
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut descendant_hashes = Vec::new();
+        let mut visited = BTreeSet::new();
+        while let Some(hash) = stack.pop() {
+            if !visited.insert(hash) {
+                continue;
+            }
+            if let Some(children) = self.children_by_parent.get(&hash) {
+                stack.extend(children.iter().copied());
+            }
+            descendant_hashes.push(hash);
+        }
+
+        descendant_hashes
+            .into_iter()
+            .filter_map(|hash| self.remove(&hash))
+            .collect()
+    }
+
     fn enforce_limit(&mut self) {
         while self.blocks.len() > MAX_SIDE_BRANCH_BLOCKS {
             let Some(evict_hash) = self.eviction_candidate() else {
@@ -2367,7 +2391,7 @@ impl NodeSync {
         let block_hash = block.header.block_hash();
         let block_height = block.header.height;
         if let Err(validation) = validate_received_block_envelope(&block, self.network) {
-            self.mark_block_state(block_hash, block_height, BlockValidationState::Invalid);
+            self.mark_invalid_block_family(block_hash, block_height);
             let _ = dev::append_log(
                 "p2p",
                 &format!(
@@ -2485,7 +2509,7 @@ impl NodeSync {
                     );
                 }
                 Err(err) => {
-                    self.mark_block_state(block_hash, block_height, BlockValidationState::Invalid);
+                    self.mark_invalid_block_family(block_hash, block_height);
                     let _ = dev::append_log(
                         "p2p",
                         &format!(
@@ -2837,44 +2861,57 @@ impl NodeSync {
             return Vec::new();
         };
         let start_height = node.height().saturating_add(1);
-        for (hash, height) in &self.block_validation_heights {
-            if *height < start_height || *height > max_missing_height {
-                continue;
-            }
-            if self
-                .block_validation_states
-                .get(hash)
-                .is_some_and(|state| *state == BlockValidationState::Invalid)
-            {
-                continue;
-            }
-            if node.is_canonical_block(hash)
-                || self.side_branches.get(hash).is_some()
-                || node.block_by_hash(*hash).is_some()
-            {
-                continue;
-            }
-            repair
-                .entry(*height)
-                .or_insert_with(BTreeSet::new)
-                .insert(*hash);
-        }
-        for (height, blocks_at_height) in self
-            .pending_header_blocks
-            .range(start_height..=max_missing_height)
-        {
-            for hash in blocks_at_height.keys().copied() {
-                if node.is_canonical_block(&hash)
-                    || self.side_branches.get(&hash).is_some()
-                    || node.block_by_hash(hash).is_some()
+        if start_height <= max_missing_height {
+            for (hash, height) in &self.block_validation_heights {
+                if *height < start_height || *height > max_missing_height {
+                    continue;
+                }
+                if self
+                    .block_validation_states
+                    .get(hash)
+                    .is_some_and(|state| *state == BlockValidationState::Invalid)
+                {
+                    continue;
+                }
+                if node.is_canonical_block(hash)
+                    || self.side_branches.get(hash).is_some()
+                    || node.block_by_hash(*hash).is_some()
                 {
                     continue;
                 }
                 repair
                     .entry(*height)
                     .or_insert_with(BTreeSet::new)
-                    .insert(hash);
+                    .insert(*hash);
             }
+            for (height, blocks_at_height) in self
+                .pending_header_blocks
+                .range(start_height..=max_missing_height)
+            {
+                for hash in blocks_at_height.keys().copied() {
+                    if node.is_canonical_block(&hash)
+                        || self.side_branches.get(&hash).is_some()
+                        || node.block_by_hash(hash).is_some()
+                    {
+                        continue;
+                    }
+                    repair
+                        .entry(*height)
+                        .or_insert_with(BTreeSet::new)
+                        .insert(hash);
+                }
+            }
+        } else {
+            let request_count = repair.values().map(BTreeSet::len).sum::<usize>();
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "orphan bridge parent repair using backward gap local_height={} max_missing_height={} count={}",
+                    node.height(),
+                    max_missing_height,
+                    request_count
+                ),
+            );
         }
 
         repair
@@ -3015,6 +3052,7 @@ impl NodeSync {
                             tip, err
                         ),
                     );
+                    let mut dropped = 0usize;
                     for hash in &candidate_hashes {
                         let hash = *hash;
                         let height = self
@@ -3022,12 +3060,10 @@ impl NodeSync {
                             .get(&hash)
                             .copied()
                             .unwrap_or_default();
-                        self.mark_block_state(hash, height, BlockValidationState::Invalid);
-                        self.downloader.note_block_received(hash);
-                        self.pending_compact_blocks.remove(&hash);
-                        self.side_branches.remove(&hash);
+                        dropped = dropped
+                            .saturating_add(self.mark_invalid_block_family(hash, height).max(1));
                     }
-                    return Ok(candidate_count.max(1));
+                    return Ok(dropped.max(candidate_count).max(1));
                 }
                 Err(err) => {
                     let tip = candidate_hashes
@@ -3039,6 +3075,7 @@ impl NodeSync {
                         "p2p",
                         &format!("dropping invalid side branch tip={} error={}", tip, err),
                     );
+                    let mut dropped = 0usize;
                     for hash in &candidate_hashes {
                         let hash = *hash;
                         let height = self
@@ -3046,12 +3083,10 @@ impl NodeSync {
                             .get(&hash)
                             .copied()
                             .unwrap_or_default();
-                        self.mark_block_state(hash, height, BlockValidationState::Invalid);
-                        self.downloader.note_block_received(hash);
-                        self.pending_compact_blocks.remove(&hash);
-                        self.side_branches.remove(&hash);
+                        dropped = dropped
+                            .saturating_add(self.mark_invalid_block_family(hash, height).max(1));
                     }
-                    return Ok(candidate_count.max(1));
+                    return Ok(dropped.max(candidate_count).max(1));
                 }
             }
         }
@@ -3316,6 +3351,39 @@ impl NodeSync {
         let _state_label = state.as_str();
         self.block_validation_heights.insert(hash, height);
         self.block_validation_states.insert(hash, state);
+    }
+
+    fn mark_invalid_block_family(&mut self, hash: [u8; 48], height: u64) -> usize {
+        self.mark_block_state(hash, height, BlockValidationState::Invalid);
+        self.downloader.note_block_received(hash);
+        self.pending_compact_blocks.remove(&hash);
+        self.remove_pending_header_block(height, &hash);
+
+        let mut removed = usize::from(self.side_branches.remove(&hash).is_some());
+        for descendant in self.side_branches.remove_descendants_of(&hash) {
+            let descendant_hash = descendant.header.block_hash();
+            self.mark_block_state(
+                descendant_hash,
+                descendant.header.height,
+                BlockValidationState::Invalid,
+            );
+            self.downloader.note_block_received(descendant_hash);
+            self.pending_compact_blocks.remove(&descendant_hash);
+            self.remove_pending_header_block(descendant.header.height, &descendant_hash);
+            removed = removed.saturating_add(1);
+        }
+
+        if removed > 1 {
+            let _ = dev::append_log(
+                "p2p",
+                &format!(
+                    "pruned invalid side branch family root={} descendants={}",
+                    short_hash(&hash),
+                    removed.saturating_sub(1)
+                ),
+            );
+        }
+        removed
     }
 
     fn mark_finalized_boundary(&mut self, node: &Node) {
@@ -6920,6 +6988,74 @@ mod tests {
         assert_eq!(requested.len(), 2);
         assert_eq!(requested[0], blocks[2].header.block_hash());
         assert_eq!(requested[1], blocks[4].header.block_hash());
+    }
+
+    #[test]
+    fn orphan_parent_repair_handles_backward_gap_without_panicking() {
+        let mut node = Node::new(NodeConfig::new(Network::Regnet));
+        node.dev_seed_chainstate(3, synthetic_header_hash(3, 0xA3), Vec::<UtxoEntry>::new())
+            .expect("seed local height");
+        assert_eq!(node.height(), 3);
+
+        let mut sync = NodeSync::new(Network::Regnet);
+        sync.prime(&node);
+        sync.last_block_progress_unix = now_unix().saturating_sub(
+            sync.block_request_retry_timeout()
+                .as_secs()
+                .saturating_add(1),
+        );
+        sync.downloader.note_peer_ready("peer");
+
+        let missing_parent_hash = synthetic_header_hash(1, 0xB9);
+        let stale_side_child = coinbase_block(
+            Network::Regnet,
+            2,
+            missing_parent_hash,
+            pow::target_for_height(Network::Regnet, 2),
+            1_700_000_222,
+        );
+        sync.side_branches.insert("peer", stale_side_child);
+
+        let mut outbound = Vec::new();
+        sync.heal_buffered_branch_parents(Some("peer"), &node, &mut outbound);
+
+        assert_eq!(
+            outbound_getdata_hashes(&outbound),
+            vec![missing_parent_hash]
+        );
+    }
+
+    #[test]
+    fn invalid_side_branch_prunes_buffered_descendants() {
+        let genesis_hash = genesis::genesis_state(Network::Regnet)
+            .block
+            .header
+            .block_hash();
+        let block_1 = synthetic_coinbase_block(Network::Regnet, 1, genesis_hash, 0xD1);
+        let block_2 =
+            synthetic_coinbase_block(Network::Regnet, 2, block_1.header.block_hash(), 0xD2);
+        let block_3 =
+            synthetic_coinbase_block(Network::Regnet, 3, block_2.header.block_hash(), 0xD3);
+        let blocks = vec![block_1, block_2, block_3];
+        let mut sync = NodeSync::new(Network::Regnet);
+        let node = Node::new(NodeConfig::new(Network::Regnet));
+        sync.prime(&node);
+
+        for block in &blocks {
+            sync.side_branches.insert("peer", block.clone());
+        }
+
+        let invalid_root = blocks[0].header.block_hash();
+        let removed = sync.mark_invalid_block_family(invalid_root, blocks[0].header.height);
+
+        assert_eq!(removed, 3);
+        assert!(sync.side_branches.is_empty());
+        for block in &blocks {
+            assert_eq!(
+                sync.block_validation_states.get(&block.header.block_hash()),
+                Some(&BlockValidationState::Invalid)
+            );
+        }
     }
 
     #[test]
